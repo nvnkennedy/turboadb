@@ -1,0 +1,6 @@
+# Dev/build tooling (the package itself needs no runtime deps).
+PyQt5>=5.15   # GUI from source
+pyinstaller>=6.0
+pillow>=9.0   # icon generation
+build
+twine

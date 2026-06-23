@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TurboADB — Android ADB + scrcpy toolkit</title>
+<meta name="description" content="One pip package for driving Android over ADB + scrcpy: a Python API, a full CLI, and a desktop GUI. Built for Android Automotive / IVI head units and regular phones.">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <img src="icon.png" alt="" width="30" height="30">
+      <span>TurboADB</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#usage">Usage</a>
+      <a href="#remote">Remote</a>
+      <a data-gh="repo" href="#">GitHub</a>
+      <a href="https://pypi.org/project/turboadb/">PyPI</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <img class="hero-logo" src="icon.png" alt="TurboADB logo" width="104" height="104">
+      <h1>TurboADB</h1>
+      <p class="tagline">
+        Drive Android over <strong>ADB</strong> + <strong>scrcpy</strong> from one
+        pip package — a Python API, a full CLI, and a desktop GUI. Built for
+        Android&nbsp;Automotive&nbsp;/&nbsp;IVI head units and regular phones alike.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download for Windows</a>
+        <a class="btn btn-ghost" href="#install">pip install turboadb</a>
+      </div>
+      <p class="cta-sub">
+        Bundled GUI executable — no Python needed. Or <code>pip install turboadb</code>
+        for the CLI, API, and GUI together.
+      </p>
+    </div>
+  </section>
+
+  <!-- WHAT IT IS -->
+  <section class="band">
+    <div class="wrap">
+      <div class="lead">
+        TurboADB wraps <code>adb</code> and <code>scrcpy</code> so you don't have to
+        remember their flags. The same engine powers all three front-ends, so
+        anything you can click in the GUI you can script in Python or run as a
+        one-line command. It bundles its own tools (downloaded on first run), works
+        against devices on <em>another machine's</em> adb server over RDP, and knows
+        the quirks of Android Automotive head units.
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section id="features" class="section">
+    <div class="wrap">
+      <h2>Everything it does</h2>
+      <div class="grid">
+
+        <div class="card">
+          <div class="ic">🖥</div>
+          <h3>Interactive shell</h3>
+          <p>A real <code>adb shell</code> terminal: history, tab-completion,
+          copy/paste, columnised <code>ls</code>, and a <strong>Stop</strong> button
+          that actually kills a runaway command like <code>logcat</code> — even over
+          a remote adb server.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📜</div>
+          <h3>Live logcat</h3>
+          <p>Filter by level, tag, or live regex; pause and clear. Under a flood the
+          view stays responsive and <strong>nothing is lost</strong> — every line is
+          archived to disk, so a save is the complete log.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📁</div>
+          <h3>Files &amp; apps</h3>
+          <p>Browse the device filesystem and push/pull files. List, install (incl.
+          split APKs), uninstall, clear data, and start/stop packages.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">🎛</div>
+          <h3>Device controls</h3>
+          <p>One click for system keys, media, Wi-Fi / Bluetooth / airplane /
+          hotspot, screen on/off, brightness, app launchers, and an on-screen
+          keyboard. Every one is also a CLI command.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📱</div>
+          <h3>Mirroring &amp; capture</h3>
+          <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
+          IVI units and remote-tunnel handling. Screenshots and screen recording
+          that work over RDP.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📞</div>
+          <h3>Telephony</h3>
+          <p>Dial, place / answer / end calls, read the call log, list SMS, and
+          compose a message — handy on IVI units with telephony.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">🌐</div>
+          <h3>Remote devices</h3>
+          <p>No need to plug the device into your own machine. Point TurboADB at
+          another PC's adb server and drive whatever is connected there — exactly
+          what you want for a lab unit reached over RDP.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📡</div>
+          <h3>Serve &amp; deploy</h3>
+          <p>Share this PC's devices with one command, or push <code>serve</code>
+          onto remote Windows hosts <em>from your machine</em> over WinRM — one host
+          or a whole fleet, with a pre-flight test.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">🔧</div>
+          <h3>Root &amp; mount</h3>
+          <p>root / unroot, remount, <code>mount -o remount,rw /</code>, and
+          disable/enable verity (with the required reboot handled) for engineering
+          builds.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">⬆</div>
+          <h3>Bundled &amp; self-updating</h3>
+          <p><code>adb</code> and <code>scrcpy</code> download themselves on first
+          run. The Upgrade button updates TurboADB from PyPI, refreshes the tools,
+          and restarts.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- INSTALL -->
+  <section id="install" class="section alt">
+    <div class="wrap">
+      <h2>Install</h2>
+      <div class="cols">
+        <div>
+          <h3>Windows app (no Python)</h3>
+          <p>Download the standalone GUI and double-click it. It downloads
+          <code>adb</code> and <code>scrcpy</code> on first run.</p>
+          <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download turboadb-gui.exe</a>
+        </div>
+        <div>
+          <h3>With pip (CLI + API + GUI)</h3>
+          <div class="code">
+            <button class="copy" data-copy="pip install turboadb">Copy</button>
+            <pre><code>pip install turboadb</code></pre>
+          </div>
+          <p class="muted">Then run <code>turboadb-gui</code>, or use
+          <code>turboadb</code> on the command line, or
+          <code>import turboadb</code> in Python.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- USAGE -->
+  <section id="usage" class="section">
+    <div class="wrap">
+      <h2>Three ways to use it</h2>
+      <div class="cols3">
+        <div>
+          <h3>GUI</h3>
+          <div class="code"><pre><code>turboadb-gui</code></pre></div>
+          <p class="muted">A desktop + Start-menu shortcut is created on first launch.</p>
+        </div>
+        <div>
+          <h3>CLI</h3>
+          <div class="code"><pre><code>turboadb devices
+turboadb -s SERIAL \
+  shell -- getprop ro.product.model
+turboadb -s SERIAL screenshot shot.png</code></pre></div>
+        </div>
+        <div>
+          <h3>Python</h3>
+          <div class="code"><pre><code>from turboadb import ADBHandler, ADBConfig
+
+dev = ADBHandler(ADBConfig(serial="SERIAL"))
+dev.connect()
+dev.install("app.apk", grant_perms=True)</code></pre></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REMOTE -->
+  <section id="remote" class="section alt">
+    <div class="wrap">
+      <h2>Remote &amp; lab setups</h2>
+      <div class="cols">
+        <div>
+          <h3>Drive a device on another PC</h3>
+          <div class="code"><pre><code>turboadb --adb-host lab-pc-01 devices
+turboadb --adb-host lab-pc-01 -s DEVICE \
+  shell -- pm list packages</code></pre></div>
+          <p class="muted">The lab machine just needs to share its adb server.</p>
+        </div>
+        <div>
+          <h3>Share / deploy that sharing</h3>
+          <div class="code"><pre><code># on the host with the device:
+turboadb serve --startup-task
+
+# or push it to remote hosts from here:
+turboadb deploy-serve lab-pc-01 lab-pc-02 \
+  -u "DOMAIN\user"</code></pre></div>
+          <p class="muted">Deploy uses WinRM (NTLM); each target needs WinRM on and
+          admin rights.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA FOOTER -->
+  <section class="band closing">
+    <div class="wrap center">
+      <img src="icon.png" alt="" width="56" height="56">
+      <h2>Get TurboADB</h2>
+      <div class="cta">
+        <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download for Windows</a>
+        <a class="btn btn-ghost" href="https://pypi.org/project/turboadb/">View on PyPI</a>
+        <a class="btn btn-ghost" data-gh="repo" href="#">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <span>TurboADB · MIT licensed</span>
+    <span>
+      <a data-gh="repo" href="#">GitHub</a> ·
+      <a href="https://pypi.org/project/turboadb/">PyPI</a> ·
+      <a data-gh="releases" href="#">Releases</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+  // ──────────────────────────────────────────────────────────────────
+  //  EDIT THIS ONE LINE: set it to "your-github-username/turboadb"
+  const REPO = "YOUR-USERNAME/turboadb";
+  // ──────────────────────────────────────────────────────────────────
+  const base = "https://github.com/" + REPO;
+  const urls = {
+    repo: base,
+    releases: base + "/releases",
+    exe: base + "/releases/latest/download/turboadb-gui.exe",
+  };
+  document.querySelectorAll("[data-gh]").forEach(function (a) {
+    a.href = urls[a.getAttribute("data-gh")] || base;
+  });
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      navigator.clipboard.writeText(b.getAttribute("data-copy"));
+      const t = b.textContent; b.textContent = "Copied"; b.classList.add("ok");
+      setTimeout(function () { b.textContent = t; b.classList.remove("ok"); }, 1200);
+    });
+  });
+</script>
+</body>
+</html>

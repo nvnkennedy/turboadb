@@ -1,0 +1,22 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+*.spec.bak
+.venv/
+venv/
+*.log
+
+# The bundled GUI executable is a build artifact (~56 MB). It's rebuilt by
+# scripts/build_exe.py for the PyPI wheel and attached to GitHub Releases, so it
+# does not belong in git history.
+turboadb/bin/*.exe
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
