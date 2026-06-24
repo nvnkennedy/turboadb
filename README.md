@@ -312,7 +312,10 @@ Mirror in its own window or embedded in the tab. A **compatibility mode**
 choke on the defaults, and it works through a remote adb server.
 
 **GUI** — the **Mirror** tab / **Scrcpy** ribbon button → Mirror (window), Embed,
-or the IVI/compatibility option. Pick a specific display on multi-display units.
+or the IVI/compatibility option. Pick a specific display on multi-display units,
+or **▦ Mirror all** to show every display at once. The **🎮 Control + Mirror**
+tab puts the screen and the device controls side by side, so you can watch and
+tap/press without switching tabs.
 
 **CLI**:
 

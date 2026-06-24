@@ -404,6 +404,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
+        # don't truncate device-tab titles; scroll when there are many
+        self.tabs.setElideMode(Qt.ElideNone)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(lambda *_: self._update_status())
         plus = QToolButton(); plus.setText("  +  "); plus.setToolTip("New device")
@@ -585,13 +589,16 @@ class MainWindow(QMainWindow):
         w.log.connect(self.log_panel.append)
         w.title_changed.connect(lambda title, ww=w: self._set_tab_title(ww, title))
         idx = self.tabs.addTab(w, name)
+        self.tabs.setTabIcon(idx, theme.emoji_icon("📱"))
         self.tabs.setCurrentIndex(idx)
         self.log_panel.append(f"Opening '{name}'…")
 
     def _set_tab_title(self, widget, title):
         idx = self.tabs.indexOf(widget)
         if idx >= 0:
-            self.tabs.setTabText(idx, f"📱 {title}")
+            # emoji as the tab ICON + plain text, so the label never truncates
+            self.tabs.setTabText(idx, title)
+            self.tabs.setTabIcon(idx, theme.emoji_icon("📱"))
         self._update_status()
 
     def _update_status(self):

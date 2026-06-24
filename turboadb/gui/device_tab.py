@@ -427,6 +427,11 @@ class DeviceTab(QWidget):
         lay.addLayout(bar)
 
         self.inner = QTabWidget()
+        # show full tab labels (Qt elides them by default, which truncated the
+        # Shell/Logcat/… text); scroll instead of cram when there are many
+        self.inner.setElideMode(Qt.ElideNone)
+        self.inner.setUsesScrollButtons(True)
+        self.inner.tabBar().setExpanding(False)
         lay.addWidget(self.inner, 1)
         self._enable_actions(False)
 
@@ -552,13 +557,43 @@ class DeviceTab(QWidget):
         self.mirror_tab = MirrorPanel(handler, self.session,
                                       automotive=self._automotive)
         self.mirror_tab.log.connect(self.log)
-        self.inner.addTab(self.shell, "🖥 Shell")
-        self.inner.addTab(self.logcat, "📜 Logcat")
-        self.inner.addTab(self.files, "📁 Files")
-        self.inner.addTab(self.apps, "📦 Apps")
-        self.inner.addTab(self.controls, "🎛 Controls")
-        self.inner.addTab(self.phone, "📞 Phone")
-        self.inner.addTab(self.mirror_tab, "📱 Mirror")
+        # the emoji goes on the tab as a real ICON (with plain text), so Qt sizes
+        # the tab to the text correctly — inline emoji in the label throws the
+        # width calc off and truncated the labels
+        self._add_subtab(self.shell, "🖥", "Shell")
+        self._add_subtab(self.logcat, "📜", "Logcat")
+        self._add_subtab(self.files, "📁", "Files")
+        self._add_subtab(self.apps, "📦", "Apps")
+        self._add_subtab(self.controls, "🎛", "Controls")
+        self._add_subtab(self.phone, "📞", "Phone")
+        self._add_subtab(self.mirror_tab, "📱", "Mirror")
+        # a combined "easy control" view: the screen + the controls side by side
+        self.combo_view = self._build_control_view(handler)
+        self._add_subtab(self.combo_view, "🎮", "Control + Mirror")
+
+    def _add_subtab(self, widget, emoji, label):
+        idx = self.inner.addTab(widget, label)
+        self.inner.setTabIcon(idx, theme.emoji_icon(emoji))
+        return idx
+
+    def _build_control_view(self, handler):
+        """A side-by-side view: the device screen (mirror / live view) on the left,
+        the controls panel on the right — so you can watch and tap/press without
+        switching tabs. Each is its own instance bound to the same device."""
+        from PyQt5.QtWidgets import QSplitter
+        split = QSplitter(Qt.Horizontal)
+        self.cv_mirror = MirrorPanel(handler, self.session,
+                                     automotive=self._automotive)
+        self.cv_mirror.log.connect(self.log)
+        self.cv_controls = ControlsPanel(handler)
+        self.cv_controls.log.connect(self.log)
+        split.addWidget(self.cv_mirror)
+        split.addWidget(self.cv_controls)
+        split.setStretchFactor(0, 3)         # the screen gets the larger share
+        split.setStretchFactor(1, 2)
+        split.setSizes([640, 380])
+        split.setChildrenCollapsible(False)
+        return split
 
     def _on_fail(self, msg):
         self.status.setText("Connect failed")
@@ -644,7 +679,7 @@ class DeviceTab(QWidget):
 
     def close_session(self):
         for attr in ("shell", "logcat", "files", "apps", "controls", "phone",
-                     "mirror_tab"):
+                     "mirror_tab", "cv_mirror", "cv_controls"):
             p = getattr(self, attr, None)
             if p is not None:
                 try:

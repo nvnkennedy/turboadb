@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 
 from ..config import ScrcpyOptions
 from ..results import OperationResult
-from ..scrcpy import is_remote_session
+from ..scrcpy import is_remote_session, is_local_host
+from ..tools import scrcpy_available
 from . import settings as settings_mod
 
 _IS_WIN = os.name == "nt"
@@ -72,6 +73,21 @@ def _post_close(title) -> bool:
     u.PostMessageW.restype = wintypes.BOOL
     u.PostMessageW(hwnd, 0x0010, 0, 0)        # WM_CLOSE
     return True
+
+
+def _bitrate_to_bps(value) -> str:
+    """Normalise a bitrate like '16M' / '8m' / '16000000' to a bits-per-second
+    integer string — what device-side ``screenrecord --bit-rate`` expects (older
+    builds reject the 'M' suffix)."""
+    s = str(value).strip().lower()
+    try:
+        if s.endswith("m"):
+            return str(int(float(s[:-1]) * 1_000_000))
+        if s.endswith("k"):
+            return str(int(float(s[:-1]) * 1_000))
+        return str(int(float(s)))
+    except Exception:
+        return "16000000"
 
 
 def _default_save_dir() -> str:
@@ -278,22 +294,43 @@ class _RecordThread(QThread):
     pull the file. No video tunnel and no GPU needed, so it works while using
     Live View, over a remote adb server / RDP / IVI — anywhere the adb
     connection works. (screenrecord caps at ~3 min and has no audio.)"""
-    done = pyqtSignal(str)
+    done = pyqtSignal(list)      # the saved part file(s)
     fail = pyqtSignal(str)
+    part = pyqtSignal(int)       # a new part started (Android's 3-min cap)
 
-    def __init__(self, handler, path, stop_event):
+    def __init__(self, handler, path, stop_event, bit_rate=None):
         super().__init__()
         self.handler = handler
         self.path = path
         self.stop_event = stop_event
+        self.bit_rate = bit_rate
 
     def run(self):
+        # A single device-side screenrecord is capped at ~3 min by Android. Rather
+        # than just stopping mid-capture, record back-to-back parts until the user
+        # stops — each a valid, sharp clip (explicit high bitrate + native size).
+        base, ext = os.path.splitext(self.path)
+        ext = ext or ".mp4"
+        parts, n = [], 0
         try:
-            self.handler.screen_record(self.path, time_limit=180,
-                                       stop_event=self.stop_event, safe=False)
-            self.done.emit(self.path)
+            while not self.stop_event.is_set():
+                seg = self.path if n == 0 else f"{base}-part{n + 1:02d}{ext}"
+                if n > 0:
+                    self.part.emit(n + 1)
+                self.handler.screen_record(seg, time_limit=180,
+                                           bit_rate=self.bit_rate,
+                                           stop_event=self.stop_event, safe=False)
+                if os.path.exists(seg) and os.path.getsize(seg) > 0:
+                    parts.append(seg)
+                n += 1
+                # if the user didn't press stop, the 3-min cap ended this segment —
+                # loop straight into the next part instead of stopping
+            self.done.emit(parts)
         except Exception as exc:
-            self.fail.emit(f"{type(exc).__name__}: {exc}")
+            if parts:
+                self.done.emit(parts)        # keep whatever was captured
+            else:
+                self.fail.emit(f"{type(exc).__name__}: {exc}")
 
 
 class MirrorPanel(QWidget):
@@ -320,9 +357,15 @@ class MirrorPanel(QWidget):
         self._rec_path = None
         self._rec_thread = None
         self._rec_stop = None
+        self._rec_mode = None        # "scrcpy" (clean, preferred) | "device" (fallback)
+        self._rec_scrcpy = None      # the off-screen scrcpy --record session
+        self._rec_title = None
+        self._rec_wait = None
         self._shot = None
         self._live = None
         self._dev_w = self._dev_h = 0
+        self._displays = []          # cached [{id,size}] from the last list
+        self._multi = []             # ScrcpySessions when mirroring ALL displays
 
         from .flowlayout import FlowLayout
         self._rdp = is_remote_session()
@@ -346,6 +389,13 @@ class MirrorPanel(QWidget):
         self.btn_stop = QPushButton("■ Stop"); self.btn_stop.setProperty("role", "danger")
         self.btn_stop.clicked.connect(self.stop); self.btn_stop.setEnabled(False)
         self.cmb_display = QComboBox(); self.cmb_display.addItem("default display", None)
+        # don't truncate display labels: size the box (and its popup) to the
+        # longest entry, and give it room in the toolbar
+        self.cmb_display.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cmb_display.setMinimumWidth(160)
+        self.cmb_display.setToolTip("Which display to mirror. Head units expose "
+                                    "several (cluster, centre stack, passenger); "
+                                    "this list fills in automatically on connect.")
         self.btn_record = QPushButton("🔴 Record…"); self.btn_record.setProperty("role", "ghost")
         self.btn_record.setToolTip("Record the device screen to a video file. "
                                    "Records on the device itself, so it works "
@@ -384,8 +434,16 @@ class MirrorPanel(QWidget):
                                  "when the on-screen / physical keyboard won't "
                                  "type through the mirror.")
         self.btn_type.clicked.connect(self._type_text)
-        self.btn_displays = QPushButton("Displays"); self.btn_displays.setProperty("role", "ghost")
+        self.btn_displays = QPushButton("↻ Displays"); self.btn_displays.setProperty("role", "ghost")
+        self.btn_displays.setToolTip("Re-scan the device's displays.")
         self.btn_displays.clicked.connect(self.refresh_displays)
+        self.btn_mirror_all = QPushButton("▦ Mirror all"); self.btn_mirror_all.setProperty("role", "ghost")
+        self.btn_mirror_all.setToolTip("Mirror EVERY display at once, each in its "
+                                       "own window — handy on an IVI with cluster + "
+                                       "centre + passenger screens. Best on local / "
+                                       "USB (a remote server shares one video "
+                                       "tunnel, so it can only do one at a time).")
+        self.btn_mirror_all.clicked.connect(self._mirror_all)
         self.btn_max = QPushButton("⛶ Max view"); self.btn_max.setProperty("role", "ghost")
         self.btn_max.setCheckable(True)
         self.btn_max.setToolTip("Hide the log + sidebar so the screen gets the "
@@ -394,7 +452,7 @@ class MirrorPanel(QWidget):
         for w in (self.btn_mirror, self.btn_live, self.btn_stop, self.btn_record,
                   self.btn_shot, self.btn_type, self.btn_opts,
                   QLabel("Display:"), self.cmb_display, self.btn_displays,
-                  self.btn_max):
+                  self.btn_mirror_all, self.btn_max):
             bar.addWidget(w)
         lay.addWidget(bar_w)
 
@@ -420,6 +478,10 @@ class MirrorPanel(QWidget):
         self.live_view.tapped.connect(self._live_tap)
         self.live_view.swiped.connect(self._live_swipe)
         lay.addWidget(self.live_view, 1)
+
+        # populate the display list automatically once the tab is up (so the
+        # dropdown is ready without the user clicking "Displays" first)
+        QTimer.singleShot(700, self.refresh_displays)
 
     # ----- live view (screencap streaming; works over remote/RDP/IVI) -----
     def _toggle_live(self):
@@ -513,12 +575,61 @@ class MirrorPanel(QWidget):
         enabled only when nothing is being viewed; Stop while viewing; Record
         while viewing OR already recording (it records device-side, so it can
         run alongside Live View)."""
-        viewing = (self._scrcpy is not None) or (self._live is not None)
+        viewing = (self._scrcpy is not None) or (self._live is not None) \
+            or bool(self._multi)
         self.btn_mirror.setEnabled(not viewing)
         self.btn_live.setEnabled(not viewing)
+        self.btn_mirror_all.setEnabled(not viewing and len(self._displays) > 1)
         self.btn_stop.setEnabled(viewing)
         self.btn_record.setEnabled(viewing or self._recording)
         self.btn_record.setText("⏹ Stop recording" if self._recording else "🔴 Record…")
+
+    # ----- mirror EVERY display, each in its own window -----
+    def _mirror_all(self):
+        if not self._displays:
+            self.log.emit("[WARNING] No displays listed yet — click ↻ Displays.")
+            return
+        if self._scrcpy is not None or self._live is not None:
+            self.stop()
+        self._stop_multi()
+        st = settings_mod.load()
+        name = self.session_dict.get("name") or "turboadb"
+        launched = 0
+        for d in self._displays:
+            opts = ScrcpyOptions(
+                max_size=(st.get("scrcpy_max_size") or None),
+                bit_rate=st.get("scrcpy_bit_rate") or None,
+                video_codec=(st.get("scrcpy_video_codec") or None),
+                stay_awake=st.get("scrcpy_stay_awake", True),
+                no_audio=True,
+                display_id=d["id"],
+                keyboard_mode="uhid" if self.act_uhid.isChecked() else None,
+                window_title=f"{name} — display {d['id']}")
+            self._tune(opts)
+            try:
+                res = self.handler.mirror(opts, compat=self.act_compat.isChecked(),
+                                          safe=True)
+                sess = res.value if isinstance(res, OperationResult) else res
+                if sess is not None:
+                    self._multi.append(sess); launched += 1
+            except Exception as exc:
+                self.log.emit(f"[WARNING] display {d['id']}: {exc}")
+        if launched:
+            self.status.setText(f"Mirroring {launched} display(s), each in its own "
+                                f"window. “■ Stop” closes them all.")
+            self.log.emit(f"[OK] mirroring {launched} display(s) in separate windows")
+        else:
+            self.log.emit("[ERROR] could not mirror any display (try local/USB, or "
+                          "compatibility mode)")
+        self._refresh_buttons()
+
+    def _stop_multi(self):
+        for s in self._multi:
+            try:
+                s.stop()
+            except Exception:
+                pass
+        self._multi = []
 
     def _toggle_max(self):
         """Hide/show the main window's docks so the mirror gets the whole window
@@ -542,12 +653,19 @@ class MirrorPanel(QWidget):
         self._dt.start()
 
     def _got_displays(self, displays):
+        self._displays = list(displays or [])
+        keep = self.cmb_display.currentData()       # preserve the user's choice
         self.cmb_display.clear()
         self.cmb_display.addItem("default display", None)
-        for d in displays or []:
-            label = f"display {d['id']}" + (f"  ({d['size']})" if d.get("size") else "")
+        for d in self._displays:
+            label = f"Display {d['id']}" + (f"  ·  {d['size']}" if d.get("size") else "")
             self.cmb_display.addItem(label, d["id"])
-        self.log.emit(f"[OK] {len(displays or [])} display(s)")
+        idx = self.cmb_display.findData(keep)
+        if idx >= 0:
+            self.cmb_display.setCurrentIndex(idx)
+        # let several IVI displays sit side by side
+        self.btn_mirror_all.setEnabled(len(self._displays) > 1)
+        self.log.emit(f"[OK] {len(self._displays)} display(s) found")
 
     def _tune(self, opts):
         """Apply the 'software render (RDP)' choice and, in that mode, sensible
@@ -581,42 +699,130 @@ class MirrorPanel(QWidget):
             return
         if not path.lower().endswith(".mp4"):
             path += ".mp4"
-        import threading
         self._rec_path = path
-        self._rec_stop = threading.Event()
         self._recording = True
-        self._rec_thread = _RecordThread(self.handler, path, self._rec_stop)
+        # Prefer scrcpy --record: it muxes the H.264 stream from the first REAL
+        # frame, so there's no encoder warm-up black frame, no 3-min cap, and it's
+        # sharp. It needs a workable local video path (great when the device is
+        # local — incl. USB on the machine you're RDP'd into). For a genuinely
+        # REMOTE adb server, scrcpy's tunnel is fragile, so use the device-side
+        # screenrecord (universal, auto-continues past the 3-min cap).
+        cfg = getattr(self.handler, "config", None)
+        remote = bool(cfg and cfg.adb_server_host) \
+            and not is_local_host(cfg.adb_server_host)
+        if (not remote) and scrcpy_available(cfg.scrcpy_path if cfg else None):
+            self._record_scrcpy(path)
+        else:
+            self._record_device(path)
+        self._refresh_buttons()
+
+    def _record_scrcpy(self, path):
+        """Record via an OFF-SCREEN scrcpy --record window — clean (no black start),
+        sharp, no time limit. Stopped politely so the mp4 is finalized."""
+        self._rec_mode = "scrcpy"
+        self._rec_title = f"turboadb-rec-{os.getpid()}-{id(self)}"
+        st = settings_mod.load()
+        opts = ScrcpyOptions(
+            max_size=(st.get("scrcpy_max_size") or None),
+            bit_rate=st.get("scrcpy_bit_rate") or None,
+            video_codec=(st.get("scrcpy_video_codec") or None),
+            no_audio=True, no_control=True, stay_awake=True,
+            display_id=self.cmb_display.currentData(),
+            record=path, record_format="mp4",
+            window_title=self._rec_title, window_borderless=True,
+            window_x=-32000, window_y=-32000)        # off-screen: no window shows
+        self._tune(opts)
+        res = self.handler.mirror(opts, compat=self.act_compat.isChecked(),
+                                  safe=True)
+        sess = res.value if isinstance(res, OperationResult) else res
+        if sess is None or (isinstance(res, OperationResult) and not res.success):
+            self.log.emit("[WARNING] scrcpy recorder didn't start — using the "
+                          "device-side recorder instead")
+            self._record_device(path)
+            return
+        self._rec_scrcpy = sess
+        self.status.setText(f"● Recording (scrcpy — sharp, no time limit) → {path}")
+        self.log.emit(f"[OK] recording with scrcpy: no black warm-up frame, no "
+                      f"3-min limit → {path}")
+        QTimer.singleShot(2500, self._check_rec_scrcpy)
+
+    def _check_rec_scrcpy(self):
+        """If the off-screen scrcpy recorder died early (e.g. no video path over a
+        flaky link), transparently switch to the device-side recorder so the user
+        still gets a recording instead of an empty file."""
+        if self._rec_mode != "scrcpy" or not self._recording:
+            return
+        if self._rec_scrcpy is not None and not self._rec_scrcpy.running:
+            self.log.emit("[WARNING] scrcpy recorder stopped early — switching to "
+                          "device-side recording")
+            self._rec_scrcpy = None
+            if self._recording:
+                self._record_device(self._rec_path)
+
+    def _record_device(self, path):
+        """Record on the device (``screenrecord``) and pull it — works everywhere
+        (Live View, remote/RDP), auto-continuing past Android's ~3-min cap."""
+        import threading
+        self._rec_mode = "device"
+        st = settings_mod.load()
+        br = st.get("scrcpy_bit_rate") or "16M"
+        bits = _bitrate_to_bps(br)
+        self._rec_stop = threading.Event()
+        self._rec_thread = _RecordThread(self.handler, path, self._rec_stop,
+                                         bit_rate=bits)
         self._rec_thread.done.connect(self._record_finished)
         self._rec_thread.fail.connect(self._record_failed)
+        self._rec_thread.part.connect(self._record_part)
         self._rec_thread.start()
-        self._refresh_buttons()
         self.status.setText(f"● Recording the device screen → {path}")
-        self.log.emit(f"[OK] recording (device-side, up to ~3 min) → {path}")
+        self.log.emit(f"[OK] recording at {br} (device-side; auto-continues past "
+                      f"the ~3-min Android cap) → {path}")
 
     def _stop_record(self):
         if not self._recording:
             return
         self._recording = False
-        if self._rec_stop is not None:
-            self._rec_stop.set()             # tell screenrecord to stop & pull
         self.btn_record.setEnabled(False)
         self.log.emit("Finishing the recording (saving to your PC)…")
         self.status.setText("Finishing the recording…")
+        if self._rec_mode == "scrcpy" and self._rec_scrcpy is not None:
+            # WM_CLOSE -> scrcpy finalizes the mp4 cleanly; wait for it off-thread
+            _post_close(self._rec_title)
+            sess, self._rec_scrcpy = self._rec_scrcpy, None
+            self._rec_wait = _RecWaitThread(sess, graceful=True)
+            self._rec_wait.done.connect(
+                lambda _clean: self._record_finished([self._rec_path]))
+            self._rec_wait.start()
+        elif self._rec_stop is not None:
+            self._rec_stop.set()             # tell screenrecord to stop & pull
 
-    def _record_finished(self, path):
+    def _record_part(self, n):
+        self.status.setText(f"● Recording — part {n} (Android caps each clip at "
+                            f"~3 min; the previous part was saved)…")
+        self.log.emit(f"[INFO] 3-min cap reached — continuing in part {n}")
+
+    def _record_finished(self, parts):
         self._recording = False
         self._refresh_buttons()
         self.status.show()
-        ok = bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
-        if ok:
-            self.log.emit(f"[OK] recording saved → {path}")
-            self._saved_popup("Recording", path)
-        else:
-            self.log.emit(f"[ERROR] recording file is empty → {path}")
+        parts = [p for p in (parts or [])
+                 if p and os.path.exists(p) and os.path.getsize(p) > 0]
+        if not parts:
+            bad = self._rec_path or ""
+            self.log.emit(f"[ERROR] recording file is empty → {bad}")
             QMessageBox.warning(self, "Recording",
-                                f"The recording didn't save any data:\n{path}\n\n"
+                                f"The recording didn't save any data:\n{bad}\n\n"
                                 "Some head units block screenrecord (secure "
                                 "surface). Try a screenshot instead.")
+            return
+        if len(parts) == 1:
+            self.log.emit(f"[OK] recording saved → {parts[0]}")
+            self._saved_popup("Recording", parts[0])
+        else:
+            names = ", ".join(os.path.basename(p) for p in parts)
+            self.log.emit(f"[OK] long recording saved in {len(parts)} parts "
+                          f"(Android's 3-min cap): {names}")
+            self._saved_popup(f"Recording — {len(parts)} parts", parts[0])
 
     def _record_failed(self, msg):
         self._recording = False
@@ -912,8 +1118,13 @@ class MirrorPanel(QWidget):
             self._fit_timer = None
 
     def stop(self):
-        # the Stop button stops whatever you're VIEWING (mirror or Live View);
-        # a recording runs independently device-side and is stopped via Record.
+        # the Stop button stops whatever you're VIEWING (mirror, Live View, or the
+        # multi-display windows); a recording runs independently device-side.
+        if self._multi:
+            self._stop_multi()
+            self._refresh_buttons()
+            self.status.setText("Stopped all display windows.")
+            return
         if self._live is not None:
             self._stop_live()
             return
@@ -932,15 +1143,26 @@ class MirrorPanel(QWidget):
         self.status.setText("Stopped. Click “▶ Mirror” or “🖥 Live View” to view.")
 
     def _finalize_rec_sync(self):
-        """If a recording is in progress, stop it and let the worker pull the
-        file — used when the panel/tab is closing."""
+        """If a recording is in progress, stop it and let the file finalize —
+        used when the panel/tab is closing."""
         if not self._recording:
             return
         self._recording = False
-        if self._rec_stop is not None:
-            self._rec_stop.set()
-        if self._rec_thread is not None:
-            self._rec_thread.wait(8000)          # let screenrecord stop + pull
+        if self._rec_mode == "scrcpy" and self._rec_scrcpy is not None:
+            _post_close(self._rec_title)             # finalize the mp4
+            try:
+                self._rec_scrcpy.wait(timeout=8)
+            except Exception:
+                try:
+                    self._rec_scrcpy.stop()
+                except Exception:
+                    pass
+            self._rec_scrcpy = None
+        else:
+            if self._rec_stop is not None:
+                self._rec_stop.set()
+            if self._rec_thread is not None:
+                self._rec_thread.wait(8000)          # let screenrecord stop + pull
 
     def close_panel(self):
         if self._live is not None:

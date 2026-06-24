@@ -3,6 +3,45 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.5
+
+- **Tab labels no longer truncate.** The emoji now renders as a real tab *icon*
+  with plain text (inline emoji in a styled tab label throws off Qt's width
+  calculation). Fixed on both the device tabs and the inner sub-tabs.
+- **New “🎮 Control + Mirror” view** — a side-by-side sub-tab with the device
+  screen on the left and the full controls panel on the right, so you can watch
+  and tap/press at the same time without switching tabs.
+
+## 1.0.4
+
+- **Screen recording: no more black opening frame.** Recording now prefers
+  `scrcpy --record` via an off-screen window — it muxes the H.264 stream from the
+  first real frame (no encoder warm-up black frame, no 3-min cap, sharp), and is
+  closed politely so the mp4 is finalized. Falls back to device-side
+  `screenrecord` for a genuinely remote adb server, and auto-switches to it if the
+  scrcpy recorder fails to start.
+
+## 1.0.3
+
+- **Recording quality + length.** Explicit high bitrate at native resolution
+  (was soft/low), and a single device-side clip now auto-continues into the next
+  part past Android’s ~3-minute `screenrecord` cap instead of just stopping.
+- **Displays auto-load on connect** into a dropdown that no longer truncates and
+  remembers your selection.
+- **“▦ Mirror all”** — mirror every display at once, each in its own window (IVI
+  cluster + centre + passenger).
+- Tab labels set to not elide.
+
+## 1.0.2
+
+- **Detailed usage docs** — the README now documents every feature three ways
+  (GUI · CLI · Python), and the website gained a matching **Guide** page.
+
+## 1.0.1
+
+- Fixed the PyPI logo (absolute image URL), set the author to **Naveen Daniel
+  Kennedy**, and added Website / Source / Changelog / Bug-tracker links.
+
 ## 1.0.0
 
 First stable release. TurboADB has been in daily use against phones and Android
