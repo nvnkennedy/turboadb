@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="turboadb/assets/icon.png" alt="TurboADB" width="96" height="96">
+  <img src="https://raw.githubusercontent.com/NVNKENNEDY/turboadb/main/turboadb/assets/icon.png" alt="TurboADB" width="96" height="96">
 
   # TurboADB
 
@@ -10,239 +10,514 @@
   [![PyPI](https://img.shields.io/pypi/v/turboadb.svg)](https://pypi.org/project/turboadb/)
   [![Python](https://img.shields.io/pypi/pyversions/turboadb.svg)](https://pypi.org/project/turboadb/)
   [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+  **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest) · [📦 PyPI](https://pypi.org/project/turboadb/)**
 </div>
 
 ---
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
-same engine powers all three front-ends, so anything you can click in the GUI you
-can also script in Python or run as a one-line CLI command. It bundles its own
-`adb`/`scrcpy` (downloaded on first run), works against devices on **another
-machine's** adb server (handy over RDP / in a lab), and knows the quirks of
-Android Automotive head units.
+same engine powers all three front-ends, so **every feature below works three
+ways** — click it in the GUI, run it as a one-line CLI command, or call it from
+Python. It bundles its own `adb`/`scrcpy` (downloaded on first run), drives
+devices on *another* machine's adb server (handy over RDP / in a lab), and knows
+the quirks of Android Automotive head units.
+
+The rest of this README is a hands-on guide: for each feature you get the **GUI**
+steps, the **CLI** command, and the **Python** call.
 
 ## Contents
 
-- [What you get](#what-you-get)
 - [Install](#install)
-- [Three ways to use it](#three-ways-to-use-it)
-- Features
-  - [Interactive shell](#interactive-shell) · [Live logcat](#live-logcat) ·
-    [File browser](#file-browser) · [App manager](#app-manager)
-  - [Device controls](#device-controls) · [Screen mirroring (scrcpy)](#screen-mirroring-scrcpy) ·
-    [Screenshots &amp; recording](#screenshots--recording)
-  - [Phone / telephony](#phone--telephony) · [Root &amp; mount](#root--mount)
-  - [Remote devices over the network](#remote-devices-over-the-network) ·
-    [Share this PC's devices (serve)](#share-this-pcs-devices-serve) ·
-    [Deploy serve to remote hosts](#deploy-serve-to-remote-hosts)
-  - [Auto-update](#auto-update)
-- [CLI reference](#cli-reference)
-- [Python API](#python-api)
-- [Notes for Android Automotive / IVI](#notes-for-android-automotive--ivi)
-- [Building from source](#building-from-source)
+- [First, target a device](#first-target-a-device) — the `-s` / config every command needs
+- **Feature guide**
+  - [Interactive shell](#interactive-shell) · [Logcat](#logcat) · [Files](#files-pushpull) · [Apps](#apps)
+  - [Device controls](#device-controls): [keys](#keys--input) · [media & connectivity](#media--connectivity) · [screen & launchers](#screen--app-launchers) · [keyboard](#on-screen-keyboard)
+  - [Mirroring (scrcpy)](#mirroring-scrcpy) · [Screenshots & recording](#screenshots--recording)
+  - [Telephony](#telephony) · [Root & mount](#root--mount) · [Reboot](#reboot) · [Device info](#device-info)
+  - [Remote devices](#remote-devices) · [Share devices (serve)](#share-devices-serve) · [Deploy serve over WinRM](#deploy-serve-over-winrm)
+  - [Keep things up to date](#keep-things-up-to-date)
+- [CLI cheatsheet](#cli-cheatsheet)
+- [Python API notes](#python-api-notes)
+- [Android Automotive / IVI tips](#android-automotive--ivi-tips)
+- [Build from source](#build-from-source)
 - [License](#license)
 
-## What you get
-
-| | |
-|---|---|
-| **[Interactive shell](#interactive-shell)** | A real `adb shell` terminal with history, tab-completion, copy/paste, and a Stop button that actually kills a runaway command. |
-| **[Live logcat](#live-logcat)** | Level/tag/regex filtering, pause, and a complete save — never drops lines under a flood, even over RDP. |
-| **[File browser](#file-browser)** | Browse the device filesystem, push/pull files. |
-| **[App manager](#app-manager)** | List, install (incl. split APKs), uninstall, clear data, start/stop. |
-| **[Device controls](#device-controls)** | Keys, media, Wi-Fi/BT/airplane/hotspot, screen on/off, brightness, app launchers, an on-screen keyboard. |
-| **[Mirroring](#screen-mirroring-scrcpy)** | scrcpy in a separate window or embedded, with a compatibility mode for IVI units. |
-| **[Capture](#screenshots--recording)** | Screenshots and screen recording. |
-| **[Telephony](#phone--telephony)** | Dial, call, answer/end, call log, SMS. |
-| **[Root / mount](#root--mount)** | root/unroot, remount, mount rw, disable/enable verity. |
-| **[Remote](#remote-devices-over-the-network)** | Drive devices plugged into another PC over its adb server. |
-| **[Serve + deploy](#share-this-pcs-devices-serve)** | Share this PC's devices, or push `serve` onto remote Windows hosts over WinRM. |
-
 ## Install
+
+Pick whichever fits — both give you the full GUI.
+
+### A · Windows app — no Python needed
+
+1. Download **[`turboadb-gui.exe`](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
+   (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
+2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
+   (about 20 seconds) and adds a desktop shortcut.
+
+### B · With pip — CLI + Python API + GUI
 
 ```bash
 pip install turboadb
 ```
 
-That's everything — the CLI, the Python API, and the bundled GUI executable. On
-first run TurboADB downloads `adb` and `scrcpy` into `~/.turboadb/tools` for you.
-
-If you want to run the GUI from source instead of the bundled exe (e.g. on an ARM
-host where there's no exe), add PyQt5:
+Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or
+`import turboadb` (the API). Optional extras, only if you run the GUI **from
+source** (e.g. on ARM where there's no exe):
 
 ```bash
-pip install "turboadb[gui]"      # GUI from source
-pip install "turboadb[winrm]"    # remote 'serve' deploy over WinRM
-pip install "turboadb[all]"      # both
+pip install "turboadb[gui]"    # GUI from source (PyQt5)
+pip install "turboadb[winrm]"  # remote 'serve' deploy over WinRM
+pip install "turboadb[all]"    # both
 ```
 
-No Python? Grab the standalone Windows GUI from the GitHub Releases page and
-double-click it.
+`adb` and `scrcpy` download themselves into `~/.turboadb/tools` on first use, so
+they never need to be on your PATH.
 
-## Three ways to use it
+## First, target a device
 
-**GUI** — `turboadb-gui` (a desktop shortcut is created on first launch):
+Everything operates on one device. How you point at it is the only thing that
+changes between local, network, and remote.
+
+**In the GUI** — click **Connect** in the ribbon and pick the device (USB,
+network, or a remote PC's adb server). Connected devices also show live in the
+left sidebar; double-click one to open it in a tab.
+
+**CLI** — list first, then pass `-s`:
 
 ```bash
-turboadb-gui
+turboadb devices                                  # what's attached here
+turboadb -s 10BE330KG9000AF info                  # a USB serial
+turboadb -s 192.168.1.50:5555 info                # a network device
+turboadb connect 192.168.1.50:5555                # adb connect first if needed
+turboadb --adb-host lab-pc-01 devices             # devices on ANOTHER pc's server
+turboadb --adb-host lab-pc-01 -s DEVICE info      # …and drive one of them
 ```
 
-**CLI** — fully argument-driven, one device action per command:
-
-```bash
-turboadb devices
-turboadb -s SERIAL shell -- getprop ro.build.version.release
-turboadb -s SERIAL install app.apk --grant
-turboadb -s SERIAL screenshot shot.png
-```
-
-**Python** — the same engine, for test frameworks and scripts:
+**Python** — build an `ADBConfig`, then `connect()`:
 
 ```python
 from turboadb import ADBHandler, ADBConfig
 
-dev = ADBHandler(ADBConfig(serial="SERIAL"))
+# USB (omit serial if it's the only device)
+dev = ADBHandler(ADBConfig(serial="10BE330KG9000AF"))
+
+# network device
+dev = ADBHandler(ADBConfig(host="192.168.1.50", port=5555))
+
+# a device on a remote machine's adb server
+dev = ADBHandler(ADBConfig(adb_server_host="lab-pc-01", adb_server_port=5037,
+                           serial="DEVICE"))
 dev.connect()
-print(dev.shell("getprop ro.product.model").stdout)
-dev.install("app.apk", grant_perms=True)
-dev.screenshot("shot.png")
 ```
+
+Pass `safe=True` to the handler (the GUI does) to get an `OperationResult` back
+instead of an exception on failure — handy when you don't want one bad call to
+abort a run.
 
 ---
 
+# Feature guide
+
 ## Interactive shell
 
-A proper terminal, not a one-shot. You type into it, history works, `Tab`
-completes commands and paths, and selection/copy/paste behave like any console.
-Because it runs without a pseudo-terminal (which keeps typing reliable on
-Windows), a flooding command like `logcat` can't be stopped with `Ctrl+C` alone —
-so there's a **Stop** button (and a smart `Ctrl+C`) that tears the shell down,
-kills the device-side process, and reopens instantly, keeping your working
-directory. A bare `ls` is shown in columns like a real terminal would.
+A real terminal, not a one-shot: history, `Tab` completion, copy/paste, and a
+**Stop** button that actually kills a runaway command like `logcat` (there's no
+PTY, so a plain `Ctrl+C` can't — Stop tears the shell down, kills the device-side
+process, and reopens, keeping your working directory). A bare `ls` is shown in
+columns.
 
-CLI equivalent: `turboadb -s SERIAL shell -- <command>`.
+**In the GUI** — open a device → **Shell** tab → start typing. Right-click for
+Copy/Paste/Save/Send-key; the red **Stop** halts whatever is running.
 
-## Live logcat
+**CLI** — one-shot commands (everything after `--` goes to the device):
 
-Filter by level, tag, or live regex; pause and resume; clear. Under a flood
-(especially over a slow/RDP link) the on-screen view drops lines to stay
-responsive, but **every line is archived to disk** so a Save writes the complete
-log, not just what's on screen. Saved files are timestamped `.log` files.
+```bash
+turboadb -s SERIAL shell -- getprop ro.build.version.release
+turboadb -s SERIAL shell --su -- "cat /data/misc/file"   # wrap in su -c
+```
 
-CLI: `turboadb -s SERIAL logcat --tag ActivityManager --match "ANR|FATAL" --save boot.log`.
+**Python** — `shell()` for one-shots, `open_shell()` for an interactive session:
 
-## File browser
+```python
+r = dev.shell("getprop ro.product.model")
+print(r.stdout, r.exit_code, r.ok)
 
-Browse the device filesystem in a tree, and push/pull files.
-CLI: `turboadb -s SERIAL push local.apk /data/local/tmp/` and
-`turboadb -s SERIAL pull /sdcard/log.txt .`.
+sess = dev.open_shell()          # persistent ShellSession
+sess.send("ls /sdcard\n")
+print(sess.read())
+sess.close()
+```
 
-## App manager
+## Logcat
 
-List installed packages (filter third-party/system), install single or split
-APKs (with `--grant` to grant all permissions), uninstall, clear app data, and
-force-start/stop.
-CLI: `packages`, `install`, `uninstall`, `clear`, `start`, `stop`.
+Filter by level, tag, or live regex; pause/clear; save the **complete** log (even
+under a flood the on-screen view trims to stay responsive, but every line is kept
+on disk).
+
+**In the GUI** — **Logcat** tab → set Level / tag / regex → **Start**. **Save**
+writes a timestamped `.log` with everything captured.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL logcat --tag ActivityManager --priority W
+turboadb -s SERIAL logcat --match "ANR|FATAL" --save crash.log
+turboadb -s SERIAL logcat --dump                  # dump current buffer and exit
+turboadb -s SERIAL logcat-clear                   # clear the buffers
+```
+
+**Python** — `logcat()` streams via an `on_line` callback (and tees to a file);
+`iter_lines()` is a plain generator if you'd rather loop:
+
+```python
+dev.logcat(tag="ActivityManager", match="ANR", on_line=print, save_to="crash.log")
+
+for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
+    if "FATAL" in line:
+        break
+```
+
+## Files (push/pull)
+
+**In the GUI** — **Files** tab → browse the device tree → use the push/pull
+buttons.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL push app.apk /data/local/tmp/
+turboadb -s SERIAL pull /sdcard/Download/log.txt .
+```
+
+**Python**:
+
+```python
+dev.push("app.apk", "/data/local/tmp/")
+dev.pull("/sdcard/Download/log.txt", "log.txt")
+```
+
+## Apps
+
+List, install (single or split APKs), uninstall, clear data, start/stop.
+
+**In the GUI** — **Apps** tab: filter the package list, then Install / Uninstall /
+Clear / Start / Stop.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL packages --third-party
+turboadb -s SERIAL install app.apk --grant            # grant all permissions
+turboadb -s SERIAL install base.apk split_config.apk  # split install
+turboadb -s SERIAL uninstall com.example.app
+turboadb -s SERIAL clear com.example.app              # wipe app data
+turboadb -s SERIAL start com.example.app
+turboadb -s SERIAL stop com.example.app
+```
+
+**Python**:
+
+```python
+for pkg in dev.list_packages(third_party=True):
+    print(pkg)
+dev.install("app.apk", grant_perms=True)
+dev.install_multiple(["base.apk", "split_config.apk"])
+dev.uninstall("com.example.app")
+dev.clear_app("com.example.app")
+dev.start_app("com.example.app")
+dev.stop_app("com.example.app")
+```
 
 ## Device controls
 
-A panel of one-click actions, every one of which is also a CLI command:
+The GUI's **Controls** tab is a grid of one-click actions. Each is also a CLI
+command and an API call.
 
-- **System keys** — back, home, recents, power, notifications
-- **Media** — volume up/down/mute, prev/play-pause/next
-- **Connectivity** — Wi-Fi, Bluetooth, airplane, hotspot (on/off)
-- **Screen & power** — screen on/off, open Settings, reboot
-- **Apps & web** — open a URL, web search, browser/YouTube/Maps/Store/Gallery/Camera/Calculator
-- **Keyboard** — type text into the focused field, plus Enter/Backspace/Tab/Esc/Search
+### Keys & input
 
-## Screen mirroring (scrcpy)
-
-Mirror in a separate window or embedded in the tab. A **compatibility mode**
-(software decode, forced tunnel host/port, UHID keyboard) handles IVI units that
-choke on the defaults, and it works through a remote adb server too. Pick a
-specific display on multi-display head units.
-CLI: `turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M`.
-
-## Screenshots & recording
-
-One-click PNG screenshot and screen recording (device-side `screenrecord`, pulled
-back when you stop — works over RDP without a video tunnel).
-CLI: `turboadb -s SERIAL screenshot shot.png` and
-`turboadb -s SERIAL record clip.mp4 --time-limit 20`.
-
-## Phone / telephony
-
-Open the dialer, place/answer/end calls, read the call log, list SMS, and compose
-a message. Useful on IVI units with telephony.
-CLI: `dial`, `call`, `end-call`, `answer`, `call-log`, `sms`, `send-sms`.
-
-## Root & mount
-
-For rooted/engineering builds: `root` / `unroot`, `remount`, `mount-rw`
-(`mount -o remount,rw /`), and `disable-verity` / `enable-verity` (which sync and
-offer the required reboot).
-
-## Remote devices over the network
-
-You don't need the device plugged into your own machine. Point TurboADB at
-**another PC's adb server** and drive whatever is connected there — exactly what
-you want when the unit lives in a lab and you reach it over RDP.
+**GUI** — Controls → System keys / the scroll-tap pad.
 
 ```bash
-# list and drive devices on another machine's adb server
-turboadb --adb-host lab-pc-01 --adb-port 5037 devices
-turboadb --adb-host lab-pc-01 -s DEVICE shell -- pm list packages
+turboadb -s SERIAL key home          # back, home, recents, power, notifications…
+turboadb -s SERIAL scroll down       # up | down | left | right
+turboadb -s SERIAL tap                # tap the centre of the screen
 ```
 
 ```python
-dev = ADBHandler(ADBConfig(adb_server_host="lab-pc-01", adb_server_port=5037,
-                           serial="DEVICE"))
+dev.keyevent("home")
+dev.scroll("down")
+dev.tap_center()
 ```
 
-For that to work, the machine with the device has to share its adb server — see
-next.
+### Media & connectivity
 
-## Share this PC's devices (serve)
-
-Turn the machine a device is plugged into a host that others can reach:
+**GUI** — Controls → Media controls / Connectivity.
 
 ```bash
-turboadb serve --startup-task
+turboadb -s SERIAL media play-pause   # previous | next | play-pause
+turboadb -s SERIAL wifi on            # on | off
+turboadb -s SERIAL bluetooth off
+turboadb -s SERIAL airplane on
+turboadb -s SERIAL hotspot on         # best-effort (see IVI tips)
 ```
 
-This starts an adb server on all interfaces, opens the firewall (5037 + scrcpy's
-27184), and registers a SYSTEM startup task so it keeps sharing headlessly across
-reboots. In the GUI it's the **ADB Server ▸ Share this PC's devices** option.
+```python
+dev.media("play-pause")
+dev.set_wifi(True)
+dev.set_bluetooth(False)
+dev.set_airplane(True)
+dev.set_hotspot(True)
+```
 
-## Deploy serve to remote hosts
+### Screen & app launchers
 
-You can also push `serve` onto remote Windows hosts **from your machine**, without
-logging into each one, over WinRM:
+**GUI** — Controls → Screen & Power / Apps & Web.
+
+```bash
+turboadb -s SERIAL screen off         # on | off
+turboadb -s SERIAL settings           # open the Settings app
+turboadb -s SERIAL open https://maps.google.com
+turboadb -s SERIAL search "nearest charger"
+turboadb -s SERIAL camera             # also: gallery, calculator
+```
+
+```python
+dev.screen_off()
+dev.open_settings()
+dev.open_url("https://maps.google.com")
+dev.web_search("nearest charger")
+dev.open_camera()        # open_gallery(), open_calculator()
+```
+
+### On-screen keyboard
+
+Type into the focused field (useful when the unit has no soft keyboard).
+
+**GUI** — Controls → Keyboard: type, **Send**.
+
+```bash
+turboadb -s SERIAL text "hello world"
+turboadb -s SERIAL key enter
+```
+
+```python
+dev.input_text("hello world")
+dev.keyevent("enter")
+```
+
+## Mirroring (scrcpy)
+
+Mirror in its own window or embedded in the tab. A **compatibility mode**
+(software decode, forced tunnel host/port, UHID keyboard) handles IVI units that
+choke on the defaults, and it works through a remote adb server.
+
+**GUI** — the **Mirror** tab / **Scrcpy** ribbon button → Mirror (window), Embed,
+or the IVI/compatibility option. Pick a specific display on multi-display units.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M
+turboadb -s SERIAL scrcpy --no-control --turn-screen-off
+```
+
+**Python**:
+
+```python
+from turboadb import ScrcpyOptions
+sess = dev.mirror(ScrcpyOptions(max_size=1280, bit_rate="8M"))
+sess.wait()          # blocks until the scrcpy window closes
+```
+
+## Screenshots & recording
+
+**GUI** — the **Screenshot** ribbon button; record from the Mirror panel.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL screenshot shot.png
+turboadb -s SERIAL record clip.mp4 --time-limit 20 --size 1280x720
+```
+
+**Python**:
+
+```python
+dev.screenshot("shot.png")
+dev.screen_record("clip.mp4", time_limit=20, size="1280x720")
+```
+
+> Recording uses device-side `screenrecord` and pulls the file back, so it works
+> over RDP without a video tunnel.
+
+## Telephony
+
+**GUI** — the **Phone** tab.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL dial 1800123456        # open dialer pre-filled
+turboadb -s SERIAL call 1800123456        # place the call
+turboadb -s SERIAL answer
+turboadb -s SERIAL end-call
+turboadb -s SERIAL call-log --limit 20
+turboadb -s SERIAL sms --limit 20
+turboadb -s SERIAL send-sms 1800123456 "on my way"
+```
+
+**Python**:
+
+```python
+dev.dial("1800123456"); dev.call("1800123456")
+dev.answer_call(); dev.end_call()
+for c in dev.call_log(20): print(c)
+for m in dev.sms_list(20): print(m)
+dev.send_sms("1800123456", "on my way")
+```
+
+## Root & mount
+
+For rooted / engineering builds.
+
+**GUI** — the **Root / Mount** ribbon dropdown.
+
+**CLI**:
+
+```bash
+turboadb -s SERIAL root            # restart adbd as root  (unroot to undo)
+turboadb -s SERIAL remount         # adb remount
+turboadb -s SERIAL mount-rw        # mount -o remount,rw /
+turboadb -s SERIAL disable-verity  # syncs and offers the required reboot
+```
+
+**Python**:
+
+```python
+dev.root(); dev.unroot()
+dev.remount(); dev.mount_rw()
+dev.disable_verity(); dev.enable_verity()
+```
+
+## Reboot
+
+**GUI** — the **Reboot** dropdown (system / recovery / bootloader / sideload —
+the risky ones warn first, doubly so on automotive).
+
+```bash
+turboadb -s SERIAL reboot
+turboadb -s SERIAL reboot recovery       # recovery | bootloader | sideload
+```
+
+```python
+dev.reboot()
+dev.reboot("recovery")
+```
+
+## Device info
+
+**GUI** — shown in the tab header and the log on connect; **ℹ Build info** /
+**🔋 Battery** in Controls.
+
+```bash
+turboadb -s SERIAL info --json
+turboadb -s SERIAL build-info
+turboadb -s SERIAL battery
+```
+
+```python
+d = dev.device_info()    # dict: manufacturer, model, android_version, sdk, abi, automotive…
+print(d["model"], d["android_version"], d["automotive"])
+print(dev.battery())
+```
+
+## Remote devices
+
+Drive a device that's plugged into a **different** machine, over its adb server —
+exactly what you want for a lab unit reached by RDP. Add `--adb-host` to any CLI
+command, or set `adb_server_host` in the config. (The host machine has to be
+sharing its adb server — see the next two sections.)
+
+```bash
+turboadb --adb-host lab-pc-01 devices
+turboadb --adb-host lab-pc-01 -s DEVICE shell -- pm list packages
+turboadb --adb-host lab-pc-01 -s DEVICE scrcpy --max-size 1280
+```
+
+```python
+dev = ADBHandler(ADBConfig(adb_server_host="lab-pc-01", serial="DEVICE"))
+dev.connect()
+```
+
+## Share devices (serve)
+
+Turn the machine a device is plugged into a host others can reach.
+
+**GUI** — **ADB Server ▸ Share this PC's devices** (offers "start once" or "start
++ run at login").
+
+**CLI**:
+
+```bash
+turboadb serve                    # start the shared server + open the firewall
+turboadb serve --startup-task     # …and keep it running headless across reboots
+turboadb serve --uninstall-startup
+```
+
+**Python**:
+
+```python
+from turboadb.devices import start_shared_server, open_firewall, install_serve_task
+print(start_shared_server())
+print(open_firewall((5037, 27184)))
+install_serve_task()              # SYSTEM startup task, headless
+```
+
+## Deploy serve over WinRM
+
+Push `serve` onto remote Windows hosts **from your machine** — one host or a whole
+fleet — without logging into each. Uses pywinrm/NTLM, so domain credentials work
+over plain WinRM.
+
+**GUI** — the **ADB Server** button: enter the host(s) + admin credentials,
+**Test connection**, then **Deploy**.
+
+**CLI**:
 
 ```bash
 turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user"
 turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --test   # just check WinRM first
 ```
 
-In the GUI this is the **ADB Server** button: enter the host(s) + admin
-credentials, Test connection, Deploy. It uses pywinrm with NTLM, so it works with
-domain credentials over plain WinRM. Each target needs WinRM enabled
-(`Enable-PSRemoting -Force` once), Python + turboadb installed, and your account a
-local admin.
+**Python**:
 
-## Auto-update
+```python
+from turboadb.remote_deploy import deploy_serve
+deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password",
+             on_status=print)
+```
 
-The GUI's **Upgrade** button checks PyPI for a newer TurboADB; if there is one it
-updates via pip, refreshes `adb`/`scrcpy`, and restarts into the new version. From
-the CLI: `turboadb self-update`. Tools-only refresh: `turboadb upgrade-tools`.
+> Each target needs WinRM enabled (`Enable-PSRemoting -Force` once), your account a
+> local admin, and Python + turboadb installed there.
+
+## Keep things up to date
+
+**GUI** — the **Upgrade** ribbon button checks PyPI for a newer TurboADB, updates
+it, refreshes `adb`/`scrcpy`, and restarts.
+
+```bash
+turboadb self-update      # upgrade TurboADB itself, then adb/scrcpy
+turboadb upgrade-tools    # only refresh adb/scrcpy
+turboadb doctor           # report what's installed / missing
+```
 
 ---
 
-## CLI reference
+## CLI cheatsheet
 
 `turboadb -h` lists everything; `turboadb <command> -h` details one. Most read
-commands take `--json` for machine-readable output. Target a device with
-`-s SERIAL` (or `-s host:port`); add `--adb-host HOST` to use a remote adb server.
+commands take `--json`. Target with `-s SERIAL`; add `--adb-host HOST` for a
+remote server.
 
 ```
 devices  info  shell  logcat  logcat-clear  push  pull  install  uninstall
@@ -255,53 +530,47 @@ answer  call-log  sms  send-sms  serve  deploy-serve  doctor  fetch-tools
 upgrade-tools  self-update  shortcut  gui
 ```
 
-## Python API
+## Python API notes
+
+`import turboadb` exposes the engine and its types. Calls return small
+dataclasses — `CommandResult` (`.stdout`, `.stderr`, `.exit_code`, `.ok`),
+`TransferResult`, `StreamResult`. Construct a handler with `safe=True` for
+non-raising `OperationResult`s, or leave it default to get exceptions you can
+catch (`ADBError` and friends). See [`examples/examples.py`](examples/examples.py)
+and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```python
-from turboadb import ADBHandler, ADBConfig
+from turboadb import ADBHandler, ADBConfig, ScrcpyOptions
 
 dev = ADBHandler(ADBConfig(serial="SERIAL"))
 dev.connect()
-
-dev.set_wifi(True)
-dev.keyevent("home")
-dev.media("play-pause")
-dev.set_hotspot(True)
-dev.screen_off()
-info = dev.device_info()          # manufacturer, model, android_version, automotive…
-for line in dev.logcat(tag="ActivityManager", match="ANR"):
-    print(line)
-dev.reboot()
+assert dev.shell("getprop ro.build.version.release").ok
+dev.install("app.apk", grant_perms=True)
+dev.screenshot("after_install.png")
 ```
 
-Results are small dataclasses (`CommandResult`, `TransferResult`, …) with `.ok`,
-`.stdout`, `.exit_code`, etc. In "safe" mode (used by the GUI) calls return an
-`OperationResult` instead of raising. See [`examples/examples.py`](examples/examples.py)
-and [ARCHITECTURE.md](ARCHITECTURE.md).
+## Android Automotive / IVI tips
 
-## Notes for Android Automotive / IVI
-
-- `device_info()` flags `automotive` so the GUI adapts (e.g. the mirror label).
-- Mirroring: use **compatibility mode** if the default scrcpy fails.
-- `bootloader` / `sideload` reboots are gated behind an extra warning — many head
-  units have no on-screen recovery UI and can get stuck.
-- Apps like Calculator/Camera/Play Store are often absent; launchers fall back
-  gracefully and the log says when nothing happened.
-- Hotspot can't always be toggled purely via adb (uid permissions) — TurboADB
+- `device_info()` flags `automotive`; the GUI adapts (e.g. the mirror label).
+- If the default mirror fails, use **compatibility mode** (software decode).
+- `bootloader` / `sideload` reboots warn hard — many head units have no on-screen
+  recovery UI and can get stuck.
+- Calculator / Camera / Play Store are often absent; launchers fall back and the
+  log says when nothing happened.
+- Hotspot can't always be toggled purely over adb (uid permissions) — TurboADB
   tries `cmd wifi`, then falls back to opening the tethering settings.
 
-## Building from source
+## Build from source
 
 ```bash
-git clone <your-repo-url> turboadb && cd turboadb
+git clone https://github.com/NVNKENNEDY/turboadb && cd turboadb
 pip install -r requirements.txt
 python -m turboadb.gui            # run the GUI from source
 python scripts/build_exe.py       # rebuild the bundled Windows exe
 python tests/test_offline.py      # offline checks
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together and
-[CHANGELOG.md](CHANGELOG.md) for release notes.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

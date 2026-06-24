@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TurboADB — Usage guide (GUI · CLI · Python)</title>
+<meta name="description" content="Detailed usage for every TurboADB feature, three ways: in the GUI, on the command line, and from Python.">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="index.html">
+      <img src="icon.png" alt="" width="30" height="30"><span>TurboADB</span>
+    </a>
+    <nav class="nav-links">
+      <a href="index.html#features">Features</a>
+      <a href="index.html#install">Install</a>
+      <a href="guide.html">Guide</a>
+      <a data-gh="repo" href="#">GitHub</a>
+      <a href="https://pypi.org/project/turboadb/">PyPI</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="guide-hero">
+    <div class="wrap">
+      <h1>Usage guide</h1>
+      <p>Every feature, three ways — click it in the <b>GUI</b>, run it on the
+      <b>CLI</b>, or call it from <b>Python</b>. Target a device with
+      <code>-s SERIAL</code> (or an <code>ADBConfig</code>); add
+      <code>--adb-host HOST</code> for a device on another machine.</p>
+      <div class="guide-toc">
+        <a href="#connect">Connect</a><a href="#shell">Shell</a>
+        <a href="#logcat">Logcat</a><a href="#files">Files</a>
+        <a href="#apps">Apps</a><a href="#controls">Controls</a>
+        <a href="#mirror">Mirroring</a><a href="#capture">Capture</a>
+        <a href="#phone">Telephony</a><a href="#root">Root &amp; mount</a>
+        <a href="#remote">Remote</a><a href="#serve">Serve</a>
+        <a href="#deploy">Deploy</a><a href="#update">Update</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:30px">
+    <div class="wrap">
+
+      <!-- CONNECT -->
+      <article class="feature" id="connect">
+        <h3>Target a device</h3>
+        <p class="desc">Everything operates on one device — local USB, a network
+        device, or one on another machine's adb server.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">Click <b>Connect</b> in the ribbon → choose USB / Network /
+          Remote PC. Live devices also appear in the left sidebar — double-click to open.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb devices
+turboadb -s 10BE330KG9000AF info
+turboadb --adb-host lab-pc-01 -s DEVICE info</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>from turboadb import ADBHandler, ADBConfig
+dev = ADBHandler(ADBConfig(serial="10BE330KG9000AF"))
+# remote: ADBConfig(adb_server_host="lab-pc-01", serial="DEVICE")
+dev.connect()</code></pre></div></div>
+      </article>
+
+      <!-- SHELL -->
+      <article class="feature" id="shell">
+        <h3>Interactive shell</h3>
+        <p class="desc">A real terminal with history, tab-completion, and a Stop
+        button that actually kills a runaway command like <code>logcat</code>.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">Open a device → <b>Shell</b> tab → type. Right-click for
+          Copy/Paste/Save; the red <b>Stop</b> halts whatever is running.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL shell -- getprop ro.build.version.release</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>r = dev.shell("getprop ro.product.model")
+print(r.stdout, r.ok)
+sess = dev.open_shell(); sess.send("ls /sdcard\n"); print(sess.read())</code></pre></div></div>
+      </article>
+
+      <!-- LOGCAT -->
+      <article class="feature" id="logcat">
+        <h3>Logcat</h3>
+        <p class="desc">Filter by level / tag / live regex, pause, and save the
+        complete log — nothing is dropped under a flood.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Logcat</b> tab → set Level / tag / regex → <b>Start</b>.
+          <b>Save</b> writes a timestamped <code>.log</code>.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL logcat --tag ActivityManager --match "ANR|FATAL" --save crash.log</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.logcat(tag="ActivityManager", match="ANR", on_line=print, save_to="crash.log")
+for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
+    ...</code></pre></div></div>
+      </article>
+
+      <!-- FILES -->
+      <article class="feature" id="files">
+        <h3>Files (push / pull)</h3>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Files</b> tab → browse the device tree → push / pull.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL push app.apk /data/local/tmp/
+turboadb -s SERIAL pull /sdcard/Download/log.txt .</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.push("app.apk", "/data/local/tmp/")
+dev.pull("/sdcard/Download/log.txt", "log.txt")</code></pre></div></div>
+      </article>
+
+      <!-- APPS -->
+      <article class="feature" id="apps">
+        <h3>Apps</h3>
+        <p class="desc">List, install (single or split APKs), uninstall, clear
+        data, start / stop.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Apps</b> tab → filter the list, then Install / Uninstall /
+          Clear / Start / Stop.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL packages --third-party
+turboadb -s SERIAL install app.apk --grant
+turboadb -s SERIAL uninstall com.example.app</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.list_packages(third_party=True)
+dev.install("app.apk", grant_perms=True)
+dev.install_multiple(["base.apk", "split_config.apk"])
+dev.uninstall("com.example.app")</code></pre></div></div>
+      </article>
+
+      <!-- CONTROLS -->
+      <article class="feature" id="controls">
+        <h3>Device controls</h3>
+        <p class="desc">Keys, media, connectivity, screen, app launchers, and an
+        on-screen keyboard — the GUI's Controls tab, each also a command and a call.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Controls</b> tab → click any tile.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL key home
+turboadb -s SERIAL media play-pause
+turboadb -s SERIAL wifi on        # bluetooth | airplane | hotspot
+turboadb -s SERIAL screen off
+turboadb -s SERIAL open https://maps.google.com
+turboadb -s SERIAL text "hello world"</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.keyevent("home"); dev.media("play-pause")
+dev.set_wifi(True); dev.set_hotspot(True); dev.screen_off()
+dev.open_url("https://maps.google.com"); dev.input_text("hello world")</code></pre></div></div>
+      </article>
+
+      <!-- MIRROR -->
+      <article class="feature" id="mirror">
+        <h3>Mirroring (scrcpy)</h3>
+        <p class="desc">In a window or embedded, with a compatibility mode for IVI
+        units and remote-tunnel handling.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Mirror</b> tab / <b>Scrcpy</b> button → Mirror, Embed,
+          or compatibility mode; pick a display on multi-display units.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>from turboadb import ScrcpyOptions
+sess = dev.mirror(ScrcpyOptions(max_size=1280, bit_rate="8M"))
+sess.wait()</code></pre></div></div>
+      </article>
+
+      <!-- CAPTURE -->
+      <article class="feature" id="capture">
+        <h3>Screenshots &amp; recording</h3>
+        <p class="desc">Recording uses device-side <code>screenrecord</code>, so it
+        works over RDP without a video tunnel.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Screenshot</b> ribbon button; record from the Mirror panel.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL screenshot shot.png
+turboadb -s SERIAL record clip.mp4 --time-limit 20 --size 1280x720</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.screenshot("shot.png")
+dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div></div>
+      </article>
+
+      <!-- PHONE -->
+      <article class="feature" id="phone">
+        <h3>Telephony</h3>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">The <b>Phone</b> tab — dialer, calls, call log, SMS.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL call 1800123456
+turboadb -s SERIAL call-log --limit 20
+turboadb -s SERIAL send-sms 1800123456 "on my way"</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.call("1800123456"); dev.end_call()
+for c in dev.call_log(20): print(c)
+dev.send_sms("1800123456", "on my way")</code></pre></div></div>
+      </article>
+
+      <!-- ROOT -->
+      <article class="feature" id="root">
+        <h3>Root &amp; mount</h3>
+        <p class="desc">For rooted / engineering builds.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">The <b>Root / Mount</b> ribbon dropdown.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb -s SERIAL root         # unroot to undo
+turboadb -s SERIAL mount-rw
+turboadb -s SERIAL disable-verity</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev.root(); dev.remount(); dev.mount_rw(); dev.disable_verity()</code></pre></div></div>
+      </article>
+
+      <!-- REMOTE -->
+      <article class="feature" id="remote">
+        <h3>Remote devices</h3>
+        <p class="desc">Drive a device plugged into another machine over its adb
+        server — the host just has to be sharing (see Serve).</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>Connect → Remote PC</b>; enter the host + device.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb --adb-host lab-pc-01 devices
+turboadb --adb-host lab-pc-01 -s DEVICE shell -- pm list packages</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>dev = ADBHandler(ADBConfig(adb_server_host="lab-pc-01", serial="DEVICE"))
+dev.connect()</code></pre></div></div>
+      </article>
+
+      <!-- SERVE -->
+      <article class="feature" id="serve">
+        <h3>Share devices (serve)</h3>
+        <p class="desc">Turn the machine a device is plugged into a host others can
+        reach.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step"><b>ADB Server ▸ Share this PC's devices</b>.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb serve --startup-task   # shared server + firewall, headless across reboots</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>from turboadb.devices import start_shared_server, install_serve_task
+start_shared_server(); install_serve_task()</code></pre></div></div>
+      </article>
+
+      <!-- DEPLOY -->
+      <article class="feature" id="deploy">
+        <h3>Deploy serve over WinRM</h3>
+        <p class="desc">Push <code>serve</code> onto remote Windows hosts from your
+        machine — one host or a fleet. Each target needs WinRM on and admin rights.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">The <b>ADB Server</b> button → enter host(s) + admin
+          credentials → <b>Test connection</b> → <b>Deploy</b>.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user"
+turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --test</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>from turboadb.remote_deploy import deploy_serve
+deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password", on_status=print)</code></pre></div></div>
+      </article>
+
+      <!-- UPDATE -->
+      <article class="feature" id="update">
+        <h3>Keep things up to date</h3>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <p class="step">The <b>Upgrade</b> button updates TurboADB, refreshes
+          adb/scrcpy, and restarts.</p></div>
+        <div class="mode"><span class="tag cli">CLI</span>
+          <div class="code"><pre><code>turboadb self-update      # TurboADB + adb/scrcpy
+turboadb upgrade-tools    # only adb/scrcpy
+turboadb doctor           # what's installed / missing</code></pre></div></div>
+        <div class="mode"><span class="tag py">Python</span>
+          <div class="code"><pre><code>from turboadb import upgrade_tools
+upgrade_tools()</code></pre></div></div>
+      </article>
+
+    </div>
+  </section>
+
+  <section class="band closing">
+    <div class="wrap center">
+      <h2>Ready to try it?</h2>
+      <div class="cta">
+        <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download for Windows</a>
+        <a class="btn btn-ghost" href="index.html">Back to home</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <span>TurboADB · MIT licensed</span>
+    <span><a data-gh="repo" href="#">GitHub</a> ·
+      <a href="https://pypi.org/project/turboadb/">PyPI</a></span>
+  </div>
+</footer>
+
+<script>
+  const REPO = "nvnkennedy/turboadb";   // EDIT: set to your-username/turboadb
+  const base = "https://github.com/" + REPO;
+  const urls = { repo: base, releases: base + "/releases",
+    exe: base + "/releases/latest/download/turboadb-gui.exe" };
+  document.querySelectorAll("[data-gh]").forEach(function (a) {
+    a.href = urls[a.getAttribute("data-gh")] || base;
+  });
+</script>
+</body>
+</html>

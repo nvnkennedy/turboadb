@@ -95,3 +95,24 @@ h1,h2,h3{line-height:1.2;letter-spacing:-.01em}
 .foot a:hover{color:var(--text)}
 
 @media(max-width:560px){.hero h1{font-size:2.5rem}.tagline{font-size:1.05rem}}
+
+/* ── usage guide page ─────────────────────────────────────────────── */
+.guide-hero{padding:54px 0 8px;text-align:center}
+.guide-hero h1{font-size:2.4rem;margin:.2em 0 .15em}
+.guide-hero p{color:var(--dim);max-width:660px;margin:0 auto;font-size:1.08rem}
+.feature{padding:34px 0;border-top:1px solid var(--line)}
+.feature:first-of-type{border-top:none}
+.feature h3{font-size:1.45rem;margin:0 0 8px}
+.feature .desc{color:var(--dim);margin:0 0 18px;max-width:780px}
+.mode{margin:0 0 14px}
+.mode .tag{display:inline-block;font-size:.7rem;font-weight:800;letter-spacing:.06em;
+  text-transform:uppercase;padding:3px 9px;border-radius:6px;margin-bottom:8px}
+.tag.gui{background:rgba(40,194,214,.18);color:var(--accent2)}
+.tag.cli{background:rgba(123,227,154,.15);color:#7be39a}
+.tag.py{background:rgba(199,155,255,.16);color:#c79bff}
+.mode .step{margin:.1em 0 0;color:var(--text)}
+.mode .code{margin-top:4px}
+.guide-toc{display:flex;flex-wrap:wrap;gap:8px 16px;justify-content:center;
+  margin:22px auto 4px;max-width:840px}
+.guide-toc a{color:var(--dim);font-size:.9rem}
+.guide-toc a:hover{color:var(--accent2)}

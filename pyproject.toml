@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.0.0"
+version = "1.0.2"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "TurboADB contributors" }]
+authors = [{ name = "Naveen Daniel Kennedy" }]
 keywords = ["adb", "scrcpy", "android", "automotive", "android-automotive",
             "ivi", "logcat", "automation", "pyqt5", "testing", "embedded"]
 classifiers = [
@@ -41,8 +41,12 @@ turboadb-shortcut = "turboadb.cli:create_shortcut"
 turboadb-gui = "turboadb.cli:launch_gui"
 
 [project.urls]
-Homepage = "https://pypi.org/project/turboadb/"
-Source = "https://pypi.org/project/turboadb/"
+Homepage = "https://nvnkennedy.github.io/turboadb/"
+Documentation = "https://nvnkennedy.github.io/turboadb/"
+Source = "https://github.com/NVNKENNEDY/turboadb"
+Download = "https://github.com/NVNKENNEDY/turboadb/releases/latest"
+Changelog = "https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/NVNKENNEDY/turboadb/issues"
 
 [tool.setuptools]
 packages = ["turboadb", "turboadb.gui"]
