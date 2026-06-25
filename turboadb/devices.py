@@ -218,6 +218,19 @@ def start_shared_server(port: int = 5037, adb_path: str | None = None,
                        f"{last or 'no response'}")
 
 
+def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
+    """Stop the network-shared adb server and return to a normal local-only one:
+    kill the ``-a`` (all-interfaces) server, then start a plain server that binds
+    to localhost again, so this PC keeps working but no longer shares its devices.
+    Best-effort; returns a short status string."""
+    adb = find_adb(adb_path)
+    subprocess.run([adb, "-P", str(port), "kill-server"],
+                   capture_output=True, timeout=15, creationflags=NO_WINDOW)
+    subprocess.run([adb, "start-server"],
+                   capture_output=True, timeout=15, creationflags=NO_WINDOW)
+    return "shared adb server stopped — back to local-only (localhost)"
+
+
 def _startup_dir() -> str:
     """The current user's Windows Startup folder (programs run at login)."""
     appdata = os.environ.get("APPDATA", os.path.expanduser("~"))

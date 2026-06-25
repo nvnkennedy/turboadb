@@ -15,6 +15,7 @@ DEFAULTS = {
     "term_font_size": 10,
     "adb_path": "",                  # blank = auto-detect
     "scrcpy_path": "",               # blank = auto-detect
+    "ffmpeg_path": "",               # blank = auto (cache/PATH); for the Webcam tab
     "scrcpy_max_size": 0,            # 0 = native
     "scrcpy_bit_rate": "8M",
     "scrcpy_video_codec": "",        # "" = auto; h264 is most IVI-compatible

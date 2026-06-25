@@ -263,18 +263,37 @@ def launch_gui(argv=None) -> int:
 # --------------------------------------------------------------------------- #
 # argument plumbing
 # --------------------------------------------------------------------------- #
-def _add_target(p: argparse.ArgumentParser) -> None:
-    p.add_argument("-s", "--serial", default=None,
+def _add_target(p: argparse.ArgumentParser, suppress: bool = True) -> None:
+    """Attach the shared target/connection flags.
+
+    These flags are accepted both *before* the subcommand (e.g.
+    ``turboadb -s SERIAL info``, the form used throughout the README) and
+    *after* it (e.g. ``turboadb info -s SERIAL``). To make both orders work the
+    flags live on the top-level parser AND on every subparser:
+
+    * The top-level parser is added with ``suppress=False`` so it carries the
+      real default values.
+    * Each subparser is added with ``suppress=True`` (the default) so its copies
+      use ``argparse.SUPPRESS`` defaults — present only when the user actually
+      passes the flag after the subcommand, and so never clobbering a value
+      already parsed at the top level. (argparse copies a subparser's parsed
+      namespace, including its defaults, over the outer one.)
+    """
+    _none = argparse.SUPPRESS if suppress else None
+    _port = argparse.SUPPRESS if suppress else 5037
+    _json = argparse.SUPPRESS if suppress else False
+    p.add_argument("-s", "--serial", default=_none,
                    help="device serial, or host:port for a network device")
-    p.add_argument("--adb-path", default=None, help="path to the adb executable")
-    p.add_argument("--adb-host", default=None,
+    p.add_argument("--adb-path", default=_none, help="path to the adb executable")
+    p.add_argument("--adb-host", default=_none,
                    help="remote adb server host — drive a device plugged into "
                         "another machine (that machine: adb -a nodaemon server start)")
-    p.add_argument("--adb-port", type=int, default=5037,
+    p.add_argument("--adb-port", type=int, default=_port,
                    help="remote adb server port (default 5037)")
-    p.add_argument("--timeout", type=float, default=None,
+    p.add_argument("--timeout", type=float, default=_none,
                    help="per-command timeout (seconds)")
-    p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p.add_argument("--json", action="store_true", default=_json,
+                   help="emit machine-readable JSON")
 
 
 def _handler(args) -> ADBHandler:
@@ -305,6 +324,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Android ADB + scrcpy device toolkit (automotive & general).")
     parser.add_argument("-V", "--version", action="version",
                         version=f"turboadb {__version__}")
+    # Accept the shared target flags before the subcommand too, so the
+    # documented `turboadb -s SERIAL <cmd>` order works. This holds the real
+    # defaults; the per-subcommand copies (added via _add_target) use SUPPRESS
+    # so they never overwrite a value parsed here.
+    _add_target(parser, suppress=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="report whether adb/scrcpy were found")
@@ -422,6 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_scr.add_argument("--record", default=None, help="record mirror to FILE")
     p_scr.add_argument("--turn-screen-off", action="store_true")
     p_scr.add_argument("--no-control", action="store_true")
+    p_scr.add_argument("--video-source", choices=["display", "camera"],
+                       default=None,
+                       help="mirror the device camera instead of the screen "
+                            "(scrcpy 2.2+, Android 12+)")
+    p_scr.add_argument("--camera-facing", choices=["front", "back", "external"],
+                       default=None, help="which camera (with --video-source camera)")
+    p_scr.add_argument("--camera-size", default=None,
+                       help="camera resolution WxH (with --video-source camera)")
     p_scr.add_argument("--wait", action="store_true",
                        help="block until the scrcpy window is closed")
 
@@ -782,7 +814,8 @@ def main(argv=None) -> int:
             opts = ScrcpyOptions(
                 max_size=args.max_size, bit_rate=args.bit_rate, max_fps=args.max_fps,
                 record=args.record, turn_screen_off=args.turn_screen_off,
-                no_control=args.no_control)
+                no_control=args.no_control, video_source=args.video_source,
+                camera_facing=args.camera_facing, camera_size=args.camera_size)
             sess = dev.mirror(opts)
             print(f"scrcpy launched (pid {sess.pid}). Close its window to end.")
             if args.wait:

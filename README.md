@@ -33,7 +33,7 @@ steps, the **CLI** command, and the **Python** call.
 - **Feature guide**
   - [Interactive shell](#interactive-shell) · [Logcat](#logcat) · [Files](#files-pushpull) · [Apps](#apps)
   - [Device controls](#device-controls): [keys](#keys--input) · [media & connectivity](#media--connectivity) · [screen & launchers](#screen--app-launchers) · [keyboard](#on-screen-keyboard)
-  - [Mirroring (scrcpy)](#mirroring-scrcpy) · [Screenshots & recording](#screenshots--recording)
+  - [Mirroring (scrcpy)](#mirroring-scrcpy) · [Screenshots & recording](#screenshots--recording) · [Webcam (host camera)](#webcam-host-camera)
   - [Telephony](#telephony) · [Root & mount](#root--mount) · [Reboot](#reboot) · [Device info](#device-info)
   - [Remote devices](#remote-devices) · [Share devices (serve)](#share-devices-serve) · [Deploy serve over WinRM](#deploy-serve-over-winrm)
   - [Keep things up to date](#keep-things-up-to-date)
@@ -315,13 +315,17 @@ choke on the defaults, and it works through a remote adb server.
 or the IVI/compatibility option. Pick a specific display on multi-display units,
 or **▦ Mirror all** to show every display at once. The **🎮 Control + Mirror**
 tab puts the screen and the device controls side by side, so you can watch and
-tap/press without switching tabs.
+tap/press without switching tabs. **📷 Camera** mirrors the device *camera*
+instead of the screen — a live webcam-style view, front or back (chosen under
+**⚙ Options**); needs scrcpy 2.2+ and Android 12+. The display list loads lazily
+the first time you open the tab, so connecting never starts scrcpy on its own.
 
 **CLI**:
 
 ```bash
 turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M
 turboadb -s SERIAL scrcpy --no-control --turn-screen-off
+turboadb -s SERIAL scrcpy --video-source camera --camera-facing front
 ```
 
 **Python**:
@@ -352,6 +356,25 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")
 
 > Recording uses device-side `screenrecord` and pulls the file back, so it works
 > over RDP without a video tunnel.
+
+## Webcam (host camera)
+
+Different from the *device* camera (`scrcpy --video-source camera`): the **📹 Webcam**
+tab views a **host** webcam — a USB or laptop camera on the machine running TurboADB.
+Point one at the physical head unit / bench and watch it **beside** the scrcpy mirror.
+
+**GUI** — open a device, go to the **Webcam** sub-tab (or the **Webcam** ribbon
+button) → **🔍 Scan cameras** → pick one → **▶ Start**. Then **Snapshot**, **Record**
+(saved as a clean H.264 MP4), **Pause**, **Rotate**/**Mirror**, and Fill/Fit/Stretch.
+
+> **Works locally *and* over RDP.** Capture is local DirectShow, so when TurboADB
+> runs inside an RDP session it sees whatever camera that session exposes. If none
+> shows up: enable camera redirection in the RDP client (Local Resources → More… →
+> Cameras), turn on Windows camera privacy ("Let desktop apps access your camera"),
+> and make sure nothing else is using it.
+>
+> ffmpeg powers the capture; it's downloaded once (~160 MB, cached under
+> `~/.turboadb/ffmpeg`) or set **Settings → ffmpeg path** to your own.
 
 ## Telephony
 

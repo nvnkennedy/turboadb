@@ -100,6 +100,9 @@ class ScrcpyOptions:
                                           # GPU-less sessions where d3d/opengl fail)
     crop: Optional[str] = None            # --crop WxH:X:Y (great for IVI displays)
     display_id: Optional[int] = None      # --display-id (multi-display head units)
+    video_source: Optional[str] = None    # --video-source display|camera (scrcpy 2.2+)
+    camera_facing: Optional[str] = None   # --camera-facing front|back|external
+    camera_size: Optional[str] = None     # --camera-size WxH
     record: Optional[str] = None          # --record FILE (mp4/mkv)
     record_format: Optional[str] = None   # --record-format mp4|mkv
     stay_awake: bool = True               # --stay-awake
@@ -144,6 +147,12 @@ class ScrcpyOptions:
             args += ["--crop", str(self.crop)]
         if self.display_id is not None:
             args += ["--display-id", str(self.display_id)]
+        if self.video_source:
+            args += [f"--video-source={self.video_source}"]
+        if self.camera_facing:
+            args += [f"--camera-facing={self.camera_facing}"]
+        if self.camera_size:
+            args += ["--camera-size", str(self.camera_size)]
         if self.record:
             args += ["--record", str(self.record)]
         if self.record_format:

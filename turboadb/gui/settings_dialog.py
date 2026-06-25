@@ -43,8 +43,11 @@ class SettingsDialog(QDialog):
         tf = QFormLayout(tools)
         self.adb_path = QLineEdit(self.cfg.get("adb_path", ""))
         self.scrcpy_path = QLineEdit(self.cfg.get("scrcpy_path", ""))
+        self.ffmpeg_path = QLineEdit(self.cfg.get("ffmpeg_path", ""))
+        self.ffmpeg_path.setPlaceholderText("blank = download once / use PATH (Webcam tab)")
         tf.addRow("adb path", _browse_row(self.adb_path, self))
         tf.addRow("scrcpy path", _browse_row(self.scrcpy_path, self))
+        tf.addRow("ffmpeg path", _browse_row(self.ffmpeg_path, self))
         lay.addWidget(tools)
 
         scr = QGroupBox("scrcpy defaults")
@@ -100,6 +103,7 @@ class SettingsDialog(QDialog):
             "term_font_size": self.font_size.value(),
             "adb_path": self.adb_path.text().strip(),
             "scrcpy_path": self.scrcpy_path.text().strip(),
+            "ffmpeg_path": self.ffmpeg_path.text().strip(),
             "scrcpy_max_size": self.max_size.value(),
             "scrcpy_bit_rate": self.bit_rate.text().strip(),
             "scrcpy_video_codec": ("" if self.codec.currentText() == "auto"

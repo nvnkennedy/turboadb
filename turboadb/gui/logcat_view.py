@@ -94,6 +94,8 @@ class LogcatPanel(QWidget):
         self.thread = None
         self._paused = False
         self._filter_re = None
+        self._hl_re = None            # keyword/regex to highlight (None = off)
+        self._hl_fmt = None           # the highlight char-format (lazy)
         self._fmt_cache = {}          # color -> QTextCharFormat (reused per batch)
         self._pending = []            # lines waiting to be drawn (coalesced)
         # A GUI-side timer paints at a FIXED low rate, decoupled from how fast
@@ -112,6 +114,14 @@ class LogcatPanel(QWidget):
         self.tag.setMaximumWidth(160)
         self.filt = QLineEdit(); self.filt.setPlaceholderText("regex filter (live)…")
         self.filt.textChanged.connect(self._set_filter)
+        self.hl = QLineEdit()
+        self.hl.setPlaceholderText("highlight (e.g. error|anr|crash)…")
+        self.hl.setToolTip("Highlight matches in-line (case-insensitive regex) "
+                           "without hiding the rest — great for spotting "
+                           "errors/ANRs/your tag in a flood. The Level colours "
+                           "still apply; matches get a bright marker.")
+        self.hl.setMaximumWidth(220)
+        self.hl.textChanged.connect(self._set_highlight)
         self.clear_first = QCheckBox("clear first")
         self.btn_start = QPushButton(" Start"); self.btn_start.setProperty("role", "ok")
         self.btn_start.setIcon(theme.emoji_icon("▶"))
@@ -125,7 +135,7 @@ class LogcatPanel(QWidget):
         self.btn_save = QPushButton(" Save…"); self.btn_save.setProperty("role", "ghost")
         self.btn_save.setIcon(theme.emoji_icon("💾"))
         self.btn_save.clicked.connect(self._save)
-        for w in (QLabel("Level:"), self.level, self.tag, self.filt,
+        for w in (QLabel("Level:"), self.level, self.tag, self.filt, self.hl,
                   self.clear_first, self.btn_start, self.btn_pause,
                   self.btn_clear, self.btn_save):
             ctrl.addWidget(w)
@@ -165,6 +175,16 @@ class LogcatPanel(QWidget):
             self._filter_re = re.compile(text) if text else None
         except re.error:
             self._filter_re = None
+
+    def _set_highlight(self, text):
+        """Keywords/regex to mark in-line (case-insensitive). Unlike the filter,
+        this never hides lines — it just makes matches pop out."""
+        try:
+            self._hl_re = re.compile(text, re.IGNORECASE) if text else None
+        except re.error:
+            self._hl_re = None       # keep typing a partial regex without errors
+        self.hl.setStyleSheet("" if self._hl_re or not text
+                              else "QLineEdit{color:%s;}" % theme.DANGER)
 
     # --- start/stop ---
     def toggle(self):
@@ -253,6 +273,8 @@ class LogcatPanel(QWidget):
         cur = self.view.textCursor()
         cur.movePosition(QTextCursor.End)
         fmt_cache = self._fmt_cache
+        hre = self._hl_re
+        hl_fmt = self._highlight_fmt() if hre is not None else None
         for line in lines:
             color = "#cfd8e3"
             head = line[:40]
@@ -264,9 +286,39 @@ class LogcatPanel(QWidget):
             if fmt is None:
                 fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
                 fmt_cache[color] = fmt
-            cur.insertText(line + "\n", fmt)
+            # Fast path (the common case): no highlight, or this line has no match
+            # — a single insertText keeps the flood cheap. Only split a line into
+            # segments when it actually contains a match.
+            if hre is not None and hre.search(line):
+                self._insert_highlighted(cur, line, fmt, hre, hl_fmt)
+            else:
+                cur.insertText(line + "\n", fmt)
         if at_bottom:
             sb.setValue(sb.maximum())
+
+    def _highlight_fmt(self):
+        """The in-line marker format (bright amber, bold) — built once."""
+        if self._hl_fmt is None:
+            f = QTextCharFormat()
+            f.setBackground(QColor("#ffd54a"))
+            f.setForeground(QColor("#1a1a1a"))
+            f.setFontWeight(QFont.Bold)
+            self._hl_fmt = f
+        return self._hl_fmt
+
+    @staticmethod
+    def _insert_highlighted(cur, line, base_fmt, hre, hl_fmt):
+        """Insert *line* with matched spans in *hl_fmt* and the rest in *base_fmt*."""
+        pos = 0
+        for m in hre.finditer(line):
+            s, e = m.start(), m.end()
+            if e == s:                       # skip zero-width matches
+                continue
+            if s > pos:
+                cur.insertText(line[pos:s], base_fmt)
+            cur.insertText(line[s:e], hl_fmt)
+            pos = e
+        cur.insertText(line[pos:] + "\n", base_fmt)
 
     def _save(self):
         default = "turboadb-logcat-" + time.strftime("%Y%m%d-%H%M%S") + ".log"

@@ -115,6 +115,29 @@ class _ShareThread(QThread):
             self.msg.emit(f"[ERROR] share devices: {exc}")
 
 
+class _StopShareThread(QThread):
+    """Undo device sharing on THIS PC: remove both auto-start vectors (login
+    launcher + SYSTEM scheduled task) and return the adb server to local-only."""
+    msg = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from ..devices import (uninstall_startup, uninstall_serve_task,
+                                   stop_shared_server)
+            removed = []
+            if uninstall_startup():
+                removed.append("login auto-start launcher")
+            if uninstall_serve_task():
+                removed.append("SYSTEM startup task")
+            self.msg.emit("[OK] removed auto-start: " + (", ".join(removed)
+                          if removed else "none was installed"))
+            self.msg.emit("[OK] " + stop_shared_server())
+            self.msg.emit("[OK] This PC no longer shares its devices and will not "
+                          "start the shared server automatically.")
+        except Exception as exc:
+            self.msg.emit(f"[ERROR] stop sharing: {exc}")
+
+
 class _DeployThread(QThread):
     """Deploy + start `turboadb serve` on remote hosts over WinRM, streaming
     per-host status back to the log."""
@@ -334,6 +357,8 @@ class MainWindow(QMainWindow):
                         self.deploy_serve_remote)
         smenu.addAction(theme.emoji_icon("🛰"), "Share THIS PC's devices…",
                         self.share_devices)
+        smenu.addAction(theme.emoji_icon("🛑", theme.DANGER),
+                        "Stop sharing & remove auto-start", self.stop_sharing)
         smenu.addSeparator()
         smenu.addAction(theme.emoji_icon("🔄"), "Restart local ADB server",
                         self.restart_adb_server)
@@ -347,6 +372,7 @@ class MainWindow(QMainWindow):
             ("📦", "Apps", lambda: self._subtab("apps")),
             ("🎛", "Controls", lambda: self._subtab("controls")),
             ("📱", "Scrcpy", self._mirror_current),
+            ("📹", "Webcam", lambda: self._subtab("webcam")),
             ("📸", "Screenshot", self._shot_current),
             ("🔲", "Split", self.toggle_split),
             ("📋", "Logs", self.toggle_log),
@@ -358,6 +384,11 @@ class MainWindow(QMainWindow):
             act = QAction(theme.emoji_icon(emoji), label, self)
             act.triggered.connect(slot)
             tb.addAction(act)
+        # one-click dark/light toggle (glyph shows the theme you'll switch TO)
+        self.act_theme = QAction(self)
+        self.act_theme.triggered.connect(self.toggle_theme)
+        tb.addAction(self.act_theme)
+        self._sync_theme_action()
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -741,6 +772,27 @@ class MainWindow(QMainWindow):
         self._share.finished.connect(self._poll_devices)
         self._share.start()
 
+    def stop_sharing(self):
+        """Stop sharing this PC's devices and remove BOTH auto-start vectors (the
+        login launcher and the SYSTEM startup task), so nothing runs on its own at
+        boot/login anymore. Addresses 'turboadb keeps auto-starting locally'."""
+        if getattr(self, "_unshare", None) and self._unshare.isRunning():
+            self.log_panel.append("[WARNING] Stop-sharing is already running…")
+            return
+        if QMessageBox.question(
+                self, "Stop sharing & remove auto-start",
+                "Stop sharing this PC's devices and remove the auto-start "
+                "(login launcher + SYSTEM startup task)?\n\n"
+                "The adb server returns to local-only. Removing the SYSTEM task "
+                "may need Administrator.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.log_panel.append("Stopping device sharing and removing auto-start…")
+        self._unshare = _StopShareThread()
+        self._unshare.msg.connect(self.log_panel.append)
+        self._unshare.finished.connect(self._poll_devices)
+        self._unshare.start()
+
     def deploy_serve_remote(self):
         """Install/start `turboadb serve` on remote Windows hosts FROM here, over
         WinRM — so you don't have to RDP into each one to enable device sharing."""
@@ -1053,7 +1105,31 @@ class MainWindow(QMainWindow):
             cfg = dlg.result_settings()
             settings_mod.save(cfg)
             QApplication.instance().setStyleSheet(theme.stylesheet(cfg["theme"]))
+            self._sync_theme_action()
             self.log_panel.append(f"[OK] Settings saved — theme: {cfg['theme']}")
+
+    def _sync_theme_action(self):
+        """Point the ribbon toggle at the theme you'll switch TO (moon = go dark,
+        sun = go light), so the glyph always reflects the next click."""
+        if not hasattr(self, "act_theme"):
+            return
+        from . import settings as settings_mod
+        light = settings_mod.get("theme") == "light"
+        self.act_theme.setIcon(theme.emoji_icon("🌙" if light else "☀"))
+        self.act_theme.setText("Dark" if light else "Light")
+        self.act_theme.setToolTip(
+            "Switch to the %s theme" % ("dark" if light else "light"))
+
+    def toggle_theme(self):
+        """Flip dark/light in one click and apply it live to the whole app."""
+        from . import settings as settings_mod
+        data = settings_mod.load()
+        new = "light" if data.get("theme") == "dark" else "dark"
+        data["theme"] = new
+        settings_mod.save(data)
+        QApplication.instance().setStyleSheet(theme.stylesheet(new))
+        self._sync_theme_action()
+        self.log_panel.append(f"[OK] Theme: {new}")
 
     def _close_tab(self, index):
         w = self.tabs.widget(index)

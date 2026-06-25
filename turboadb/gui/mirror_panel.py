@@ -423,6 +423,8 @@ class MirrorPanel(QWidget):
         self.act_uhid = omenu.addAction("Hardware keyboard (UHID — fixes typing "
                                         "on RDP / IVI)")
         self.act_uhid.setCheckable(True); self.act_uhid.setChecked(self._rdp)
+        self.act_cam_front = omenu.addAction("📷 Camera: use FRONT (else back)")
+        self.act_cam_front.setCheckable(True)
         self.btn_opts.setMenu(omenu)
         self.btn_shot = QPushButton("📸 Screenshot"); self.btn_shot.setProperty("role", "ghost")
         self.btn_shot.setToolTip("Capture a PNG of the screen (works on any "
@@ -444,13 +446,18 @@ class MirrorPanel(QWidget):
                                        "USB (a remote server shares one video "
                                        "tunnel, so it can only do one at a time).")
         self.btn_mirror_all.clicked.connect(self._mirror_all)
+        self.btn_camera = QPushButton("📷 Camera"); self.btn_camera.setProperty("role", "ghost")
+        self.btn_camera.setToolTip("Mirror the device CAMERA instead of the screen "
+                                   "(needs scrcpy 2.2+ and Android 12+). Pick front "
+                                   "or back under ⚙ Options.")
+        self.btn_camera.clicked.connect(self._mirror_camera)
         self.btn_max = QPushButton("⛶ Max view"); self.btn_max.setProperty("role", "ghost")
         self.btn_max.setCheckable(True)
         self.btn_max.setToolTip("Hide the log + sidebar so the screen gets the "
                                 "full window — much bigger for a portrait device.")
         self.btn_max.clicked.connect(self._toggle_max)
-        for w in (self.btn_mirror, self.btn_live, self.btn_stop, self.btn_record,
-                  self.btn_shot, self.btn_type, self.btn_opts,
+        for w in (self.btn_mirror, self.btn_live, self.btn_camera, self.btn_stop,
+                  self.btn_record, self.btn_shot, self.btn_type, self.btn_opts,
                   QLabel("Display:"), self.cmb_display, self.btn_displays,
                   self.btn_mirror_all, self.btn_max):
             bar.addWidget(w)
@@ -479,9 +486,18 @@ class MirrorPanel(QWidget):
         self.live_view.swiped.connect(self._live_swipe)
         lay.addWidget(self.live_view, 1)
 
-        # populate the display list automatically once the tab is up (so the
-        # dropdown is ready without the user clicking "Displays" first)
-        QTimer.singleShot(700, self.refresh_displays)
+        # Load the display list LAZILY — only the first time this Mirror tab is
+        # actually shown, not on connect. (Auto-loading on connect launched scrcpy
+        # immediately — twice, with the Control+Mirror view — which looked like the
+        # app "auto-starting" something. Now nothing scrcpy-related runs until you
+        # open the Mirror tab.)
+        self._displays_loaded = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_displays_loaded", True):
+            self._displays_loaded = True
+            QTimer.singleShot(150, self.refresh_displays)
 
     # ----- live view (screencap streaming; works over remote/RDP/IVI) -----
     def _toggle_live(self):
@@ -630,6 +646,15 @@ class MirrorPanel(QWidget):
             except Exception:
                 pass
         self._multi = []
+
+    # ----- mirror the device CAMERA (scrcpy 2.2+, Android 12+) -----
+    def _mirror_camera(self):
+        """Open the device's CAMERA as the video source instead of the screen —
+        a live webcam-style view (front or back, chosen under ⚙ Options). Needs
+        scrcpy 2.2+ on the host and Android 12+ on the device."""
+        facing = "front" if self.act_cam_front.isChecked() else "back"
+        self.log.emit(f"Opening the device {facing} camera (scrcpy)…")
+        self.start(camera=facing)
 
     def _toggle_max(self):
         """Hide/show the main window's docks so the mirror gets the whole window
@@ -876,13 +901,18 @@ class MirrorPanel(QWidget):
 
     # ----- start / stop -----
     def start(self, display_id="__use_combo__", compat=None, embed=None,
-              record=None, record_format=None):
+              record=None, record_format=None, camera=None):
         if self._live is not None:               # switch away from Live View
             self._stop_live()
         if self._scrcpy is not None:
             self.stop()
         if display_id == "__use_combo__":
             display_id = self.cmb_display.currentData()
+        # The camera is its own video source — it has no display id and scrcpy
+        # disables control for it, so a plain separate window is the safe choice.
+        if camera:
+            display_id = None
+            embed = False
         if compat is None:
             compat = self.act_compat.isChecked()
         if embed is None:
@@ -906,9 +936,13 @@ class MirrorPanel(QWidget):
             no_audio=not self.act_audio.isChecked(),
             record=record, record_format=record_format,
             display_id=display_id,
+            video_source=("camera" if camera else None),
+            camera_facing=(camera or None),
             keyboard_mode="uhid" if self.act_uhid.isChecked() else None,
             window_title=self.session_dict.get("name") or "turboadb")
         self._tune(opts)
+        if camera:
+            self.status.setText(f"Camera ({camera}) — live view")
         if opts.render_driver == "software":
             self.log.emit("[INFO] using software rendering (Remote Desktop / "
                           "GPU-less) — capped to keep it smooth")

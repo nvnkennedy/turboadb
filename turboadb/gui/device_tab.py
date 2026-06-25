@@ -24,6 +24,7 @@ from .apps_panel import AppsPanel
 from .controls_panel import ControlsPanel
 from .phone_panel import PhonePanel
 from .mirror_panel import MirrorPanel
+from .camera_widget import CameraPanel
 
 
 def config_from_session(s: dict) -> ADBConfig:
@@ -557,6 +558,11 @@ class DeviceTab(QWidget):
         self.mirror_tab = MirrorPanel(handler, self.session,
                                       automotive=self._automotive)
         self.mirror_tab.log.connect(self.log)
+        # host webcam (USB/laptop camera, incl. over RDP) — point it at the
+        # physical head unit / bench and watch beside the mirror. Host-level, so it
+        # needs no device handler.
+        self.webcam = CameraPanel()
+        self.webcam.log.connect(self.log)
         # the emoji goes on the tab as a real ICON (with plain text), so Qt sizes
         # the tab to the text correctly — inline emoji in the label throws the
         # width calc off and truncated the labels
@@ -567,6 +573,7 @@ class DeviceTab(QWidget):
         self._add_subtab(self.controls, "🎛", "Controls")
         self._add_subtab(self.phone, "📞", "Phone")
         self._add_subtab(self.mirror_tab, "📱", "Mirror")
+        self._add_subtab(self.webcam, "📹", "Webcam")
         # a combined "easy control" view: the screen + the controls side by side
         self.combo_view = self._build_control_view(handler)
         self._add_subtab(self.combo_view, "🎮", "Control + Mirror")
@@ -619,7 +626,7 @@ class DeviceTab(QWidget):
 
     def show_subtab(self, name: str):
         names = {"shell": 0, "logcat": 1, "files": 2, "apps": 3,
-                 "controls": 4, "phone": 5, "mirror": 6}
+                 "controls": 4, "phone": 5, "mirror": 6, "webcam": 7}
         if self.handler and name in names:
             self.inner.setCurrentIndex(names[name])
 
@@ -679,7 +686,7 @@ class DeviceTab(QWidget):
 
     def close_session(self):
         for attr in ("shell", "logcat", "files", "apps", "controls", "phone",
-                     "mirror_tab", "cv_mirror", "cv_controls"):
+                     "mirror_tab", "webcam", "cv_mirror", "cv_controls"):
             p = getattr(self, attr, None)
             if p is not None:
                 try:
