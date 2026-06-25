@@ -64,6 +64,40 @@
     </div>
   </section>
 
+  <!-- WHAT'S NEW -->
+  <section id="whatsnew" class="section alt">
+    <div class="wrap">
+      <h2>What's new</h2>
+      <div class="whatsnew">
+        <div class="wn">
+          <h3><span class="ver">v1.0.7</span> Host webcam</h3>
+          <ul>
+            <li><b>📹 Webcam tab</b> — view a USB / laptop camera on the machine
+            running TurboADB, beside the scrcpy mirror. Point it at the physical
+            head unit or bench.</li>
+            <li><b>Works locally <em>and</em> over RDP</b> — local DirectShow capture
+            sees whatever camera the RDP session exposes.</li>
+            <li>Snapshot, record (H.264 MP4), pause, rotate / mirror, Fill·Fit·Stretch.</li>
+          </ul>
+        </div>
+        <div class="wn">
+          <h3><span class="ver">v1.0.6</span> Quick wins</h3>
+          <ul>
+            <li><b>📷 Device-camera mirror</b> — mirror the phone's own camera
+            (<code>scrcpy --video-source camera</code>), front or back.</li>
+            <li><b>Logcat keyword highlighting</b> — mark <code>error|anr|crash</code>
+            in-line without hiding the rest.</li>
+            <li><b>One-click dark / light toggle</b>, and a <b>Stop sharing &amp;
+            remove auto-start</b> control. Nothing auto-starts on connect.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="center muted" style="margin-top:22px">
+        Full history in the <a data-gh="changelog" href="#">changelog</a>.
+      </p>
+    </div>
+  </section>
+
   <!-- FEATURES -->
   <section id="features" class="section">
     <div class="wrap">
@@ -82,7 +116,8 @@
         <div class="card">
           <div class="ic">📜</div>
           <h3>Live logcat</h3>
-          <p>Filter by level, tag, or live regex; pause and clear. Under a flood the
+          <p>Filter by level, tag, or live regex; <strong>highlight</strong> keywords
+          like <code>error|anr|crash</code> in-line; pause and clear. Under a flood the
           view stays responsive and <strong>nothing is lost</strong> — every line is
           archived to disk, so a save is the complete log.</p>
         </div>
@@ -106,8 +141,17 @@
           <div class="ic">📱</div>
           <h3>Mirroring &amp; capture</h3>
           <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
-          IVI units and remote-tunnel handling. Screenshots and screen recording
-          that work over RDP.</p>
+          IVI units. <strong>Mirror all</strong> displays at once, a side-by-side
+          <strong>Control + Mirror</strong> view, or the device <strong>camera</strong>.
+          Screenshots and recording that work over RDP.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">📹</div>
+          <h3>Host webcam</h3>
+          <p>View a USB / laptop camera on the machine running TurboADB — point it at
+          the physical head unit and watch beside the mirror. Works <strong>locally
+          and over RDP</strong>; snapshot, record, rotate / flip.</p>
         </div>
 
         <div class="card">
@@ -130,7 +174,8 @@
           <h3>Serve &amp; deploy</h3>
           <p>Share this PC's devices with one command, or push <code>serve</code>
           onto remote Windows hosts <em>from your machine</em> over WinRM — one host
-          or a whole fleet, with a pre-flight test.</p>
+          or a whole fleet, with a pre-flight test. One click to <strong>stop sharing
+          &amp; remove auto-start</strong> again.</p>
         </div>
 
         <div class="card">
@@ -217,7 +262,7 @@ dev.install("app.apk", grant_perms=True)</code></pre></div>
       <div class="cols">
         <div>
           <h3>Drive a device on another PC</h3>
-          <div class="code"><pre><code>turboadb --adb-host lab-pc-01 devices
+          <div class="code"><pre><code>turboadb devices --adb-host lab-pc-01
 turboadb --adb-host lab-pc-01 -s DEVICE \
   shell -- pm list packages</code></pre></div>
           <p class="muted">The lab machine just needs to share its adb server.</p>
@@ -272,6 +317,7 @@ turboadb deploy-serve lab-pc-01 lab-pc-02 \
   const urls = {
     repo: base,
     releases: base + "/releases",
+    changelog: base + "/blob/main/CHANGELOG.md",
     exe: base + "/releases/latest/download/turboadb-gui.exe",
   };
   document.querySelectorAll("[data-gh]").forEach(function (a) {

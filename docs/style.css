@@ -116,3 +116,28 @@ h1,h2,h3{line-height:1.2;letter-spacing:-.01em}
   margin:22px auto 4px;max-width:840px}
 .guide-toc a{color:var(--dim);font-size:.9rem}
 .guide-toc a:hover{color:var(--accent2)}
+
+/* numbered GUI steps */
+.steps{margin:.15em 0 0;padding-left:1.3em;color:var(--text)}
+.steps li{margin:.3em 0}
+.steps li::marker{color:var(--accent2);font-weight:700}
+.steps b{font-weight:600}
+
+/* a neutral tag (e.g. "GUI only") + a "new" pill */
+.tag.note{background:rgba(154,164,175,.14);color:var(--dim)}
+.badge-new{display:inline-block;font-size:.62rem;font-weight:800;letter-spacing:.06em;
+  text-transform:uppercase;vertical-align:middle;margin-left:8px;padding:2px 7px;
+  border-radius:20px;background:rgba(40,194,214,.16);color:var(--accent2);
+  border:1px solid rgba(40,194,214,.4)}
+
+/* "what's new" band (home) */
+.whatsnew{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));
+  gap:18px;margin-top:6px}
+.wn{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:12px;padding:18px 20px}
+.wn h3{margin:0 0 10px;font-size:1.1rem;display:flex;align-items:center;gap:10px}
+.wn .ver{font-family:var(--mono);font-size:.72rem;color:var(--accent2);
+  border:1px solid var(--line);border-radius:20px;padding:2px 9px;font-weight:600}
+.wn ul{margin:0;padding-left:1.1em;color:var(--dim);font-size:.95rem}
+.wn li{margin:.34em 0}
+.wn li b{color:var(--text);font-weight:600}

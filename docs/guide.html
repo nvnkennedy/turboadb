@@ -38,9 +38,10 @@
         <a href="#logcat">Logcat</a><a href="#files">Files</a>
         <a href="#apps">Apps</a><a href="#controls">Controls</a>
         <a href="#mirror">Mirroring</a><a href="#capture">Capture</a>
-        <a href="#phone">Telephony</a><a href="#root">Root &amp; mount</a>
-        <a href="#remote">Remote</a><a href="#serve">Serve</a>
-        <a href="#deploy">Deploy</a><a href="#update">Update</a>
+        <a href="#webcam">Webcam</a><a href="#phone">Telephony</a>
+        <a href="#root">Root &amp; mount</a><a href="#remote">Remote</a>
+        <a href="#serve">Serve</a><a href="#deploy">Deploy</a>
+        <a href="#extras">GUI extras</a><a href="#update">Update</a>
       </div>
     </div>
   </section>
@@ -54,8 +55,14 @@
         <p class="desc">Everything operates on one device — local USB, a network
         device, or one on another machine's adb server.</p>
         <div class="mode"><span class="tag gui">GUI</span>
-          <p class="step">Click <b>Connect</b> in the ribbon → choose USB / Network /
-          Remote PC. Live devices also appear in the left sidebar — double-click to open.</p></div>
+          <ol class="steps">
+            <li>Click <b>Connect</b> in the ribbon.</li>
+            <li>Pick <b>USB</b>, <b>Network</b> (host:port), or <b>Remote PC</b>
+            (another machine's adb server).</li>
+            <li>Hit <b>Connect</b> — a device tab opens with Shell, Logcat, Files…</li>
+          </ol>
+          <p class="muted">Live devices also appear in the left sidebar —
+          double-click any to open it.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb devices
 turboadb -s 10BE330KG9000AF info
@@ -86,11 +93,16 @@ sess = dev.open_shell(); sess.send("ls /sdcard\n"); print(sess.read())</code></p
       <!-- LOGCAT -->
       <article class="feature" id="logcat">
         <h3>Logcat</h3>
-        <p class="desc">Filter by level / tag / live regex, pause, and save the
-        complete log — nothing is dropped under a flood.</p>
+        <p class="desc">Filter by level / tag / live regex, highlight keywords,
+        pause, and save the complete log — nothing is dropped under a flood.</p>
         <div class="mode"><span class="tag gui">GUI</span>
-          <p class="step"><b>Logcat</b> tab → set Level / tag / regex → <b>Start</b>.
-          <b>Save</b> writes a timestamped <code>.log</code>.</p></div>
+          <ol class="steps">
+            <li>Open the <b>Logcat</b> tab and set <b>Level</b> / <b>tag</b> (optional).</li>
+            <li>Press <b>Start</b>. Type a regex in <b>filter</b> to hide non-matching
+            lines, or in <b>highlight</b> (e.g. <code>error|anr|crash</code>) to mark
+            matches in-line <em>without</em> hiding the rest.</li>
+            <li><b>Save</b> writes the complete log to a timestamped <code>.log</code>.</li>
+          </ol></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL logcat --tag ActivityManager --match "ANR|FATAL" --save crash.log</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
@@ -155,16 +167,29 @@ dev.open_url("https://maps.google.com"); dev.input_text("hello world")</code></p
       <article class="feature" id="mirror">
         <h3>Mirroring (scrcpy)</h3>
         <p class="desc">In a window or embedded, with a compatibility mode for IVI
-        units and remote-tunnel handling.</p>
+        units and remote-tunnel handling. Mirror every display at once, watch and
+        control side by side, or mirror the device's own camera.</p>
         <div class="mode"><span class="tag gui">GUI</span>
-          <p class="step"><b>Mirror</b> tab / <b>Scrcpy</b> button → Mirror, Embed,
-          or compatibility mode; pick a display on multi-display units.</p></div>
+          <ol class="steps">
+            <li>Open the <b>Mirror</b> tab (or the <b>Scrcpy</b> ribbon button).</li>
+            <li>Pick a display, then <b>▶ Mirror</b> (window) or <b>🖥 Live View</b>
+            (reliable over RDP). For a stubborn IVI use <b>⚙ Options → compatibility</b>.</li>
+            <li><b>▦ Mirror all</b> opens every display at once; <b>📷 Camera</b>
+            mirrors the device camera (front/back under ⚙ Options).</li>
+            <li>The <b>🎮 Control + Mirror</b> sub-tab puts the screen and the
+            controls side by side.</li>
+          </ol>
+          <p class="muted">The display list loads only when you open the tab — so
+          connecting never starts scrcpy on its own.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
-          <div class="code"><pre><code>turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M</code></pre></div></div>
+          <div class="code"><pre><code>turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M
+turboadb -s SERIAL scrcpy --video-source camera --camera-facing front</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
           <div class="code"><pre><code>from turboadb import ScrcpyOptions
 sess = dev.mirror(ScrcpyOptions(max_size=1280, bit_rate="8M"))
-sess.wait()</code></pre></div></div>
+sess.wait()
+# device camera instead of the screen:
+dev.mirror(ScrcpyOptions(video_source="camera", camera_facing="front"))</code></pre></div></div>
       </article>
 
       <!-- CAPTURE -->
@@ -180,6 +205,32 @@ turboadb -s SERIAL record clip.mp4 --time-limit 20 --size 1280x720</code></pre><
         <div class="mode"><span class="tag py">Python</span>
           <div class="code"><pre><code>dev.screenshot("shot.png")
 dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div></div>
+      </article>
+
+      <!-- WEBCAM -->
+      <article class="feature" id="webcam">
+        <h3>Webcam (host camera) <span class="badge-new">new</span></h3>
+        <p class="desc">Different from the device camera above: this views a
+        <b>host</b> webcam — a USB / laptop camera on the machine running TurboADB.
+        Point one at the physical head unit or bench and watch it beside the mirror.
+        It captures locally, so it also works when TurboADB runs inside an
+        <b>RDP</b> session (it sees that session's redirected camera).</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <ol class="steps">
+            <li>Open a device → the <b>📹 Webcam</b> sub-tab (or the <b>Webcam</b>
+            ribbon button).</li>
+            <li>Click <b>🔍 Scan cameras</b> (the first time, ffmpeg is fetched once,
+            ~160 MB → <code>~/.turboadb/ffmpeg</code>), pick a camera and quality.</li>
+            <li>Press <b>▶ Start</b>. Then <b>Snapshot</b>, <b>Record</b> (clean H.264
+            MP4), <b>Pause</b>, <b>Rotate</b> / <b>Mirror</b>, and Fill·Fit·Stretch.</li>
+          </ol>
+          <p class="muted">No camera listed over RDP? Enable camera redirection in
+          the RDP client (Local Resources → More… → Cameras), turn on Windows camera
+          privacy, and close any app already using it.</p></div>
+        <div class="mode"><span class="tag note">GUI only</span>
+          <p class="step">The host webcam is a desktop feature (it isn't an adb
+          device operation, so there's no CLI / Python call). Bring your own ffmpeg by
+          setting <b>Settings → ffmpeg path</b> for offline use.</p></div>
       </article>
 
       <!-- PHONE -->
@@ -219,7 +270,7 @@ turboadb -s SERIAL disable-verity</code></pre></div></div>
         <div class="mode"><span class="tag gui">GUI</span>
           <p class="step"><b>Connect → Remote PC</b>; enter the host + device.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
-          <div class="code"><pre><code>turboadb --adb-host lab-pc-01 devices
+          <div class="code"><pre><code>turboadb devices --adb-host lab-pc-01
 turboadb --adb-host lab-pc-01 -s DEVICE shell -- pm list packages</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
           <div class="code"><pre><code>dev = ADBHandler(ADBConfig(adb_server_host="lab-pc-01", serial="DEVICE"))
@@ -232,12 +283,19 @@ dev.connect()</code></pre></div></div>
         <p class="desc">Turn the machine a device is plugged into a host others can
         reach.</p>
         <div class="mode"><span class="tag gui">GUI</span>
-          <p class="step"><b>ADB Server ▸ Share this PC's devices</b>.</p></div>
+          <p class="step"><b>ADB Server ▾ → Share this PC's devices</b> (optionally
+          "run at login"). To undo it, <b>ADB Server ▾ → 🛑 Stop sharing &amp; remove
+          auto-start</b> — stops sharing and removes both the login launcher and the
+          SYSTEM startup task.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
-          <div class="code"><pre><code>turboadb serve --startup-task   # shared server + firewall, headless across reboots</code></pre></div></div>
+          <div class="code"><pre><code>turboadb serve --startup-task    # shared server + firewall, headless across reboots
+turboadb serve --uninstall-startup   # stop auto-start again</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
-          <div class="code"><pre><code>from turboadb.devices import start_shared_server, install_serve_task
-start_shared_server(); install_serve_task()</code></pre></div></div>
+          <div class="code"><pre><code>from turboadb.devices import (start_shared_server, install_serve_task,
+                              stop_shared_server, uninstall_serve_task)
+start_shared_server(); install_serve_task()
+# undo:
+uninstall_serve_task(); stop_shared_server()</code></pre></div></div>
       </article>
 
       <!-- DEPLOY -->
@@ -254,6 +312,24 @@ turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --test</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
           <div class="code"><pre><code>from turboadb.remote_deploy import deploy_serve
 deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password", on_status=print)</code></pre></div></div>
+      </article>
+
+      <!-- GUI EXTRAS -->
+      <article class="feature" id="extras">
+        <h3>GUI extras</h3>
+        <p class="desc">Small conveniences that make long sessions nicer.</p>
+        <div class="mode"><span class="tag gui">GUI</span>
+          <ul class="steps">
+            <li><b>🌙 / ☀ Theme</b> — one-click dark / light toggle in the ribbon
+            (the glyph shows the theme you'll switch to).</li>
+            <li><b>🔲 Split</b> — view two device tabs side by side.</li>
+            <li><b>⛶ Max view</b> (on the Mirror tab) hides the docks so the screen
+            fills the window.</li>
+            <li><b>📋 Logs</b> — toggle the leveled, filterable log dock; the noisy
+            adb trace is hidden by default.</li>
+            <li><b>⚙ Settings</b> — theme, fonts, tool paths (adb / scrcpy /
+            <b>ffmpeg</b>), and scrcpy defaults.</li>
+          </ul></div>
       </article>
 
       <!-- UPDATE -->
