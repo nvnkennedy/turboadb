@@ -70,6 +70,34 @@ def _checkmark_png(color: str = "#ffffff") -> str:
 
 
 _CHECK_CACHE = {}
+_ARROW_CACHE = {}
+
+
+def _down_arrow_png(color: str = "#aeb4bb") -> str:
+    """Paint (once) a small down-chevron PNG and return its path. Qt's stylesheet
+    engine can't draw a CSS border-triangle for a subcontrol — it renders as a tiny
+    square/'dot' — so QComboBox::down-arrow points at a real image instead."""
+    import os, tempfile
+    cached = _ARROW_CACHE.get(color)
+    if cached and os.path.exists(cached):
+        return cached
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor
+    pm = QPixmap(14, 9)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color)); pen.setWidthF(1.8)
+    pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.drawLine(3, 3, 7, 7)           # a clean "v" chevron
+    p.drawLine(7, 7, 11, 3)
+    p.end()
+    path = os.path.join(tempfile.gettempdir(),
+                        f"turboadb-arrow-{color.lstrip('#')}.png")
+    pm.save(path)
+    _ARROW_CACHE[color] = path
+    return path
 
 
 def stylesheet(name: str = "dark") -> str:
@@ -79,6 +107,10 @@ def stylesheet(name: str = "dark") -> str:
         check = _checkmark_png("#ffffff").replace("\\", "/")
     except Exception:
         check = ""
+    try:
+        arrow = _down_arrow_png(c['dim']).replace("\\", "/")
+    except Exception:
+        arrow = ""
     return f"""
     QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 10.5pt; }}
     QMainWindow::separator {{ background: {c['border']}; width: 1px; height: 1px; }}
@@ -91,6 +123,8 @@ def stylesheet(name: str = "dark") -> str:
         padding: 4px 8px; color: {c['text']};
     }}
     QToolButton:hover {{ background: {c['raised']}; border: 1px solid {c['border']}; }}
+    QToolBar#ribbon QToolButton {{ padding: 3px 5px; }}   /* tight ribbon */
+    QToolBar#ribbon {{ spacing: 1px; }}
     QToolButton:pressed {{ background: {ACCENT}; color: #042830; }}
     QToolButton[role="ok"] {{ background: {ACCENT}; color: #042830; border-radius: 8px;
         padding: 6px 12px; font-weight: 700; }}
@@ -138,10 +172,10 @@ def stylesheet(name: str = "dark") -> str:
         background: {c['panel']}; color: {c['dim']}; border-color: {c['border']};
     }}
     QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right;
-        border: none; width: 20px; }}
-    QComboBox::down-arrow {{ width: 0; height: 0; margin-right: 7px;
-        border-left: 5px solid transparent; border-right: 5px solid transparent;
-        border-top: 6px solid {atext}; }}
+        border: none; width: 22px; }}
+    QComboBox::down-arrow {{ image: url({arrow}); width: 14px; height: 9px;
+        margin-right: 7px; }}
+    QComboBox::down-arrow:disabled {{ image: url({arrow}); }}
     QComboBox QAbstractItemView, QListView {{
         background: {c['raised']}; color: {c['text']}; border: 1px solid {c['border']};
         selection-background-color: {ACCENT}; selection-color: #042830; outline: 0;

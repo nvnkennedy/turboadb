@@ -363,17 +363,30 @@ Different from the *device* camera (`scrcpy --video-source camera`): the **📹 
 tab views a **host** webcam — a USB or laptop camera on the machine running TurboADB.
 Point one at the physical head unit / bench and watch it **beside** the scrcpy mirror.
 
-**GUI** — open a device, go to the **Webcam** sub-tab (or the **Webcam** ribbon
-button) → **🔍 Scan cameras** → pick one → **▶ Start**. Then **Snapshot**, **Record**
-(saved as a clean H.264 MP4), **Pause**, **Rotate**/**Mirror**, and Fill/Fit/Stretch.
+**GUI** — click the **📹 Webcam** ribbon button (or **View → Open webcam**) to open
+it as a standalone tab — no device needed. (It's also a per-device sub-tab, handy
+beside the mirror.) Pick a **Source**:
 
-> **Works locally *and* over RDP.** Capture is local DirectShow, so when TurboADB
-> runs inside an RDP session it sees whatever camera that session exposes. If none
-> shows up: enable camera redirection in the RDP client (Local Resources → More… →
+- **Local (this PC / RDP session)** — **🔍 Scan cameras** → pick one → **▶ Start**.
+- **Remote (RDP / Windows machine)** — enter the host + admin login → **Scan** →
+  **Start**. No SSH: TurboADB uses the same WinRM/NTLM path as `deploy-serve` to run
+  ffmpeg on the remote and stream its camera back over a direct TCP socket.
+
+Then **Snapshot**, **Record** (clean H.264 MP4), **Pause**, **Rotate**/**Mirror**,
+and Fill/Fit/Stretch.
+
+> **Local works over RDP too.** Capture is local DirectShow, so when TurboADB runs
+> inside an RDP session it sees whatever camera that session exposes. If none shows
+> up: enable camera redirection in the RDP client (Local Resources → More… →
 > Cameras), turn on Windows camera privacy ("Let desktop apps access your camera"),
 > and make sure nothing else is using it.
 >
-> ffmpeg powers the capture; it's downloaded once (~160 MB, cached under
+> **Remote** needs WinRM on the target (`Enable-PSRemoting -Force`), the account a
+> local admin, and ffmpeg installed there. A physical USB camera on that machine
+> works headlessly; a camera redirected into someone's RDP session is only visible
+> inside that session.
+>
+> ffmpeg powers the capture; locally it's downloaded once (~160 MB, cached under
 > `~/.turboadb/ffmpeg`) or set **Settings → ffmpeg path** to your own.
 
 ## Telephony

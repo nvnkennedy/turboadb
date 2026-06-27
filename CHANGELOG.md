@@ -3,6 +3,38 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.10
+
+- **The Webcam opens right away — no device needed.** It's now a standalone tab you
+  open from the ribbon **📹 Webcam** button or **View → Open webcam (host camera)**,
+  instead of only being reachable as a sub-tab after a device is connected. (The
+  per-device Webcam sub-tab, handy beside the mirror, stays as well.)
+
+## 1.0.9
+
+- **Ribbon no longer overflows before you maximize.** The toolbar is now tight
+  (icon-only device shortcuts with tooltips; only Connect / ADB Server keep
+  labels), and the global actions — **theme · settings · help · exit** — are grouped
+  at the far right and stay visible at normal window sizes instead of hiding in the
+  “»” overflow until maximized.
+- Webcam: the horizontal-flip toggle is renamed **Flip** (was “Mirror”, which
+  clashed with scrcpy screen mirroring), the remote “diagnosing…” status no longer
+  flashes “Stopped”, and remote camera names with quotes are escaped safely.
+
+## 1.0.8
+
+- **Webcam now has a Remote source — view a camera on another Windows / RDP
+  machine, no SSH.** Pick **Source → Remote**, enter the host + admin login, and
+  TurboADB uses the same WinRM/NTLM path as `deploy-serve` to launch ffmpeg there
+  and stream its camera back over a direct TCP socket. (Local — which already
+  covers running TurboADB inside an RDP session — stays the default.) Clear
+  diagnostics when a remote camera has no video.
+- **Settings is now a proper preferences window** — a sidebar with focused pages
+  (Appearance · Tools · scrcpy · Logcat · Startup) instead of one long form, with
+  an ffmpeg-path field and a launch-time auto-update toggle.
+- **Dropdown arrows fixed.** Combo-boxes were drawing a tiny “dot” (Qt can't render
+  a CSS border-triangle for a subcontrol) — they now show a real chevron, app-wide.
+
 ## 1.0.7
 
 - **New “📹 Webcam” tab — view a host webcam, locally and over RDP.** Point a USB /

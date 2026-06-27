@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.0.7"
+version = "1.0.10"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"

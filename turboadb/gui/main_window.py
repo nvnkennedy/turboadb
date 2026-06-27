@@ -262,6 +262,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(ico("✖", theme.DANGER), "Exit", self.close, "Ctrl+Q")
 
         m_view = mb.addMenu("&View")
+        m_view.addAction(ico("📹"), "Open webcam (host camera)", self.open_webcam_tab)
         m_view.addAction(ico("📋"), "Toggle log panel", self.toggle_log)
         m_view.addAction(ico("🔲"), "Toggle split / tabbed view", self.toggle_split)
 
@@ -316,10 +317,14 @@ class MainWindow(QMainWindow):
     # ---- ribbon toolbar ----
     def _build_ribbon(self):
         tb = QToolBar("Ribbon")
+        tb.setObjectName("ribbon")               # tighter padding via theme QSS
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        tb.setIconSize(QSize(22, 22))            # compact, so more fits when narrow
-        # when items don't fit, Qt shows a ">>" overflow — Exit is always reachable
+        # Icon-only by default keeps the ribbon TIGHT so it fits without maximizing —
+        # only the two primary split buttons (Connect / ADB Server) carry labels.
+        # The device shortcuts get tooltips; the global actions (theme / settings /
+        # help / exit) are grouped at the far right and stay visible at any width.
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        tb.setIconSize(QSize(22, 22))
         self.addToolBar(tb)
 
         # Connect: one click opens the unified Connect dialog (USB / Network /
@@ -365,6 +370,8 @@ class MainWindow(QMainWindow):
         srv_btn.setMenu(smenu)
         tb.addWidget(srv_btn)
 
+        # device shortcuts — compact icon buttons with tooltips (their labels live
+        # in the menu bar too). Settings / Help moved to the right group below.
         items = [
             ("🖥", "Shell", lambda: self._subtab("shell")),
             ("📜", "Logcat", lambda: self._subtab("logcat")),
@@ -372,32 +379,41 @@ class MainWindow(QMainWindow):
             ("📦", "Apps", lambda: self._subtab("apps")),
             ("🎛", "Controls", lambda: self._subtab("controls")),
             ("📱", "Scrcpy", self._mirror_current),
-            ("📹", "Webcam", lambda: self._subtab("webcam")),
+            ("📹", "Webcam", self.open_webcam_tab),
             ("📸", "Screenshot", self._shot_current),
             ("🔲", "Split", self.toggle_split),
             ("📋", "Logs", self.toggle_log),
             ("🔄", "Upgrade", self.upgrade_tools_gui),
-            ("⚙", "Settings", self.show_settings),
-            ("❓", "Help", self._open_docs),
         ]
         for emoji, label, slot in items:
             act = QAction(theme.emoji_icon(emoji), label, self)
+            act.setToolTip(label)
             act.triggered.connect(slot)
             tb.addAction(act)
+
+        # expanding spacer pushes the global actions to the far right (max-right),
+        # where they stay tight and visible without maximizing the window.
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
         # one-click dark/light toggle (glyph shows the theme you'll switch TO)
         self.act_theme = QAction(self)
         self.act_theme.triggered.connect(self.toggle_theme)
         tb.addAction(self.act_theme)
         self._sync_theme_action()
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        tb.addWidget(spacer)
+        settings_act = QAction(theme.emoji_icon("⚙"), "Settings", self)
+        settings_act.setToolTip("Settings")
+        settings_act.triggered.connect(self.show_settings)
+        tb.addAction(settings_act)
+        help_act = QAction(theme.emoji_icon("❓"), "Help", self)
+        help_act.setToolTip("Help / Documentation")
+        help_act.triggered.connect(self._open_docs)
+        tb.addAction(help_act)
         exit_act = QAction(theme.emoji_icon("✖", theme.DANGER), "Exit", self)
+        exit_act.setToolTip("Exit TurboADB")
         exit_act.triggered.connect(self.close)
         tb.addAction(exit_act)
-        ew = tb.widgetForAction(exit_act)        # red text only (no red fill)
-        if ew is not None:
-            ew.setStyleSheet("QToolButton{color:%s;}" % theme.DANGER)
 
     # ---- sidebar ----
     def _build_sidebar(self):
@@ -623,6 +639,24 @@ class MainWindow(QMainWindow):
         self.tabs.setTabIcon(idx, theme.emoji_icon("📱"))
         self.tabs.setCurrentIndex(idx)
         self.log_panel.append(f"Opening '{name}'…")
+
+    def open_webcam_tab(self):
+        """Open the host Webcam as a standalone tab — available right away, with no
+        device connected. Focuses the existing one if it's already open."""
+        from .camera_widget import CameraPanel
+        if self._tiled:
+            self.toggle_split()
+        existing = getattr(self, "_webcam_tab", None)
+        if existing is not None and self.tabs.indexOf(existing) >= 0:
+            self.tabs.setCurrentWidget(existing)
+            return
+        cam = CameraPanel()
+        cam.log.connect(self.log_panel.append)
+        self._webcam_tab = cam
+        idx = self.tabs.addTab(cam, "Webcam")
+        self.tabs.setTabIcon(idx, theme.emoji_icon("📹"))
+        self.tabs.setCurrentIndex(idx)
+        self.log_panel.append("Opened the host Webcam (no device needed).")
 
     def _set_tab_title(self, widget, title):
         idx = self.tabs.indexOf(widget)

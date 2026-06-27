@@ -215,10 +215,11 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
         Point one at the physical head unit or bench and watch it beside the mirror.
         It captures locally, so it also works when TurboADB runs inside an
         <b>RDP</b> session (it sees that session's redirected camera).</p>
-        <div class="mode"><span class="tag gui">GUI</span>
+        <div class="mode"><span class="tag gui">GUI · Local</span>
           <ol class="steps">
-            <li>Open a device → the <b>📹 Webcam</b> sub-tab (or the <b>Webcam</b>
-            ribbon button).</li>
+            <li>Click the <b>📹 Webcam</b> ribbon button (or <b>View → Open
+            webcam</b>) — it opens as a standalone tab, <b>no device needed</b>.
+            <b>Source</b> = <b>Local (this PC / RDP session)</b>.</li>
             <li>Click <b>🔍 Scan cameras</b> (the first time, ffmpeg is fetched once,
             ~160 MB → <code>~/.turboadb/ffmpeg</code>), pick a camera and quality.</li>
             <li>Press <b>▶ Start</b>. Then <b>Snapshot</b>, <b>Record</b> (clean H.264
@@ -227,10 +228,22 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
           <p class="muted">No camera listed over RDP? Enable camera redirection in
           the RDP client (Local Resources → More… → Cameras), turn on Windows camera
           privacy, and close any app already using it.</p></div>
-        <div class="mode"><span class="tag note">GUI only</span>
-          <p class="step">The host webcam is a desktop feature (it isn't an adb
-          device operation, so there's no CLI / Python call). Bring your own ffmpeg by
-          setting <b>Settings → ffmpeg path</b> for offline use.</p></div>
+        <div class="mode"><span class="tag gui">GUI · Remote (no SSH)</span>
+          <ol class="steps">
+            <li>Set <b>Source</b> = <b>Remote (RDP / Windows machine)</b> and enter
+            the host, user, domain and password.</li>
+            <li><b>🔍 Scan cameras</b>, then <b>▶ Start</b> — TurboADB uses the same
+            WinRM/NTLM path as <code>deploy-serve</code> to launch ffmpeg on the
+            remote and stream its camera back over a direct TCP socket.</li>
+          </ol>
+          <p class="muted">The target needs WinRM on (<code>Enable-PSRemoting
+          -Force</code>), the account a local admin, and ffmpeg installed there. A
+          physical USB camera works headlessly; a camera redirected into someone's
+          RDP session is only visible inside that session.</p></div>
+        <div class="mode"><span class="tag note">Note</span>
+          <p class="step">The webcam is a desktop feature (not an adb device op, so
+          there's no CLI / Python call). Bring your own ffmpeg via <b>Settings →
+          ffmpeg path</b> for offline use.</p></div>
       </article>
 
       <!-- PHONE -->
