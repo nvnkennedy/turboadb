@@ -125,7 +125,9 @@ class _LocalPrep(QThread):
 
 
 class _RemotePrep(QThread):
-    """List cameras on a remote Windows/RDP host over WinRM (NTLM)."""
+    """List cameras on a remote Windows/RDP host over WinRM (NTLM), provisioning
+    ffmpeg there (one-time download) if it's missing."""
+    progress = pyqtSignal(str)
     done = pyqtSignal(str, list, str)   # remote ffmpeg path, cameras, diag
     fail = pyqtSignal(str)
 
@@ -137,7 +139,7 @@ class _RemotePrep(QThread):
         try:
             from . import remote_webcam
             cams, ffmpeg, diag = remote_webcam.list_remote_cameras(
-                self.host, self.login, self.password)
+                self.host, self.login, self.password, log=self.progress.emit)
             self.done.emit(ffmpeg, cams, diag)
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
@@ -162,9 +164,10 @@ class _RemoteStart(QThread):
             pid = remote_webcam.start_remote_stream(
                 self.host, self.login, self.password, self.camera, self.ffmpeg,
                 width=self.w, height=self.h, fps=self.fps, stream_port=self.port)
-            # ffmpeg with ?listen=1 needs a moment to bind before we connect
+            # ffmpeg opens the camera THEN binds the listen socket, so give it a
+            # generous window (camera init can take a few seconds) before giving up
             sock = None
-            deadline = time.time() + 12
+            deadline = time.time() + 22
             last = ""
             while time.time() < deadline:
                 try:
@@ -173,8 +176,25 @@ class _RemoteStart(QThread):
                 except Exception as exc:
                     last = str(exc); sock = None; time.sleep(0.6)
             if sock is None:
-                raise RuntimeError(f"couldn't connect to the remote video port "
-                                   f"{self.host}:{self.port} ({last})")
+                # ffmpeg never started listening — stop it (free the camera) and ask
+                # ffmpeg WHY via a short capture probe, so the error is actionable
+                try:
+                    remote_webcam.stop_remote_stream(
+                        self.host, self.login, self.password, pid, stream_port=self.port)
+                except Exception:
+                    pass
+                pid = None
+                diag = ""
+                try:
+                    diag = remote_webcam.probe_remote_camera(
+                        self.host, self.login, self.password, self.camera, self.ffmpeg)
+                except Exception:
+                    pass
+                msg = (f"couldn't connect to the remote video port "
+                       f"{self.host}:{self.port} ({last}).")
+                if diag:
+                    msg += f"\n\nffmpeg on the remote reported:\n{diag[:1200]}"
+                raise RuntimeError(msg)
             sock.settimeout(1.0)
             self.ok.emit(pid, sock)
         except Exception as exc:
@@ -252,11 +272,19 @@ class CameraPanel(QWidget):
         self.remote_row = QWidget()
         rl = QHBoxLayout(self.remote_row); rl.setContentsMargins(0, 0, 0, 0)
         rl.addWidget(QLabel("RDP host:"))
-        self.r_host = QLineEdit()
+        # remember the last host/user/domain (never the password) so they don't have
+        # to be retyped every session
+        from . import settings as _s
+        _cfg = _s.load()
+        self.r_host = QLineEdit(_cfg.get("webcam_remote_host", ""))
         self.r_host.setPlaceholderText("remote machine IP / hostname")
-        self.r_user = QLineEdit(); self.r_user.setPlaceholderText("user")
-        self.r_domain = QLineEdit(); self.r_domain.setPlaceholderText("domain (optional)")
-        self.r_pass = QLineEdit(); self.r_pass.setEchoMode(QLineEdit.Password)
+        self.r_user = QLineEdit(_cfg.get("webcam_remote_user", ""))
+        self.r_user.setPlaceholderText("user")
+        self.r_domain = QLineEdit(_cfg.get("webcam_remote_domain", ""))
+        self.r_domain.setPlaceholderText("domain (optional)")
+        # password comes from the OS credential vault (keyring), not settings.json
+        self.r_pass = QLineEdit(_s.webcam_remote_password())
+        self.r_pass.setEchoMode(QLineEdit.Password)
         self.r_pass.setPlaceholderText("password")
         rl.addWidget(self.r_host, 2); rl.addWidget(QLabel("user:")); rl.addWidget(self.r_user, 1)
         rl.addWidget(QLabel("domain:")); rl.addWidget(self.r_domain, 1)
@@ -412,6 +440,7 @@ class CameraPanel(QWidget):
                 return
             self._set_status(f"Connecting to {host} over WinRM…", "info")
             self._prep = _RemotePrep(host, self._remote_login(), self.r_pass.text())
+            self._prep.progress.connect(lambda m: self._set_status(m, "info"))
             self._prep.done.connect(self._remote_ready)
             self._prep.fail.connect(self._prep_fail)
             self._prep.start()
@@ -432,7 +461,21 @@ class CameraPanel(QWidget):
     def _remote_ready(self, ffmpeg, cams, diag):
         self.refresh_btn.setEnabled(True)
         self._remote_ffmpeg = ffmpeg
+        self._save_remote_details()      # remember host/user/domain (not password)
         self._fill(cams, diag)
+
+    def _save_remote_details(self):
+        try:
+            from . import settings as _s
+            data = _s.load()
+            data["webcam_remote_host"] = self.r_host.text().strip()
+            data["webcam_remote_user"] = self.r_user.text().strip()
+            data["webcam_remote_domain"] = self.r_domain.text().strip()
+            _s.save(data)
+            # password -> OS credential vault (never settings.json)
+            _s.set_webcam_remote_password(self.r_pass.text())
+        except Exception:
+            pass
 
     def _fill(self, cams, diag=""):
         self.camera.clear()

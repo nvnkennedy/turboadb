@@ -3,6 +3,46 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.14
+
+- **Remote webcam now actually connects.** The remote ffmpeg was launched as a child
+  of the WinRM session, so it was killed the instant the call returned — nothing was
+  listening, hence "connection actively refused". It's now spawned **detached** (via
+  WMI `Win32_Process.Create`) so it survives, with `listen_timeout` and a kill of any
+  stale ffmpeg holding the port/camera first. The connect window is longer (camera
+  init takes a moment), and if it still can't connect the error now includes **what
+  ffmpeg actually reported** (camera in use, privacy, etc.) instead of just "refused".
+
+## 1.0.13
+
+- **Remote webcam: ffmpeg is now *pushed* to the remote (works with no internet
+  there).** Instead of only having the remote download it, TurboADB copies your local
+  `ffmpeg.exe` to the remote over its admin share (`\\host\C$`) — fast on a LAN and
+  the reliable equivalent of TurboSSH's SFTP push — then falls back to a remote
+  download, then a clear manual-drop message. This fixes "ffmpeg wasn't found on the
+  remote" on locked-down lab machines.
+- **Compact / standard ribbon, like TurboSSH.** A new **🗜** ribbon button (and
+  **View → Toggle compact / standard ribbon**) switches between icons-only (compact,
+  the default — fits without maximizing) and **icons + text** (standard, readable).
+  The choice is remembered.
+
+## 1.0.12
+
+- **The Remote-webcam password is now remembered too — in the OS credential vault.**
+  Like TurboSSH, the host / user / domain go in settings and the **password is stored
+  securely via `keyring`** (Windows Credential Manager), never in `settings.json`.
+  It's pre-filled next time so the whole remote connection is one click.
+
+## 1.0.11
+
+- **Remote webcam now provisions ffmpeg by itself.** If the remote machine has no
+  ffmpeg, it **downloads it there** (one-time, into `%USERPROFILE%\.turboadb\ffmpeg`)
+  over WinRM — the WinRM-friendly equivalent of TurboSSH's SFTP push — instead of
+  just failing with “ffmpeg wasn't found”. Falls back to a clear message (drop
+  `ffmpeg.exe` over RDP) if the remote can't reach the internet.
+- **Remote connection is remembered.** The RDP host / user / domain are saved after
+  a successful scan and pre-filled next time (the password is never stored).
+
 ## 1.0.10
 
 - **The Webcam opens right away — no device needed.** It's now a standalone tab you

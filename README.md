@@ -381,10 +381,15 @@ and Fill/Fit/Stretch.
 > Cameras), turn on Windows camera privacy ("Let desktop apps access your camera"),
 > and make sure nothing else is using it.
 >
-> **Remote** needs WinRM on the target (`Enable-PSRemoting -Force`), the account a
-> local admin, and ffmpeg installed there. A physical USB camera on that machine
-> works headlessly; a camera redirected into someone's RDP session is only visible
-> inside that session.
+> **Remote** needs WinRM on the target (`Enable-PSRemoting -Force`) and the account
+> a local admin. ffmpeg is **provisioned automatically**: TurboADB first **copies your
+> local `ffmpeg.exe` to the remote over its admin share** (`\\host\C$`, fast on a LAN
+> and no internet needed there — like TurboSSH's push); if the share isn't reachable
+> it falls back to the remote downloading ffmpeg itself, and failing that you can drop
+> `ffmpeg.exe` in `C:\Windows\Temp\turboadb-ffmpeg\` over RDP. The host / user / domain
+> are remembered and the **password is saved in the Windows Credential vault**
+> (keyring), never in a file. A physical USB camera works headlessly; a camera
+> redirected into someone's RDP session is only visible inside that session.
 >
 > ffmpeg powers the capture; locally it's downloaded once (~160 MB, cached under
 > `~/.turboadb/ffmpeg`) or set **Settings → ffmpeg path** to your own.

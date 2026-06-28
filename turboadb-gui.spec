@@ -2,6 +2,8 @@
 from PyInstaller.utils.hooks import collect_submodules, collect_all
 
 hiddenimports = ['winrm', 'requests_ntlm', 'spnego']   # WinRM remote-deploy (NTLM)
+hiddenimports += ['keyring.backends', 'keyring.backends.Windows']  # OS vault (password)
+hiddenimports += collect_submodules('keyring')
 hiddenimports += collect_submodules('turboadb')
 datas = [('turboadb/assets/icon.ico', 'turboadb/assets'),
          ('turboadb/assets/icon.png', 'turboadb/assets')]

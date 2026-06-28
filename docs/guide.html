@@ -237,9 +237,11 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
             remote and stream its camera back over a direct TCP socket.</li>
           </ol>
           <p class="muted">The target needs WinRM on (<code>Enable-PSRemoting
-          -Force</code>), the account a local admin, and ffmpeg installed there. A
-          physical USB camera works headlessly; a camera redirected into someone's
-          RDP session is only visible inside that session.</p></div>
+          -Force</code>) and the account a local admin. ffmpeg is downloaded onto the
+          remote automatically on first use (or drop <code>ffmpeg.exe</code> in
+          <code>%USERPROFILE%\.turboadb\ffmpeg\</code>). The host / user / domain are
+          remembered (never the password). A physical USB camera works headlessly; a
+          camera redirected into an RDP session is only visible inside it.</p></div>
         <div class="mode"><span class="tag note">Note</span>
           <p class="step">The webcam is a desktop feature (not an adb device op, so
           there's no CLI / Python call). Bring your own ffmpeg via <b>Settings →

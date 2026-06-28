@@ -263,6 +263,9 @@ class MainWindow(QMainWindow):
 
         m_view = mb.addMenu("&View")
         m_view.addAction(ico("📹"), "Open webcam (host camera)", self.open_webcam_tab)
+        m_view.addAction(ico("🗜"), "Toggle compact / standard ribbon",
+                         self._toggle_ribbon_density)
+        m_view.addAction(ico("🌗"), "Toggle dark / light theme", self.toggle_theme)
         m_view.addAction(ico("📋"), "Toggle log panel", self.toggle_log)
         m_view.addAction(ico("🔲"), "Toggle split / tabbed view", self.toggle_split)
 
@@ -319,12 +322,14 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Ribbon")
         tb.setObjectName("ribbon")               # tighter padding via theme QSS
         tb.setMovable(False)
-        # Icon-only by default keeps the ribbon TIGHT so it fits without maximizing —
-        # only the two primary split buttons (Connect / ADB Server) carry labels.
-        # The device shortcuts get tooltips; the global actions (theme / settings /
-        # help / exit) are grouped at the far right and stay visible at any width.
-        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
         tb.setIconSize(QSize(22, 22))
+        self._ribbon = tb
+        # Two densities (like TurboSSH): STANDARD shows icons + text (readable);
+        # COMPACT is icons-only (frees space when the window is narrow). The 🗜
+        # ribbon button toggles it and the choice is remembered. The global actions
+        # (theme / settings / help / exit) are grouped at the far right either way.
+        from . import settings as settings_mod
+        self._compact = bool(settings_mod.get("compact_ribbon"))
         self.addToolBar(tb)
 
         # Connect: one click opens the unified Connect dialog (USB / Network /
@@ -343,6 +348,7 @@ class MainWindow(QMainWindow):
         dmenu.addAction("Pair device (Android 11+)…", self.pair_device)
         dmenu.addAction("Restart ADB server", self.restart_adb_server)
         dev_btn.setMenu(dmenu)
+        self._dev_btn = dev_btn
         tb.addWidget(dev_btn)
 
         # ADB Server: click = deploy/start `serve` on a remote machine (enter its
@@ -368,10 +374,11 @@ class MainWindow(QMainWindow):
         smenu.addAction(theme.emoji_icon("🔄"), "Restart local ADB server",
                         self.restart_adb_server)
         srv_btn.setMenu(smenu)
+        self._srv_btn = srv_btn
         tb.addWidget(srv_btn)
 
-        # device shortcuts — compact icon buttons with tooltips (their labels live
-        # in the menu bar too). Settings / Help moved to the right group below.
+        # device shortcuts — icon (+ text in standard density) with tooltips (their
+        # labels also live in the menu bar). Settings / Help are in the right group.
         items = [
             ("🖥", "Shell", lambda: self._subtab("shell")),
             ("📜", "Logcat", lambda: self._subtab("logcat")),
@@ -402,6 +409,10 @@ class MainWindow(QMainWindow):
         self.act_theme.triggered.connect(self.toggle_theme)
         tb.addAction(self.act_theme)
         self._sync_theme_action()
+        # compact (icons only) <-> standard (icons + text) density toggle
+        self.act_density = QAction(theme.emoji_icon("🗜"), "Compact", self)
+        self.act_density.triggered.connect(self._toggle_ribbon_density)
+        tb.addAction(self.act_density)
         settings_act = QAction(theme.emoji_icon("⚙"), "Settings", self)
         settings_act.setToolTip("Settings")
         settings_act.triggered.connect(self.show_settings)
@@ -414,6 +425,29 @@ class MainWindow(QMainWindow):
         exit_act.setToolTip("Exit TurboADB")
         exit_act.triggered.connect(self.close)
         tb.addAction(exit_act)
+        self._apply_ribbon_density()
+
+    def _apply_ribbon_density(self):
+        """STANDARD = icons + text (readable); COMPACT = icons only (tight)."""
+        style = (Qt.ToolButtonIconOnly if self._compact
+                 else Qt.ToolButtonTextUnderIcon)
+        self._ribbon.setToolButtonStyle(style)
+        for b in (getattr(self, "_dev_btn", None), getattr(self, "_srv_btn", None)):
+            if b is not None:
+                b.setToolButtonStyle(style)
+        if hasattr(self, "act_density"):
+            self.act_density.setText("Standard" if self._compact else "Compact")
+            self.act_density.setToolTip(
+                "Switch to %s ribbon" %
+                ("standard (icons + text)" if self._compact else "compact (icons only)"))
+
+    def _toggle_ribbon_density(self):
+        from . import settings as settings_mod
+        self._compact = not self._compact
+        self._apply_ribbon_density()
+        data = settings_mod.load()
+        data["compact_ribbon"] = self._compact
+        settings_mod.save(data)
 
     # ---- sidebar ----
     def _build_sidebar(self):

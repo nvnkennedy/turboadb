@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.0.10"
+version = "1.0.14"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,9 +28,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-gui = ["PyQt5>=5.15"]
+gui = ["PyQt5>=5.15", "keyring>=23.0"]   # keyring: Remote-webcam password in OS vault
 winrm = ["pywinrm>=0.4.3"]            # remote 'serve' deploy over WinRM (NTLM)
-all = ["PyQt5>=5.15", "pywinrm>=0.4.3"]
+all = ["PyQt5>=5.15", "pywinrm>=0.4.3", "keyring>=23.0"]
 
 [project.scripts]
 turboadb = "turboadb.cli:main"
