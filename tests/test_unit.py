@@ -101,6 +101,43 @@ def test_logcat_buffers(fake_adb):
     assert cap["args"].count("-b") == 2
 
 
+_PNG = b"\x89PNG\r\n\x1a\nrest-of-image"
+
+
+# --------------------------------------------------------------------------- #
+# capture_png method caching (Live View runs this many times/second)
+# --------------------------------------------------------------------------- #
+def test_capture_png_caches_working_method(fake_adb):
+    fake_adb.add("exec-out screencap -p", stdout=_PNG)   # method 1 works
+    h = ADBHandler(ADBConfig(serial="x"))
+    assert h.capture_png()[:4] == b"\x89PNG"
+    assert h._cap_method == 0
+    n_after_first = len(fake_adb.calls)
+    # second frame: only the cached method is invoked (one call), no re-probe
+    assert h.capture_png()[:4] == b"\x89PNG"
+    assert len(fake_adb.calls) - n_after_first == 1
+
+
+def test_capture_png_falls_through_to_file_method(fake_adb):
+    # methods 1 & 2 return non-PNG; method 3 (file) works
+    fake_adb.add("exec-out screencap -p", stdout=b"not-a-png")
+    fake_adb.add("shell screencap -p\b", stdout=b"junk")   # (won't match file form)
+    fake_adb.add("exec-out cat", stdout=_PNG)
+    h = ADBHandler(ADBConfig(serial="x"))
+    assert h.capture_png()[:4] == b"\x89PNG"
+    assert h._cap_method == 2
+
+
+def test_capture_png_raises_when_all_fail(fake_adb):
+    fake_adb.add("screencap", stdout=b"secure surface")
+    fake_adb.add("exec-out cat", stdout=b"secure surface")
+    from turboadb.exceptions import ADBError
+    h = ADBHandler(ADBConfig(serial="x"))
+    with pytest.raises(ADBError):
+        h.capture_png()
+    assert h._cap_method is None
+
+
 # --------------------------------------------------------------------------- #
 # device_info / health parsing
 # --------------------------------------------------------------------------- #

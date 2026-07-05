@@ -3,6 +3,27 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.18
+
+A deep-review pass hardening the 1.0.17 changes, focused on the remote/RDP and
+IVI paths.
+
+- **Live View no longer re-probes screencap every frame.** The screen-capture
+  method that works is now remembered and reused, so on a device that needs the
+  file-based fallback, each frame does one capture instead of two failed probes
+  plus a file write/read/delete — a big load drop now that Live View runs at up
+  to 10 fps.
+- **Fixed a Live View crash risk** when stopping over a slow link: a still-running
+  capture thread is now parked until it exits instead of having its reference
+  dropped mid-run (which could hard-crash Qt with "QThread destroyed while
+  running"). Same safe teardown when the tab/app closes.
+- **Fixed a 64-bit handle bug** in the embedded-mirror resize: `GetWindowRect`
+  was called without an argument prototype, which could truncate the window
+  handle on 64-bit Windows; it's now declared correctly.
+- **Remote deploy can't hang forever.** WinRM now uses bounded read/operation
+  timeouts (120 s), so an unreachable or wedged host fails in a known time
+  instead of blocking the modal deploy popup indefinitely.
+
 ## 1.0.17
 
 - **Remote-deploy credentials are remembered.** The ADB Server deploy dialog no

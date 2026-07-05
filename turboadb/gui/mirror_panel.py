@@ -42,6 +42,10 @@ def _win_api():
     u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
                              ctypes.c_int, ctypes.c_int, wintypes.BOOL]
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    # declare argtypes explicitly: without them ctypes defaults the HWND arg to
+    # a 32-bit int and truncates a 64-bit handle on win64
+    u.GetWindowRect.restype = wintypes.BOOL
+    u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     return ctypes, u
 
 
@@ -560,7 +564,17 @@ class MirrorPanel(QWidget):
 
     def _stop_live(self):
         if self._live is not None:
-            self._live.stop(); self._live.wait(900); self._live = None
+            live, self._live = self._live, None
+            live.stop()
+            try:                       # ignore late frames from a mid-flight
+                live.frame.disconnect()          # screencap after we've stopped
+            except Exception:
+                pass
+            if not live.wait(900):
+                # a slow remote screencap is still running — DON'T drop the ref
+                # (a GC of a live QThread hard-crashes); park it until it exits
+                from .qtutil import park_thread
+                park_thread(live)
         self.live_view.hide()
         self.container.show()
         self.status.show()
@@ -1275,8 +1289,7 @@ class MirrorPanel(QWidget):
                 self._rec_thread.wait(8000)          # let screenrecord stop + pull
 
     def close_panel(self):
-        if self._live is not None:
-            self._live.stop(); self._live.wait(900); self._live = None
+        self._stop_live()               # parks the thread if it's still running
         self._finalize_rec_sync()
         if self._shot is not None:
             self._shot.wait(700)

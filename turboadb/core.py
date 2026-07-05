@@ -164,6 +164,7 @@ class ADBHandler:
         self._adb: Optional[str] = None
         self._serial: Optional[str] = config.target  # active -s target
         self._connected = False
+        self._cap_method: Optional[int] = None       # cached screencap method idx
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -1769,6 +1770,27 @@ class ADBHandler:
     def _bytes(stdout):
         return stdout if isinstance(stdout, (bytes, bytearray)) else b""
 
+    def _cap_exec_out(self):
+        r = self._run(["exec-out", "screencap", "-p"], timeout=60,
+                      binary=True, check=False)
+        d = self._bytes(r.stdout)
+        return (bytes(d) if d[:4] == b"\x89PNG" else None), r, len(d)
+
+    def _cap_shell(self):
+        r = self._run(["shell", "screencap", "-p"], timeout=60,
+                      binary=True, check=False)
+        d = self._bytes(r.stdout).replace(b"\r\n", b"\n")
+        return (bytes(d) if d[:4] == b"\x89PNG" else None), r, len(d)
+
+    def _cap_file(self):
+        remote = "/data/local/tmp/_turboadb_live.png"
+        self._run(["shell", "screencap", "-p", remote], timeout=60, check=False)
+        r = self._run(["exec-out", "cat", remote], timeout=60, binary=True,
+                      check=False)
+        d = self._bytes(r.stdout)
+        self._run(["shell", "rm", "-f", remote], timeout=15, check=False)
+        return (bytes(d) if d[:4] == b"\x89PNG" else None), r, len(d)
+
     def capture_png(self, *, safe: Optional[bool] = None) -> bytes:
         """Capture the screen as PNG bytes, trying several methods so it works on
         locked-down / automotive devices and over remote adb servers:
@@ -1778,38 +1800,37 @@ class ADBHandler:
            mangle the binary stream)
         3. write a PNG on the device, then read it back with ``exec-out cat``
 
-        Raises :class:`ADBError` with the actual device output if none yield a
-        valid PNG (e.g. a secure/automotive surface that blocks screencap)."""
+        The method that works is REMEMBERED and tried first next time — so Live
+        View (which captures many frames/second) doesn't re-probe the two failing
+        methods on every frame (and, for method 3, doesn't do the failed probes'
+        round-trips before the file write). Raises :class:`ADBError` with the
+        actual device output if none yield a valid PNG."""
+        methods = [self._cap_exec_out, self._cap_shell, self._cap_file]
+
         def _do():
-            # 1) exec-out (no translation)
-            r = self._run(["exec-out", "screencap", "-p"], timeout=60,
-                          binary=True, check=False)
-            d = self._bytes(r.stdout)
-            if d[:4] == b"\x89PNG":
-                return bytes(d)
-            # 2) shell + undo CRLF translation
-            r2 = self._run(["shell", "screencap", "-p"], timeout=60,
-                           binary=True, check=False)
-            d2 = self._bytes(r2.stdout).replace(b"\r\n", b"\n")
-            if d2[:4] == b"\x89PNG":
-                return bytes(d2)
-            # 3) write on device, read back
-            remote = "/data/local/tmp/_turboadb_live.png"
-            self._run(["shell", "screencap", "-p", remote], timeout=60, check=False)
-            r3 = self._run(["exec-out", "cat", remote], timeout=60,
-                           binary=True, check=False)
-            d3 = self._bytes(r3.stdout)
-            self._run(["shell", "rm", "-f", remote], timeout=15, check=False)
-            if d3[:4] == b"\x89PNG":
-                return bytes(d3)
-            # nothing worked — report exactly what the device gave us
-            errtxt = (r.stderr or r2.stderr or "").strip()
+            order = list(range(len(methods)))
+            cached = self._cap_method
+            if cached is not None and cached in order:
+                order.remove(cached)
+                order.insert(0, cached)         # try the known-good one first
+            last = {}
+            for i in order:
+                png, res, nbytes = methods[i]()
+                last[i] = (res, nbytes)
+                if png is not None:
+                    self._cap_method = i        # remember for next frame
+                    return png
+            self._cap_method = None             # nothing worked — re-probe next time
+            errtxt = ""
+            for i in (0, 1):
+                if i in last and last[i][0].stderr:
+                    errtxt = last[i][0].stderr.strip(); break
+            sizes = "; ".join(f"m{i + 1}: {last.get(i, (None, 0))[1]} bytes"
+                              for i in range(len(methods)))
             raise ADBError(
                 "screencap did not produce a PNG on this device "
-                f"(exec-out: {len(d)} bytes starting {bytes(d[:8])!r}; "
-                f"shell: {len(d2)} bytes; file: {len(d3)} bytes; "
-                f"stderr: {errtxt[:160] or 'none'}). The screen may be a "
-                "secure/automotive surface that blocks screen capture.")
+                f"({sizes}; stderr: {errtxt[:160] or 'none'}). The screen may be "
+                "a secure/automotive surface that blocks screen capture.")
         return self._guard("capture_png", _do, safe=safe)
 
     def screenshot(self, local_path: Optional[str] = None, *,

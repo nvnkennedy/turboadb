@@ -69,13 +69,20 @@ try {{
 
 
 def _session(host, login, password, *, winrm_port=5985, use_ssl=False,
-             transport="ntlm"):
+             transport="ntlm", read_timeout=None, operation_timeout=None):
     import winrm
     scheme = "https" if use_ssl else "http"
     endpoint = f"{scheme}://{host}:{winrm_port}/wsman"
+    # Bound the timeouts so an unreachable / non-responding host fails in a known
+    # time instead of hanging the (now modal) deploy popup. 120 s is plenty for a
+    # dependency-free `pip install -U turboadb` + starting the server; read_timeout
+    # must exceed operation_timeout (a pywinrm requirement).
+    op = operation_timeout if operation_timeout is not None else 120
+    rd = read_timeout if read_timeout is not None else op + 30
     return winrm.Session(
         endpoint, auth=(login, password), transport=transport,
-        server_cert_validation="ignore" if use_ssl else "validate")
+        server_cert_validation="ignore" if use_ssl else "validate",
+        read_timeout_sec=rd, operation_timeout_sec=op)
 
 
 def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False):
