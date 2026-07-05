@@ -3,6 +3,17 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.19
+
+- **Packaging fix: installs from source on Python 3.8 again.** `pyproject.toml`
+  used the modern SPDX `license = "MIT"` string, which only newer setuptools
+  (≥77, unavailable on Python 3.8) accepts — so an editable/source build on 3.8
+  (and the 3.8 CI job) failed with *"`project.license` must be valid exactly by
+  one definition"*. Reverted to the universal `license = { text = "MIT" }` table
+  form (+ the MIT classifier). The prebuilt wheels were unaffected; this only
+  matters when building from the sdist. Added a test that validates the
+  packaging metadata so it can't regress.
+
 ## 1.0.18
 
 A deep-review pass hardening the 1.0.17 changes, focused on the remote/RDP and

@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.0.18"
+version = "1.0.19"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "MIT"
-license-files = ["LICENSE"]
+# Classic PEP 621 table form — works on every setuptools>=61 (the SPDX string
+# form `license = "MIT"` needs setuptools>=77, which isn't available on the
+# Python 3.8 our CI matrix builds on, so it broke the editable install there).
+license = { text = "MIT" }
 authors = [{ name = "Naveen Daniel Kennedy" }]
 keywords = ["adb", "scrcpy", "android", "automotive", "android-automotive",
             "ivi", "logcat", "automation", "pyqt5", "testing", "embedded"]
@@ -27,6 +29,7 @@ classifiers = [
     "Topic :: System :: Hardware",
     "Topic :: Utilities",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Typing :: Typed",
 ]
 # Batteries-included: the engine + CLI wrap adb/scrcpy and need no third-party
