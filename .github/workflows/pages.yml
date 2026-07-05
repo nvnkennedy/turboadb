@@ -1,0 +1,41 @@
+name: Deploy docs to Pages
+
+# Publishes the static site in docs/ to GitHub Pages via the official Actions
+# deploy (not the branch auto-build). The concurrency group is what eliminates
+# the intermittent "Deployment failed, try again later" — only one Pages
+# deployment runs at a time, and a newer push cleanly supersedes an in-flight
+# one instead of racing it.
+#
+# ONE-TIME SETUP: repo Settings → Pages → Build and deployment → Source →
+# "GitHub Actions" (instead of "Deploy from a branch"). After that this workflow
+# owns Pages and deploys are reliable.
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4
