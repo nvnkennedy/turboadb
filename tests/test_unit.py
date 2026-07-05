@@ -147,6 +147,61 @@ def test_safe_mode_wraps_errors(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
+# connectivity toggles: modern fallbacks + honest failure (IVI/Android 12+)
+# --------------------------------------------------------------------------- #
+def test_set_wifi_falls_back_to_cmd_wifi(fake_adb):
+    # classic `svc wifi` refused (removed in Android 12+) -> `cmd wifi` used
+    fake_adb.add("svc wifi", stdout="Killed", returncode=1)
+    fake_adb.add("cmd wifi set-wifi-enabled", stdout="")
+    h = ADBHandler(ADBConfig(serial="x"))
+    out = h.set_wifi(True)
+    assert out == "ok (cmd wifi)"
+    joined = [" ".join(c) for c in fake_adb.calls]
+    assert any("cmd wifi set-wifi-enabled enabled" in c for c in joined)
+
+
+def test_set_bluetooth_reports_blocked_honestly(fake_adb):
+    # BOTH methods refused -> an explanation, not a fake "ok"
+    fake_adb.add("svc bluetooth", stdout="Killed", returncode=1)
+    fake_adb.add("cmd bluetooth_manager", stdout="Exception: not allowed",
+                 returncode=1)
+    h = ADBHandler(ADBConfig(serial="x"))
+    out = h.set_bluetooth(True)
+    assert "can't be toggled" in out
+
+
+def test_set_airplane_settings_fallback(fake_adb):
+    fake_adb.add("cmd connectivity airplane-mode", stdout="unknown command",
+                 returncode=1)
+    fake_adb.add("settings put global airplane_mode_on", stdout="")
+    h = ADBHandler(ADBConfig(serial="x"))
+    out = h.set_airplane(True)
+    assert out == "ok (settings fallback)"
+    joined = [" ".join(c) for c in fake_adb.calls]
+    assert any("airplane_mode_on 1" in c for c in joined)
+    assert any("am broadcast" in c for c in joined)
+
+
+def test_launch_package_query_activities_fallback(fake_adb):
+    """A system/IVI app with NO launcher activity must still launch via the
+    query-activities MAIN fallback (step 4)."""
+    pkg = "com.oem.hvac"
+    # steps 1/1b: resolve-activity yields nothing usable
+    fake_adb.add("resolve-activity", stdout="No activity found")
+    # step 2: monkey refused (typical on automotive)
+    fake_adb.add("monkey", stdout="No activities found to run", returncode=1)
+    # step 3: MAIN/LAUNCHER intent fails
+    fake_adb.add("android.intent.category.LAUNCHER", stdout="Error: no activities")
+    # step 4: query-activities lists a MAIN activity; starting it succeeds
+    fake_adb.add("query-activities", stdout=f"{pkg}/.MainActivity\n")
+    fake_adb.add(f"-n {pkg}/.MainActivity", stdout="Starting: Intent {...}")
+    h = ADBHandler(ADBConfig(serial="x"))
+    assert h._launch_package(pkg) is True
+    joined = [" ".join(c) for c in fake_adb.calls]
+    assert any(f"-n {pkg}/.MainActivity" in c for c in joined)
+
+
+# --------------------------------------------------------------------------- #
 # device / mdns line parsing
 # --------------------------------------------------------------------------- #
 def test_parse_device_line():

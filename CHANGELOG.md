@@ -3,6 +3,44 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.17
+
+- **Remote-deploy credentials are remembered.** The ADB Server deploy dialog no
+  longer asks for the admin login every single time: the user is kept in
+  settings and the **password in the OS credential vault** (Windows Credential
+  Manager, like the webcam password) and both are pre-filled. A **Remember**
+  checkbox controls it — untick to forget the stored credentials.
+- **Deploying ‘serve’ now shows a blocking progress popup** with live per-host
+  status, and finishes with a summary (which hosts succeeded / failed) instead
+  of silently logging in the background while nothing visible happened.
+- **Live View is much smoother and sharper.** The frame rate is now adaptive —
+  it streams as fast as the link allows (up to 10 fps) instead of a hard 2 fps —
+  and the expensive PNG decode + smooth scaling moved **off the UI thread**, so
+  the app no longer stutters under the stream. Frames are smooth-downscaled once
+  from the native screenshot, keeping the picture crisp. Tap/swipe mapping stays
+  exact.
+- **Better scrcpy quality over Remote Desktop.** The software-render caps went
+  from 1024 px / 4 Mbps to **1280 px / 8 Mbps**, SDL now uses **linear
+  filtering** when scaling the frame to the window (the old nearest-neighbour is
+  what looked jagged/blocky), and the embedded mirror no longer forces a window
+  resize twice a second (a steady stutter source). A tip in the log suggests
+  disabling audio forwarding over RDP for extra smoothness.
+- **Saved targets no longer show their name twice** — auto-named targets (name =
+  address/serial) rendered as "192.168.1.7:5555 · 192.168.1.7:5555"; the label
+  now appears once.
+- **The Apps tab is finally useful on IVI / automotive builds:** on an
+  automotive device it now lists **all** apps by default (nearly everything
+  there is a preinstalled system app, so the old third-party-only default showed
+  a near-empty list). Starting an app gained two extra fallbacks that reach
+  in-house/system apps with **no launcher activity** (resolve without the
+  LAUNCHER category, then the package's first MAIN activity via
+  `cmd package query-activities`).
+- **Connectivity toggles work on modern / automotive Android:** Wi-Fi falls back
+  to `cmd wifi set-wifi-enabled` (the classic `svc wifi` was removed in
+  Android 12+), Bluetooth to `cmd bluetooth_manager`, and airplane mode to the
+  settings key + broadcast. When *every* method is refused (locked-down IVI),
+  the log now says so honestly instead of reporting a fake "ok".
+
 ## 1.0.16
 
 New capabilities and a proper test/CI foundation — all additive, with the

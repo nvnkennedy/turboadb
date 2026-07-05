@@ -122,6 +122,10 @@ class ControlsPanel(QWidget):
             return (f"[WARNING] {label}: nothing happened — not available on this "
                     f"device (on an IVI the app may not be installed; try the "
                     f"Apps tab to launch what IS installed)")
+        # the connectivity toggles return an explanation when every method was
+        # refused — surface that as a warning, not a fake success
+        if "can't be" in r or "permission-denied" in r:
+            return f"[WARNING] {label}: {r}"
         return f"[OK] {label}: {r}"
 
     def _run(self, label, fn):

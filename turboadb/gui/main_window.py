@@ -662,7 +662,11 @@ class MainWindow(QMainWindow):
                        f"{s.get('serial') or 'only device'}")
             else:
                 tgt = s.get("serial") or "only device"
-            it = QListWidgetItem(f"  {s.get('name')}   ·  {tgt}")
+            name = s.get("name") or tgt
+            # auto-named targets ARE their address/serial — showing
+            # "192.168.1.7:5555 · 192.168.1.7:5555" repeated the name twice
+            label = f"  {name}" if name == tgt else f"  {name}   ·  {tgt}"
+            it = QListWidgetItem(label)
             it.setIcon(theme.emoji_icon(glyph, colour))
             it.setData(Qt.UserRole, s.get("name"))
             self.session_list.addItem(it)
@@ -1052,13 +1056,62 @@ class MainWindow(QMainWindow):
         from . import settings as settings_mod
         for h in reversed(vals["hosts"]):
             settings_mod.add_recent("recent_remote_hosts", h)
-        self.log_panel.append(
-            f"Deploying ‘serve’ to {len(vals['hosts'])} host(s) over WinRM…")
+        n = len(vals["hosts"])
+        self.log_panel.append(f"Deploying ‘serve’ to {n} host(s) over WinRM…")
+        # a MODAL progress popup while the deploy runs — it takes a while
+        # (pip update + server start per host) and used to happen invisibly in
+        # the background, which made it look like the click did nothing
+        self._dep_dlg = QProgressDialog(
+            f"Deploying ‘serve’ to {n} host(s) over WinRM…\n"
+            f"(updating turboadb + starting the shared adb server on each — "
+            f"this can take a couple of minutes)", None, 0, 0, self)
+        self._dep_dlg.setWindowTitle("TurboADB — remote deploy")
+        self._dep_dlg.setWindowModality(Qt.WindowModal)
+        self._dep_dlg.setMinimumDuration(0)
+        self._dep_dlg.setMinimumWidth(460)
+        self._dep_dlg.setAutoClose(False); self._dep_dlg.setAutoReset(False)
+        self._dep_dlg.show()
+        self._dep_results = []
         self._deploy = _DeployThread(vals["hosts"], vals["user"],
                                      vals["password"], vals["port"],
                                      vals["update"], vals.get("use_ssl", False))
-        self._deploy.status.connect(self.log_panel.append)
+        self._deploy.status.connect(self._on_deploy_status)
+        self._deploy.finished.connect(self._on_deploy_finished)
         self._deploy.start()
+
+    def _on_deploy_status(self, msg):
+        self.log_panel.append(msg)
+        if msg.startswith(("[OK]", "[ERROR]")):
+            self._dep_results.append(msg)
+        try:                                     # live line in the popup
+            import re
+            self._dep_dlg.setLabelText(
+                re.sub(r"^\[(OK|ERROR|WARNING|INFO)\]\s*", "", msg)[:200])
+        except Exception:
+            pass
+
+    def _on_deploy_finished(self):
+        try:
+            self._dep_dlg.close()
+        except Exception:
+            pass
+        results = [r for r in getattr(self, "_dep_results", [])
+                   if r != "[OK] Remote deploy finished."]
+        ok = [r for r in results if r.startswith("[OK]")]
+        bad = [r for r in results if r.startswith("[ERROR]")]
+        import re
+        lines = "\n".join("• " + re.sub(r"^\[(OK|ERROR)\]\s*", "", r)[:160]
+                          for r in results) or "(no per-host output)"
+        if bad:
+            QMessageBox.warning(
+                self, "Remote deploy finished (with errors)",
+                f"{len(ok)} host(s) OK, {len(bad)} failed:\n\n{lines}")
+        else:
+            QMessageBox.information(
+                self, "Remote deploy finished",
+                f"All {len(ok)} host(s) deployed:\n\n{lines}\n\n"
+                f"Connect to them via Connect → Remote.")
+        self._poll_devices()
 
     def restart_adb_server(self):
         self.log_panel.append("Restarting ADB server… (fixes 'device not "

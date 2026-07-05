@@ -247,6 +247,10 @@ def launch_scrcpy(serial: Optional[str] = None,
         env = env or os.environ.copy()
         env["SDL_RENDER_DRIVER"] = "software"
         env["SDL_FRAMEBUFFER_ACCELERATION"] = "0"
+        # linear filtering when SDL scales the frame to the window — the default
+        # nearest-neighbour is what made the software-rendered (RDP) mirror look
+        # jagged/blocky whenever the window size didn't match the video size
+        env["SDL_RENDER_SCALE_QUALITY"] = "1"
 
     logfh = None
     if log_path:

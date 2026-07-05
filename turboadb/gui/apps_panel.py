@@ -32,7 +32,7 @@ class _Job(QThread):
 class AppsPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, parent=None):
+    def __init__(self, handler, automotive=False, parent=None):
         super().__init__(parent)
         self.handler = handler
         self._jobs = []
@@ -41,7 +41,13 @@ class AppsPanel(QWidget):
         top = QHBoxLayout()
         self.filt = QLineEdit(); self.filt.setPlaceholderText("filter packages…")
         self.filt.textChanged.connect(self._apply_filter)
-        self.third = QCheckBox("third-party only"); self.third.setChecked(True)
+        # On automotive / IVI builds nearly EVERYTHING is a preinstalled system
+        # app — a third-party-only default showed a near-empty, useless list
+        # there, so show all apps on those devices.
+        self.third = QCheckBox("third-party only")
+        self.third.setChecked(not automotive)
+        self.third.setToolTip("Untick to include system / preinstalled apps — "
+                              "on IVI head units almost every app is one.")
         self.third.toggled.connect(self.refresh)
         ref = QPushButton("Refresh"); ref.setProperty("role", "ghost")
         ref.clicked.connect(self.refresh)

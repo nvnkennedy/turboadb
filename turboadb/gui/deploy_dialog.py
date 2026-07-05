@@ -68,18 +68,28 @@ class DeployDialog(QDialog):
         grid.addWidget(self.hosts, 0, 1)
 
         grid.addWidget(self._lbl("Admin user"), 1, 0)
-        self.user = QLineEdit()
+        self.user = QLineEdit(settings_mod.get("deploy_user") or "")
         self.user.setPlaceholderText(r"DOMAIN\user   (e.g.  EU\nkennedy)")
         grid.addWidget(self.user, 1, 1)
 
         grid.addWidget(self._lbl("Password"), 2, 0)
         pw_row = QHBoxLayout(); pw_row.setSpacing(6)
-        self.pw = QLineEdit(); self.pw.setEchoMode(QLineEdit.Password)
+        # pre-filled from the OS credential vault so it isn't retyped every time
+        self.pw = QLineEdit(settings_mod.deploy_password())
+        self.pw.setEchoMode(QLineEdit.Password)
         eye = QToolButton(); eye.setText("👁"); eye.setCheckable(True)
         eye.setToolTip("Show / hide password")
         eye.toggled.connect(lambda on: self.pw.setEchoMode(
             QLineEdit.Normal if on else QLineEdit.Password))
+        self.remember = QCheckBox("Remember")
+        self.remember.setChecked(bool(settings_mod.get("deploy_remember")))
+        self.remember.setToolTip(
+            "Remember these credentials for next time. The user is kept in "
+            "settings; the password goes in the OS credential vault (Windows "
+            "Credential Manager) — never in a plain file. Untick to forget "
+            "them on the next deploy.")
         pw_row.addWidget(self.pw, 1); pw_row.addWidget(eye)
+        pw_row.addWidget(self.remember)
         pw_w = QWidget(); pw_w.setLayout(pw_row)
         grid.addWidget(pw_w, 2, 1)
 
@@ -181,11 +191,29 @@ class DeployDialog(QDialog):
         self.btn_test.setEnabled(True); self.btn_deploy.setEnabled(True)
         self._append("— test finished —")
 
+    def _save_credentials(self):
+        """Persist (or forget) the admin login per the Remember checkbox —
+        user in settings.json, password in the OS credential vault only."""
+        try:
+            v = self.values()
+            data = settings_mod.load()
+            data["deploy_remember"] = self.remember.isChecked()
+            if self.remember.isChecked():
+                data["deploy_user"] = v["user"]
+                settings_mod.set_deploy_password(v["password"])
+            else:
+                data["deploy_user"] = ""
+                settings_mod.set_deploy_password("")   # delete from the vault
+            settings_mod.save(data)
+        except Exception:
+            pass
+
     def _on_deploy(self):
         prob = self._problem()
         if prob:
             self._append(f"[WARNING] {prob}")
             return
+        self._save_credentials()
         self.accept()
 
     def _append(self, text):

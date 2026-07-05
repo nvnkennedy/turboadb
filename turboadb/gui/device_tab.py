@@ -567,7 +567,8 @@ class DeviceTab(QWidget):
         self.shell.disconnected.connect(self._on_shell_lost)
         self.logcat = LogcatPanel(handler); self.logcat.log.connect(self.log)
         self.files = FileBrowser(handler, start="/sdcard"); self.files.log.connect(self.log)
-        self.apps = AppsPanel(handler); self.apps.log.connect(self.log)
+        self.apps = AppsPanel(handler, automotive=self._automotive)
+        self.apps.log.connect(self.log)
         self.controls = ControlsPanel(handler); self.controls.log.connect(self.log)
         self.phone = PhonePanel(handler); self.phone.log.connect(self.log)
         self.mirror_tab = MirrorPanel(handler, self.session,

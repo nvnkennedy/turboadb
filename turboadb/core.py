@@ -644,28 +644,80 @@ class ADBHandler:
                                     timeout=10).ok
         return self._guard("tap_center", _do, safe=safe)
 
+    @staticmethod
+    def _toggle_failed(res) -> bool:
+        """True when a connectivity toggle visibly did nothing — non-zero exit
+        or a refusal in the output. (These commands exit 0 with an error TEXT on
+        many builds, so the old exit-code-only check reported 'ok' for toggles
+        that never happened — the 'nothing works on the head unit' complaint.)"""
+        out = (res.stdout + res.stderr).lower()
+        return (not res.ok) or any(x in out for x in (
+            "unknown command", "no such", "usage:", "error", "exception",
+            "not allowed", "permission", "denied", "invalid", "failed",
+            "killed", "not found", "unsupported", "aborted"))
+
+    def _try_toggles(self, label, attempts, blocked_msg):
+        """Run *attempts* (list of (argv, ok_message)) until one visibly works;
+        return its message, else *blocked_msg* — an honest result instead of a
+        false 'ok'."""
+        for args, msg in attempts:
+            r = self._logged_run(label, ["shell"] + args, timeout=15)
+            if not self._toggle_failed(r):
+                return msg
+        return blocked_msg
+
     def set_wifi(self, on: bool, *, safe: Optional[bool] = None):
+        """Toggle Wi-Fi. ``svc wifi`` first (classic), then ``cmd wifi
+        set-wifi-enabled`` (the modern interface — ``svc wifi`` was removed in
+        Android 12 and is permission-blocked on most automotive builds)."""
         st = "enable" if on else "disable"
-        return self._guard("set_wifi",
-                           lambda: self._logged_run(f"wifi {st}",
-                                                    ["shell", "svc", "wifi", st],
-                                                    timeout=15).text or "ok", safe=safe)
+        mode = "enabled" if on else "disabled"
+        return self._guard("set_wifi", lambda: self._try_toggles(
+            f"wifi {st}",
+            [(["svc", "wifi", st], "ok"),
+             (["cmd", "wifi", "set-wifi-enabled", mode], "ok (cmd wifi)")],
+            "wifi can't be toggled via adb on this device (the shell user is "
+            "permission-denied — common on automotive builds)"), safe=safe)
 
     def set_bluetooth(self, on: bool, *, safe: Optional[bool] = None):
+        """Toggle Bluetooth. ``svc bluetooth`` was REMOVED in Android 12+, so
+        fall back to ``cmd bluetooth_manager`` there."""
         st = "enable" if on else "disable"
-        return self._guard("set_bluetooth",
-                           lambda: self._logged_run(f"bluetooth {st}",
-                                                    ["shell", "svc", "bluetooth", st],
-                                                    timeout=15).text or "ok", safe=safe)
+        return self._guard("set_bluetooth", lambda: self._try_toggles(
+            f"bluetooth {st}",
+            [(["svc", "bluetooth", st], "ok"),
+             (["cmd", "bluetooth_manager", st], "ok (cmd bluetooth_manager)")],
+            "bluetooth can't be toggled via adb on this device (svc bluetooth "
+            "was removed in Android 12+ and cmd bluetooth_manager is "
+            "permission-blocked here)"), safe=safe)
 
     def set_airplane(self, on: bool, *, safe: Optional[bool] = None):
-        """Toggle airplane mode (Android 11+ via ``cmd connectivity``)."""
+        """Toggle airplane mode: ``cmd connectivity`` (Android 11+), falling
+        back to the settings key + state broadcast for older / locked-down
+        builds."""
         st = "enable" if on else "disable"
-        return self._guard("set_airplane",
-                           lambda: self._logged_run(
-                               f"airplane {st}",
-                               ["shell", "cmd", "connectivity", "airplane-mode", st],
-                               timeout=15).text or "ok", safe=safe)
+        val = "1" if on else "0"
+
+        def _do():
+            r = self._logged_run(f"airplane {st}",
+                                 ["shell", "cmd", "connectivity",
+                                  "airplane-mode", st], timeout=15)
+            if not self._toggle_failed(r):
+                return "ok"
+            # legacy fallback: set the global flag, then broadcast the change
+            # (the broadcast is best-effort — blocked for shell on some builds,
+            # but the flag alone flips it on many older devices)
+            s = self._logged_run(f"airplane {st} (settings)",
+                                 ["shell", "settings", "put", "global",
+                                  "airplane_mode_on", val], timeout=15)
+            if self._toggle_failed(s):
+                return ("airplane mode can't be toggled via adb on this "
+                        "device (permission-denied)")
+            self._run(["shell", "am", "broadcast", "-a",
+                       "android.intent.action.AIRPLANE_MODE", "--ez", "state",
+                       "true" if on else "false"], timeout=15, check=False)
+            return "ok (settings fallback)"
+        return self._guard("set_airplane", _do, safe=safe)
 
     def _open_tether_settings(self) -> bool:
         """Open the Hotspot/Tethering settings screen. Tries AOSP, OEM and
@@ -869,33 +921,49 @@ class ADBHandler:
         1. Resolve the package's LAUNCHER activity and start it by explicit
            component (``am start -n pkg/Activity``) — works where ``monkey`` is
            blocked, which is common on automotive/IVI.
+        1b. Resolve WITHOUT the LAUNCHER category — many in-house / system apps
+            on IVI builds have a main activity that isn't launcher-categorised,
+            which is why "nothing responded" when starting them.
         2. ``monkey -p pkg`` (the usual launcher shortcut).
         3. A bare MAIN/LAUNCHER intent.
+        4. The package's first exported MAIN activity from
+           ``cmd package query-activities`` — the last resort that reaches
+           system apps with no launcher entry at all.
         """
         def _bad(out):
             out = out.lower()
             return any(x in out for x in ("error", "no activities", "unable to "
                        "resolve", "does not exist", "not found", "exception",
                        "permission denial"))
+
+        def _comp_from(text):
+            comp = ""
+            for line in (text or "").splitlines():
+                line = line.strip()
+                if line.startswith(package + "/") and " " not in line:
+                    comp = line
+            return comp
+
+        def _start_component(comp):
+            a = self._logged_run(f"start {comp}",
+                                 ["shell", "am", "start", "-n", comp],
+                                 timeout=20)
+            return a.ok and not _bad(a.stdout + a.stderr)
+
         self._emit(logging.INFO, f"launching {package}…")
         # 1) resolve the launcher activity, then start that component
-        try:
-            r = self._run(["shell", "cmd", "package", "resolve-activity",
-                           "--brief", "-c", "android.intent.category.LAUNCHER",
-                           package], timeout=15, check=False)
-            comp = ""
-            for line in r.text.splitlines():
-                line = line.strip()
-                if "/" in line and " " not in line:
-                    comp = line
-            if comp and "/" in comp:
-                a = self._logged_run(f"start {comp}",
-                                     ["shell", "am", "start", "-n", comp],
-                                     timeout=20)
-                if a.ok and not _bad(a.stdout + a.stderr):
+        # 1b) same, without the LAUNCHER category (IVI/system apps often lack it)
+        for resolve_args in (["cmd", "package", "resolve-activity", "--brief",
+                              "-c", "android.intent.category.LAUNCHER", package],
+                             ["cmd", "package", "resolve-activity", "--brief",
+                              package]):
+            try:
+                r = self._run(["shell"] + resolve_args, timeout=15, check=False)
+                comp = _comp_from(r.text)
+                if comp and _start_component(comp):
                     return True
-        except Exception:
-            pass
+            except Exception:
+                pass
         # 2) monkey
         m = self._logged_run(f"monkey {package}",
                              ["shell", "monkey", "-p", package, "-c",
@@ -908,11 +976,27 @@ class ADBHandler:
                               "android.intent.action.MAIN", "-c",
                               "android.intent.category.LAUNCHER", package],
                              timeout=20)
-        ok = b.ok and not _bad(b.stdout + b.stderr)
-        if not ok:
-            self._emit(logging.WARNING, f"could not launch {package} "
-                       "(blocked or no launcher activity on this device)")
-        return ok
+        if b.ok and not _bad(b.stdout + b.stderr):
+            return True
+        # 4) any MAIN activity the package declares (query-activities) — reaches
+        # system/in-house IVI apps that have no launcher entry at all
+        try:
+            q = self._run(["shell",
+                           "cmd package query-activities --brief -a "
+                           "android.intent.action.MAIN 2>/dev/null | "
+                           f"grep -F {package}/ | head -n 3"],
+                          timeout=20, check=False)
+            for line in q.text.splitlines():
+                comp = line.strip()
+                if comp.startswith(package + "/") and " " not in comp:
+                    if _start_component(comp):
+                        return True
+        except Exception:
+            pass
+        self._emit(logging.WARNING, f"could not launch {package} "
+                   "(no startable activity, or launching it is blocked on this "
+                   "device)")
+        return False
 
     def _open_app(self, label, intent_args, fallback_key, *, safe):
         """Try a standard intent; if it doesn't resolve, launch the first

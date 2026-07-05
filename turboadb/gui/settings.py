@@ -34,6 +34,10 @@ DEFAULTS = {
     "webcam_remote_host": "",
     "webcam_remote_user": "",
     "webcam_remote_domain": "",
+    # remembered admin login for the remote 'serve' deploy (ADB Server button).
+    # The user is stored here; the PASSWORD goes in the OS credential vault.
+    "deploy_user": "",
+    "deploy_remember": True,
 }
 
 
@@ -49,6 +53,33 @@ def webcam_remote_password() -> str:
         return keyring.get_password(*_KR_WEBCAM) or ""
     except Exception:
         return ""
+
+
+# The remote-deploy (ADB Server) admin password lives in the OS credential
+# vault too — retyping it on every deploy was a constant annoyance.
+_KR_DEPLOY = ("turboadb-deploy", "::default")
+
+
+def deploy_password() -> str:
+    try:
+        import keyring
+        return keyring.get_password(*_KR_DEPLOY) or ""
+    except Exception:
+        return ""
+
+
+def set_deploy_password(value: str) -> None:
+    try:
+        import keyring
+        if value:
+            keyring.set_password(_KR_DEPLOY[0], _KR_DEPLOY[1], value)
+        else:
+            try:
+                keyring.delete_password(_KR_DEPLOY[0], _KR_DEPLOY[1])
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def set_webcam_remote_password(value: str) -> None:

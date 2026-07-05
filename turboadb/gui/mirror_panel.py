@@ -151,27 +151,49 @@ class _DisplaysThread(QThread):
 class _LiveThread(QThread):
     """Stream the screen by polling ``screencap`` over the EXISTING adb
     connection. Unlike scrcpy this needs no video tunnel and no GPU, so it works
-    over a remote adb server / RDP / head units where scrcpy can't. Lower FPS."""
-    frame = pyqtSignal(bytes)
+    over a remote adb server / RDP / head units where scrcpy can't.
+
+    Tuned for smoothness: the rate is ADAPTIVE (captures back-to-back, capped at
+    *max_fps*, instead of the old hard 2 fps), and the expensive work — PNG
+    decode of a full-resolution screenshot plus the smooth down-scale to the
+    view size — happens HERE, off the UI thread. The GUI only receives an
+    already-scaled QImage, so painting is cheap and the app never stutters
+    under the stream (which it did when every frame was decoded + smoothly
+    rescaled on the UI thread)."""
+    frame = pyqtSignal(object, int, int)   # pre-scaled QImage, device W, H
     note = pyqtSignal(str)
 
-    def __init__(self, handler, fps: float = 2.0):
+    def __init__(self, handler, max_fps: float = 10.0):
         super().__init__()
         self.handler = handler
         self._stop = False
-        self.interval = max(0.2, 1.0 / max(0.5, fps))
+        self.min_interval = 1.0 / max(1.0, max_fps)
+        # the panel keeps these current with the view size; plain-int reads are
+        # safe across threads
+        self.target_w = 0
+        self.target_h = 0
 
     def run(self):
+        from PyQt5.QtGui import QImage
         first = True
         while not self._stop:
             t0 = time.time()
             try:
                 data = self.handler.screenshot(None, safe=False)   # PNG bytes
                 if isinstance(data, (bytes, bytearray)) and data[:4] == b"\x89PNG":
-                    self.frame.emit(bytes(data))
-                    if first:
-                        self.note.emit("[OK] live view streaming")
-                        first = False
+                    img = QImage.fromData(bytes(data), "PNG")
+                    if not img.isNull():
+                        dev_w, dev_h = img.width(), img.height()
+                        tw, th = self.target_w, self.target_h
+                        if tw > 0 and th > 0 and (dev_w > tw or dev_h > th):
+                            # smooth-downscale ONCE here, from the native frame
+                            img = img.scaled(tw, th, Qt.KeepAspectRatio,
+                                             Qt.SmoothTransformation)
+                        self.frame.emit(img, dev_w, dev_h)
+                        if first:
+                            self.note.emit("[OK] live view streaming (adaptive "
+                                           "rate — as fast as this link allows)")
+                            first = False
                 elif first:
                     self.note.emit("[WARNING] live view: screencap returned no "
                                    "image on this device")
@@ -180,7 +202,10 @@ class _LiveThread(QThread):
                 if first:
                     self.note.emit(f"[ERROR] live view: {exc}")
                     first = False
-            rem = self.interval - (time.time() - t0)
+            # adaptive pacing: on a fast link this caps at max_fps; on a slow
+            # (remote/RDP) link the capture time dominates and we simply run
+            # back-to-back — no artificial 0.5 s wait on top
+            rem = self.min_interval - (time.time() - t0)
             while rem > 0 and not self._stop:
                 time.sleep(min(0.05, rem)); rem -= 0.05
 
@@ -207,17 +232,27 @@ class _LiveView(QLabel):
         self._draw()
 
     def _draw(self):
-        if self._pm is not None and not self._pm.isNull():
-            self.setPixmap(self._pm.scaled(self.size(), Qt.KeepAspectRatio,
-                                           Qt.SmoothTransformation))
+        if self._pm is None or self._pm.isNull():
+            return
+        # frames arrive pre-scaled to this view — when they already fit, show
+        # them as-is instead of smooth-rescaling a full pixmap every frame
+        if (self._pm.width() <= self.width() and
+                self._pm.height() <= self.height()):
+            self.setPixmap(self._pm)
+            return
+        self.setPixmap(self._pm.scaled(self.size(), Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation))
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._draw()
 
     def _frac(self, pos):
-        if self._pm is None or self._pm.isNull():
+        # measure the pixmap that is ACTUALLY displayed (centred, unscaled by
+        # the label), so tap coordinates stay exact for both draw paths
+        disp = self.pixmap()
+        if disp is None or disp.isNull():
             return None
-        s = self._pm.size().scaled(self.size(), Qt.KeepAspectRatio)
+        s = disp.size()
         ox = (self.width() - s.width()) / 2
         oy = (self.height() - s.height()) / 2
         if s.width() <= 0 or s.height() <= 0:
@@ -515,7 +550,9 @@ class MirrorPanel(QWidget):
         self.container.hide()
         self.live_view.show()
         self.log.emit("[OK] live view starting (screencap stream over adb)…")
-        self._live = _LiveThread(self.handler, fps=2.0)
+        self._live = _LiveThread(self.handler, max_fps=10.0)
+        self._live.target_w = max(0, self.live_view.width())
+        self._live.target_h = max(0, self.live_view.height())
         self._live.frame.connect(self._on_live_frame)
         self._live.note.connect(self.log)
         self._live.start()
@@ -530,12 +567,17 @@ class MirrorPanel(QWidget):
         self._refresh_buttons()
         self.log.emit("[OK] live view stopped")
 
-    def _on_live_frame(self, data):
+    def _on_live_frame(self, img, dev_w, dev_h):
+        # img arrives DECODED and pre-scaled from the worker — turning it into a
+        # pixmap is the only work left on the UI thread, so no more stutter
         from PyQt5.QtGui import QPixmap
-        pm = QPixmap()
-        if pm.loadFromData(data) and not pm.isNull():
-            self._dev_w, self._dev_h = pm.width(), pm.height()
+        self._dev_w, self._dev_h = dev_w, dev_h    # native size for tap mapping
+        pm = QPixmap.fromImage(img)
+        if not pm.isNull():
             self.live_view.set_frame(pm)
+        if self._live is not None:                 # track view resizes for the
+            self._live.target_w = self.live_view.width()      # next frame
+            self._live.target_h = self.live_view.height()
 
     def _live_tap(self, fx, fy):
         if not self._dev_w:
@@ -706,12 +748,19 @@ class MirrorPanel(QWidget):
 
     def _tune(self, opts):
         """Apply the 'software render (RDP)' choice and, in that mode, sensible
-        caps so the picture stays smooth over a remote/GPU-less link."""
+        caps so the picture stays smooth over a remote/GPU-less link. The old
+        1024 px / 4M caps looked visibly soft and blocky — 1280 px / 8M is still
+        smooth in software rendering (with linear SDL scaling set at launch) but
+        markedly sharper. Settings → scrcpy overrides these when set."""
         if self.act_soft.isChecked():
             opts.render_driver = "software"
-            opts.max_size = opts.max_size or 1024     # smaller frame = far smoother
-            opts.bit_rate = opts.bit_rate or "4M"
+            opts.max_size = opts.max_size or 1280
+            opts.bit_rate = opts.bit_rate or "8M"
             opts.max_fps = opts.max_fps or 30
+            if not opts.no_audio:
+                self.log.emit("[INFO] tip: untick ⚙ Options → Forward audio for "
+                              "an even smoother mirror over Remote Desktop "
+                              "(audio costs extra CPU + bandwidth there)")
         return opts
 
     # ----- screen recording (device-side; works with mirror OR Live View) -----
@@ -1146,14 +1195,23 @@ class MirrorPanel(QWidget):
 
     def _fit(self):
         """Force the embedded scrcpy window to fill the container (scrcpy/SDL
-        keeps resizing itself to the video frame, so we keep correcting it)."""
+        keeps resizing itself to the video frame, so we keep correcting it).
+        Skips the call when the window ALREADY fills the container — the old
+        unconditional MoveWindow every 500 ms made SDL re-handle a resize twice
+        a second forever, a steady source of embedded-mirror stutter."""
         if not self._child_hwnd:
             return
+        w = max(1, self.container.width())
+        h = max(1, self.container.height())
         try:
-            _ctypes, u = _win_api()
-            u.MoveWindow(self._child_hwnd, 0, 0,
-                         max(1, self.container.width()),
-                         max(1, self.container.height()), True)
+            import ctypes
+            from ctypes import wintypes
+            _c, u = _win_api()
+            rect = wintypes.RECT()
+            if u.GetWindowRect(self._child_hwnd, ctypes.byref(rect)):
+                if (rect.right - rect.left) == w and (rect.bottom - rect.top) == h:
+                    return                       # already the right size
+            u.MoveWindow(self._child_hwnd, 0, 0, w, h, True)
         except Exception:
             pass
 
