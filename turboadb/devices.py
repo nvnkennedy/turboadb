@@ -123,20 +123,81 @@ def first_online(adb_path: str | None = None) -> Optional[Device]:
     return None
 
 
+def _parse_mdns_line(line: str) -> Optional[dict]:
+    """One line of ``adb mdns services``:
+    ``adb-XXXX-YYYY	_adb-tls-connect._tcp	192.168.1.5:5555``.
+    Whitespace-separated on some adb builds; returns None for non-service lines."""
+    line = line.strip()
+    if not line or line.lower().startswith("list of discovered"):
+        return None
+    parts = line.split()
+    if len(parts) < 3 or "._tcp" not in parts[1]:
+        return None
+    name, service, addr = parts[0], parts[1].rstrip("."), parts[2]
+    host, _, port = addr.rpartition(":")
+    if not host or not port.isdigit():
+        return None
+    kind = ("connect" if "connect" in service
+            else "pairing" if "pairing" in service else service)
+    return {"name": name, "service": kind, "host": host, "port": int(port),
+            "address": addr}
+
+
+def mdns_devices(adb_path: str | None = None, timeout: float = 10.0) -> list:
+    """Discover Android 11+ *Wireless debugging* devices on the LAN via
+    ``adb mdns services``. Returns a list of dicts
+    ``{"name","service","host","port","address"}`` where ``service`` is
+    ``connect`` (ready for ``adb connect``) or ``pairing`` (shows a pair code).
+
+    Returns ``[]`` when nothing is found or this adb has no mdns support —
+    never raises for those cases (only for adb itself being missing)."""
+    adb = find_adb(adb_path)
+    try:
+        out = subprocess.run([adb, "mdns", "services"], capture_output=True,
+                             text=True, timeout=timeout,
+                             creationflags=NO_WINDOW)
+    except Exception:
+        return []
+    found = []
+    for line in (out.stdout or "").splitlines():
+        d = _parse_mdns_line(line)
+        if d is not None:
+            found.append(d)
+    return found
+
+
 # --------------------------------------------------------------------------- #
 # Shared adb server (expose THIS PC's devices to the network)
 # --------------------------------------------------------------------------- #
 def server_is_shared(port: int = 5037, adb_path: str | None = None) -> bool:
-    """True if an adb server is already up AND reachable on all interfaces — i.e.
-    another machine could drive this PC's devices. We probe the loopback first
-    (cheap) and treat a running server on *port* as good enough to skip a restart
-    when it was started with -a."""
+    """True if an adb server is up AND reachable on a non-loopback interface —
+    i.e. another machine could actually drive this PC's devices. (The old check
+    only confirmed *a* server answered on the port, which a localhost-only one
+    also does — it never really tested the ``-a`` binding.)"""
     adb = find_adb(adb_path)
     try:
         out = subprocess.run([adb, "-P", str(port), "devices"],
                              capture_output=True, text=True, timeout=10,
                              creationflags=NO_WINDOW)
-        return out.returncode == 0 and "daemon not running" not in (out.stderr or "")
+        if out.returncode != 0 or "daemon not running" in (out.stderr or ""):
+            return False
+    except Exception:
+        return False
+    # a server answered on loopback — now try it via this machine's LAN address
+    import socket
+    try:
+        lan_ips = {info[4][0]
+                   for info in socket.getaddrinfo(socket.gethostname(), None,
+                                                  socket.AF_INET)}
+        lan_ips.discard("127.0.0.1")
+        for ip in lan_ips:
+            try:
+                with socket.create_connection((ip, port), timeout=2):
+                    return True
+            except OSError:
+                continue
+        # no LAN address at all (offline machine): fall back to "server is up"
+        return not lan_ips
     except Exception:
         return False
 

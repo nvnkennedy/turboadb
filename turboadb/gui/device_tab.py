@@ -396,6 +396,14 @@ class DeviceTab(QWidget):
         self.btn_shot.setProperty("role", "ghost")
         self.btn_shot.clicked.connect(self.screenshot)
 
+        self.btn_health = QToolButton()
+        self.btn_health.setText(" Health"); self.btn_health.setIcon(theme.emoji_icon("❤"))
+        self.btn_health.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_health.setProperty("role", "ghost")
+        self.btn_health.setToolTip("Battery, temperature, memory, CPU and uptime "
+                                   "in one snapshot.")
+        self.btn_health.clicked.connect(self.show_health)
+
         # Root / Mount: the common adb maintenance operations as one-click items
         self.btn_adv = QToolButton()
         self.btn_adv.setText(" Root / Mount"); self.btn_adv.setIcon(theme.emoji_icon("🔧"))
@@ -411,6 +419,9 @@ class DeviceTab(QWidget):
         amenu.addSeparator()
         amenu.addAction("adb disable-verity  (sync + reboot)", lambda: self._verity(False))
         amenu.addAction("adb enable-verity  (sync + reboot)", lambda: self._verity(True))
+        amenu.addSeparator()
+        amenu.addAction("Go wireless (USB → Wi-Fi)", self.go_wireless)
+        amenu.addAction("Capture bugreport…", self.capture_bugreport)
         self.btn_adv.setMenu(amenu)
 
         self.btn_reboot = QToolButton()
@@ -424,8 +435,8 @@ class DeviceTab(QWidget):
             menu.addAction(label, lambda m=mode: self.reboot(m))
         self.btn_reboot.setMenu(menu)
 
-        for w in (self.status, self.btn_mirror, self.btn_shot, self.btn_adv,
-                  self.btn_reboot):
+        for w in (self.status, self.btn_mirror, self.btn_shot, self.btn_health,
+                  self.btn_adv, self.btn_reboot):
             bar.addWidget(w)
         bar.setStretch(0, 1)
         lay.addLayout(bar)
@@ -447,7 +458,8 @@ class DeviceTab(QWidget):
         self._ct.start()
 
     def _enable_actions(self, on):
-        for w in (self.btn_mirror, self.btn_shot, self.btn_adv, self.btn_reboot):
+        for w in (self.btn_mirror, self.btn_shot, self.btn_health, self.btn_adv,
+                  self.btn_reboot):
             w.setEnabled(on)
 
     # ---- reconnect after a reboot / disconnect ----
@@ -661,6 +673,65 @@ class DeviceTab(QWidget):
         t = _ActionThread(lambda: self.handler.screenshot(path, safe=False))
         t.done.connect(lambda p: self.log.emit(f"[OK] screenshot saved: {p}"))
         t.fail.connect(lambda m: self.log.emit("[ERROR] screenshot: " + m))
+        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t); t.start()
+
+    def show_health(self):
+        if not self.handler:
+            return
+        self.log.emit("reading device health…")
+        t = _ActionThread(lambda: self.handler.health_text(safe=False))
+        t.done.connect(self._show_health_dialog)
+        t.fail.connect(lambda m: self.log.emit("[ERROR] health: " + m))
+        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t); t.start()
+
+    def _show_health_dialog(self, text):
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QPlainTextEdit,
+                                     QDialogButtonBox)
+        from PyQt5.QtGui import QFont
+        dlg = QDialog(self); dlg.setWindowTitle("Device health"); dlg.resize(420, 240)
+        v = QVBoxLayout(dlg)
+        view = QPlainTextEdit(); view.setReadOnly(True); view.setPlainText(text)
+        view.setFont(QFont("Consolas", 10))
+        v.addWidget(view)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        dlg.exec_()
+
+    def go_wireless(self):
+        if not self.handler:
+            return
+        if QMessageBox.question(
+                self, "Go wireless",
+                "Switch this device from USB to Wi-Fi?\n\nTurboADB will read the "
+                "device's IP, run 'adb tcpip', and connect to it — afterwards you "
+                "can unplug the cable. The device must be on the same network as "
+                "this PC.") != QMessageBox.Yes:
+            return
+        self.log.emit("switching device to wireless (USB → Wi-Fi)…")
+        t = _ActionThread(lambda: self.handler.go_wireless(safe=False))
+        t.done.connect(lambda s: self.log.emit(
+            f"[OK] now reachable wirelessly at {s} — the USB cable can be "
+            f"unplugged. Save it from Connect → Network to reconnect later."))
+        t.fail.connect(lambda m: self.log.emit("[ERROR] go wireless: " + m))
+        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t); t.start()
+
+    def capture_bugreport(self):
+        if not self.handler:
+            return
+        import time as _t
+        default = _t.strftime("bugreport-%Y%m%d-%H%M%S.zip")
+        path, _ = QFileDialog.getSaveFileName(self, "Save bugreport", default,
+                                              "Zip (*.zip);;All files (*)")
+        if not path:
+            return
+        self.log.emit("capturing bugreport (this takes a few minutes)…")
+        t = _ActionThread(lambda: self.handler.bugreport(path, safe=False))
+        t.done.connect(lambda p: self.log.emit(f"[OK] bugreport saved: {p}"))
+        t.fail.connect(lambda m: self.log.emit("[ERROR] bugreport: " + m))
         t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
         self._threads.append(t); t.start()
 

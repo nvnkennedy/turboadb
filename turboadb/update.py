@@ -64,6 +64,36 @@ def check() -> str | None:
     return latest if is_newer(latest) else None
 
 
+_CHECK_CACHE = os.path.join(os.path.expanduser("~"), ".turboadb",
+                            "update-check.json")
+
+
+def check_cached(max_age: float = 86400) -> str | None:
+    """Like :func:`check`, but hits PyPI at most once per *max_age* seconds
+    (default: daily) — for the quiet launch check, so starting the app several
+    times a day doesn't mean several network round-trips."""
+    if not can_self_update():
+        return None
+    import time
+    try:
+        with open(_CHECK_CACHE, encoding="utf-8") as fh:
+            c = json.load(fh)
+        if time.time() - float(c.get("ts", 0)) < max_age:
+            latest = c.get("latest")
+            return latest if is_newer(latest) else None
+    except Exception:
+        pass
+    latest = pypi_latest()
+    if latest:                       # cache successes only — a network blip
+        try:                         # shouldn't silence the check for a day
+            os.makedirs(os.path.dirname(_CHECK_CACHE), exist_ok=True)
+            with open(_CHECK_CACHE, "w", encoding="utf-8") as fh:
+                json.dump({"ts": time.time(), "latest": latest}, fh)
+        except Exception:
+            pass
+    return latest if is_newer(latest) else None
+
+
 def _pip_upgrade_cmd():
     return [sys.executable, "-m", "pip", "install", "--upgrade",
             "--no-input", "--disable-pip-version-check", "turboadb"]

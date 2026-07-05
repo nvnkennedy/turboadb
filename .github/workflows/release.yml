@@ -1,0 +1,39 @@
+name: Release
+
+# Build the Windows GUI exe and attach it (plus the wheel/sdist) to the GitHub
+# Release when a v* tag is pushed. PyPI upload stays manual via
+# scripts/release.py — this only automates the exe artifact that used to be
+# built and attached by hand, so PyPI and GitHub Releases can't drift apart.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[all]" pyinstaller pillow build
+      - name: Build the one-file GUI exe
+        run: python -m PyInstaller --clean --noconfirm turboadb-gui.spec
+      - name: Build wheel + sdist
+        run: python -m build
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/turboadb-gui.exe
+            dist/*.whl
+            dist/*.tar.gz
+          fail_on_unmatched_files: false

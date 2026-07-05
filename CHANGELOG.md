@@ -3,6 +3,67 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.16
+
+New capabilities and a proper test/CI foundation — all additive, with the
+existing behavior unchanged.
+
+**New features**
+
+- **Find Wi-Fi devices automatically.** Device menu (and the Connect ▾ menu) →
+  **Discover Wi-Fi devices** uses `adb mdns services` to list Android 11+
+  Wireless-debugging devices on the LAN and offers to connect + save them. Also
+  `turboadb discover` on the CLI and `turboadb.mdns_devices()` in the library.
+- **One-click go wireless.** On a USB device: Root/Mount ▾ → **Go wireless
+  (USB → Wi-Fi)** reads the device's IP, runs `adb tcpip`, and connects — then
+  the cable can be unplugged. CLI: `turboadb wireless`; library:
+  `handler.go_wireless()`.
+- **Run a command on ALL devices.** Device menu → **Run a command on all
+  devices** streams one `adb shell` command across every connected device — handy
+  for a bench of head units.
+- **Device health snapshot.** A new **❤ Health** button per device (and
+  `turboadb health` / `handler.health()`): battery %, temperature, memory, CPU
+  load and uptime in one view.
+- **Bugreport capture.** Root/Mount ▾ → **Capture bugreport** and
+  `turboadb bugreport` save a full `adb bugreport` zip.
+- **Logcat crash preset.** A **Crashes** button sets the crash buffer + Error
+  level + FATAL/ANR highlighting in one click. The live regex filter now also
+  re-filters what's **already on screen**, not just new lines.
+- **Files: drag-and-drop upload.** Drag files/folders from your file manager onto
+  the Files list to upload them to the current directory.
+- **Export / Import saved targets** (File menu) — share bench configs as JSON.
+- **WinRM over HTTPS (5986)** checkbox in the remote-deploy dialog.
+- Optional **shell tab-completion** for the CLI (`pip install "turboadb[completion]"`).
+
+**Reliability / correctness**
+
+- scrcpy downloads are **SHA-256 verified** against the release's published sums,
+  and every downloaded zip is CRC-checked before install — a corrupt or truncated
+  download fails cleanly instead of installing garbage.
+- The scrcpy GitHub version check is now **ETag-cached**, so repeated checks stop
+  tripping GitHub's unauthenticated rate limit (which had surfaced as spurious
+  "couldn't check"). The launch update check against PyPI is cached to once/day.
+- The previous platform-tools/scrcpy is kept as a `.old` folder after an update —
+  a one-step offline rollback if a new release misbehaves.
+- The tool-download progress dialog now names the current stage ("adb (1/2)…",
+  "scrcpy (2/2)…") instead of the bar appearing to jump backwards.
+- Hotspot enable uses a **random** password instead of a hardcoded one.
+- Saved targets keep a **stable position** when edited (no more jumping to the
+  bottom of the sidebar).
+- `server_is_shared()` now genuinely tests the all-interfaces binding.
+- A rotating debug log at `~/.turboadb/turboadb.log`, and background-thread
+  crashes are captured to `crash.log` too.
+
+**Project infrastructure**
+
+- A real **pytest suite** (`tests/`) with a fake-adb harness that exercises the
+  actual arg-building/parsing/safe-mode code paths — plus tests for the tool
+  update/swap/zip-slip machinery. **GitHub Actions CI** runs it on Windows +
+  Linux across Python 3.8–3.13, with ruff lint and a build check. A tagged
+  **release workflow** builds and attaches the Windows GUI exe.
+- `py.typed` marker (the library now ships its type hints), Python 3.8–3.13
+  classifiers, and a `[test]` / `[completion]` extra.
+
 ## 1.0.15
 
 - **Logcat no longer floods 100,000s of cached lines the moment you press Start.**

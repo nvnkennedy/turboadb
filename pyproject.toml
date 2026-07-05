@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.0.15"
+version = "1.0.16"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -15,11 +15,19 @@ keywords = ["adb", "scrcpy", "android", "automotive", "android-automotive",
             "ivi", "logcat", "automation", "pyqt5", "testing", "embedded"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Software Development :: Testing",
     "Topic :: System :: Hardware",
     "Topic :: Utilities",
     "Intended Audience :: Developers",
+    "Typing :: Typed",
 ]
 # Batteries-included: the engine + CLI wrap adb/scrcpy and need no third-party
 # Python deps. PyQt5 is OPTIONAL ([gui]) — the GUI also ships as a bundled exe so
@@ -31,6 +39,8 @@ dependencies = []
 gui = ["PyQt5>=5.15", "keyring>=23.0"]   # keyring: Remote-webcam password in OS vault
 winrm = ["pywinrm>=0.4.3"]            # remote 'serve' deploy over WinRM (NTLM)
 all = ["PyQt5>=5.15", "pywinrm>=0.4.3", "keyring>=23.0"]
+test = ["pytest>=7.0"]               # CI test suite (no device / adb needed)
+completion = ["argcomplete>=3.0"]    # optional shell tab-completion for the CLI
 
 [project.scripts]
 turboadb = "turboadb.cli:main"
@@ -52,4 +62,4 @@ Changelog = "https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md"
 packages = ["turboadb", "turboadb.gui"]
 
 [tool.setuptools.package-data]
-turboadb = ["*.md", "assets/*.ico", "assets/*.png", "bin/*.exe"]
+turboadb = ["*.md", "py.typed", "assets/*.ico", "assets/*.png", "bin/*.exe"]

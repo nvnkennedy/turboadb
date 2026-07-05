@@ -442,6 +442,36 @@ class ADBHandler:
             return res.text or res.stderr.strip()
         return self._guard("tcpip", _do, safe=safe)
 
+    def device_ip(self, *, safe: Optional[bool] = None):
+        """The device's own Wi-Fi/LAN IPv4 address (best-effort: ``ip route``
+        'src' first, then wlan0), or '' if it has none."""
+        def _do():
+            r = self._run(["shell", "ip", "route"], timeout=15, check=False)
+            m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", r.stdout or "")
+            if m:
+                return m.group(1)
+            r = self._run(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"],
+                          timeout=15, check=False)
+            m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)", r.stdout or "")
+            return m.group(1) if m else ""
+        return self._guard("device_ip", _do, safe=safe)
+
+    def go_wireless(self, port: int = 5555, *, safe: Optional[bool] = None):
+        """One-shot USB → Wi-Fi switch: read the device's IP, restart adbd in
+        TCP mode (``adb tcpip``), then ``adb connect`` to it. Returns the new
+        ``host:port`` serial. Run while the device is on USB; afterwards the
+        cable can be unplugged."""
+        def _do():
+            ip = self.device_ip(safe=False)
+            if not ip:
+                raise ADBConnectionError(
+                    "the device reports no Wi-Fi/LAN IP — join it to the same "
+                    "network first, then retry.")
+            self.tcpip(port, safe=False)
+            time.sleep(1.5)                    # adbd restarts in TCP mode
+            return self.connect_tcp(ip, port, safe=False)
+        return self._guard("go_wireless", _do, safe=safe)
+
     def connect_tcp(self, host: str, port: int = 5555, *,
                     safe: Optional[bool] = None):
         """``adb connect host:port`` and switch this handler to that target."""
@@ -676,19 +706,24 @@ class ADBHandler:
 
         def _do():
             if on:
+                # random per-invocation password instead of a hardcoded one
+                import secrets
+                pw = "tb-" + secrets.token_hex(4)
                 attempts = [
-                    ["cmd", "wifi", "start-softap", "TurboADB", "wpa2", "turboadb123"],
-                    ["cmd", "wifi", "start-softap", "TurboADB", "open"],
-                    ["cmd", "wifi", "start-tethering"],
+                    (["cmd", "wifi", "start-softap", "TurboADB", "wpa2", pw],
+                     f"ok — SSID 'TurboADB', password: {pw}"),
+                    (["cmd", "wifi", "start-softap", "TurboADB", "open"],
+                     "ok — SSID 'TurboADB' (open network)"),
+                    (["cmd", "wifi", "start-tethering"], "ok"),
                 ]
             else:
-                attempts = [["cmd", "wifi", "stop-softap"],
-                            ["cmd", "wifi", "stop-tethering"]]
-            for a in attempts:
+                attempts = [(["cmd", "wifi", "stop-softap"], "ok"),
+                            (["cmd", "wifi", "stop-tethering"], "ok")]
+            for a, msg in attempts:
                 r = self._logged_run("hotspot " + ("on" if on else "off"),
                                      ["shell"] + a, timeout=20)
                 if r.ok and not _bad(r.stdout + r.stderr):
-                    return "ok"
+                    return msg
             # nothing worked via adb (on locked-down/automotive builds the shell
             # user lacks the TETHER_PRIVILEGED permission) — open the settings UI
             if self._open_tether_settings():
@@ -955,6 +990,97 @@ class ADBHandler:
         return self._guard("battery",
                            lambda: self._run(["shell", "dumpsys", "battery"],
                                              timeout=20).text, safe=safe)
+
+    @staticmethod
+    def _parse_health(batt: str, meminfo: str, top: str, uptime: str) -> dict:
+        """Parse the raw command output into the health snapshot dict — split
+        out so it's unit-testable without a device."""
+        info = {"battery_level": None, "battery_temp_c": None,
+                "battery_status": None, "mem_total_kb": None,
+                "mem_available_kb": None, "cpu": None, "uptime": None}
+        m = re.search(r"^\s*level:\s*(\d+)", batt, re.M)
+        if m:
+            info["battery_level"] = int(m.group(1))
+        m = re.search(r"^\s*temperature:\s*(\d+)", batt, re.M)
+        if m:
+            info["battery_temp_c"] = int(m.group(1)) / 10.0
+        m = re.search(r"^\s*status:\s*(\d+)", batt, re.M)
+        if m:
+            info["battery_status"] = {1: "unknown", 2: "charging",
+                                      3: "discharging", 4: "not charging",
+                                      5: "full"}.get(int(m.group(1)))
+        m = re.search(r"^MemTotal:\s*(\d+)\s*kB", meminfo, re.M)
+        if m:
+            info["mem_total_kb"] = int(m.group(1))
+        m = re.search(r"^MemAvailable:\s*(\d+)\s*kB", meminfo, re.M)
+        if m:
+            info["mem_available_kb"] = int(m.group(1))
+        # toybox top -bn1 header: "400%cpu  12%user ... 380%idle"
+        m = re.search(r"(\d+)%cpu.*?(\d+)%idle", top)
+        if m:
+            total, idle = int(m.group(1)), int(m.group(2))
+            if total > 0:
+                info["cpu"] = f"{max(0, total - idle) * 100 // total}%"
+        up = uptime.strip().splitlines()
+        if up:
+            info["uptime"] = up[0].strip()
+        return info
+
+    def health(self, *, safe: Optional[bool] = None):
+        """A one-shot device health snapshot: battery level / temperature /
+        status, memory total + available, rough CPU load, and uptime. All
+        best-effort — a field a device doesn't report is simply ``None``."""
+        def _do():
+            batt = self._run(["shell", "dumpsys", "battery"],
+                             timeout=20, check=False).stdout
+            mem = self._run(["shell", "cat", "/proc/meminfo"],
+                            timeout=15, check=False).stdout
+            top = self._run(["shell", "top", "-bn1"],
+                            timeout=20, check=False).stdout
+            upt = self._run(["shell", "uptime"],
+                            timeout=15, check=False).stdout
+            return self._parse_health(batt or "", mem or "", top or "",
+                                      upt or "")
+        return self._guard("health", _do, safe=safe)
+
+    def health_text(self, *, safe: Optional[bool] = None):
+        """The health snapshot as a readable block (for the GUI/CLI)."""
+        def _do():
+            h = self.health(safe=False)
+            mt, ma = h.get("mem_total_kb"), h.get("mem_available_kb")
+            mem = (f"{ma // 1024} MB free of {mt // 1024} MB"
+                   if mt and ma is not None else "n/a")
+            lines = [
+                f"battery   {h.get('battery_level', 'n/a')}%"
+                + (f"  ({h['battery_status']})" if h.get("battery_status") else ""),
+                f"temp      {h['battery_temp_c']} °C"
+                if h.get("battery_temp_c") is not None else "temp      n/a",
+                f"memory    {mem}",
+                f"cpu       {h.get('cpu') or 'n/a'}",
+                f"uptime    {h.get('uptime') or 'n/a'}",
+            ]
+            return "\n".join(lines)
+        return self._guard("health_text", _do, safe=safe)
+
+    def bugreport(self, local_path: str, *, timeout: float = 900,
+                  safe: Optional[bool] = None):
+        """Capture a full ``adb bugreport`` to *local_path* (a .zip on modern
+        devices). Slow — a couple of minutes is normal; *timeout* is generous."""
+        def _do():
+            lp = os.path.expanduser(local_path)
+            parent = os.path.dirname(lp)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._emit(logging.INFO,
+                       f"Capturing bugreport → {lp} (takes a few minutes)…")
+            res = self._run(["bugreport", lp], timeout=timeout, check=False)
+            if not res.ok or not os.path.exists(lp):
+                raise ADBError("bugreport failed: "
+                               f"{res.stderr.strip() or res.text or 'no output'}")
+            self._emit(logging.INFO, f"Bugreport saved: {lp} "
+                                     f"({os.path.getsize(lp)} bytes)")
+            return lp
+        return self._guard("bugreport", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # Telephony / messaging — dialler, calls, call log, SMS

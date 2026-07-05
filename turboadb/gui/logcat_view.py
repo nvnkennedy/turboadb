@@ -93,6 +93,7 @@ class LogcatPanel(QWidget):
         self.handler = handler
         self.thread = None
         self._paused = False
+        self._use_crash_buffers = False
         self._filter_re = None
         self._hl_re = None            # keyword/regex to highlight (None = off)
         self._hl_fmt = None           # the highlight char-format (lazy)
@@ -104,12 +105,21 @@ class LogcatPanel(QWidget):
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._render_pending)
         self._render_timer.start(350)
+        # debounce the on-screen re-filter so holding a key doesn't re-render the
+        # (large) buffer on every character
+        self._refilter_timer = QTimer(self)
+        self._refilter_timer.setSingleShot(True)
+        self._refilter_timer.timeout.connect(self._refilter_view)
 
         lay = QVBoxLayout(self)
         ctrl = QHBoxLayout()
         self.level = QComboBox()
         self.level.addItems(["Verbose (all)", "Debug", "Info", "Warn",
                             "Error", "Fatal"])
+        # a manual level change clears the crash preset (so it isn't stuck on
+        # the crash buffers after the user moves on); guarded during the preset
+        self._applying_preset = False
+        self.level.currentIndexChanged.connect(self._on_level_changed)
         # How much of the device's ALREADY-BUFFERED (cached) log to show before
         # following live. Plain `adb logcat` dumps its whole in-memory buffer
         # first — often hundreds of thousands of OLD lines in seconds — which
@@ -129,6 +139,13 @@ class LogcatPanel(QWidget):
         self.tag.setMaximumWidth(160)
         self.filt = QLineEdit(); self.filt.setPlaceholderText("regex filter (live)…")
         self.filt.textChanged.connect(self._set_filter)
+        # a crash preset: switch to the crash buffer + Error level in one click
+        self.btn_crash = QPushButton(" Crashes")
+        self.btn_crash.setProperty("role", "ghost")
+        self.btn_crash.setToolTip("Show only crashes & ANRs: the 'crash' buffer "
+                                  "at Error level, highlighting FATAL/ANR. Click "
+                                  "Start after.")
+        self.btn_crash.clicked.connect(self._crash_preset)
         self.hl = QLineEdit()
         self.hl.setPlaceholderText("highlight (e.g. error|anr|crash)…")
         self.hl.setToolTip("Highlight matches in-line (case-insensitive regex) "
@@ -151,7 +168,7 @@ class LogcatPanel(QWidget):
         self.btn_save.setIcon(theme.emoji_icon("💾"))
         self.btn_save.clicked.connect(self._save)
         for w in (QLabel("Level:"), self.level, QLabel("History:"), self.hist,
-                  self.tag, self.filt, self.hl,
+                  self.tag, self.filt, self.hl, self.btn_crash,
                   self.clear_first, self.btn_start, self.btn_pause,
                   self.btn_clear, self.btn_save):
             ctrl.addWidget(w)
@@ -185,12 +202,53 @@ class LogcatPanel(QWidget):
         m.addAction(ico("🧹"), "Clear", self._clear_view)
         m.exec_(self.view.viewport().mapToGlobal(pos))
 
+    _CRASH_BUFFERS = ["crash", "main", "system"]
+
+    def _on_level_changed(self, *_):
+        if not self._applying_preset:
+            self._use_crash_buffers = False
+
+    def _crash_preset(self):
+        """One-click crash/ANR view: crash buffer, Error level, FATAL/ANR
+        highlighted. Applied to the controls; the user presses Start."""
+        self._applying_preset = True
+        self.level.setCurrentText("Error")
+        self._applying_preset = False
+        self.tag.clear()
+        self.hl.setText("FATAL|ANR|Exception|crash")
+        self._use_crash_buffers = True
+        self.log.emit("[INFO] crash preset set — press Start to stream crashes "
+                      "& ANRs (crash buffer, Error level)")
+
     # --- filter ---
     def _set_filter(self, text):
         try:
             self._filter_re = re.compile(text) if text else None
         except re.error:
             self._filter_re = None
+        self._refilter_timer.start(300)          # debounced re-filter
+
+    def _refilter_view(self):
+        """Re-apply the live regex filter to what's ALREADY on screen, so
+        tightening the filter also hides stale non-matching lines (it used to
+        only affect newly-arriving lines).
+
+        Reads the ON-SCREEN text (bounded by the display cap), never the full
+        disk archive — so this stays cheap even during a huge capture. (Loosening
+        the filter therefore doesn't resurrect already-scrolled-off lines; the
+        complete log is always in Save.)"""
+        fre = self._filter_re
+        try:
+            text = self.view.toPlainText()
+        except Exception:
+            return
+        if not text:
+            return
+        lines = text.splitlines()
+        if fre is not None:
+            lines = [ln for ln in lines if fre.search(ln)]
+        self.view.clear()
+        self._draw_lines(lines)
 
     def _set_highlight(self, text):
         """Keywords/regex to mark in-line (case-insensitive). Unlike the filter,
@@ -223,6 +281,9 @@ class LogcatPanel(QWidget):
             except Exception:
                 pass
         args = ["logcat", "-v", fmt]
+        if self._use_crash_buffers:
+            for b in self._CRASH_BUFFERS:
+                args += ["-b", b]
         tailn = self.hist.currentData()
         if tailn:                              # None = full cached buffer
             args += ["-T", str(tailn)]
@@ -286,6 +347,13 @@ class LogcatPanel(QWidget):
             lines = [ln for ln in lines if fre.search(ln)]
             if not lines:
                 return
+        self._draw_lines(lines)
+
+    def _draw_lines(self, lines):
+        """Append *lines* to the view with level colouring + highlight marking.
+        Shared by live rendering and the re-filter re-render."""
+        if not lines:
+            return
         sb = self.view.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
         cur = self.view.textCursor()

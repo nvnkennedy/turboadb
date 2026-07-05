@@ -1,3 +1,4 @@
+# PYTHON_ARGCOMPLETE_OK
 """
 TurboADB command-line interface (fully argument-driven).
 
@@ -497,6 +498,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_target(p_tcp)
     p_tcp.add_argument("port", type=int, nargs="?", default=5555)
 
+    p_wless = sub.add_parser(
+        "wireless",
+        help="one-shot USB -> Wi-Fi: read the device's IP, adb tcpip, then "
+             "connect (afterwards the cable can be unplugged)")
+    _add_target(p_wless)
+    p_wless.add_argument("port", type=int, nargs="?", default=5555)
+
+    p_discover = sub.add_parser(
+        "discover",
+        help="find Android 11+ Wireless-debugging devices on the LAN "
+             "(adb mdns services)")
+    p_discover.add_argument("--adb-path", default=None)
+    p_discover.add_argument("--json", action="store_true")
+
     p_pair = sub.add_parser("pair", help="pair with an Android 11+ device")
     p_pair.add_argument("hostport", help="host:pairing_port")
     p_pair.add_argument("code", help="6-digit pairing code")
@@ -555,6 +570,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_target(p_close)
     p_bat = sub.add_parser("battery", help="battery stats (dumpsys battery)")
     _add_target(p_bat)
+    p_health = sub.add_parser("health", help="one-shot health snapshot "
+                                             "(battery/temp/memory/cpu/uptime)")
+    _add_target(p_health)
+    p_bug = sub.add_parser("bugreport", help="capture a full adb bugreport "
+                                             "(slow — a few minutes)")
+    _add_target(p_bug)
+    p_bug.add_argument("path", nargs="?", default=None,
+                       help="output file (default: bugreport-<time>.zip)")
     p_bld = sub.add_parser("build-info", help="build / version properties")
     _add_target(p_bld)
     p_rm = sub.add_parser("remount", help="adb remount read-write")
@@ -623,8 +646,25 @@ def _ensure_progress(pct):
         sys.stderr.write("\n")
 
 
+def _make_output_crashproof():
+    """Never let a non-ASCII character (—, →, ·, …) crash the CLI on a legacy
+    Windows console (cp1252): degrade unencodable chars to '?' instead of
+    raising UnicodeEncodeError. Best-effort; only touches the CLI's own streams."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")   # Python 3.7+
+        except Exception:
+            pass
+
+
 def main(argv=None) -> int:
+    _make_output_crashproof()
     parser = build_parser()
+    try:                       # optional shell tab-completion (pip install
+        import argcomplete     # argcomplete + activate-global-python-argcomplete)
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
     args = parser.parse_args(argv)
     cmd = args.cmd
 
@@ -762,6 +802,23 @@ def main(argv=None) -> int:
             else:
                 for d in devs:
                     print(d)
+            return 0
+
+        if cmd == "discover":
+            from .devices import mdns_devices
+            found = mdns_devices(args.adb_path)
+            if getattr(args, "json", False):
+                print(json.dumps(found, indent=2))
+            elif not found:
+                print("No Wireless-debugging devices found on the LAN.\n"
+                      "On the device: Settings > Developer options > Wireless "
+                      "debugging (Android 11+). Pairing entries need "
+                      "'turboadb pair' first.")
+            else:
+                for d in found:
+                    print(f"{d['address']:22}  {d['service']:8}  {d['name']}")
+                print(f"\n[{len(found)} service(s)]  ·  connect ones are ready "
+                      f"for:  turboadb connect HOST:PORT", file=sys.stderr)
             return 0
 
         if cmd == "restart-server":
@@ -934,6 +991,17 @@ def main(argv=None) -> int:
                 print("\nreverse removed.")
         elif cmd == "tcpip":
             print(dev.tcpip(args.port))
+        elif cmd == "wireless":
+            serial = dev.go_wireless(args.port)
+            print(f"connected wirelessly as {serial} - the USB cable can be "
+                  f"unplugged now")
+        elif cmd == "health":
+            print(dev.health_text())
+        elif cmd == "bugreport":
+            import time as _t
+            out = args.path or _t.strftime("bugreport-%Y%m%d-%H%M%S.zip")
+            print("Capturing bugreport (takes a few minutes)…", file=sys.stderr)
+            print(f"Saved {dev.bugreport(out)}")
         elif cmd == "reboot":
             dev.reboot(args.mode)
             print(f"reboot {args.mode or ''}".strip())

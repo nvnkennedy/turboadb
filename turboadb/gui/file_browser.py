@@ -91,7 +91,65 @@ class FileBrowser(QWidget):
 
         lay.addLayout(top); lay.addWidget(self.list, 1)
         lay.addLayout(ops); lay.addWidget(self.bar)
+        # drag files/folders from the OS file manager straight onto the list to
+        # upload them to the current device directory (additive — the buttons
+        # still work exactly as before)
+        self.setAcceptDrops(True)
+        self.list.setAcceptDrops(True)
+        self.list.setDragDropMode(QListWidget.DropOnly)
+        self.list.viewport().installEventFilter(self)
+        self._hint = QLabel("Tip: drag files or folders here to upload them to "
+                            "this directory.")
+        self._hint.setStyleSheet("color:#8a93a0; font-size:9pt;")
+        lay.addWidget(self._hint)
         self.refresh()
+
+    # ---- drag-and-drop upload ----
+    def eventFilter(self, obj, event):
+        from PyQt5.QtCore import QEvent
+        if obj is self.list.viewport():
+            if event.type() == QEvent.DragEnter or event.type() == QEvent.DragMove:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Drop:
+                if event.mimeData().hasUrls():
+                    self._drop_upload(event.mimeData().urls())
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            self._drop_upload(event.mimeData().urls())
+            event.acceptProposedAction()
+
+    def _drop_upload(self, urls):
+        locals_ = [u.toLocalFile() for u in urls if u.isLocalFile()]
+        locals_ = [p for p in locals_ if p and os.path.exists(p)]
+        if not locals_:
+            return
+        # upload sequentially so the single progress bar stays meaningful
+        self._drop_queue = list(locals_)
+        self.log.emit(f"uploading {len(locals_)} item(s) to {self.cwd}…")
+        self._next_drop()
+
+    def _next_drop(self):
+        if not getattr(self, "_drop_queue", None):
+            self.bar.setVisible(False)       # queue drained — finish up
+            self.refresh()
+            return
+        local = self._drop_queue.pop(0)
+        remote = posixpath.join(self.cwd, os.path.basename(local.rstrip("/\\")))
+        self._run("push", local, remote, then=self._next_drop)
 
     # --- navigation ---
     def refresh(self):
@@ -155,17 +213,23 @@ class FileBrowser(QWidget):
         return it.data(Qt.UserRole) if it else (None, None)
 
     # --- transfers ---
-    def _run(self, direction, a, b):
+    def _run(self, direction, a, b, then=None):
         self.bar.setVisible(True); self.bar.setValue(0)
         t = _TransferThread(self.handler, direction, a, b)
         t.progress.connect(self.bar.setValue)
-        t.done.connect(lambda m: (self.log.emit("[OK] " + m), self._after()))
-        t.failed.connect(lambda m: (self.log.emit("[ERROR] " + m), self._after()))
+        t.done.connect(lambda m: (self.log.emit("[OK] " + m), self._after(then)))
+        t.failed.connect(lambda m: (self.log.emit("[ERROR] " + m),
+                                    self._after(then)))
         t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
         self._threads.append(t)
         t.start()
 
-    def _after(self):
+    def _after(self, then=None):
+        # only hide the bar + refresh when nothing else is queued (a multi-file
+        # drop chains through *then*)
+        if then is not None:
+            then()
+            return
         self.bar.setVisible(False)
         self.refresh()
 

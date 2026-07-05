@@ -26,6 +26,7 @@ import zipfile
 import tempfile
 import platform
 import subprocess
+import urllib.error
 import urllib.request
 
 from .exceptions import ADBError, ADBNotFoundError
@@ -155,9 +156,10 @@ def _kill_adb_server(adb_path: str | None = None) -> None:
 
 def _swap_dir(new_dir: str, dest: str) -> None:
     """Replace *dest* with *new_dir* atomically-ish: move the old directory
-    aside, move the new one in, then delete the old. If a file in the old dir is
-    still locked (a running adb server / scrcpy session), the rename fails LOUDLY
-    instead of silently leaving a half-updated mix of old and new files."""
+    aside (kept as ``dest.old`` for a manual rollback), then move the new one
+    in. If a file in the old dir is still locked (a running adb server / scrcpy
+    session), the rename fails LOUDLY instead of silently leaving a
+    half-updated mix of old and new files."""
     old = None
     if os.path.isdir(dest):
         old = dest + ".old"
@@ -178,8 +180,9 @@ def _swap_dir(new_dir: str, dest: str) -> None:
             except OSError:
                 pass
         raise
-    if old:
-        shutil.rmtree(old, ignore_errors=True)
+    # keep the previous version as *.old — a one-step offline rollback if a new
+    # platform-tools/scrcpy release turns out to be broken (it's replaced on the
+    # next swap, so at most one extra copy sits on disk)
 
 
 def _chmod_x(path: str) -> None:
@@ -208,6 +211,7 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "platform-tools.zip")
         _download(url, zip_path, on_progress)
+        _check_zip(zip_path)      # a truncated download must fail BEFORE the swap
         # the zip contains a top-level "platform-tools/" folder
         staging = os.path.join(tmp, "new")
         _extract_zip(zip_path, staging)
@@ -226,7 +230,51 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     return adb
 
 
-def _scrcpy_asset_url() -> str:
+def _release_cache_path() -> str:
+    return os.path.join(tools_dir(), ".scrcpy-release.json")
+
+
+def _github_release_json(timeout: float = 30) -> dict:
+    """The scrcpy latest-release JSON, with **ETag caching** — repeated checks
+    send If-None-Match and reuse the cached body on 304, so the unauthenticated
+    GitHub rate limit (60 req/h/IP) stops making update checks randomly fail.
+    On any network/rate-limit error the last cached copy is used if available."""
+    cache_path = _release_cache_path()
+    cached = None
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+    except Exception:
+        pass
+    headers = dict(_UA)
+    if cached and cached.get("etag"):
+        headers["If-None-Match"] = cached["etag"]
+    req = urllib.request.Request(SCRCPY_RELEASES_API, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+            etag = resp.headers.get("ETag") or ""
+        try:
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                json.dump({"etag": etag, "data": data}, fh)
+        except Exception:
+            pass
+        return data
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and cached and cached.get("data"):
+            return cached["data"]           # unchanged since last time
+        if cached and cached.get("data"):
+            return cached["data"]           # rate-limited etc. — use the cache
+        raise
+    except Exception:
+        if cached and cached.get("data"):
+            return cached["data"]
+        raise
+
+
+def _scrcpy_assets() -> tuple:
+    """(zip_url, zip_name, sums_url|None) for the right Windows scrcpy asset.
+    *sums_url* points at the release's SHA256SUMS.txt when it publishes one."""
     key = _os_key()
     if key != "windows":
         raise ADBNotFoundError(
@@ -235,18 +283,58 @@ def _scrcpy_asset_url() -> str:
             "distro's package).")
     is64 = platform.machine().endswith("64") or sys.maxsize > 2**32
     want = "win64" if is64 else "win32"
-    req = urllib.request.Request(SCRCPY_RELEASES_API, headers=_UA)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.load(resp)
+    data = _github_release_json()
     assets = data.get("assets", [])
+    sums = next((a["browser_download_url"] for a in assets
+                 if a["name"].upper().startswith("SHA256SUMS")), None)
     for a in assets:
         if a["name"].endswith(".zip") and want in a["name"]:
-            return a["browser_download_url"]
-    # fall back to any windows zip
-    for a in assets:
+            return a["browser_download_url"], a["name"], sums
+    for a in assets:                        # fall back to any windows zip
         if a["name"].endswith(".zip") and "win" in a["name"]:
-            return a["browser_download_url"]
+            return a["browser_download_url"], a["name"], sums
     raise ADBNotFoundError("No suitable scrcpy Windows release asset was found.")
+
+
+def _verify_sha256(path: str, name: str, sums_url: str) -> None:
+    """Check *path* against the published SHA256SUMS.txt entry for *name*.
+    Best-effort: if the sums file can't be fetched or has no entry, skip; a
+    MISMATCH always raises (corrupt or tampered download)."""
+    import hashlib
+    try:
+        req = urllib.request.Request(sums_url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            sums = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return                              # can't fetch the sums — skip check
+    expected = None
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == name:
+            expected = parts[0].lower()
+            break
+    if not expected:
+        return
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    if h.hexdigest().lower() != expected:
+        raise ADBError(f"SHA-256 mismatch for {name} — the download is corrupt "
+                       f"or tampered with; nothing was installed. Try again.")
+
+
+def _check_zip(path: str) -> None:
+    """CRC-check the whole archive so a truncated download fails BEFORE any
+    swap, not halfway through extraction."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            bad = z.testzip()
+    except zipfile.BadZipFile as exc:
+        raise ADBError(f"downloaded archive is not a valid zip: {exc}") from exc
+    if bad:
+        raise ADBError(f"downloaded archive is corrupt (bad CRC: {bad}); "
+                       f"nothing was installed. Try again.")
 
 
 def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
@@ -255,10 +343,13 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
     existing = managed_scrcpy()
     if existing and not force:
         return existing
-    url = _scrcpy_asset_url()
+    url, asset_name, sums_url = _scrcpy_assets()
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "scrcpy.zip")
         _download(url, zip_path, on_progress)
+        _check_zip(zip_path)
+        if sums_url:
+            _verify_sha256(zip_path, asset_name, sums_url)
         staging = os.path.join(tmp, "scrcpy-new")
         _extract_zip(zip_path, tmp, strip_top_to=staging)
         if not os.path.isfile(os.path.join(staging, _exe("scrcpy"))):
@@ -414,9 +505,7 @@ def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
 
 def latest_scrcpy_version() -> str | None:
     try:
-        req = urllib.request.Request(SCRCPY_RELEASES_API, headers=_UA)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.load(resp)
+        data = _github_release_json()      # ETag-cached, rate-limit friendly
         tag = (data.get("tag_name") or "").lstrip("vV")
         return tag or None
     except Exception:
@@ -512,21 +601,35 @@ def upgrade_tools(*, on_progress=None, notify=None) -> dict:
 
 
 def fetch_tools(*, adb: bool = True, scrcpy: bool = True, force: bool = False,
-                on_progress=None) -> dict:
+                on_progress=None, on_stage=None) -> dict:
     """Download whatever's requested into the cache. Returns
     ``{"adb": path|None, "scrcpy": path|None, "errors": {...}}``.
+
+    *on_stage* (optional) is called with a short label ("adb (1/2)", …) as each
+    tool starts, so a progress UI can say WHAT is downloading instead of its
+    bar appearing to jump backwards between the two 0-100 runs.
 
     scrcpy bundles its own adb on Windows; downloading scrcpy alone is enough to
     get both, but fetching platform-tools gives you the latest standalone adb.
     """
+    def stage(label):
+        if on_stage:
+            try:
+                on_stage(label)
+            except Exception:
+                pass
+
+    total = int(adb) + int(scrcpy)
     result = {"adb": None, "scrcpy": None, "errors": {}}
     if adb:
+        stage(f"platform-tools / adb (1/{total})")
         try:
             result["adb"] = download_platform_tools(force=force,
                                                     on_progress=on_progress)
         except Exception as exc:
             result["errors"]["adb"] = str(exc)
     if scrcpy:
+        stage(f"scrcpy ({total}/{total})")
         try:
             result["scrcpy"] = download_scrcpy(force=force, on_progress=on_progress)
         except Exception as exc:

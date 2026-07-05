@@ -1,0 +1,18 @@
+# Conservative lint config: catch real bugs (pyflakes) without enforcing a
+# style churn across the existing codebase. Widen the select list over time.
+target-version = "py38"
+line-length = 100
+
+[lint]
+select = ["F", "E9"]        # pyflakes + syntax/IO errors only
+ignore = [
+    "F401",   # unused imports — many are lazy/optional-dependency guards
+    "F403",   # star imports (none, but keep noise down)
+    "F405",
+    "F841",   # assigned-but-unused local — a few side-effecting calls keep the
+              # name for readability (e.g. res = self._run(..., check=True))
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["F811", "F841"]        # fixtures / intentional locals
+"scripts/*" = ["F841"]

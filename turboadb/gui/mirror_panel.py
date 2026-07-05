@@ -98,7 +98,7 @@ def _default_save_dir() -> str:
 def _open_path(path) -> None:
     try:
         if _IS_WIN:
-            os.startfile(path)                # noqa: type-defined on Windows
+            os.startfile(path)                # type: ignore[attr-defined]  # Windows-only
         elif sys.platform == "darwin":
             subprocess.Popen(["open", path])
         else:

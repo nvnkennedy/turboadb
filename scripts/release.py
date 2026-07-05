@@ -97,6 +97,14 @@ def main(argv=None) -> int:
 
     if not args.skip_tests:
         run([sys.executable, "tests/test_offline.py"])
+        # the pytest suite (fake-adb unit tests) — skipped gracefully if pytest
+        # isn't installed, so a minimal env can still cut a release
+        try:
+            import pytest  # noqa: F401
+            run([sys.executable, "-m", "pytest", "tests/", "-q"])
+        except ImportError:
+            print("  (pytest not installed — skipping the pytest suite; "
+                  "pip install pytest to run it)")
 
     print("\nUpdating version strings:")
     set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")

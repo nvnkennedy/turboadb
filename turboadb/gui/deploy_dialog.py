@@ -16,15 +16,18 @@ class _TestThread(QThread):
     line = pyqtSignal(str)
     done = pyqtSignal()
 
-    def __init__(self, hosts, user, pw, port):
+    def __init__(self, hosts, user, pw, port, use_ssl=False):
         super().__init__()
         self.hosts, self.user, self.pw, self.port = hosts, user, pw, port
+        self.use_ssl = use_ssl
 
     def run(self):
         try:
             from ..remote_deploy import deploy_serve
             deploy_serve(self.hosts, self.user, self.pw, port=self.port,
-                         test_only=True, on_status=self.line.emit)
+                         test_only=True, use_ssl=self.use_ssl,
+                         winrm_port=5986 if self.use_ssl else 5985,
+                         on_status=self.line.emit)
         except Exception as exc:
             self.line.emit(f"[ERROR] test: {exc}")
         self.done.emit()
@@ -86,7 +89,12 @@ class DeployDialog(QDialog):
         self.port.setFixedWidth(90)
         self.update = QCheckBox("Update turboadb on each host first")
         self.update.setChecked(True)
+        self.https = QCheckBox("WinRM over HTTPS (5986)")
+        self.https.setToolTip("Use encrypted WinRM (port 5986) instead of plain "
+                              "HTTP (5985). The host must have an HTTPS WinRM "
+                              "listener configured.")
         port_row.addWidget(self.port); port_row.addWidget(self.update)
+        port_row.addWidget(self.https)
         port_row.addStretch(1)
         port_w = QWidget(); port_w.setLayout(port_row)
         grid.addWidget(port_w, 3, 1)
@@ -138,7 +146,8 @@ class DeployDialog(QDialog):
         hosts = [h.strip() for h in raw.splitlines() if h.strip()]
         return {"hosts": hosts, "user": self.user.text().strip(),
                 "password": self.pw.text(), "port": self.port.value(),
-                "update": self.update.isChecked()}
+                "update": self.update.isChecked(),
+                "use_ssl": self.https.isChecked()}
 
     def _problem(self):
         v = self.values()
@@ -162,7 +171,8 @@ class DeployDialog(QDialog):
         self.status.clear()
         self._append(f"Testing WinRM on {len(v['hosts'])} host(s)…")
         self.btn_test.setEnabled(False); self.btn_deploy.setEnabled(False)
-        self._test = _TestThread(v["hosts"], v["user"], v["password"], v["port"])
+        self._test = _TestThread(v["hosts"], v["user"], v["password"], v["port"],
+                                 v["use_ssl"])
         self._test.line.connect(self._append)
         self._test.done.connect(self._test_done)
         self._test.start()

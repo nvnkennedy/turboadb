@@ -78,15 +78,17 @@ def _session(host, login, password, *, winrm_port=5985, use_ssl=False,
         server_cert_validation="ignore" if use_ssl else "validate")
 
 
-def _run_ps(host, login, password, script, *, winrm_port):
-    r = _session(host, login, password, winrm_port=winrm_port).run_ps(script)
+def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False):
+    r = _session(host, login, password, winrm_port=winrm_port,
+                 use_ssl=use_ssl).run_ps(script)
     out = (r.std_out or b"").decode("utf-8", "replace").strip()
     err = (r.std_err or b"").decode("utf-8", "replace").strip()
     return r.status_code, out, err
 
 
 def deploy_serve(hosts, username, password, *, update=True, port=5037,
-                 test_only=False, winrm_port=5985, on_status=None) -> int:
+                 test_only=False, winrm_port=5985, use_ssl=False,
+                 on_status=None) -> int:
     """Deploy (or, with *test_only*, just verify WinRM/credentials on) *hosts* —
     one or many. *username* should be ``DOMAIN\\user``. Streams leveled status
     lines to *on_status*. Returns 0 if every host succeeded, else 1."""
@@ -108,7 +110,7 @@ def deploy_serve(hosts, username, password, *, update=True, port=5037,
             if test_only:
                 code, out, err = _run_ps(h, username, password,
                                          "'OK:'+$env:COMPUTERNAME",
-                                         winrm_port=winrm_port)
+                                         winrm_port=winrm_port, use_ssl=use_ssl)
                 if code == 0 and "OK:" in out:
                     name = out.split("OK:", 1)[1].strip().splitlines()[0]
                     say(f"[OK] {h}: WinRM reachable, credentials accepted "
@@ -121,7 +123,7 @@ def deploy_serve(hosts, username, password, *, update=True, port=5037,
 
             script = _DEPLOY_PS.format(upd="1" if update else "0", port=port)
             code, out, err = _run_ps(h, username, password, script,
-                                     winrm_port=winrm_port)
+                                     winrm_port=winrm_port, use_ssl=use_ssl)
             ok = code == 0 and "STATUS:" in out and "ERROR:" not in out
             if ok:
                 detail = next((l[len("STATUS:"):].strip()

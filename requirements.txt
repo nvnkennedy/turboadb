@@ -1,6 +1,14 @@
-# Dev/build tooling (the package itself needs no runtime deps).
-PyQt5>=5.15   # GUI from source
-pyinstaller>=6.0
-pillow>=9.0   # icon generation
+# Dev/build tooling. The package itself needs NO runtime deps — install those
+# via extras instead:  pip install -e ".[all]"   (PyQt5 + pywinrm + keyring)
+#
+# Runtime extras live in pyproject.toml ([project.optional-dependencies]); this
+# file is only the local dev/build toolchain.
+PyQt5>=5.15      # GUI from source ( == the [gui] extra )
+pywinrm>=0.4.3   # remote 'serve' + remote webcam ( == the [winrm] extra )
+keyring>=23.0    # Remote-webcam password in the OS vault
+pyinstaller>=6.0 # bundled one-file GUI exe
+pillow>=9.0      # icon generation (scripts/make_icon.py)
+pytest>=7.0      # test suite
+ruff             # lint
 build
 twine

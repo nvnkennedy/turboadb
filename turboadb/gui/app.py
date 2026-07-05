@@ -28,6 +28,42 @@ def _crash_log(text: str):
         pass
 
 
+def _install_app_logging():
+    """A rotating debug log at ~/.turboadb/turboadb.log capturing the library's
+    log records (real adb commands, durations, errors) and any background-thread
+    crash — so "it didn't work" reports have something concrete to attach.
+    Best-effort; never fatal if logging can't be set up."""
+    import logging
+    import logging.handlers
+    import threading
+    try:
+        os.makedirs(_FLAG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(_FLAG_DIR, "turboadb.log"), maxBytes=1_000_000,
+            backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root = logging.getLogger("turboadb")
+        root.setLevel(logging.DEBUG)
+        # avoid stacking duplicate handlers if main() is ever re-entered
+        if not any(isinstance(h, logging.handlers.RotatingFileHandler)
+                   for h in root.handlers):
+            root.addHandler(handler)
+    except Exception:
+        pass
+    # worker-thread exceptions -> crash.log too (the Qt excepthook only covers
+    # the UI thread)
+    try:
+        def _thread_hook(args):
+            import traceback
+            _crash_log("[background thread] " + "".join(
+                traceback.format_exception(args.exc_type, args.exc_value,
+                                           args.exc_traceback)))
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
+
 def _install_excepthook():
     """Uncaught GUI-thread errors -> log to the panel + a non-fatal popup,
     instead of crashing the app."""
@@ -116,6 +152,7 @@ def main():
         app.setPalette(pal)
     except Exception:
         pass
+    _install_app_logging()
     _install_excepthook()
     _first_run_tasks()
     _sweep_stale_logs()

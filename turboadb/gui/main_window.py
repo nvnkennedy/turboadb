@@ -67,8 +67,47 @@ class _AdbServerThread(QThread):
             self.done.emit(f"[ERROR] restart adb server: {exc}")
 
 
+class _DiscoverThread(QThread):
+    """Find Android 11+ Wireless-debugging devices on the LAN (adb mdns)."""
+    done = pyqtSignal(list)
+
+    def run(self):
+        try:
+            from ..devices import mdns_devices
+            self.done.emit(mdns_devices())
+        except Exception:
+            self.done.emit([])
+
+
+class _BroadcastThread(QThread):
+    """Run one adb shell command on EVERY connected device, off the UI thread."""
+    line = pyqtSignal(str)
+    done = pyqtSignal()
+
+    def __init__(self, serials, command):
+        super().__init__()
+        self.serials, self.command = serials, command
+
+    def run(self):
+        from ..core import ADBHandler
+        from ..config import ADBConfig
+        for s in self.serials:
+            try:
+                h = ADBHandler(ADBConfig(serial=s), safe=True)
+                res = h.shell(self.command, safe=False)
+                head = (res.text or res.stderr.strip() or "(no output)")
+                head = head.splitlines()[0][:200] if head else "(no output)"
+                tag = "OK" if res.ok else f"exit {res.exit_code}"
+                self.line.emit(f"[{'OK' if res.ok else 'WARNING'}] {s}: "
+                               f"{tag} · {head}")
+            except Exception as exc:
+                self.line.emit(f"[ERROR] {s}: {exc}")
+        self.done.emit()
+
+
 class _ToolsDownloadThread(QThread):
     progress = pyqtSignal(int)
+    stage = pyqtSignal(str)
     done = pyqtSignal(dict)
 
     def __init__(self, mode="fetch", force=False):
@@ -84,7 +123,8 @@ class _ToolsDownloadThread(QThread):
                 res = upgrade_tools(on_progress=self.progress.emit)
             else:
                 res = fetch_tools(adb=True, scrcpy=True, force=self.force,
-                                  on_progress=self.progress.emit)
+                                  on_progress=self.progress.emit,
+                                  on_stage=self.stage.emit)
         except Exception as exc:
             res = {"adb": None, "scrcpy": None, "errors": {"download": str(exc)}}
         self.done.emit(res or {})
@@ -143,16 +183,18 @@ class _DeployThread(QThread):
     per-host status back to the log."""
     status = pyqtSignal(str)
 
-    def __init__(self, hosts, user, pw, port, update):
+    def __init__(self, hosts, user, pw, port, update, use_ssl=False):
         super().__init__()
         self.hosts, self.user, self.pw = hosts, user, pw
-        self.port, self.update = port, update
+        self.port, self.update, self.use_ssl = port, update, use_ssl
 
     def run(self):
         try:
             from ..remote_deploy import deploy_serve
             deploy_serve(self.hosts, self.user, self.pw, update=self.update,
-                         port=self.port, on_status=self.status.emit)
+                         port=self.port, use_ssl=self.use_ssl,
+                         winrm_port=5986 if self.use_ssl else 5985,
+                         on_status=self.status.emit)
             self.status.emit("[OK] Remote deploy finished.")
         except Exception as exc:
             self.status.emit(f"[ERROR] remote deploy: {exc}")
@@ -174,13 +216,18 @@ class _ShortcutThread(QThread):
 
 
 class _AppUpdateCheckThread(QThread):
-    """Ask PyPI (off the UI thread) whether a newer TurboADB exists."""
+    """Ask PyPI (off the UI thread) whether a newer TurboADB exists.
+    *cached=True* uses the once-a-day cache (for the quiet launch check)."""
     result = pyqtSignal(str)               # latest version if newer, else ""
+
+    def __init__(self, cached=False):
+        super().__init__()
+        self.cached = cached
 
     def run(self):
         try:
-            from ..update import check
-            self.result.emit(check() or "")
+            from ..update import check, check_cached
+            self.result.emit((check_cached() if self.cached else check()) or "")
         except Exception:
             self.result.emit("")
 
@@ -262,6 +309,9 @@ class MainWindow(QMainWindow):
         m_file.addAction(ico("🖥"), "Create desktop + Start-menu shortcuts",
                          self.make_shortcuts_now)
         m_file.addSeparator()
+        m_file.addAction(ico("📤"), "Export saved targets…", self.export_targets)
+        m_file.addAction(ico("📥"), "Import saved targets…", self.import_targets)
+        m_file.addSeparator()
         m_file.addAction(ico("✖", theme.DANGER), "Exit", self.close, "Ctrl+Q")
 
         m_view = mb.addMenu("&View")
@@ -277,7 +327,12 @@ class MainWindow(QMainWindow):
         m_dev.addAction(ico("📸"), "Screenshot", self._shot_current)
         m_dev.addSeparator()
         m_dev.addAction(ico("🔄"), "Restart ADB server", self.restart_adb_server)
+        m_dev.addAction(ico("📶"), "Discover Wi-Fi devices (Android 11+)…",
+                        self.discover_wireless)
         m_dev.addAction(ico("🔗"), "Pair device (Android 11+)…", self.pair_device)
+        m_dev.addSeparator()
+        m_dev.addAction(ico("📢"), "Run a command on ALL devices…",
+                        self.broadcast_command)
         m_dev.addAction(ico("🛰"), "Share this PC's devices over the network…",
                         self.share_devices)
         m_dev.addAction(ico("📡"), "Deploy ‘serve’ to remote machines (WinRM)…",
@@ -300,6 +355,39 @@ class MainWindow(QMainWindow):
             self.log_panel.append(f"[WARNING] Could not create: {', '.join(bad)}.")
         else:
             self.log_panel.append("[OK] Desktop + Start-menu shortcuts refreshed.")
+
+    def export_targets(self):
+        from PyQt5.QtWidgets import QFileDialog
+        if not self.store.sessions:
+            QMessageBox.information(self, "Export targets",
+                                    "No saved targets to export yet.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export saved targets", "turboadb-targets.json",
+            "JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            n = self.store.export_to(path)
+            self.log_panel.append(f"[OK] exported {n} target(s) → {path}")
+        except Exception as exc:
+            self.log_panel.append(f"[ERROR] export targets: {exc}")
+
+    def import_targets(self):
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import saved targets", "",
+            "JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            n = self.store.import_from(path)
+            self.refresh_sessions()
+            self.log_panel.append(f"[OK] imported {n} target(s) from {path}")
+        except Exception as exc:
+            self.log_panel.append(f"[ERROR] import targets: {exc}")
+            QMessageBox.warning(self, "Import targets",
+                                f"Couldn't import that file:\n\n{exc}")
 
     def save_active_output(self):
         t = self._current_tab()
@@ -348,6 +436,8 @@ class MainWindow(QMainWindow):
         dmenu.addAction("Connect to a device…", self.open_connect)
         dmenu.addAction("Save a target (without connecting)…", self.new_session)
         dmenu.addSeparator()
+        dmenu.addAction("Discover Wi-Fi devices (Android 11+)…",
+                        self.discover_wireless)
         dmenu.addAction("Pair device (Android 11+)…", self.pair_device)
         dmenu.addAction("Restart ADB server", self.restart_adb_server)
         dev_btn.setMenu(dmenu)
@@ -782,6 +872,77 @@ class MainWindow(QMainWindow):
         label = name or s.get("serial") or s.get("host") or s.get("adb_host") or "device"
         self._open_session(s, label)
 
+    def discover_wireless(self):
+        """Find Android 11+ Wireless-debugging devices on the LAN (adb mdns) and
+        offer to connect to a 'connect'-ready one."""
+        if getattr(self, "_disc", None) and self._disc.isRunning():
+            return
+        self.log_panel.append("Scanning the LAN for Wireless-debugging devices "
+                              "(adb mdns)…")
+        self._disc = _DiscoverThread()
+        self._disc.done.connect(self._on_discovered)
+        self._disc.start()
+
+    def _on_discovered(self, found):
+        connectable = [d for d in found if d.get("service") == "connect"]
+        pairing = [d for d in found if d.get("service") == "pairing"]
+        for d in found:
+            self.log_panel.append(f"[OK] found {d['service']}: {d['address']} "
+                                  f"({d['name']})")
+        if not found:
+            self.log_panel.append("[INFO] no Wireless-debugging devices found. "
+                                  "On the device: Settings → Developer options → "
+                                  "Wireless debugging (same Wi-Fi as this PC).")
+            QMessageBox.information(
+                self, "Discover Wi-Fi devices",
+                "No Android 11+ Wireless-debugging devices were found on the "
+                "LAN.\n\nOn the device, turn on Settings → Developer options → "
+                "Wireless debugging, and make sure it's on the same network as "
+                "this PC. New devices usually need Pair (with a code) once first.")
+            return
+        if pairing and not connectable:
+            self.log_panel.append("[INFO] found only PAIRING entries — use "
+                                  "Pair device to enter the code shown on-screen.")
+        for d in connectable:
+            s = {"name": d["address"], "type": "network",
+                 "host": d["host"], "port": d["port"]}
+            self.store.save(s)
+        if connectable:
+            self.refresh_sessions()
+            first = connectable[0]
+            if QMessageBox.question(
+                    self, "Discover Wi-Fi devices",
+                    f"Found {len(connectable)} connectable device(s). Connect to "
+                    f"{first['address']} now?\n\n(All were saved to the sidebar.)"
+                    ) == QMessageBox.Yes:
+                self._open_session({"name": first["address"], "type": "network",
+                                    "host": first["host"], "port": first["port"]},
+                                   first["address"])
+
+    def broadcast_command(self):
+        """Run a single adb shell command on EVERY connected device at once."""
+        online = [d for d in self._live_devices if d.is_online]
+        if not online:
+            QMessageBox.information(self, "Run on all devices",
+                                    "No connected devices. Plug in / connect "
+                                    "some first.")
+            return
+        cmd, ok = QInputDialog.getText(
+            self, "Run on all devices",
+            f"adb shell command to run on all {len(online)} connected "
+            f"device(s):", text="getprop ro.build.version.release")
+        if not ok or not cmd.strip():
+            return
+        if getattr(self, "_bcast", None) and self._bcast.isRunning():
+            self.log_panel.append("[WARNING] a broadcast is already running.")
+            return
+        self.log_panel.append(f"Running on {len(online)} device(s):  {cmd}")
+        self._bcast = _BroadcastThread([d.serial for d in online], cmd.strip())
+        self._bcast.line.connect(self.log_panel.append)
+        self._bcast.done.connect(
+            lambda: self.log_panel.append("[OK] broadcast finished."))
+        self._bcast.start()
+
     def pair_device(self):
         addr, ok = QInputDialog.getText(
             self, "Pair device (Android 11+)",
@@ -895,7 +1056,7 @@ class MainWindow(QMainWindow):
             f"Deploying ‘serve’ to {len(vals['hosts'])} host(s) over WinRM…")
         self._deploy = _DeployThread(vals["hosts"], vals["user"],
                                      vals["password"], vals["port"],
-                                     vals["update"])
+                                     vals["update"], vals.get("use_ssl", False))
         self._deploy.status.connect(self.log_panel.append)
         self._deploy.start()
 
@@ -1050,6 +1211,9 @@ class MainWindow(QMainWindow):
         self._timer.stop()          # the device poll re-locks adb.exe mid-replace
         self._dl = _ToolsDownloadThread(mode=mode, force=force)
         self._dl.progress.connect(self._dlg.setValue)
+        self._dl.stage.connect(
+            lambda s: self._dlg.setLabelText(f"Downloading {s}…\n"
+                                             "Cached in ~/.turboadb/tools."))
         self._dl.done.connect(self._tools_done)
         self._dl.start()
 
@@ -1078,7 +1242,7 @@ class MainWindow(QMainWindow):
         self._poll_devices()
 
     def _quiet_update_check(self):
-        self._upd_quiet = _AppUpdateCheckThread()
+        self._upd_quiet = _AppUpdateCheckThread(cached=True)  # daily cache
         self._upd_quiet.result.connect(self._on_quiet_update)
         self._upd_quiet.start()
 
@@ -1278,7 +1442,8 @@ class MainWindow(QMainWindow):
         # is destroyed (with this window) while its thread is alive
         from .qtutil import park_thread
         for attr in ("_poll", "_as", "_dl", "_share", "_unshare", "_deploy",
-                     "_sc", "_upd_chk", "_upd_run", "_upd_quiet"):
+                     "_sc", "_upd_chk", "_upd_run", "_upd_quiet", "_disc",
+                     "_bcast"):
             park_thread(getattr(self, attr, None))
         for i in range(self.tabs.count()):
             try:
