@@ -240,8 +240,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._check_tools)
         # make sure the Desktop + Start-menu shortcuts exist (self-healing)
         QTimer.singleShot(1000, self._ensure_shortcuts)
-        # NOTE: no automatic update check at launch — updates happen only when the
-        # user clicks the ribbon "Upgrade" button (checks TurboADB + adb + scrcpy).
+        # quiet launch check (Settings → Startup, on by default): if PyPI has a
+        # newer TurboADB it only logs a line — installing still happens ONLY via
+        # the ribbon 🔄 Upgrade button, never automatically.
+        if settings_mod.get("auto_update"):
+            QTimer.singleShot(2500, self._quiet_update_check)
 
     # ---- menu bar (basic actions: sessions, save files, tools, help) ----
     def _build_menubar(self):
@@ -835,9 +838,13 @@ class MainWindow(QMainWindow):
             return
         self.log_panel.append("Starting shared adb server (network device "
                               "sharing)…")
+        # pause the device poll: its `adb devices` would auto-start a plain
+        # localhost server in the kill→bind gap and steal port 5037
+        self._timer.stop()
         self._share = _ShareThread(install_startup=(clicked is b_start_login))
         self._share.msg.connect(self.log_panel.append)
-        self._share.finished.connect(self._poll_devices)
+        self._share.finished.connect(
+            lambda: (self._timer.start(3000), self._poll_devices()))
         self._share.start()
 
     def stop_sharing(self):
@@ -856,9 +863,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
         self.log_panel.append("Stopping device sharing and removing auto-start…")
+        self._timer.stop()          # keep the poll out of the kill→restart gap
         self._unshare = _StopShareThread()
         self._unshare.msg.connect(self.log_panel.append)
-        self._unshare.finished.connect(self._poll_devices)
+        self._unshare.finished.connect(
+            lambda: (self._timer.start(3000), self._poll_devices()))
         self._unshare.start()
 
     def deploy_serve_remote(self):
@@ -976,6 +985,9 @@ class MainWindow(QMainWindow):
         self._dlg.setAutoClose(True); self._dlg.setMinimumDuration(0)
         self._dlg.setValue(0)
         self.log_panel.append("Checking for adb/scrcpy updates…")
+        # pause the 3-second device poll: its `adb devices` restarts the adb
+        # server, re-locking adb.exe in the middle of the replace
+        self._timer.stop()
         self._dl = _ToolsDownloadThread(mode="upgrade")
         self._dl.progress.connect(self._dlg.setValue)
         self._dl.done.connect(self._upgrade_done)
@@ -986,6 +998,7 @@ class MainWindow(QMainWindow):
             self._dlg.close()
         except Exception:
             pass
+        self._timer.start(3000)               # resume the device poll
         checks = res.get("checks") or {}
         for tool in ("adb", "scrcpy"):
             c = checks.get(tool) or {}
@@ -993,10 +1006,18 @@ class MainWindow(QMainWindow):
                 self.log_panel.append(
                     f"[OK] {tool}: installed {c.get('installed')} · "
                     f"latest {c.get('latest')}")
+        unknown = res.get("unknown") or []
         if res.get("up_to_date"):
             self.log_panel.append("[OK] adb & scrcpy are already up to date.")
             QMessageBox.information(self, "Up to date",
                                     "adb and scrcpy are already the latest version.")
+        elif unknown and not res.get("updated") and not res.get("errors"):
+            # a FAILED check used to be reported as "already up to date"
+            msg = ("Couldn't check " + " / ".join(unknown) + " for updates "
+                   "(no network, or the version source is rate-limiting). "
+                   "Nothing was changed — try again in a while.")
+            self.log_panel.append(f"[WARNING] {msg}")
+            QMessageBox.warning(self, "Update check failed", msg)
         for tool, path in (res.get("updated") or {}).items():
             self.log_panel.append(f"[OK] updated {tool} → {path}")
         for tool, err in (res.get("errors") or {}).items():
@@ -1004,6 +1025,15 @@ class MainWindow(QMainWindow):
         if res.get("updated"):
             QMessageBox.information(self, "Updated",
                                     "Updated: " + ", ".join(res["updated"].keys()))
+            # a custom adb path overrides the managed download — say so
+            from . import settings as settings_mod
+            custom = (os.environ.get("TURBOADB_ADB")
+                      or (settings_mod.get("adb_path") or "").strip())
+            if "adb" in res["updated"] and custom:
+                self.log_panel.append(
+                    f"[WARNING] a custom adb path is set ({custom}) and takes "
+                    f"precedence over the freshly downloaded adb — clear it in "
+                    f"Settings → Tools (or unset TURBOADB_ADB) to use the update.")
         self._poll_devices()
 
     def _run_tools(self, mode, label, force=False):
@@ -1017,6 +1047,7 @@ class MainWindow(QMainWindow):
         self._dlg.setMinimumDuration(0)
         self._dlg.setValue(0)
         self.log_panel.append(label)
+        self._timer.stop()          # the device poll re-locks adb.exe mid-replace
         self._dl = _ToolsDownloadThread(mode=mode, force=force)
         self._dl.progress.connect(self._dlg.setValue)
         self._dl.done.connect(self._tools_done)
@@ -1027,6 +1058,11 @@ class MainWindow(QMainWindow):
             self._dlg.close()
         except Exception:
             pass
+        self._timer.start(3000)              # resume the device poll
+        if res.get("note") == "already-ensured":
+            self.log_panel.append(
+                "[INFO] tools were already checked earlier in this session — "
+                "use the 🔄 Upgrade button to force a fresh check.")
         if res.get("adb"):
             self.log_panel.append(f"[OK] adb ready: {res['adb']}")
         if res.get("scrcpy"):
@@ -1041,7 +1077,21 @@ class MainWindow(QMainWindow):
                                 "or install them manually (see Help).")
         self._poll_devices()
 
+    def _quiet_update_check(self):
+        self._upd_quiet = _AppUpdateCheckThread()
+        self._upd_quiet.result.connect(self._on_quiet_update)
+        self._upd_quiet.start()
+
+    def _on_quiet_update(self, latest):
+        if latest:
+            self.log_panel.append(
+                f"[INFO] TurboADB {latest} is available (you have "
+                f"{self._version}) — click the 🔄 Upgrade button to update.")
+
     def _ensure_shortcuts(self):
+        from . import settings as settings_mod
+        if not settings_mod.get("make_shortcut_first_run"):
+            return           # the user opted out of shortcut self-healing
         self._sc = _ShortcutThread()
         self._sc.done.connect(self._on_shortcuts)
         self._sc.start()
@@ -1094,6 +1144,8 @@ class MainWindow(QMainWindow):
                 "Could not update automatically:\n\n"
                 f"{err}\n\nUpdate manually with:\n    pip install --upgrade turboadb")
             return
+        for tool, err in (res.get("tools_errors") or {}).items():
+            self.log_panel.append(f"[WARNING] {tool} refresh failed: {err}")
         bits = []
         if res.get("adb"):
             bits.append(f"adb {res['adb']}")
@@ -1222,6 +1274,12 @@ class MainWindow(QMainWindow):
             self._timer.stop()
         except Exception:
             pass
+        # park any still-running worker threads — Qt crashes if a QThread object
+        # is destroyed (with this window) while its thread is alive
+        from .qtutil import park_thread
+        for attr in ("_poll", "_as", "_dl", "_share", "_unshare", "_deploy",
+                     "_sc", "_upd_chk", "_upd_run", "_upd_quiet"):
+            park_thread(getattr(self, attr, None))
         for i in range(self.tabs.count()):
             try:
                 self.tabs.widget(i).close_session()

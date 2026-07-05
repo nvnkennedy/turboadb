@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                              QSpinBox, QComboBox, QDialogButtonBox, QGroupBox,
-                             QLabel, QHBoxLayout, QPushButton, QWidget)
+                             QLabel, QHBoxLayout, QPushButton, QWidget,
+                             QMessageBox)
 
-from ..devices import list_devices
+from .connect_dialog import _ScanThread
+from .qtutil import park_thread
 
 _MODES = ["USB device", "Network device (Wi-Fi / Ethernet)",
           "Remote ADB server (another PC)"]
@@ -85,24 +87,41 @@ class SessionDialog(QDialog):
         self._sync()
 
     def _detect(self):
-        try:
-            self.serial.clear()
-            for d in list_devices():
-                self.serial.addItem(d.serial)
-        except Exception:
-            pass
+        self._scan_into(self.serial, None, 5037, quiet=True)
 
     def _detect_remote(self):
         host = self.srv_host.text().strip()
         if not host:
             return
-        try:
-            self.rserial.clear()
-            for d in list_devices(server_host=host, server_port=self.srv_port.value()):
-                self.rserial.addItem(d.serial)
-        except Exception as exc:
-            from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Remote ADB server", str(exc))
+        self._scan_into(self.rserial, host, self.srv_port.value(), quiet=False)
+
+    def _scan_into(self, combo, host, port, *, quiet):
+        """List devices OFF the UI thread — a remote scan blocks for up to the
+        adb timeout (15 s), which used to freeze this modal dialog."""
+        if getattr(self, "_scan", None) and self._scan.isRunning():
+            return
+        prev = combo.currentText().strip()
+        combo.clear()
+        combo.setEditText("scanning…")
+        self._scan = _ScanThread(host, port)
+        park_thread(self._scan)             # survive the dialog closing mid-scan
+
+        def done(devs):
+            combo.clear()
+            for d in devs:
+                combo.addItem(d.serial)
+            if not devs:
+                combo.setEditText(prev)
+
+        def fail(msg):
+            combo.clear()
+            combo.setEditText(prev)
+            if not quiet:
+                QMessageBox.warning(self, "Remote ADB server", msg)
+
+        self._scan.done.connect(done)
+        self._scan.fail.connect(fail)
+        self._scan.start()
 
     def _sync(self, *_):
         m = self.mode.currentIndex()

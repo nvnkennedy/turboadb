@@ -86,8 +86,28 @@ assert toolsdl._decide("37.0.0", "37.0.0") is False    # up to date
 assert toolsdl._decide("36.0.0", "37.0.0") is True     # newer available
 assert toolsdl._decide(None, "37.0.0") is True         # not installed
 assert toolsdl._decide("37.0.0", None) is None         # can't determine
+assert toolsdl._decide("38.0.0", "37.0.0") is False    # never "upgrade" to older
+assert toolsdl._decide("35.0.2-12147458", "35.0.2") is False  # format-insensitive
+assert toolsdl._decide("2.4", "3.1") is True           # scrcpy two-part versions
 assert callable(toolsdl.check_updates) and callable(toolsdl.upgrade_tools)
 print("upgrade decision OK")
+
+# ---- CLI REMAINDER '--' stripping ----
+from turboadb.cli import _words
+assert _words(["--", "getprop", "x"]) == ["getprop", "x"]
+assert _words(["getprop", "x"]) == ["getprop", "x"]
+assert _words([]) == [] and _words(None) == []
+print("cli remainder OK")
+
+# ---- logcat -T (live-only, skip the cached backlog) arg building ----
+h_args = ADBHandler(ADBConfig(serial="x"), safe=True)
+_built = []
+h_args.stream = lambda args, **kw: _built.append(list(args))   # capture argv
+h_args.logcat(tail=1)
+assert "-T" in _built[0] and _built[0][_built[0].index("-T") + 1] == "1", _built
+h_args.logcat()
+assert "-T" not in _built[1]                       # default unchanged for the API
+print("logcat tail OK")
 
 # ---- ScrcpyOptions embedding flags ----
 emb = ScrcpyOptions(window_borderless=True, window_x=0, window_y=0).to_args()

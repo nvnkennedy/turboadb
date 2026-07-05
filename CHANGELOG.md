@@ -3,6 +3,59 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.0.15
+
+- **Logcat no longer floods 100,000s of cached lines the moment you press Start.**
+  Plain `adb logcat` dumps the device's ENTIRE in-memory log buffer before
+  following live — that backlog (easily 500k old lines in seconds) is what looked
+  like a runaway stream. The Logcat tab has a new **History** selector, defaulting
+  to **Live only** (`-T 1`): you get *actual new logs from now*, with "Last
+  1,000 / 10,000 / Full buffer" available when you do want the cached history.
+  Also: the library gained `logcat(tail=N)` and the CLI `turboadb logcat --tail N`,
+  and **Pause no longer throws away** the lines that arrived while paused.
+- **"Upgrade adb/scrcpy" now actually updates — every time.** Three bugs stacked up
+  to make the update silently do nothing sometimes:
+  1. The new platform-tools were extracted **over a running adb server**, whose
+     locked `adb.exe` made the (error-suppressed) delete fail silently. The server
+     is now stopped first and the new copy is staged and **swapped in atomically**
+     (with a loud, actionable error if a file really is still locked).
+  2. A failed download was **stamped as done** anyway, so it was never retried.
+     The stamp is now written only when nothing failed.
+  3. A failed *version check* (no network, GitHub rate limit) was reported as
+     **"already up to date"**. It now says clearly that the check couldn't run.
+  Plus: versions are compared numerically (no pointless re-downloads on formatting
+  differences, never a downgrade), the **managed** copy is what gets checked,
+  the GUI pauses its 3-second device poll during the replace (it was restarting —
+  and re-locking — the server mid-swap), and a warning is shown when a custom
+  `adb path` / `TURBOADB_ADB` overrides the freshly downloaded adb.
+- **Settings no longer wipe each other.** Pressing OK in Settings used to reset
+  everything the dialog doesn't show — recent hosts, ribbon density, the remembered
+  webcam login. Unrelated keys are now preserved.
+- The two dead Startup settings now work: the **launch update check** (notify-only
+  log line; installing still only happens via the 🔄 Upgrade button) and the
+  **shortcut self-healing** opt-out.
+- **Files tab no longer freezes the window** — listing, mkdir, rename and delete
+  run off the UI thread (over a remote adb server they could block for 15+ s).
+  Same for the device scans in the target-edit dialog.
+- **Stability:** closing a tab (or the app) while a connect/scan/action thread is
+  still running no longer risks a hard crash ("QThread destroyed while running");
+  shell teardown no longer burns a 700 ms timeout per tab; "Share this PC's
+  devices" no longer races the device poll for port 5037.
+- **Honest results:** a recording that had to be force-stopped now warns it may be
+  truncated; a webcam recording that saved 0 bytes is reported as failed instead
+  of "saved"; `turboadb upgrade-tools` exits non-zero when the check couldn't run;
+  the self-update dialog now surfaces adb/scrcpy refresh failures instead of
+  showing the old versions as if they were fresh.
+- Fixed `turboadb shell -- <command>` sending a literal `--` to the device shell
+  (same for `text` / `search` / `send-sms`).
+- Hardening: zip extraction sanitizes archive paths (zip-slip); the admin-share
+  password for the remote webcam is passed via stdin instead of the command line;
+  PowerShell snippets escape quotes (shortcut creation broke for names/paths with
+  an apostrophe); stale scrollback temp files from crashed sessions are cleaned up
+  at launch; `_toggle_max` ("⛶ Max view") restores only the docks it hid.
+- Exports: `stop_shared_server`, `install_serve_task`, `uninstall_serve_task`,
+  `open_firewall`, `is_local_host` are importable from `turboadb` now.
+
 ## 1.0.14
 
 - **Remote webcam now actually connects.** The remote ffmpeg was launched as a child

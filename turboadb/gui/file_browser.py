@@ -35,6 +35,24 @@ class _TransferThread(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class _ShellThread(QThread):
+    """One device shell command off the UI thread — listing / mkdir / rename /
+    delete used to run synchronously and froze the whole window for the length
+    of the adb round-trip (up to the 15-25 s timeout over a remote server)."""
+    ok = pyqtSignal(object)                 # CommandResult
+    fail = pyqtSignal(str)
+
+    def __init__(self, handler, cmd):
+        super().__init__()
+        self.handler, self.cmd = handler, cmd
+
+    def run(self):
+        try:
+            self.ok.emit(self.handler.shell(self.cmd, safe=False))
+        except Exception as exc:
+            self.fail.emit(f"{type(exc).__name__}: {exc}")
+
+
 class FileBrowser(QWidget):
     log = pyqtSignal(str)
 
@@ -80,11 +98,22 @@ class FileBrowser(QWidget):
         self.path.setText(self.cwd)
         self.list.clear()
         self.list.addItem(self._mkitem("..", True))
-        try:
-            res = self.handler.shell(f"ls -1 -p {_q(self.cwd)}", safe=False)
-        except Exception as exc:
-            self.log.emit(f"[ERROR] ls {self.cwd}: {exc}")
-            return
+        loading = QListWidgetItem("  loading…")
+        loading.setFlags(Qt.NoItemFlags)
+        self.list.addItem(loading)
+        t = _ShellThread(self.handler, f"ls -1 -p {_q(self.cwd)}")
+        self._ls = t                        # only the LATEST listing may land
+        t.ok.connect(lambda res, t=t: self._on_ls(t, res))
+        t.fail.connect(lambda m, t=t: self._on_ls_fail(t, m))
+        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t)
+        t.start()
+
+    def _on_ls(self, t, res):
+        if t is not getattr(self, "_ls", None):
+            return                          # superseded by a newer navigation
+        self.list.clear()
+        self.list.addItem(self._mkitem("..", True))
         if not res.ok:
             self.log.emit(f"[ERROR] ls {self.cwd}: {res.stderr.strip() or res.text}")
             return
@@ -92,6 +121,13 @@ class FileBrowser(QWidget):
         for name in sorted(names, key=lambda n: (not n.endswith("/"), n.lower())):
             is_dir = name.endswith("/")
             self.list.addItem(self._mkitem(name.rstrip("/"), is_dir))
+
+    def _on_ls_fail(self, t, msg):
+        if t is not getattr(self, "_ls", None):
+            return
+        self.list.clear()
+        self.list.addItem(self._mkitem("..", True))
+        self.log.emit(f"[ERROR] ls {self.cwd}: {msg}")
 
     def _mkitem(self, name, is_dir):
         it = QListWidgetItem(("📁 " if is_dir else "📄 ") + name)
@@ -166,11 +202,8 @@ class FileBrowser(QWidget):
     def _mkdir(self):
         name, ok = QInputDialog.getText(self, "New folder", "Name:")
         if ok and name:
-            res = self._shell(f"mkdir -p {_q(posixpath.join(self.cwd, name))}")
-            if res is not None:
-                self.log.emit("[OK] mkdir " + name if res.ok
-                              else "[ERROR] mkdir: " + (res.stderr.strip() or res.text))
-            self.refresh()
+            self._run_shell(f"mkdir {name}",
+                            f"mkdir -p {_q(posixpath.join(self.cwd, name))}")
 
     def _rename(self):
         name, _ = self._selected()
@@ -180,11 +213,7 @@ class FileBrowser(QWidget):
         if ok and new:
             src = posixpath.join(self.cwd, name)
             dst = posixpath.join(self.cwd, new)
-            res = self._shell(f"mv {_q(src)} {_q(dst)}")
-            if res is not None:
-                self.log.emit("[OK] renamed" if res.ok
-                              else "[ERROR] rename: " + (res.stderr.strip() or res.text))
-            self.refresh()
+            self._run_shell(f"rename {name}", f"mv {_q(src)} {_q(dst)}")
 
     def _delete(self):
         name, is_dir = self._selected()
@@ -193,24 +222,27 @@ class FileBrowser(QWidget):
         if QMessageBox.question(self, "Delete", f"Delete {name}?") != QMessageBox.Yes:
             return
         target = posixpath.join(self.cwd, name)
-        res = self._shell(f"rm -rf {_q(target)}")
-        if res is not None:
-            self.log.emit("[OK] deleted " + name if res.ok
-                          else "[ERROR] delete: " + (res.stderr.strip() or res.text))
-        self.refresh()
+        self._run_shell(f"delete {name}", f"rm -rf {_q(target)}")
 
-    def _shell(self, cmd):
-        """Run a one-shot device shell command, returning a CommandResult or
-        None (after logging) if it raised."""
-        try:
-            return self.handler.shell(cmd, safe=False)
-        except Exception as exc:
-            self.log.emit(f"[ERROR] {exc}")
-            return None
+    def _run_shell(self, label, cmd):
+        """Run a one-shot device shell command on a worker thread, log the
+        outcome, then refresh the listing."""
+        t = _ShellThread(self.handler, cmd)
+        t.ok.connect(lambda res: (self.log.emit(
+            f"[OK] {label}" if res.ok
+            else f"[ERROR] {label}: " + (res.stderr.strip() or res.text)),
+            self.refresh()))
+        t.fail.connect(lambda m: (self.log.emit(f"[ERROR] {label}: {m}"),
+                                  self.refresh()))
+        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
+        self._threads.append(t)
+        t.start()
 
     def close_panel(self):
+        from .qtutil import park_thread
         for t in list(self._threads):
             t.wait(700)
+            park_thread(t)          # still running (slow remote) → keep it alive
 
 
 def _q(path: str) -> str:

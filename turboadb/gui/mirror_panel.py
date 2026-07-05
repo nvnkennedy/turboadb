@@ -664,8 +664,20 @@ class MirrorPanel(QWidget):
         if not isinstance(win, QMainWindow):
             return
         on = self.btn_max.isChecked()
-        for d in win.findChildren(QDockWidget):
-            d.setVisible(not on)
+        if on:
+            # only hide docks that are showing, and restore exactly those —
+            # blanket-showing everything un-hid docks the user had closed
+            self._max_hidden = [d for d in win.findChildren(QDockWidget)
+                                if d.isVisible()]
+            for d in self._max_hidden:
+                d.setVisible(False)
+        else:
+            for d in getattr(self, "_max_hidden", []):
+                try:
+                    d.setVisible(True)
+                except RuntimeError:
+                    pass
+            self._max_hidden = []
         self.btn_max.setText("⛶ Restore" if on else "⛶ Max view")
         QTimer.singleShot(200, self._fit)       # re-fit the embed to the new size
 
@@ -815,11 +827,17 @@ class MirrorPanel(QWidget):
             _post_close(self._rec_title)
             sess, self._rec_scrcpy = self._rec_scrcpy, None
             self._rec_wait = _RecWaitThread(sess, graceful=True)
-            self._rec_wait.done.connect(
-                lambda _clean: self._record_finished([self._rec_path]))
+            self._rec_wait.done.connect(self._on_rec_wait_done)
             self._rec_wait.start()
         elif self._rec_stop is not None:
             self._rec_stop.set()             # tell screenrecord to stop & pull
+
+    def _on_rec_wait_done(self, clean):
+        if not clean:
+            self.log.emit("[WARNING] the recorder didn't close cleanly and had "
+                          "to be force-stopped — the video file may be "
+                          "truncated; check it plays before relying on it")
+        self._record_finished([self._rec_path])
 
     def _record_part(self, n):
         self.status.setText(f"● Recording — part {n} (Android caps each clip at "
@@ -1204,4 +1222,9 @@ class MirrorPanel(QWidget):
         self._finalize_rec_sync()
         if self._shot is not None:
             self._shot.wait(700)
+        # keep still-running worker threads alive past this widget's destruction
+        from .qtutil import park_thread
+        park_thread(getattr(self, "_dt", None))
+        park_thread(getattr(self, "_rec_wait", None))
+        park_thread(getattr(self, "_rec_thread", None))
         self.stop()

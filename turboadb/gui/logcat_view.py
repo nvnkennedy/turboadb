@@ -110,6 +110,21 @@ class LogcatPanel(QWidget):
         self.level = QComboBox()
         self.level.addItems(["Verbose (all)", "Debug", "Info", "Warn",
                             "Error", "Fatal"])
+        # How much of the device's ALREADY-BUFFERED (cached) log to show before
+        # following live. Plain `adb logcat` dumps its whole in-memory buffer
+        # first — often hundreds of thousands of OLD lines in seconds — which
+        # looked like a runaway stream. Default = live only (-T 1).
+        self.hist = QComboBox()
+        self.hist.addItem("Live only", 1)
+        self.hist.addItem("Last 1,000 lines", 1000)
+        self.hist.addItem("Last 10,000 lines", 10000)
+        self.hist.addItem("Full buffer (all cached)", None)
+        self.hist.setToolTip(
+            "How much of the device's already-buffered log to include before "
+            "streaming live.\n\n'Live only' starts from NOW — no cached "
+            "backlog. Without this, adb dumps the device's entire in-memory "
+            "log cache first (easily 100,000+ old lines), which floods the "
+            "view the moment you press Start.")
         self.tag = QLineEdit(); self.tag.setPlaceholderText("tag (optional)")
         self.tag.setMaximumWidth(160)
         self.filt = QLineEdit(); self.filt.setPlaceholderText("regex filter (live)…")
@@ -135,11 +150,12 @@ class LogcatPanel(QWidget):
         self.btn_save = QPushButton(" Save…"); self.btn_save.setProperty("role", "ghost")
         self.btn_save.setIcon(theme.emoji_icon("💾"))
         self.btn_save.clicked.connect(self._save)
-        for w in (QLabel("Level:"), self.level, self.tag, self.filt, self.hl,
+        for w in (QLabel("Level:"), self.level, QLabel("History:"), self.hist,
+                  self.tag, self.filt, self.hl,
                   self.clear_first, self.btn_start, self.btn_pause,
                   self.btn_clear, self.btn_save):
             ctrl.addWidget(w)
-        ctrl.setStretch(3, 1)
+        ctrl.setStretch(5, 1)                  # the regex-filter box stretches
         lay.addLayout(ctrl)
 
         self.view = QPlainTextEdit(); self.view.setReadOnly(True)
@@ -207,6 +223,9 @@ class LogcatPanel(QWidget):
             except Exception:
                 pass
         args = ["logcat", "-v", fmt]
+        tailn = self.hist.currentData()
+        if tailn:                              # None = full cached buffer
+            args += ["-T", str(tailn)]
         if tag and lvl != "V":
             args += [f"{tag}:{lvl}", "*:S"]
         elif tag:
@@ -246,9 +265,8 @@ class LogcatPanel(QWidget):
         # COMPLETE capture at the source: archive every line BEFORE any on-screen
         # dropping, so the saved log is whole even when the view skips to keep up
         self._sb.archive("\n".join(lines) + "\n")
-        if self._paused:
-            self._pending.clear()
-            return
+        # while paused, keep buffering (bounded below) — clearing here meant
+        # everything logged during a pause vanished from the view on Resume
         self._pending.extend(lines)
         # hard cap the ON-SCREEN backlog so a sustained flood can never make the
         # GUI fall behind (the archive above already has every line)

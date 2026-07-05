@@ -115,9 +115,15 @@ def run_upgrade(notify=None) -> dict:
     try:
         say("Updating adb + scrcpy…")
         from . import toolsdl
-        toolsdl.upgrade_tools(notify=say)
+        up = toolsdl.upgrade_tools(notify=say) or {}
         res["adb"] = toolsdl.installed_adb_version()
         res["scrcpy"] = toolsdl.installed_scrcpy_version()
+        terr = up.get("errors") or {}
+        if terr:
+            # surface failures instead of silently reporting the OLD versions
+            res["tools_errors"] = terr
+            for tool, err in terr.items():
+                say(f"[WARNING] {tool} update failed: {err}")
     except Exception as exc:
         say(f"adb/scrcpy refresh skipped: {exc}")
     return res

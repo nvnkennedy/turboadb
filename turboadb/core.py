@@ -1274,7 +1274,8 @@ class ADBHandler:
                fmt: str = "threadtime", tag: Optional[str] = None,
                priority: Optional[str] = None,
                filterspecs: Optional[Sequence[str]] = None,
-               dump: bool = False, on_line=None, on_match=None, match=None,
+               dump: bool = False, tail: Optional[int] = None,
+               on_line=None, on_match=None, match=None,
                stop_on_match: bool = False, save_to: Optional[str] = None,
                append: bool = True, clean: bool = True,
                timeout: Optional[float] = None, stop_event=None,
@@ -1291,6 +1292,11 @@ class ADBHandler:
                            filters that tag; alone it sets ``*:PRIORITY``.
         :param filterspecs: explicit ``TAG:LEVEL`` specs (overrides tag/priority).
         :param dump:       ``-d`` — dump the current buffer and exit (no live).
+        :param tail:       ``-T N`` — start from only the last *N* buffered
+                           lines, then stream live. Without it, adb dumps the
+                           device's ENTIRE in-memory log buffer first (often
+                           hundreds of thousands of cached lines) before
+                           following — pass ``tail=1`` for live-only output.
         :param match:      regex; matching lines collected + trigger on_match.
         :param clear_first: run ``logcat -c`` before streaming (fresh start).
 
@@ -1302,6 +1308,8 @@ class ADBHandler:
         args = ["logcat"]
         if dump:
             args.append("-d")
+        if tail and not dump:
+            args += ["-T", str(int(tail))]
         if fmt:
             args += ["-v", fmt]
         for b in (buffers or []):

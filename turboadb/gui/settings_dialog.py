@@ -131,9 +131,11 @@ class SettingsDialog(QDialog):
         w = QWidget(); v = QVBoxLayout(w)
         self.docs = QCheckBox("Open docs on first run")
         self.docs.setChecked(self.cfg.get("open_docs_first_run", True))
-        self.shortcut = QCheckBox("Create a desktop shortcut on first run")
+        self.shortcut = QCheckBox("Keep the Desktop + Start-menu shortcuts "
+                                  "(recreated at every launch, self-healing)")
         self.shortcut.setChecked(self.cfg.get("make_shortcut_first_run", True))
-        self.autoupd = QCheckBox("Check PyPI for a newer TurboADB at launch")
+        self.autoupd = QCheckBox("Check PyPI for a newer TurboADB at launch "
+                                 "(notify in the log only — never auto-installs)")
         self.autoupd.setChecked(self.cfg.get("auto_update", True))
         v.addWidget(self.docs); v.addWidget(self.shortcut); v.addWidget(self.autoupd)
         return w
@@ -144,7 +146,11 @@ class SettingsDialog(QDialog):
         super().reject()
 
     def result_settings(self) -> dict:
-        return {
+        # start from the FULL loaded settings so keys this dialog doesn't show
+        # (recent hosts, ribbon density, remembered webcam login, …) survive —
+        # returning only the dialog's keys used to reset them all on every OK
+        out = dict(self.cfg)
+        out.update({
             "theme": self.theme.currentText(),
             "term_font": self.font.currentFont().family(),
             "term_font_size": self.font_size.value(),
@@ -161,7 +167,8 @@ class SettingsDialog(QDialog):
             "open_docs_first_run": self.docs.isChecked(),
             "make_shortcut_first_run": self.shortcut.isChecked(),
             "auto_update": self.autoupd.isChecked(),
-        }
+        })
+        return out
 
 
 def _browse_row(line_edit: QLineEdit, parent) -> QWidget:

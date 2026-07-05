@@ -71,6 +71,20 @@ if (Test-Path $exe) { 'FFMPEG:' + $exe } else {
 """
 
 
+def _ps_squote(s: str) -> str:
+    """Escape a value for use inside a single-quoted PowerShell string."""
+    return (s or "").replace("'", "''")
+
+
+def _clean_cam(camera: str) -> str:
+    """Strip characters from a camera name that PowerShell would interpret
+    inside the generated script (quotes, backticks, $-expansion, newlines)."""
+    out = camera or ""
+    for ch in ('"', "`", "$", "\r", "\n"):
+        out = out.replace(ch, "")
+    return out
+
+
 def _run_ps(host, login, password, script, winrm_port=5985):
     r = _session(host, login, password, winrm_port=winrm_port).run_ps(script)
     out = (r.std_out or b"").decode("utf-8", "replace")
@@ -93,10 +107,13 @@ def _smb_push(host, login, password, local_ffmpeg, log=None):
     share = rf"\\{host}\C$"
     remote_dir = rf"{share}\Windows\Temp\turboadb-ffmpeg"
     remote_exe = rf"{remote_dir}\ffmpeg.exe"
-    # authenticate to the share with the remote creds (clear any stale mapping first)
+    # authenticate to the share with the remote creds (clear any stale mapping
+    # first). The password goes via stdin ('*' makes net use prompt) so it never
+    # appears on the command line, where any process viewer could read it.
     subprocess.run(["net", "use", share, "/delete", "/y"],
                    capture_output=True, creationflags=_NO_WINDOW)
-    r = subprocess.run(["net", "use", share, f"/user:{login}", password],
+    r = subprocess.run(["net", "use", share, f"/user:{login}", "*"],
+                       input=password + "\r\n",
                        capture_output=True, text=True, timeout=40,
                        creationflags=_NO_WINDOW)
     if r.returncode != 0:
@@ -175,7 +192,7 @@ def list_remote_cameras(host, login, password, *, winrm_port=5985, log=None):
     ffmpeg = ensure_remote_ffmpeg(host, login, password, winrm_port=winrm_port, log=log)
     if log:
         log("Listing cameras on the remote machine…")
-    script = (f"$ff = '{ffmpeg}'\n"
+    script = (f"$ff = '{_ps_squote(ffmpeg)}'\n"
               f"$o = (& $ff -hide_banner -list_devices true -f dshow -i dummy "
               f"2>&1 | Out-String)\n$o\n")
     code, out, err = _run_ps(host, login, password, script, winrm_port)
@@ -201,7 +218,7 @@ def start_remote_stream(host, login, password, camera, ffmpeg, *, width=1280,
     instant the WinRM shell closes, so it never starts listening (connection
     refused). ``listen_timeout`` lets it wait for our connection, and any stale
     ffmpeg on the port is killed first (it would hold the camera)."""
-    cam = (camera or "").replace('"', "")
+    cam = _clean_cam(camera)
     rule = f"TurboADB Webcam {stream_port}"
     cmd_line = (f'"{ffmpeg}" -hide_banner -loglevel error -f dshow -rtbufsize 64M '
                 f'-i video="{cam}" -an -vf scale={int(width)}:{int(height)} '
@@ -254,8 +271,8 @@ def stop_remote_stream(host, login, password, pid, *, winrm_port=5985,
 def probe_remote_camera(host, login, password, camera, ffmpeg, *, winrm_port=5985):
     """Run a short verbose ffmpeg capture on the remote and return its log, so a
     'no video' case shows the real reason (in use / privacy / Session-0)."""
-    cam = (camera or "").replace('"', "")
-    script = (f"$ff = '{ffmpeg}'\n"
+    cam = _clean_cam(camera)
+    script = (f"$ff = '{_ps_squote(ffmpeg)}'\n"
               f'$o = (& $ff -hide_banner -loglevel verbose -f dshow -rtbufsize 64M '
               f'-i video="{cam}" -frames:v 1 -f null - 2>&1 | Out-String)\n$o\n')
     try:

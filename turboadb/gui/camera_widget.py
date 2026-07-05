@@ -757,10 +757,24 @@ class CameraPanel(QWidget):
         self.rec_btn.setText("⏺ Record")
         path, self._rec_path = self._rec_path, None
         if path:
-            self._show_link(path)
-            self.log.emit(f"[OK] recording saved: {path}")
-            if self.reader is not None:
-                self._set_status("Recording saved ✓ — still viewing", "ok")
+            # verify the encoder actually wrote data — with stderr discarded, a
+            # failed ffmpeg (e.g. an old custom build) used to log "saved" for
+            # an empty file
+            try:
+                ok = os.path.getsize(path) > 0
+            except OSError:
+                ok = False
+            if ok:
+                self._show_link(path)
+                self.log.emit(f"[OK] recording saved: {path}")
+                if self.reader is not None:
+                    self._set_status("Recording saved ✓ — still viewing", "ok")
+            else:
+                self.log.emit(f"[ERROR] the recording saved no data → {path} "
+                              "(the ffmpeg encoder didn't start; if a custom/"
+                              "older ffmpeg is set in Settings → Tools, clear "
+                              "it so the downloaded one is used)")
+                self._set_status("Recording failed (empty file)", "error")
 
     def _toggle_pause(self):
         self._paused = not self._paused

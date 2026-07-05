@@ -344,12 +344,15 @@ class ShellPanel(QWidget):
 
     def close_panel(self):
         self._closing = True
-        if self._pt:
-            self._pt.wait(700)
-        if self.reader:
-            self.reader.stop(); self.reader.wait(700)
+        # close the SESSION first: the reader is blocked in a read and its stop
+        # flag alone never unblocks it — waiting before closing just burned the
+        # full 700 ms timeout on every tab close
         if self.session:
             self.session.close()
+        if self.reader:
+            self.reader.stop(); self.reader.wait(700)
+        if self._pt:
+            self._pt.wait(700)
         try:
             self.term.close_archive()           # drop the temp scrollback file
         except Exception:
@@ -577,6 +580,11 @@ class DeviceTab(QWidget):
         # a combined "easy control" view: the screen + the controls side by side
         self.combo_view = self._build_control_view(handler)
         self._add_subtab(self.combo_view, "🎮", "Control + Mirror")
+        # name -> widget, so show_subtab survives any reordering of the tabs
+        self._subtabs = {"shell": self.shell, "logcat": self.logcat,
+                         "files": self.files, "apps": self.apps,
+                         "controls": self.controls, "phone": self.phone,
+                         "mirror": self.mirror_tab, "webcam": self.webcam}
 
     def _add_subtab(self, widget, emoji, label):
         idx = self.inner.addTab(widget, label)
@@ -625,10 +633,9 @@ class DeviceTab(QWidget):
                 "output to a file.")
 
     def show_subtab(self, name: str):
-        names = {"shell": 0, "logcat": 1, "files": 2, "apps": 3,
-                 "controls": 4, "phone": 5, "mirror": 6, "webcam": 7}
-        if self.handler and name in names:
-            self.inner.setCurrentIndex(names[name])
+        w = getattr(self, "_subtabs", {}).get(name)
+        if self.handler and w is not None:
+            self.inner.setCurrentWidget(w)
 
     # --- actions: the Mirror tab hosts scrcpy (separate window by default,
     #     or embedded inside the tab when you opt in) ---
@@ -685,6 +692,21 @@ class DeviceTab(QWidget):
         self._threads.append(t); t.start()
 
     def close_session(self):
+        # park still-running worker threads (connect / reconnect / actions):
+        # letting Qt destroy a running QThread with this widget crashes the app
+        # (e.g. closing a tab while a slow remote connect is in flight)
+        from .qtutil import park_thread
+        for attr in ("_ct", "_rc"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                for sig in ("ok", "fail", "log", "done"):
+                    try:
+                        getattr(t, sig).disconnect()
+                    except Exception:
+                        pass
+                park_thread(t)
+        for t in list(self._threads):
+            park_thread(t)
         for attr in ("shell", "logcat", "files", "apps", "controls", "phone",
                      "mirror_tab", "webcam", "cv_mirror", "cv_controls"):
             p = getattr(self, attr, None)

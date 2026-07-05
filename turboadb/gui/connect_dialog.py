@@ -260,6 +260,8 @@ class ConnectDialog(QDialog):
         if self._scan and self._scan.isRunning():
             return
         self._scan = _ScanThread(host, port)
+        from .qtutil import park_thread
+        park_thread(self._scan)     # survive the dialog closing mid-scan
         self._scan.done.connect(lambda devs: (on_done(devs),
                                               status_label.setText(
                                                   f"{len(devs)} device(s)")))

@@ -112,15 +112,17 @@ def _write_shortcut(folder_expr: str, name: str) -> bool:
         return False
     target, args, workdir = _resolve_gui_target()
     icon = _icon_path()
+    q = lambda s: str(s).replace("'", "''")   # for PS single-quoted strings —
+    # a user name / path containing an apostrophe broke the whole script
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$dir = {folder_expr}; "
         "if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; "
-        f"$lnk = $ws.CreateShortcut([IO.Path]::Combine($dir, '{name}.lnk')); "
-        f"$lnk.TargetPath = '{target}'; "
-        + (f"$lnk.Arguments = '{args}'; " if args else "")
-        + f"$lnk.WorkingDirectory = '{workdir}'; "
-        + (f"$lnk.IconLocation = '{icon}'; " if os.path.exists(icon) else "")
+        f"$lnk = $ws.CreateShortcut([IO.Path]::Combine($dir, '{q(name)}.lnk')); "
+        f"$lnk.TargetPath = '{q(target)}'; "
+        + (f"$lnk.Arguments = '{q(args)}'; " if args else "")
+        + f"$lnk.WorkingDirectory = '{q(workdir)}'; "
+        + (f"$lnk.IconLocation = '{q(icon)}'; " if os.path.exists(icon) else "")
         + "$lnk.Description = 'TurboADB - Android ADB + scrcpy toolkit'; "
         "$lnk.Save()"
     )
@@ -373,6 +375,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_log.add_argument("--stop-on-match", action="store_true")
     p_log.add_argument("--clear", action="store_true", help="logcat -c first")
     p_log.add_argument("--dump", action="store_true", help="-d: dump then exit")
+    p_log.add_argument("--tail", type=int, default=None, metavar="N",
+                       help="start from only the last N buffered lines, then "
+                            "stream live (-T N) — skips the device's cached "
+                            "backlog, which can be 100k+ old lines")
 
     p_clear = sub.add_parser("logcat-clear", help="clear logcat buffers (-c)")
     _add_target(p_clear)
@@ -601,6 +607,15 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # command dispatch
 # --------------------------------------------------------------------------- #
+def _words(ws):
+    """argparse keeps the '--' separator in a REMAINDER list, so the documented
+    ``turboadb shell -- getprop …`` sent a literal '--' to the device — drop it."""
+    ws = list(ws or [])
+    if ws and ws[0] == "--":
+        ws = ws[1:]
+    return ws
+
+
 def _ensure_progress(pct):
     sys.stderr.write(f"\r  {pct:3d}%")
     sys.stderr.flush()
@@ -665,12 +680,22 @@ def main(argv=None) -> int:
             for tool in ("adb", "scrcpy"):
                 c = checks[tool]
                 state = ("up to date" if c["upgrade"] is False else
-                         "UPDATE AVAILABLE" if c["upgrade"] else "unknown")
+                         "UPDATE AVAILABLE" if c["upgrade"]
+                         else "unknown (couldn't check)")
                 print(f"{tool:7}: installed={c['installed']}  "
                       f"latest={c['latest']}  -> {state}")
             if args.check:
                 return 0
-            if not (checks["adb"]["upgrade"] or checks["scrcpy"]["upgrade"]):
+            if not (checks["adb"]["upgrade"] is True
+                    or checks["scrcpy"]["upgrade"] is True):
+                unknown = [t for t in ("adb", "scrcpy")
+                           if checks[t]["upgrade"] is None]
+                if unknown:
+                    # a failed check is NOT "everything is current"
+                    print(f"\nCouldn't check {', '.join(unknown)} for updates "
+                          f"(network / rate limit) — try again in a while.",
+                          file=sys.stderr)
+                    return 1
                 print("\nEverything is current — nothing to download.")
                 return 0
             res = toolsdl.upgrade_tools(
@@ -827,7 +852,7 @@ def main(argv=None) -> int:
         if cmd == "info":
             _output(args, dev.device_info())
         elif cmd == "shell":
-            command = " ".join(args.command).strip()
+            command = " ".join(_words(args.command)).strip()
             if not command:
                 print("No command given.", file=sys.stderr)
                 return 2
@@ -849,7 +874,7 @@ def main(argv=None) -> int:
                                  match=args.match, save_to=args.save,
                                  stop_on_match=args.stop_on_match,
                                  clear_first=args.clear, dump=args.dump,
-                                 on_line=print)
+                                 tail=args.tail, on_line=print)
                 if args.match:
                     print(f"\n[{len(res.matches)} matched lines]", file=sys.stderr)
             except KeyboardInterrupt:
@@ -917,7 +942,7 @@ def main(argv=None) -> int:
         elif cmd == "key":
             print("ok" if dev.keyevent(args.key) else "failed")
         elif cmd == "text":
-            dev.input_text(" ".join(args.words)); print("typed")
+            dev.input_text(" ".join(_words(args.words))); print("typed")
         elif cmd == "scroll":
             dev.scroll(args.direction); print(f"scrolled {args.direction}")
         elif cmd == "tap":
@@ -946,7 +971,7 @@ def main(argv=None) -> int:
         elif cmd == "open":
             dev.open_url(args.url); print(f"opened {args.url}")
         elif cmd == "search":
-            q = " ".join(args.query); dev.web_search(q); print(f"searched {q!r}")
+            q = " ".join(_words(args.query)); dev.web_search(q); print(f"searched {q!r}")
         elif cmd == "camera":
             print("opened camera" if dev.open_camera() else "no camera app found")
         elif cmd == "gallery":
@@ -981,7 +1006,7 @@ def main(argv=None) -> int:
                 print(f"{r.get('type','?'):2} {r.get('address',''):14} "
                       f"{(r.get('body') or '')[:60]!r}")
         elif cmd == "send-sms":
-            dev.send_sms(args.number, " ".join(args.body))
+            dev.send_sms(args.number, " ".join(_words(args.body)))
             print(f"compose opened: {args.number}")
         return 0
 

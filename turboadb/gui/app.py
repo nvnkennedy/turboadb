@@ -48,6 +48,23 @@ def _install_excepthook():
     sys.excepthook = hook
 
 
+def _sweep_stale_logs():
+    """Scrollback temp files are removed on clean close; after a crash they
+    linger in ~/.turboadb/logs forever — drop anything older than 3 days."""
+    import glob
+    import time
+    try:
+        cutoff = time.time() - 3 * 86400
+        for p in glob.glob(os.path.join(_FLAG_DIR, "logs", "turboadb-*.log")):
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _first_run_tasks():
     """Open the docs the first time the app runs. (Desktop + Start-menu shortcuts
     are created/refreshed every launch by the main window, so they self-heal.)"""
@@ -101,6 +118,7 @@ def main():
         pass
     _install_excepthook()
     _first_run_tasks()
+    _sweep_stale_logs()
 
     global _window
     _window = MainWindow()
