@@ -3,6 +3,60 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.1
+
+The **1.1 feature release** — the work that landed across 1.0.15–1.0.19,
+promoted to a stable minor, plus the CI/packaging fixes that make it build
+cleanly from source on every supported Python. Detailed per-patch notes remain
+below.
+
+**Devices & connectivity**
+- **Wi-Fi device discovery** on the LAN (`adb mdns services`) — Device / Connect
+  menu, `turboadb discover`, and `turboadb.mdns_devices()`.
+- **One-click go-wireless** (USB → Wi-Fi): reads the device IP, `adb tcpip`,
+  reconnects — then the cable can be unplugged. `turboadb wireless` /
+  `handler.go_wireless()`.
+- **Run a command on ALL connected devices** at once from the GUI.
+
+**Diagnostics**
+- **Device health snapshot** (battery / temperature / memory / CPU / uptime) —
+  the ❤ Health button, `turboadb health`, `handler.health()`.
+- **Bugreport capture** and a one-click **logcat crash preset** (crash buffer,
+  Error level, FATAL/ANR highlighting); the live filter re-filters what's already
+  on screen.
+- **Logcat "Live only" by default** — no more flood of the device's cached
+  backlog when you press Start; pick how much history you want.
+
+**Automotive / IVI**
+- Apps tab lists **all apps** on automotive builds (not just third-party), with
+  extra launch fallbacks that reach in-house/system apps that have no launcher
+  activity.
+- Wi-Fi / Bluetooth / airplane toggles use the modern `cmd` interfaces on
+  Android 12+ and report an **honest "permission-denied"** when a locked-down
+  head unit refuses, instead of a fake "ok".
+
+**Mirroring & remote**
+- **Smoother, sharper Live View** (adaptive frame rate, decode + scale off the UI
+  thread, cached capture method) and **better scrcpy over RDP** (1280 px / 8 Mbps,
+  linear SDL scaling, no resize thrash).
+- **Remote-deploy credentials remembered** (user in settings, password in the OS
+  vault) with a blocking, summarised deploy popup and bounded WinRM timeouts;
+  optional WinRM-over-HTTPS.
+
+**Files, targets, webcam**
+- Drag-and-drop upload in the Files tab (off the UI thread); **export / import**
+  saved targets; sidebar no longer repeats an auto-named target.
+
+**Quality & packaging**
+- On-demand adb/scrcpy downloads are **SHA-256 + CRC verified**, ETag-cached
+  (no more GitHub rate-limit false "up to date"), with a `.old` rollback copy and
+  a reliable, atomic in-place update.
+- A real **pytest suite** with a fake-adb harness, **GitHub Actions CI**
+  (Windows + Linux, Python 3.8–3.13) with ruff lint and a build check, a tagged
+  **release** workflow, and a **concurrency-controlled Pages** deploy.
+- Ships type hints (`py.typed`); portable `license` metadata so source installs
+  work on Python 3.8.
+
 ## 1.0.19
 
 - **Packaging fix: installs from source on Python 3.8 again.** `pyproject.toml`
