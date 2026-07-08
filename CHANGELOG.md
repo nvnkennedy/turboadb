@@ -3,6 +3,32 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.4
+
+Makes typing actually work on every device, and de-clutters the mirror toolbar.
+
+- **A device-keyboard bar that always works.** Whenever you're mirroring or in
+  Live View, a keyboard field appears under the screen: click it and every key
+  you press — letters, digits, Enter, Backspace, Tab, arrows, and pasted text —
+  is sent straight to the device over adb (`input text` / `keyevent`). Because
+  it's a normal field inside TurboADB, it does **not** depend on any Win32
+  window-focus behaviour, so it types reliably on a **normal phone and on an IVI
+  head unit alike**, whether the mirror is embedded or in its own window, local
+  or over RDP. This is now the primary, guaranteed way to type.
+- **Embedded-window keyboard reworked.** The embed now converts the scrcpy
+  window to a proper `WS_CHILD` child (the standard approach real embedders use)
+  and, on the 🎯 Mirror keys button, brings TurboADB to the foreground and hands
+  keyboard focus to the child (Alt-nudge + `AttachThreadInput` + `SetFocus`).
+  When it works you type directly into scrcpy; when a given GPU/RDP session
+  won't cooperate, the keyboard bar above still types. (The embed + child focus
+  routing were validated with a cross-process test harness; end-to-end
+  synthesised keystrokes depend on window foreground, which only a real click
+  provides — hence the always-available bar.)
+- **De-cluttered mirror toolbar.** Down from ~13 wrapping buttons to a clean
+  row: **▶ Mirror · 🖥 Live View · ■ Stop · 🔴 Record · 📸 Screenshot · Display ·
+  ⚙ Options · ⋯ More**. Camera, Mirror-all-displays, Re-scan, Type-a-block and
+  Max-view moved into the **⋯ More** menu.
+
 ## 1.1.3
 
 UI revamp for the mirror options and the Control + Mirror view.

@@ -278,6 +278,25 @@ def test_vtuple():
 
 
 # --------------------------------------------------------------------------- #
+# device-keyboard bar mapping (the guaranteed embedded-typing path)
+# --------------------------------------------------------------------------- #
+def test_device_key_edit_mapping():
+    """Qt key events -> ('text', str) or ('key', android_keycode). Pure map, no
+    Qt widgets / adb needed — this is what forwards typing to the device
+    regardless of window focus."""
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtCore import Qt
+    from turboadb.gui.mirror_panel import _DeviceKeyEdit as K
+    assert K.map_event(Qt.Key_A, "a") == ("text", "a")
+    assert K.map_event(Qt.Key_5, "5") == ("text", "5")
+    assert K.map_event(Qt.Key_Return, "\r") == ("key", 66)      # ENTER
+    assert K.map_event(Qt.Key_Backspace, "\b") == ("key", 67)   # DEL
+    assert K.map_event(Qt.Key_Left, "") == ("key", 21)          # DPAD_LEFT
+    assert K.map_event(Qt.Key_Tab, "\t") == ("key", 61)
+    assert K.map_event(Qt.Key_Shift, "") == (None, None)        # modifier alone
+
+
+# --------------------------------------------------------------------------- #
 # scrcpy option translation
 # --------------------------------------------------------------------------- #
 def test_scrcpy_options_render_driver_uses_equals():

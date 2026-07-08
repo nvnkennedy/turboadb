@@ -15,9 +15,11 @@ import time
 import subprocess
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QStandardPaths
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QCheckBox, QInputDialog,
-                             QMessageBox, QFileDialog, QToolButton, QMenu)
+                             QLineEdit, QMessageBox, QFileDialog, QToolButton,
+                             QMenu)
 
 from ..config import ScrcpyOptions
 from ..results import OperationResult
@@ -66,6 +68,12 @@ def _win_api():
     u.AttachThreadInput.restype = wintypes.BOOL
     u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD,
                                     wintypes.BOOL]
+    u.GetAncestor.restype = wintypes.HWND
+    u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    u.SetForegroundWindow.restype = wintypes.BOOL
+    u.SetForegroundWindow.argtypes = [wintypes.HWND]
+    u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD,
+                              ctypes.c_void_p]
     return ctypes, u
 
 
@@ -79,21 +87,27 @@ _SWP_FRAMECHANGED = 0x0020
 
 
 def _reparent(child_hwnd, parent_hwnd, w, h):
-    """Adopt the scrcpy/SDL window as a REAL Win32 child.
+    """Adopt the scrcpy/SDL window as a real Win32 child (WS_CHILD) — the same
+    approach every embedder (VLC, mpv, Chromium plugin host) uses.
 
-    The old 'minimal' version did SetParent without rewriting the window style.
-    That leaves the window a top-level popup glued into our widget: Windows then
-    treats keyboard **activation/focus** as belonging to a top-level window that
-    can never be activated — mouse mostly worked, typing NEVER reached scrcpy
-    (while plain scrcpy in its own window typed fine). Converting to WS_CHILD is
-    what makes it a first-class child that can hold keyboard focus."""
+    A window is only a first-class part of the parent's focus/activation chain
+    when it carries the WS_CHILD style; a bare SetParent leaves it a top-level
+    popup that Windows activates separately, so a real click into it fights the
+    parent for activation. Converting to WS_CHILD is what lets a mouse click
+    route keyboard focus to it normally.
+
+    NOTE: this is the correct standard path for real user clicks. It cannot be
+    fully verified with synthesised keystrokes (those depend on foreground
+    acquisition, which is unreliable to force programmatically) — but the
+    device-keyboard bar is the guaranteed-working keyboard path regardless of
+    how this plays out on any given GPU/RDP session."""
     _ctypes, u = _win_api()
     getter = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
     setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+    u.SetParent(child_hwnd, parent_hwnd)
     style = getter(child_hwnd, _GWL_STYLE)
     style = (style | _WS_CHILD) & ~(_WS_POPUP | _WS_CAPTION | _WS_THICKFRAME)
     setter(child_hwnd, _GWL_STYLE, style)
-    u.SetParent(child_hwnd, parent_hwnd)
     u.SetWindowPos(child_hwnd, None, 0, 0, max(1, w), max(1, h),
                    _SWP_NOZORDER | _SWP_FRAMECHANGED)
     u.ShowWindow(child_hwnd, 5)   # SW_SHOW
@@ -101,14 +115,26 @@ def _reparent(child_hwnd, parent_hwnd, w, h):
 
 def _focus_window(hwnd) -> None:
     """Give KEYBOARD focus to the embedded (cross-process) scrcpy window.
-    SetFocus only works within the calling thread's input queue, so attach to
-    the scrcpy window's thread first — the standard Win32 pattern for focusing
-    an embedded foreign window."""
+
+    Brings TurboADB to the foreground first (the Alt-key nudge unlocks
+    SetForegroundWindow for our own process), then — because SetFocus only acts
+    within the caller thread's input queue — attaches to the scrcpy window's
+    input thread before SetFocus. Standard Win32 pattern for focusing an
+    embedded foreign window."""
     if not hwnd:
         return
     try:
         ctypes, u = _win_api()
         k = ctypes.windll.kernel32
+        # 1) make sure OUR top-level window is the active/foreground one, or the
+        #    keystrokes route nowhere useful (the Alt tap satisfies Windows'
+        #    foreground-change rule for our own process)
+        top = u.GetAncestor(hwnd, 2) if hasattr(u, "GetAncestor") else 0  # GA_ROOT
+        if top:
+            u.keybd_event(0x12, 0, 0, 0)          # VK_MENU down
+            u.keybd_event(0x12, 0, 0x0002, 0)     # VK_MENU up
+            u.SetForegroundWindow(top)
+        # 2) attach to the scrcpy thread's input queue, then focus its window
         target_tid = u.GetWindowThreadProcessId(hwnd, None)
         my_tid = k.GetCurrentThreadId()
         attached = False
@@ -335,6 +361,107 @@ class _LiveView(QLabel):
         self._press = None
 
 
+class _DeviceKeyEdit(QLineEdit):
+    """A keyboard-capture field: every keystroke is forwarded to the device (via
+    the panel's ``send`` callback) instead of edited locally, so typing here IS
+    typing on the device — Enter, Backspace, arrows and all. The field itself
+    stays empty (it's a wire, not a buffer)."""
+
+    _KEYMAP = {
+        Qt.Key_Return: 66, Qt.Key_Enter: 66, Qt.Key_Backspace: 67,
+        Qt.Key_Tab: 61, Qt.Key_Escape: 111, Qt.Key_Delete: 112,
+        Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Left: 21, Qt.Key_Right: 22,
+        Qt.Key_Home: 122, Qt.Key_End: 123,
+        Qt.Key_PageUp: 92, Qt.Key_PageDown: 93,
+    }
+
+    def __init__(self, send, parent=None):
+        super().__init__(parent)
+        self._send = send                # send("text", str) / send("key", code)
+
+    @classmethod
+    def map_event(cls, key, text):
+        """(kind, payload) for a Qt key event — pure + unit-testable."""
+        if key in cls._KEYMAP:
+            return "key", cls._KEYMAP[key]
+        if text and text.isprintable():
+            return "text", text
+        return None, None
+
+    def keyPressEvent(self, event):
+        # paste lands as one text batch
+        if event.matches(QKeySequence.Paste):
+            from PyQt5.QtWidgets import QApplication
+            txt = QApplication.clipboard().text()
+            if txt:
+                self._send("text", txt)
+            return
+        kind, payload = self.map_event(event.key(), event.text())
+        if kind is None:
+            super().keyPressEvent(event)     # let Qt handle what we don't map
+            return
+        self._send(kind, payload)
+
+
+class _KeyPumpThread(QThread):
+    """Serialises the keyboard-bar events into adb calls off the UI thread,
+    coalescing bursts of printable characters into single ``input text`` calls
+    so fast typing stays fluid."""
+    note = pyqtSignal(str)
+
+    def __init__(self, handler):
+        super().__init__()
+        self.handler = handler
+        import queue
+        self._q = queue.Queue()
+        self._stop = False
+
+    def push(self, kind, payload):
+        self._q.put((kind, payload))
+
+    def stop(self):
+        self._stop = True
+        self._q.put(None)
+
+    def run(self):
+        import queue
+        while not self._stop:
+            item = self._q.get()
+            if item is None or self._stop:
+                break
+            kind, payload = item
+            try:
+                if kind == "text":
+                    buf = payload
+                    # coalesce whatever printable text queued up meanwhile
+                    while True:
+                        try:
+                            nxt = self._q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if nxt is None:
+                            self._stop = True
+                            break
+                        if nxt[0] == "text":
+                            buf += nxt[1]
+                        else:
+                            self._flush_text(buf); buf = ""
+                            self._do_key(nxt[1])
+                    if buf:
+                        self._flush_text(buf)
+                else:
+                    self._do_key(payload)
+            except Exception as exc:
+                self.note.emit(f"[WARNING] device keyboard: {exc}")
+
+    def _flush_text(self, s):
+        if s:
+            self.handler.input_text(s, safe=False)
+
+    def _do_key(self, code):
+        self.handler.keyevent(code, safe=False)
+
+
 class _RecWaitThread(QThread):
     """Wait for the recording scrcpy process to finish writing the file after a
     polite WM_CLOSE. If it doesn't exit in time, force it. Emits whether it ended
@@ -512,66 +639,65 @@ class MirrorPanel(QWidget):
         self.btn_shot.setToolTip("Capture a PNG of the screen (works on any "
                                  "device — phone, tablet or head unit).")
         self.btn_shot.clicked.connect(self._take_screenshot)
-        self.btn_type = QPushButton("⌨ Type…"); self.btn_type.setProperty("role", "ghost")
-        self.btn_type.setToolTip("Type text into the focused field on the device "
-                                 "via adb — the reliable way to enter a URL etc. "
-                                 "when the on-screen / physical keyboard won't "
-                                 "type through the mirror.")
-        self.btn_type.clicked.connect(self._type_text)
-        self.btn_displays = QPushButton("↻ Displays"); self.btn_displays.setProperty("role", "ghost")
-        self.btn_displays.setToolTip("Re-scan the device's displays.")
-        self.btn_displays.clicked.connect(self.refresh_displays)
-        self.btn_mirror_all = QPushButton("▦ Mirror all"); self.btn_mirror_all.setProperty("role", "ghost")
-        self.btn_mirror_all.setToolTip("Mirror EVERY display at once, each in its "
-                                       "own window — handy on an IVI with cluster + "
-                                       "centre + passenger screens. Best on local / "
-                                       "USB (a remote server shares one video "
-                                       "tunnel, so it can only do one at a time).")
-        self.btn_mirror_all.clicked.connect(self._mirror_all)
-        self.btn_camera = QPushButton("📷 Camera"); self.btn_camera.setProperty("role", "ghost")
-        self.btn_camera.setToolTip("Mirror the device CAMERA instead of the screen "
-                                   "(needs scrcpy 2.2+ and Android 12+). Pick front "
-                                   "or back under ⚙ Options.")
-        self.btn_camera.clicked.connect(self._mirror_camera)
-        self.btn_max = QPushButton("⛶ Max view"); self.btn_max.setProperty("role", "ghost")
-        self.btn_max.setCheckable(True)
-        self.btn_max.setToolTip("Hide the log + sidebar so the screen gets the "
-                                "full window — much bigger for a portrait device.")
-        self.btn_max.clicked.connect(self._toggle_max)
-        for w in (self.btn_mirror, self.btn_live, self.btn_camera, self.btn_stop,
-                  self.btn_record, self.btn_shot, self.btn_type, self.btn_opts,
-                  QLabel("Display:"), self.cmb_display, self.btn_displays,
-                  self.btn_mirror_all, self.btn_max):
+        # secondary actions live in ONE ⋯ More menu — thirteen buttons in a
+        # wrapping row was the "cluttered" look; the toolbar is now 8 items
+        self.btn_more = QToolButton(); self.btn_more.setText("⋯ More")
+        self.btn_more.setProperty("role", "ghost")
+        self.btn_more.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_more.setPopupMode(QToolButton.InstantPopup)
+        mmore = QMenu(self.btn_more)
+        mmore.addAction("📷  Mirror the device camera", self._mirror_camera)
+        self.act_mirror_all = mmore.addAction(
+            "▦  Mirror ALL displays (each in its own window)", self._mirror_all)
+        self.act_mirror_all.setEnabled(False)
+        mmore.addAction("↻  Re-scan displays", self.refresh_displays)
+        mmore.addSeparator()
+        mmore.addAction("⌨  Type / paste a block of text…", self._type_text)
+        mmore.addSeparator()
+        self.act_max = mmore.addAction("⛶  Max view (hide side panels)")
+        self.act_max.setCheckable(True)
+        self.act_max.toggled.connect(self._toggle_max)
+        self.btn_more.setMenu(mmore)
+
+        for w in (self.btn_mirror, self.btn_live, self.btn_stop,
+                  self.btn_record, self.btn_shot,
+                  QLabel("Display:"), self.cmb_display,
+                  self.btn_opts, self.btn_more):
             bar.addWidget(w)
         lay.addWidget(bar_w)
 
-        self.status = QLabel("“▶ Mirror” = full-speed scrcpy (best on local/USB). "
-                             "“🖥 Live View” = reliable over remote / RDP / IVI. "
-                             "“🔴 Record” saves a video; “📸 Screenshot” / “⌨ Type” "
-                             "work on any device. Options are under “⚙ Options”.")
+        self.status = QLabel("▶ Mirror = full scrcpy (best local/USB) · "
+                             "🖥 Live View = works anywhere (RDP / IVI) · "
+                             "settings under ⚙ Options")
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
-        # a slim helper bar shown while the mirror is EMBEDDED: one reliable way
-        # to hand the keyboard to the mirror (needed in the side-by-side
-        # Control + Mirror view, where other widgets also want focus)
-        self.embed_bar = QWidget()
-        eb = QHBoxLayout(self.embed_bar)
+        # ---- the DEVICE KEYBOARD bar (shown while mirroring / Live View) ----
+        # A capture field that forwards every keystroke to the device over adb —
+        # guaranteed typing on ANY device (phone or IVI, embedded or separate
+        # window, local or RDP), independent of Win32 focus games. The 🎯 button
+        # appears when the mirror is embedded and hands it the real keyboard.
+        self.kb_bar = QWidget()
+        eb = QHBoxLayout(self.kb_bar)
         eb.setContentsMargins(4, 2, 4, 2); eb.setSpacing(8)
-        self.btn_kb_focus = QPushButton("⌨ Type in mirror")
-        self.btn_kb_focus.setProperty("role", "ok")
+        self.kb_input = _DeviceKeyEdit(self._send_key)
+        self.kb_input.setPlaceholderText(
+            "⌨ click here, then type — every key goes live to the device "
+            "(Enter, Backspace, arrows too)")
+        eb.addWidget(self.kb_input, 1)
+        self.btn_kb_focus = QPushButton("🎯 Mirror keys")
+        self.btn_kb_focus.setProperty("role", "ghost")
         self.btn_kb_focus.setToolTip(
-            "Give the keyboard to the embedded mirror, so what you type goes "
-            "to the device. Click it whenever typing lands somewhere else.")
+            "Hand the REAL keyboard back to the embedded mirror window (scrcpy "
+            "then injects keys itself). The field on the left always works "
+            "regardless.")
         self.btn_kb_focus.clicked.connect(self._focus_embedded)
+        self.btn_kb_focus.hide()
         eb.addWidget(self.btn_kb_focus)
-        _hint = QLabel("embedded — click the mirror (or the button) to type; "
-                       "keys go to the device")
-        _hint.setStyleSheet("color:#8a93a0; font-size:9pt;")
-        eb.addWidget(_hint); eb.addStretch(1)
-        self.embed_bar.hide()
-        lay.addWidget(self.embed_bar)
+        self.kb_bar.hide()
+        lay.addWidget(self.kb_bar)
+        self._key_pump = None
 
         # native container that scrcpy gets reparented into
         self.container = QWidget()
@@ -617,6 +743,15 @@ class MirrorPanel(QWidget):
 
     def _focus_embedded(self):
         _focus_window(self._child_hwnd)
+
+    def _send_key(self, kind, payload):
+        """Forward one keyboard-bar event to the device via the pump thread
+        (started lazily on first use)."""
+        if self._key_pump is None or not self._key_pump.isRunning():
+            self._key_pump = _KeyPumpThread(self.handler)
+            self._key_pump.note.connect(self.log)
+            self._key_pump.start()
+        self._key_pump.push(kind, payload)
 
     def _kb_mode(self):
         """The scrcpy --keyboard mode from the options popover: None = scrcpy's
@@ -831,15 +966,18 @@ class MirrorPanel(QWidget):
         """Single source of truth for button states: the two start buttons are
         enabled only when nothing is being viewed; Stop while viewing; Record
         while viewing OR already recording (it records device-side, so it can
-        run alongside Live View)."""
+        run alongside Live View). The device-keyboard bar follows the session:
+        visible whenever something is being viewed."""
         viewing = (self._scrcpy is not None) or (self._live is not None) \
             or bool(self._multi)
         self.btn_mirror.setEnabled(not viewing)
         self.btn_live.setEnabled(not viewing)
-        self.btn_mirror_all.setEnabled(not viewing and len(self._displays) > 1)
+        self.act_mirror_all.setEnabled(not viewing and len(self._displays) > 1)
         self.btn_stop.setEnabled(viewing)
         self.btn_record.setEnabled(viewing or self._recording)
         self.btn_record.setText("⏹ Stop recording" if self._recording else "🔴 Record…")
+        self.kb_bar.setVisible(viewing)
+        self.btn_kb_focus.setVisible(self._child_hwnd is not None)
 
     # ----- mirror EVERY display, each in its own window -----
     def _mirror_all(self):
@@ -897,14 +1035,15 @@ class MirrorPanel(QWidget):
         self.log.emit(f"Opening the device {facing} camera (scrcpy)…")
         self.start(camera=facing)
 
-    def _toggle_max(self):
+    def _toggle_max(self, on=None):
         """Hide/show the main window's docks so the mirror gets the whole window
         — the practical way to make a portrait device screen big and readable."""
         from PyQt5.QtWidgets import QMainWindow, QDockWidget
         win = self.window()
         if not isinstance(win, QMainWindow):
             return
-        on = self.btn_max.isChecked()
+        if on is None:
+            on = self.act_max.isChecked()
         if on:
             # only hide docks that are showing, and restore exactly those —
             # blanket-showing everything un-hid docks the user had closed
@@ -919,7 +1058,8 @@ class MirrorPanel(QWidget):
                 except RuntimeError:
                     pass
             self._max_hidden = []
-        self.btn_max.setText("⛶ Restore" if on else "⛶ Max view")
+        self.act_max.setText("⛶  Restore side panels" if on
+                             else "⛶  Max view (hide side panels)")
         QTimer.singleShot(200, self._fit)       # re-fit the embed to the new size
 
     # ----- display list -----
@@ -942,7 +1082,7 @@ class MirrorPanel(QWidget):
         if idx >= 0:
             self.cmb_display.setCurrentIndex(idx)
         # let several IVI displays sit side by side
-        self.btn_mirror_all.setEnabled(len(self._displays) > 1)
+        self.act_mirror_all.setEnabled(len(self._displays) > 1)
         self.log.emit(f"[OK] {len(self._displays)} display(s) found")
 
     def _tune(self, opts):
@@ -1276,7 +1416,6 @@ class MirrorPanel(QWidget):
         self._scrcpy = None
         self._stop_embed_timer()
         self._child_hwnd = None
-        self.embed_bar.hide()
         if getattr(self, "_mon", None):
             self._mon.stop(); self._mon = None
         self._refresh_buttons()
@@ -1360,8 +1499,8 @@ class MirrorPanel(QWidget):
             self.status.setText("scrcpy exited before it could be embedded. "
                                 "Try compat mode, or “Open in window”. Over Remote "
                                 "Desktop, scrcpy may need a local GPU.")
-            self.btn_stop.setEnabled(False); self.btn_mirror.setEnabled(True)
             self._scrcpy = None
+            self._refresh_buttons()
             return
         # wait until the container has a real size before adopting the window,
         # otherwise the first resize snaps scrcpy to a tiny rectangle
@@ -1379,12 +1518,12 @@ class MirrorPanel(QWidget):
                           self.container.width(), self.container.height())
                 self.status.setText("")
                 self.status.hide()
-                self.embed_bar.show()
+                self._refresh_buttons()          # shows the 🎯 Mirror keys button
                 # hand the keyboard straight to the mirror, so typing works
                 # immediately — exactly like clicking into native scrcpy
                 QTimer.singleShot(200, self._focus_embedded)
                 self.log.emit("[OK] scrcpy embedded — typing goes to the device "
-                              "(use “⌨ Type in mirror” if focus wanders)")
+                              "(⌨ bar always works; 🎯 re-focuses the mirror)")
                 # scrcpy/SDL resizes its own window to the video frame after the
                 # first frame — keep forcing it to fill the container for a few
                 # seconds so it doesn't shrink back to a tiny window.
@@ -1450,7 +1589,6 @@ class MirrorPanel(QWidget):
         if getattr(self, "_mon", None):
             self._mon.stop(); self._mon = None
         self._child_hwnd = None
-        self.embed_bar.hide()
         if self._scrcpy is not None:
             try:
                 self._scrcpy.stop()
@@ -1485,6 +1623,12 @@ class MirrorPanel(QWidget):
 
     def close_panel(self):
         self._stop_live()               # parks the thread if it's still running
+        if self._key_pump is not None:
+            self._key_pump.stop()
+            if not self._key_pump.wait(700):
+                from .qtutil import park_thread
+                park_thread(self._key_pump)
+            self._key_pump = None
         self._finalize_rec_sync()
         if self._shot is not None:
             self._shot.wait(700)
