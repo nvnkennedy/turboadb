@@ -605,26 +605,60 @@ class DeviceTab(QWidget):
         return idx
 
     def _build_control_view(self, handler):
-        """A side-by-side view: the device screen (mirror / live view) on the left,
-        the controls panel on the right — so you can watch and tap/press without
-        switching tabs. Each is its own instance bound to the same device.
-        The mirror here PREFERS embedding (prefer_embed) — a separate floating
-        window defeats the point of a combined view."""
-        from PyQt5.QtWidgets import QSplitter
-        split = QSplitter(Qt.Horizontal)
+        """The Control + Mirror view, laid out as two titled CARDS around a
+        grabbable splitter: the device screen (embedded mirror / Live View) on
+        the left, a compact controls column on the right. Each is its own
+        instance bound to the same device. (The old bare splitter jammed two
+        full panels together with an invisible seam — it read as broken.)"""
+        from PyQt5.QtWidgets import QSplitter, QFrame
+        from . import settings as settings_mod
+        col = theme.THEMES.get(settings_mod.get("theme"), theme.THEMES["dark"])
+        atext = theme.accent_text(settings_mod.get("theme"))
+
+        def card(emoji, title, inner):
+            frame = QFrame()
+            frame.setObjectName("cvCard")
+            frame.setStyleSheet(
+                f"QFrame#cvCard {{ background: {col['panel']};"
+                f" border: 1px solid {col['border']}; border-radius: 10px; }}")
+            fv = QVBoxLayout(frame)
+            fv.setContentsMargins(1, 1, 1, 1)
+            fv.setSpacing(0)
+            cap = QLabel(f"  {emoji}  {title}")
+            cap.setStyleSheet(
+                f"background: {col['ribbon']}; color: {atext};"
+                f" padding: 7px 10px; font-weight: 700;"
+                f" border-top-left-radius: 10px; border-top-right-radius: 10px;"
+                f" border-bottom: 1px solid {col['border']};")
+            fv.addWidget(cap)
+            body = QWidget()
+            bv = QVBoxLayout(body)
+            bv.setContentsMargins(6, 6, 6, 6)
+            bv.addWidget(inner)
+            fv.addWidget(body, 1)
+            return frame
+
         self.cv_mirror = MirrorPanel(handler, self.session,
                                      automotive=self._automotive,
                                      prefer_embed=True)
         self.cv_mirror.log.connect(self.log)
-        self.cv_controls = ControlsPanel(handler)
+        self.cv_controls = ControlsPanel(handler, compact=True)
         self.cv_controls.log.connect(self.log)
-        split.addWidget(self.cv_mirror)
-        split.addWidget(self.cv_controls)
+
+        split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(9)
+        split.addWidget(card("📱", "Screen — mirror / Live View", self.cv_mirror))
+        split.addWidget(card("🎛", "Controls", self.cv_controls))
         split.setStretchFactor(0, 3)         # the screen gets the larger share
         split.setStretchFactor(1, 2)
-        split.setSizes([640, 380])
+        split.setSizes([720, 400])
         split.setChildrenCollapsible(False)
-        return split
+
+        outer = QWidget()
+        ov = QVBoxLayout(outer)
+        ov.setContentsMargins(8, 8, 8, 8)
+        ov.addWidget(split)
+        return outer
 
     def _on_fail(self, msg):
         self.status.setText("Connect failed")

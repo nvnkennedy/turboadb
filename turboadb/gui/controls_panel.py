@@ -40,9 +40,13 @@ class _Runner(QThread):
 class ControlsPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, parent=None):
+    def __init__(self, handler, compact=False, parent=None):
+        """*compact=True* (the Control + Mirror side pane) allows a narrower
+        minimum width so the mirror keeps most of the space — the cards simply
+        reflow into a single column there."""
         super().__init__(parent)
         self.handler = handler
+        self._compact = compact
         self._threads = []
         self._ncols = -1
         self._ready = False          # guard: resizeEvent fires during construction
@@ -73,7 +77,7 @@ class ControlsPanel(QWidget):
         scroll.setWidget(host)
         outer.addWidget(scroll)
 
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(340 if compact else 500)
         self._ready = True
         self._relayout(1)
 

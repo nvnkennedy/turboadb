@@ -71,6 +71,31 @@ def _checkmark_png(color: str = "#ffffff") -> str:
 
 _CHECK_CACHE = {}
 _ARROW_CACHE = {}
+_DOT_CACHE = {}
+
+
+def _dot_png(color: str = "#ffffff") -> str:
+    """Paint (once) a small filled dot and return its path — the inner marker of
+    a CHECKED radio button (Qt's QSS engine can't draw one natively)."""
+    import os, tempfile
+    cached = _DOT_CACHE.get(color)
+    if cached and os.path.exists(cached):
+        return cached
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap, QPainter, QColor
+    pm = QPixmap(20, 20)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawEllipse(6, 6, 8, 8)
+    p.end()
+    path = os.path.join(tempfile.gettempdir(),
+                        f"turboadb-dot-{color.lstrip('#')}.png")
+    pm.save(path)
+    _DOT_CACHE[color] = path
+    return path
 
 
 def _down_arrow_png(color: str = "#aeb4bb") -> str:
@@ -111,6 +136,10 @@ def stylesheet(name: str = "dark") -> str:
         arrow = _down_arrow_png(c['dim']).replace("\\", "/")
     except Exception:
         arrow = ""
+    try:
+        dot = _dot_png("#042830").replace("\\", "/")
+    except Exception:
+        dot = ""
     return f"""
     QWidget {{ background: {c['win']}; color: {c['text']}; font-size: 10.5pt; }}
     QMainWindow::separator {{ background: {c['border']}; width: 1px; height: 1px; }}
@@ -220,9 +249,23 @@ def stylesheet(name: str = "dark") -> str:
     QCheckBox::indicator:checked, QGroupBox::indicator:checked {{
         background: {ACCENT}; border-color: {ACCENT}; image: url({check}); }}
     QCheckBox::indicator:disabled {{ border-color: {c['border']}; }}
-    /* checkable menu items (e.g. the ⚙ Options menu) get the same clear ✓ */
+    QRadioButton {{ background: transparent; color: {c['text']}; spacing: 8px; }}
+    QRadioButton::indicator {{ width: 20px; height: 20px;
+        border: 2px solid {c['line']}; border-radius: 12px; background: {c['input']}; }}
+    QRadioButton::indicator:hover {{ border-color: {ACCENT}; background: {c['sel']}; }}
+    QRadioButton::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT};
+        image: url({dot}); }}
+    QRadioButton::indicator:disabled {{ border-color: {c['border']}; }}
+    /* checkable menu items (e.g. context menus) get the same clear ✓ */
     QMenu::indicator {{ width: 18px; height: 18px; left: 6px; }}
     QMenu::indicator:checked {{ image: url({check}); }}
+    /* splitters (Control+Mirror, Split view): a visible, grabbable pill that
+       highlights on hover — the old invisible 1px seam looked broken */
+    QSplitter::handle:horizontal {{ background: {c['border']}; width: 7px;
+        margin: 6px 1px; border-radius: 3px; }}
+    QSplitter::handle:vertical {{ background: {c['border']}; height: 7px;
+        margin: 1px 6px; border-radius: 3px; }}
+    QSplitter::handle:hover {{ background: {ACCENT}; }}
     QStatusBar {{ background: {c['ribbon']}; color: {c['dim']}; border-top: 1px solid {c['border']}; }}
     QProgressBar {{ border: 1px solid {c['border']}; border-radius: 6px; background: {c['input']};
         text-align: center; color: {c['text']}; height: 14px; }}

@@ -3,6 +3,25 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.3
+
+UI revamp for the mirror options and the Control + Mirror view.
+
+- **⚙ Options is now a real popover panel, not a tick-mark menu.** Grouped,
+  properly themed controls — Output checkboxes (audio / compatibility /
+  software rendering / embed) each with a one-line hint, a **Keyboard** radio
+  group (Standard SDK · UHID) and a **Camera source** radio pair (Back · Front)
+  — replacing the cramped checkable menu whose tiny ticks and stay-open hack
+  read as broken. Toggle as many options as you like; the popover stays open
+  until you click outside or hit Done.
+- **Control + Mirror got a proper layout:** the screen and the controls now sit
+  in two titled cards (📱 Screen · 🎛 Controls) around a **visible, grabbable
+  splitter handle** that highlights on hover — the old invisible 1-px seam made
+  the divider undiscoverable. The controls column has a compact variant so the
+  mirror keeps most of the width (cards reflow to a single column).
+- Theme: radio buttons are now properly styled (accent dot, hover ring) and all
+  splitters app-wide use the new pill handles.
+
 ## 1.1.2
 
 Field fixes from real infotainment testing: typing in the mirror now behaves

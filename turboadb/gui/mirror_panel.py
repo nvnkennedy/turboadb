@@ -186,17 +186,8 @@ def _reveal_path(path) -> None:
         pass
 
 
-class _StayOpenMenu(QMenu):
-    """A menu that stays open when you toggle a CHECKABLE item, so several
-    options can be set in one go. Non-checkable actions (the methods) close it
-    and run normally."""
-    def mouseReleaseEvent(self, e):
-        act = self.activeAction()
-        if act is not None and act.isCheckable() and act.isEnabled():
-            act.toggle()
-            e.accept()
-            return
-        super().mouseReleaseEvent(e)
+# (the old _StayOpenMenu checkable-menu hack was replaced by the real options
+# popover panel — see MirrorPanel._build_options_menu)
 
 
 # --------------------------------------------------------------------------- #
@@ -507,42 +498,16 @@ class MirrorPanel(QWidget):
         self.btn_record.setEnabled(False)        # while mirror or Live View is on
         self.btn_record.clicked.connect(self._toggle_record)
 
-        # options live in their own ⚙ menu (kept open so you can tick several)
+        # options live in a proper POPOVER panel (see _build_options_menu) —
+        # the old checkable-menu tick list read poorly and its stay-open hack
+        # felt broken; a real panel with checkboxes/radios + hints reads right
         self.btn_opts = QToolButton(); self.btn_opts.setText("⚙ Options")
         self.btn_opts.setProperty("role", "ghost")
         self.btn_opts.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.btn_opts.setPopupMode(QToolButton.InstantPopup)
         self.btn_opts.setToolTip("Mirror options (audio, IVI compatibility, "
-                                 "software rendering, embed, keyboard).")
-        omenu = _StayOpenMenu(self.btn_opts)
-        self.act_audio = omenu.addAction("Forward audio")
-        self.act_audio.setCheckable(True); self.act_audio.setChecked(True)
-        self.act_compat = omenu.addAction("Compatibility mode (IVI / automotive)")
-        self.act_compat.setCheckable(True); self.act_compat.setChecked(automotive)
-        self.act_soft = omenu.addAction("Software rendering (Remote Desktop)")
-        self.act_soft.setCheckable(True); self.act_soft.setChecked(self._rdp)
-        self.act_embed = omenu.addAction("Embed window in this tab")
-        self.act_embed.setCheckable(True)
-        self.act_embed.setChecked(prefer_embed)
-        # Keyboard mode — proper radio choice, DEFAULT = SDK (exactly what plain
-        # scrcpy does, so typing behaves like native scrcpy). UHID used to be
-        # auto-ticked over RDP, but most IVI/head-unit kernels have no uhid
-        # support, so typing silently went nowhere while native scrcpy worked.
-        from PyQt5.QtWidgets import QActionGroup
-        kbmenu = omenu.addMenu("⌨ Keyboard mode")
-        self._kb_group = QActionGroup(kbmenu)
-        self._kb_group.setExclusive(True)
-        self.act_kb_sdk = kbmenu.addAction(
-            "Standard (SDK) — same as plain scrcpy  · recommended")
-        self.act_kb_sdk.setCheckable(True); self.act_kb_sdk.setChecked(True)
-        self.act_kb_uhid = kbmenu.addAction(
-            "UHID hardware keyboard — try ONLY if standard typing is ignored")
-        self.act_kb_uhid.setCheckable(True)
-        self._kb_group.addAction(self.act_kb_sdk)
-        self._kb_group.addAction(self.act_kb_uhid)
-        self.act_cam_front = omenu.addAction("📷 Camera: use FRONT (else back)")
-        self.act_cam_front.setCheckable(True)
-        self.btn_opts.setMenu(omenu)
+                                 "software rendering, embed, keyboard, camera).")
+        self.btn_opts.setMenu(self._build_options_menu(automotive, prefer_embed))
         self.btn_shot = QPushButton("📸 Screenshot"); self.btn_shot.setProperty("role", "ghost")
         self.btn_shot.setToolTip("Capture a PNG of the screen (works on any "
                                  "device — phone, tablet or head unit).")
@@ -654,10 +619,109 @@ class MirrorPanel(QWidget):
         _focus_window(self._child_hwnd)
 
     def _kb_mode(self):
-        """The scrcpy --keyboard mode from the radio menu: None = scrcpy's own
-        default (SDK — identical to running scrcpy by hand), 'uhid' only when
-        explicitly chosen."""
+        """The scrcpy --keyboard mode from the options popover: None = scrcpy's
+        own default (SDK — identical to running scrcpy by hand), 'uhid' only
+        when explicitly chosen."""
         return "uhid" if self.act_kb_uhid.isChecked() else None
+
+    def _build_options_menu(self, automotive, prefer_embed):
+        """The ⚙ Options POPOVER: a real, themed panel (via QWidgetAction) with
+        grouped checkboxes, radio groups and per-option hints — replacing the
+        old checkable menu whose tiny tick marks and stay-open hack read as
+        broken. Toggling anything keeps the popover open; click outside (or the
+        Done button) to dismiss."""
+        from PyQt5.QtWidgets import (QWidgetAction, QRadioButton, QButtonGroup)
+        from . import theme, settings as _s
+        _name = _s.get("theme")
+        atext = theme.accent_text(_name)
+        raised = theme.THEMES.get(_name, theme.THEMES["dark"])["raised"]
+
+        menu = QMenu(self.btn_opts)
+        panel = QWidget(menu)
+        # match the menu's raised surface — the global QWidget rule would paint
+        # the window colour here, leaving a mismatched slab inside the border
+        panel.setStyleSheet(f"background: {raised};")
+        panel.setMinimumWidth(330)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(14, 12, 14, 10)
+        v.setSpacing(5)
+
+        def section(text):
+            lab = QLabel(text.upper())
+            lab.setStyleSheet(f"color:{atext}; font-weight:800; "
+                              f"font-size:8.5pt; letter-spacing:1px; "
+                              f"padding-top:8px;")
+            v.addWidget(lab)
+
+        def hint(text):
+            lab = QLabel(text)
+            lab.setWordWrap(True)
+            lab.setStyleSheet("font-size:8.5pt; padding-left:30px;")
+            v.addWidget(lab)
+
+        title = QLabel("Mirror options")
+        title.setStyleSheet(f"color:{atext}; font-weight:800; font-size:11.5pt;")
+        v.addWidget(title)
+
+        section("Output")
+        self.act_audio = QCheckBox("Forward audio")
+        self.act_audio.setChecked(True)
+        v.addWidget(self.act_audio)
+        hint("play the device's sound on this PC (Android 11+)")
+        self.act_compat = QCheckBox("Compatibility mode (IVI / automotive)")
+        self.act_compat.setChecked(automotive)
+        v.addWidget(self.act_compat)
+        hint("H.264 + safe caps — for head-unit encoders that choke on defaults")
+        self.act_soft = QCheckBox("Software rendering")
+        self.act_soft.setChecked(self._rdp)
+        v.addWidget(self.act_soft)
+        hint("needed over Remote Desktop / GPU-less sessions")
+        self.act_embed = QCheckBox("Embed mirror in this tab")
+        self.act_embed.setChecked(prefer_embed)
+        v.addWidget(self.act_embed)
+        hint("the mirror lives inside TurboADB instead of a separate window")
+
+        section("Keyboard")
+        self.act_kb_sdk = QRadioButton("Standard (SDK) — like plain scrcpy")
+        self.act_kb_sdk.setChecked(True)
+        self.act_kb_uhid = QRadioButton("UHID hardware keyboard")
+        self._kb_group = QButtonGroup(panel)
+        self._kb_group.setExclusive(True)
+        self._kb_group.addButton(self.act_kb_sdk)
+        self._kb_group.addButton(self.act_kb_uhid)
+        v.addWidget(self.act_kb_sdk)
+        v.addWidget(self.act_kb_uhid)
+        hint("UHID only if standard typing is ignored — most IVI kernels "
+             "don't support it")
+
+        section("Camera source")
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(14)
+        self.act_cam_back = QRadioButton("Back")
+        self.act_cam_back.setChecked(True)
+        self.act_cam_front = QRadioButton("Front")
+        self._cam_group = QButtonGroup(panel)
+        self._cam_group.setExclusive(True)
+        self._cam_group.addButton(self.act_cam_back)
+        self._cam_group.addButton(self.act_cam_front)
+        cam_row.addWidget(self.act_cam_back)
+        cam_row.addWidget(self.act_cam_front)
+        cam_row.addStretch(1)
+        v.addLayout(cam_row)
+        hint("used by the 📷 Camera button (scrcpy 2.2+, Android 12+)")
+
+        done_row = QHBoxLayout()
+        done_row.addStretch(1)
+        done = QPushButton("Done")
+        done.setProperty("role", "ghost")
+        done.clicked.connect(menu.close)
+        done_row.addWidget(done)
+        v.addLayout(done_row)
+
+        wa = QWidgetAction(menu)
+        wa.setDefaultWidget(panel)
+        menu.addAction(wa)
+        return menu
 
     # ----- live view (screencap streaming; works over remote/RDP/IVI) -----
     def _toggle_live(self):
