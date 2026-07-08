@@ -46,16 +46,79 @@ def _win_api():
     # a 32-bit int and truncates a 64-bit handle on win64
     u.GetWindowRect.restype = wintypes.BOOL
     u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    # style + focus plumbing for a REAL child-window embed
+    long_ptr = ctypes.c_ssize_t
+    get_l = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+    set_l = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+    get_l.restype = long_ptr
+    get_l.argtypes = [wintypes.HWND, ctypes.c_int]
+    set_l.restype = long_ptr
+    set_l.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+    u.SetWindowPos.restype = wintypes.BOOL
+    u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               wintypes.UINT]
+    u.SetFocus.restype = wintypes.HWND
+    u.SetFocus.argtypes = [wintypes.HWND]
+    u.GetWindowThreadProcessId.restype = wintypes.DWORD
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                           ctypes.POINTER(wintypes.DWORD)]
+    u.AttachThreadInput.restype = wintypes.BOOL
+    u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.BOOL]
     return ctypes, u
 
 
+_GWL_STYLE = -16
+_WS_CHILD = 0x40000000
+_WS_POPUP = 0x80000000
+_WS_CAPTION = 0x00C00000
+_WS_THICKFRAME = 0x00040000
+_SWP_NOZORDER = 0x0004
+_SWP_FRAMECHANGED = 0x0020
+
+
 def _reparent(child_hwnd, parent_hwnd, w, h):
-    # Minimal + safe: SetParent + MoveWindow only (no window-style rewriting,
-    # which is the part most likely to destabilise a foreign SDL window).
+    """Adopt the scrcpy/SDL window as a REAL Win32 child.
+
+    The old 'minimal' version did SetParent without rewriting the window style.
+    That leaves the window a top-level popup glued into our widget: Windows then
+    treats keyboard **activation/focus** as belonging to a top-level window that
+    can never be activated — mouse mostly worked, typing NEVER reached scrcpy
+    (while plain scrcpy in its own window typed fine). Converting to WS_CHILD is
+    what makes it a first-class child that can hold keyboard focus."""
     _ctypes, u = _win_api()
+    getter = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+    setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+    style = getter(child_hwnd, _GWL_STYLE)
+    style = (style | _WS_CHILD) & ~(_WS_POPUP | _WS_CAPTION | _WS_THICKFRAME)
+    setter(child_hwnd, _GWL_STYLE, style)
     u.SetParent(child_hwnd, parent_hwnd)
-    u.MoveWindow(child_hwnd, 0, 0, max(1, w), max(1, h), True)
+    u.SetWindowPos(child_hwnd, None, 0, 0, max(1, w), max(1, h),
+                   _SWP_NOZORDER | _SWP_FRAMECHANGED)
     u.ShowWindow(child_hwnd, 5)   # SW_SHOW
+
+
+def _focus_window(hwnd) -> None:
+    """Give KEYBOARD focus to the embedded (cross-process) scrcpy window.
+    SetFocus only works within the calling thread's input queue, so attach to
+    the scrcpy window's thread first — the standard Win32 pattern for focusing
+    an embedded foreign window."""
+    if not hwnd:
+        return
+    try:
+        ctypes, u = _win_api()
+        k = ctypes.windll.kernel32
+        target_tid = u.GetWindowThreadProcessId(hwnd, None)
+        my_tid = k.GetCurrentThreadId()
+        attached = False
+        if target_tid and target_tid != my_tid:
+            attached = bool(u.AttachThreadInput(my_tid, target_tid, True))
+        u.SetFocus(hwnd)
+        if attached:
+            u.AttachThreadInput(my_tid, target_tid, False)
+    except Exception:
+        pass
 
 
 def _find_window(title):
@@ -375,7 +438,8 @@ class _RecordThread(QThread):
 class MirrorPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, session, automotive=False, parent=None):
+    def __init__(self, handler, session, automotive=False, prefer_embed=False,
+                 parent=None):
         super().__init__(parent)
         self.handler = handler
         self.session_dict = session
@@ -457,11 +521,25 @@ class MirrorPanel(QWidget):
         self.act_compat.setCheckable(True); self.act_compat.setChecked(automotive)
         self.act_soft = omenu.addAction("Software rendering (Remote Desktop)")
         self.act_soft.setCheckable(True); self.act_soft.setChecked(self._rdp)
-        self.act_embed = omenu.addAction("Embed window in this tab (experimental)")
+        self.act_embed = omenu.addAction("Embed window in this tab")
         self.act_embed.setCheckable(True)
-        self.act_uhid = omenu.addAction("Hardware keyboard (UHID — fixes typing "
-                                        "on RDP / IVI)")
-        self.act_uhid.setCheckable(True); self.act_uhid.setChecked(self._rdp)
+        self.act_embed.setChecked(prefer_embed)
+        # Keyboard mode — proper radio choice, DEFAULT = SDK (exactly what plain
+        # scrcpy does, so typing behaves like native scrcpy). UHID used to be
+        # auto-ticked over RDP, but most IVI/head-unit kernels have no uhid
+        # support, so typing silently went nowhere while native scrcpy worked.
+        from PyQt5.QtWidgets import QActionGroup
+        kbmenu = omenu.addMenu("⌨ Keyboard mode")
+        self._kb_group = QActionGroup(kbmenu)
+        self._kb_group.setExclusive(True)
+        self.act_kb_sdk = kbmenu.addAction(
+            "Standard (SDK) — same as plain scrcpy  · recommended")
+        self.act_kb_sdk.setCheckable(True); self.act_kb_sdk.setChecked(True)
+        self.act_kb_uhid = kbmenu.addAction(
+            "UHID hardware keyboard — try ONLY if standard typing is ignored")
+        self.act_kb_uhid.setCheckable(True)
+        self._kb_group.addAction(self.act_kb_sdk)
+        self._kb_group.addAction(self.act_kb_uhid)
         self.act_cam_front = omenu.addAction("📷 Camera: use FRONT (else back)")
         self.act_cam_front.setCheckable(True)
         self.btn_opts.setMenu(omenu)
@@ -510,11 +588,33 @@ class MirrorPanel(QWidget):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
+        # a slim helper bar shown while the mirror is EMBEDDED: one reliable way
+        # to hand the keyboard to the mirror (needed in the side-by-side
+        # Control + Mirror view, where other widgets also want focus)
+        self.embed_bar = QWidget()
+        eb = QHBoxLayout(self.embed_bar)
+        eb.setContentsMargins(4, 2, 4, 2); eb.setSpacing(8)
+        self.btn_kb_focus = QPushButton("⌨ Type in mirror")
+        self.btn_kb_focus.setProperty("role", "ok")
+        self.btn_kb_focus.setToolTip(
+            "Give the keyboard to the embedded mirror, so what you type goes "
+            "to the device. Click it whenever typing lands somewhere else.")
+        self.btn_kb_focus.clicked.connect(self._focus_embedded)
+        eb.addWidget(self.btn_kb_focus)
+        _hint = QLabel("embedded — click the mirror (or the button) to type; "
+                       "keys go to the device")
+        _hint.setStyleSheet("color:#8a93a0; font-size:9pt;")
+        eb.addWidget(_hint); eb.addStretch(1)
+        self.embed_bar.hide()
+        lay.addWidget(self.embed_bar)
+
         # native container that scrcpy gets reparented into
         self.container = QWidget()
         self.container.setAttribute(Qt.WA_NativeWindow, True)
         self.container.setStyleSheet("background:#000;")
         self.container.setMinimumHeight(200)
+        self.container.setFocusPolicy(Qt.NoFocus)   # never steal from the child
+        self.container.installEventFilter(self)     # click margins -> focus mirror
         lay.addWidget(self.container, 1)
 
         # screencap-based live view (shown instead of the container when active)
@@ -537,6 +637,27 @@ class MirrorPanel(QWidget):
         if not getattr(self, "_displays_loaded", True):
             self._displays_loaded = True
             QTimer.singleShot(150, self.refresh_displays)
+        # returning to a tab with an embedded mirror: hand it the keyboard again
+        if self._child_hwnd:
+            QTimer.singleShot(120, self._focus_embedded)
+
+    def eventFilter(self, obj, event):
+        # a click on the container (its margins around the embedded child)
+        # forwards keyboard focus to the mirror — matches what users expect
+        from PyQt5.QtCore import QEvent
+        if obj is self.container and event.type() == QEvent.MouseButtonPress \
+                and self._child_hwnd:
+            self._focus_embedded()
+        return super().eventFilter(obj, event)
+
+    def _focus_embedded(self):
+        _focus_window(self._child_hwnd)
+
+    def _kb_mode(self):
+        """The scrcpy --keyboard mode from the radio menu: None = scrcpy's own
+        default (SDK — identical to running scrcpy by hand), 'uhid' only when
+        explicitly chosen."""
+        return "uhid" if self.act_kb_uhid.isChecked() else None
 
     # ----- live view (screencap streaming; works over remote/RDP/IVI) -----
     def _toggle_live(self):
@@ -675,7 +796,7 @@ class MirrorPanel(QWidget):
                 stay_awake=st.get("scrcpy_stay_awake", True),
                 no_audio=True,
                 display_id=d["id"],
-                keyboard_mode="uhid" if self.act_uhid.isChecked() else None,
+                keyboard_mode=self._kb_mode(),
                 window_title=f"{name} — display {d['id']}")
             self._tune(opts)
             try:
@@ -997,15 +1118,18 @@ class MirrorPanel(QWidget):
         if compat is None:
             compat = self.act_compat.isChecked()
         if embed is None:
-            embed = self.act_embed.isChecked()       # default OFF = reliable window
+            embed = self.act_embed.isChecked()
         elif embed:
             self.act_embed.setChecked(True)
-        # Over Remote Desktop, the safest combo is compat (h264 + caps + no
-        # audio) in a SEPARATE window with software rendering — embedding adds a
-        # fragile window-reparent that often breaks on a GPU-less RDP session.
+        # Over Remote Desktop keep the compat profile, but HONOUR the embed
+        # choice — it used to be silently disabled here, which is why "embed"
+        # appeared to do nothing at all on RDP setups.
         if self.act_soft.isChecked():
             compat = True
-            embed = False
+            if embed:
+                self.log.emit("[INFO] embedding over Remote Desktop — if the "
+                              "picture stays black, untick “Embed window in "
+                              "this tab” and mirror in a separate window")
 
         st = settings_mod.load()
         opts = ScrcpyOptions(
@@ -1019,7 +1143,7 @@ class MirrorPanel(QWidget):
             display_id=display_id,
             video_source=("camera" if camera else None),
             camera_facing=(camera or None),
-            keyboard_mode="uhid" if self.act_uhid.isChecked() else None,
+            keyboard_mode=self._kb_mode(),
             window_title=self.session_dict.get("name") or "turboadb")
         self._tune(opts)
         if camera:
@@ -1028,10 +1152,10 @@ class MirrorPanel(QWidget):
             self.log.emit("[INFO] using software rendering (Remote Desktop / "
                           "GPU-less) — capped to keep it smooth")
         if opts.keyboard_mode == "uhid":
-            self.log.emit("[INFO] keyboard = UHID (virtual hardware keyboard). "
-                          "Click the scrcpy window to focus it, then type. If the "
-                          "device’s on-screen keyboard stays up it doesn’t support "
-                          "UHID — use the “⌨ Type…” button to enter text instead.")
+            self.log.emit("[WARNING] keyboard = UHID (explicitly selected). Most "
+                          "IVI/head-unit kernels have NO uhid support — if typing "
+                          "does nothing, switch ⚙ Options → Keyboard mode back to "
+                          "Standard (SDK), which is what plain scrcpy uses.")
 
         do_embed = embed and _IS_WIN
         if do_embed:
@@ -1088,6 +1212,7 @@ class MirrorPanel(QWidget):
         self._scrcpy = None
         self._stop_embed_timer()
         self._child_hwnd = None
+        self.embed_bar.hide()
         if getattr(self, "_mon", None):
             self._mon.stop(); self._mon = None
         self._refresh_buttons()
@@ -1190,7 +1315,12 @@ class MirrorPanel(QWidget):
                           self.container.width(), self.container.height())
                 self.status.setText("")
                 self.status.hide()
-                self.log.emit("[OK] scrcpy embedded")
+                self.embed_bar.show()
+                # hand the keyboard straight to the mirror, so typing works
+                # immediately — exactly like clicking into native scrcpy
+                QTimer.singleShot(200, self._focus_embedded)
+                self.log.emit("[OK] scrcpy embedded — typing goes to the device "
+                              "(use “⌨ Type in mirror” if focus wanders)")
                 # scrcpy/SDL resizes its own window to the video frame after the
                 # first frame — keep forcing it to fill the container for a few
                 # seconds so it doesn't shrink back to a tiny window.
@@ -1256,6 +1386,7 @@ class MirrorPanel(QWidget):
         if getattr(self, "_mon", None):
             self._mon.stop(); self._mon = None
         self._child_hwnd = None
+        self.embed_bar.hide()
         if self._scrcpy is not None:
             try:
                 self._scrcpy.stop()

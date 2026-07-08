@@ -383,7 +383,7 @@ class DeviceTab(QWidget):
         self.btn_mirror.setPopupMode(QToolButton.InstantPopup)   # whole btn = menu
         mmenu = QMenu(self.btn_mirror)
         mmenu.addAction("Mirror (separate window)", lambda: self.mirror())
-        mmenu.addAction("Embed in this tab (experimental)",
+        mmenu.addAction("Embed in this tab",
                         lambda: self.mirror(embed=True))
         mmenu.addAction("Mirror a specific display…", self.mirror_choose_display)
         mmenu.addAction("Mirror (compatibility mode — for IVI/automotive)",
@@ -607,11 +607,14 @@ class DeviceTab(QWidget):
     def _build_control_view(self, handler):
         """A side-by-side view: the device screen (mirror / live view) on the left,
         the controls panel on the right — so you can watch and tap/press without
-        switching tabs. Each is its own instance bound to the same device."""
+        switching tabs. Each is its own instance bound to the same device.
+        The mirror here PREFERS embedding (prefer_embed) — a separate floating
+        window defeats the point of a combined view."""
         from PyQt5.QtWidgets import QSplitter
         split = QSplitter(Qt.Horizontal)
         self.cv_mirror = MirrorPanel(handler, self.session,
-                                     automotive=self._automotive)
+                                     automotive=self._automotive,
+                                     prefer_embed=True)
         self.cv_mirror.log.connect(self.log)
         self.cv_controls = ControlsPanel(handler)
         self.cv_controls.log.connect(self.log)

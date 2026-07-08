@@ -3,6 +3,34 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.2
+
+Field fixes from real infotainment testing: typing in the mirror now behaves
+exactly like plain scrcpy, and the embedded mirror is finally first-class.
+
+- **Typing works like native scrcpy again.** TurboADB auto-selected the UHID
+  keyboard over RDP — but most IVI/head-unit kernels have no uhid support, so
+  keys silently went nowhere while plain scrcpy (which defaults to SDK
+  injection) typed fine. The default is now **Standard (SDK) — identical to
+  running scrcpy by hand** — with UHID as an explicit opt-in radio under
+  ⚙ Options → **Keyboard mode**, including an honest warning when chosen.
+- **The embedded mirror can now hold the keyboard.** The window is adopted as a
+  real Win32 child (`WS_CHILD` style conversion, frame-change applied) instead
+  of a reparented top-level popup that Windows could never give keyboard focus
+  to — the reason typing worked in a separate scrcpy window but not embedded.
+  Focus is handed to the mirror the moment it embeds (via `AttachThreadInput` +
+  `SetFocus`, the standard cross-process pattern), when you return to the tab,
+  when you click the container — and a slim **“⌨ Type in mirror”** bar appears
+  above the embedded view for one-click keyboard focus whenever another panel
+  has taken it.
+- **Embedding is honoured over Remote Desktop.** It used to be silently disabled
+  whenever software rendering was on, so “Embed in this tab” appeared to do
+  nothing at all on RDP setups.
+- **Control + Mirror view embeds by default** — the side-by-side layout is the
+  whole point there; a separate floating window defeated it. The mirror and the
+  controls now genuinely live next to each other, with the focus bar keeping
+  typing unambiguous between the two panes.
+
 ## 1.1.1
 
 The **1.1 feature release** — the work that landed across 1.0.15–1.0.19,
