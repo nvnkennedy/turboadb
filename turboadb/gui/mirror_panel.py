@@ -1369,10 +1369,12 @@ class MirrorPanel(QWidget):
 
         do_embed = embed and _IS_WIN
         if do_embed:
-            self._embed_title = f"turboadb-embed-{os.getpid()}-{id(self)}"
-            opts.window_title = self._embed_title
+            opts.window_title = f"turboadb-embed-{os.getpid()}-{id(self)}"
             opts.window_borderless = True
             opts.window_x, opts.window_y = 0, 0
+        # the EXACT window title we can later find to confirm scrcpy really put a
+        # window up (readiness) and, when embedding, to reparent it
+        self._win_title = opts.window_title
 
         import tempfile
         self._log_path = os.path.join(tempfile.gettempdir(),
@@ -1416,25 +1418,63 @@ class MirrorPanel(QWidget):
     # means a frame actually flowed.
     _HEALTHY = ("Renderer:", "Texture:", "Recording started", "INFO: Renderer",
                 "Frame: ", "v4l2", "audio player")
+    _STARTUP_TIMEOUT = 6.0        # no scrcpy window within this = hung/failed
+
+    def _scrcpy_window_up(self) -> bool:
+        """True once scrcpy has actually put its window up — the reliable
+        readiness signal for BOTH embed and separate-window modes. (The log is
+        block-buffered to a file, so its 'Renderer:' markers don't appear until
+        scrcpy exits; the WINDOW existing is what proves a live start.)"""
+        if self._child_hwnd is not None:
+            return True
+        if not _IS_WIN:
+            # no cheap window probe off Windows — fall back to a time grace
+            import time
+            return (time.time() - getattr(self, "_start_t", 0)) > self._STARTUP_TIMEOUT
+        title = getattr(self, "_win_title", None)
+        if not title:
+            return False
+        try:
+            return bool(_find_window(title))
+        except Exception:
+            return False
 
     def _check_alive(self):
-        """Poll the scrcpy process. While alive, note once it becomes 'ready'
-        (rendered or embedded). On exit: a start that NEVER became ready is a
-        failed start — auto-retry up to twice with progressively safer options,
-        then ALWAYS surface the exact reason. A ready→exit is a normal close."""
+        """Poll the scrcpy process. Readiness = its window is up (works for embed
+        AND separate window). A launch that never shows a window within
+        _STARTUP_TIMEOUT is hung/failed → killed and auto-retried. On exit, a
+        never-ready start is a failure (retry, then show the real log); a
+        ready→exit is a normal close."""
         if self._scrcpy is None:
             return
         import time
         err_live = self._scrcpy.read_log() or ""
-        if not self._became_ready and (self._child_hwnd is not None
-                                       or any(m in err_live for m in self._HEALTHY)):
+        # readiness = the window is up (fast, while running) OR a video marker is
+        # in the log (a fallback that lands at exit, when the buffered log flushes
+        # — covers scrcpy builds whose window title we can't match)
+        if not self._became_ready and (self._scrcpy_window_up()
+                or any(m in err_live for m in self._HEALTHY)):
             self._became_ready = True
-        if self._scrcpy.running:
+
+        running = self._scrcpy.running
+        ran_s = time.time() - getattr(self, "_start_t", 0)
+        # startup watchdog: alive but no window yet = it hung (the first-launch
+        # server-push race can leave scrcpy waiting forever) — kill it so the
+        # retry path runs instead of the user staring at nothing
+        if running and not self._became_ready and ran_s > self._STARTUP_TIMEOUT:
+            self.log.emit(f"[WARNING] scrcpy didn't show a window within "
+                          f"{int(self._STARTUP_TIMEOUT)}s — treating as a failed "
+                          f"start and retrying.")
+            try:
+                self._scrcpy.stop()
+            except Exception:
+                pass
+            running = False
+        if running:
             return
 
-        ran_s = time.time() - getattr(self, "_start_t", 0)
-        err = err_live.strip()
-        ready = self._became_ready or ran_s > 8      # ran a while = it worked
+        err = (self._scrcpy.read_log() or "").strip()
+        ready = self._became_ready
         self._scrcpy = None
         self._stop_embed_timer()
         self._child_hwnd = None
@@ -1545,7 +1585,7 @@ class MirrorPanel(QWidget):
         if self.container.width() < 80 or self.container.height() < 80:
             return
         try:
-            hwnd = _find_window(self._embed_title)
+            hwnd = _find_window(self._win_title)
         except Exception:
             hwnd = None
         if hwnd:

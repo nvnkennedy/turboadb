@@ -3,6 +3,28 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.8
+
+- **Mirror starts on the first click now.** The real defect: scrcpy's log is
+  block-buffered to a file, so its "started" markers don't appear while it's
+  running — which meant a working *separate-window* mirror was never confirmed,
+  and a *hung* first launch (the common server-push race, even on ordinary
+  phones) was never detected, so you had to open the mirror a second time.
+  Readiness is now detected by **scrcpy's window actually existing** (works for
+  embedded and separate-window alike), and a **startup watchdog** kills a launch
+  that shows no window within 6 s and auto-retries it — so a single click now
+  brings the mirror up by itself. If it genuinely can't start, you still get
+  scrcpy's real log and reason.
+- **"Empty this folder" keeps the folder.** It now deletes only the *contents*
+  (files and sub-folders, dotfiles included) using absolute-path globs that can
+  never match `.`/`..`, so the folder itself stays and you can add files to it
+  again immediately.
+- **Create files.** A new **New file** action (button + right-click) makes an
+  empty file in the current directory.
+- **Multi-select with checkboxes.** Every entry now has a checkbox — tick as many
+  as you like with single clicks (no Ctrl needed); all actions (download, delete,
+  …) act on the ticked items. Ctrl/Shift-click still works too.
+
 ## 1.1.7
 
 - **"scrcpy started but showed nothing" is fixed.** The success check was too

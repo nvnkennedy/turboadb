@@ -76,6 +76,7 @@ class FileBrowser(QWidget):
         # removes the selection (files AND folders)
         self.list.setSelectionMode(QListWidget.ExtendedSelection)
         self.list.itemSelectionChanged.connect(self._update_ops)
+        self.list.itemChanged.connect(lambda *_: self._update_ops())  # checkbox
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._context_menu)
         from PyQt5.QtWidgets import QShortcut
@@ -89,8 +90,9 @@ class FileBrowser(QWidget):
                 ("dl_file", "⬇ Download", self._dl_file, "ok"),
                 ("upload", "⬆ Upload…", self._upload, None),
                 ("mkdir", "New folder", self._mkdir, "ghost"),
+                ("newfile", "New file", self._new_file, "ghost"),
                 ("rename", "Rename", self._rename, "ghost"),
-                ("selall", "Select all", self.list.selectAll, "ghost"),
+                ("selall", "Select all", lambda: self._check_all(True), "ghost"),
                 ("delete", "🗑 Delete", self._delete, "danger")):
             b = QPushButton(label)
             if role:
@@ -110,8 +112,9 @@ class FileBrowser(QWidget):
         self.list.setAcceptDrops(True)
         self.list.setDragDropMode(QListWidget.DropOnly)
         self.list.viewport().installEventFilter(self)
-        self._hint = QLabel("Tip: Ctrl/Shift-click to multi-select · Del deletes · "
-                            "F2 renames · drag files here to upload.")
+        self._hint = QLabel("Tip: tick the checkboxes to select multiple · "
+                            "right-click for all actions · Del deletes · "
+                            "drag files here to upload.")
         self._hint.setStyleSheet("color:#8a93a0; font-size:9pt;")
         lay.addWidget(self._hint)
         self._update_ops()
@@ -203,6 +206,14 @@ class FileBrowser(QWidget):
     def _mkitem(self, name, is_dir):
         it = QListWidgetItem(("📁 " if is_dir else "📄 ") + name)
         it.setData(Qt.UserRole, (name, is_dir))
+        # a checkbox on every real entry, so multi-select is obvious and works
+        # with a single click (no Ctrl needed). '..' is made non-checkable
+        # (QListWidgetItem is checkable by default, so strip the flag there).
+        if name == "..":
+            it.setFlags(it.flags() & ~Qt.ItemIsUserCheckable)
+        else:
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Unchecked)
         return it
 
     def _go(self):
@@ -226,13 +237,29 @@ class FileBrowser(QWidget):
         return it.data(Qt.UserRole) if it else (None, None)
 
     def _selected_many(self):
-        """[(name, is_dir), …] for every selected real entry (never '..')."""
+        """[(name, is_dir), …] to act on: CHECKED entries if any are ticked,
+        otherwise the highlighted (selected) entries. '..' is never included."""
+        checked = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.flags() & Qt.ItemIsUserCheckable and it.checkState() == Qt.Checked:
+                name, is_dir = it.data(Qt.UserRole)
+                if name and name != "..":
+                    checked.append((name, is_dir))
+        if checked:
+            return checked
         out = []
         for it in self.list.selectedItems():
             name, is_dir = it.data(Qt.UserRole)
             if name and name != "..":
                 out.append((name, is_dir))
         return out
+
+    def _check_all(self, state):
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.flags() & Qt.ItemIsUserCheckable:
+                it.setCheckState(Qt.Checked if state else Qt.Unchecked)
 
     def _context_menu(self, pos):
         from PyQt5.QtWidgets import QMenu
@@ -259,14 +286,16 @@ class FileBrowser(QWidget):
         act_del.setEnabled(n >= 1)
         act_del.triggered.connect(self._delete)
         act_delall = m.addAction(ico("🧨", theme.DANGER),
-                                 "Delete EVERYTHING in this folder…")
+                                 "Empty this folder (delete contents, keep folder)…")
         act_delall.triggered.connect(self._delete_all)
         m.addSeparator()
-        m.addAction("Select all", self.list.selectAll)
-        m.addAction("Clear selection", self.list.clearSelection)
+        m.addAction("☑ Select all", lambda: self._check_all(True))
+        m.addAction("☐ Clear selection",
+                    lambda: (self._check_all(False), self.list.clearSelection()))
         m.addSeparator()
         m.addAction(ico("⬆"), "Upload here…", self._upload)
         m.addAction(ico("📁"), "New folder…", self._mkdir)
+        m.addAction(ico("📄"), "New file…", self._new_file)
         m.addAction("Refresh", self.refresh)
         m.exec_(self.list.viewport().mapToGlobal(pos))
 
@@ -275,17 +304,20 @@ class FileBrowser(QWidget):
         self.refresh()
 
     def _delete_all(self):
-        """Empty the current directory (delete every entry in it)."""
+        """Empty the current directory — delete everything INSIDE it, but keep
+        the folder itself so you can immediately add files again."""
         if QMessageBox.question(
-                self, "Delete everything here",
-                f"Delete ALL files and folders inside\n{self.cwd} ?\n\n"
-                f"This cannot be undone.",
+                self, "Empty this folder",
+                f"Delete everything INSIDE\n{self.cwd}\n\n"
+                f"(the folder itself is kept). This cannot be undone.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No) != QMessageBox.Yes:
             return
-        # rm the directory's CONTENTS (dotfiles included), not the dir itself
-        cmd = (f"cd {_q(self.cwd)} 2>/dev/null && rm -rf ./* ./.[!.]* ./..?* "
-               f"2>/dev/null; true")
+        base = _q(self.cwd.rstrip("/") or "/")
+        # absolute-path globs for normal entries + dotfiles, deliberately using
+        # .[!.]* and ..?* so '.' and '..' are NEVER matched (that would reach up
+        # into the parent). No `cd`, no chance of removing the folder itself.
+        cmd = (f"rm -rf {base}/* {base}/.[!.]* {base}/..?* 2>/dev/null; true")
         self._run_shell("empty folder", cmd)
 
     def _update_ops(self):
@@ -377,9 +409,19 @@ class FileBrowser(QWidget):
 
     def _mkdir(self):
         name, ok = QInputDialog.getText(self, "New folder", "Name:")
-        if ok and name:
+        if ok and name.strip():
             self._run_shell(f"mkdir {name}",
-                            f"mkdir -p {_q(posixpath.join(self.cwd, name))}")
+                            f"mkdir -p {_q(posixpath.join(self.cwd, name.strip()))}")
+
+    def _new_file(self):
+        name, ok = QInputDialog.getText(self, "New file",
+                                        "Name of the empty file to create:")
+        if ok and name.strip():
+            target = _q(posixpath.join(self.cwd, name.strip()))
+            # create an empty file (touch, with a redirect fallback for shells
+            # that lack touch)
+            self._run_shell(f"create {name.strip()}",
+                            f"touch {target} 2>/dev/null || : > {target}")
 
     def _rename(self):
         sel = self._selected_many()
