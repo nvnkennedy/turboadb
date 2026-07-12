@@ -3,6 +3,21 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.13
+
+Native keyboard now types on the embedded screen (thank you for confirming) —
+this release makes the mirror open on the **first** click, no failed attempt.
+
+- **First-click start, done properly.** Your log showed scrcpy render
+  (`Renderer: direct3d11`) and then die ~1 s later — right after we adopted its
+  window. The cause: we reparented the window *the instant it appeared*, while
+  scrcpy's SDL was still bringing up its Direct3D swapchain and hadn't drawn its
+  first frame; reparenting mid-init made it lose the graphics device and exit,
+  so it only worked on the (slightly slower) second attempt. Now we let the
+  window **settle its first frame (~0.6 s) before adopting it**, so the first
+  click embeds a stable window and stays up. The auto-retry from 1.1.12 remains
+  as a safety net, but it should rarely fire now.
+
 ## 1.1.12
 
 Two fixes from your logs.

@@ -618,6 +618,7 @@ class MirrorPanel(QWidget):
         self._fit_timer = None
         self._fit_count = 0
         self._embed_tries = 0
+        self._win_first_seen = 0.0
         self._child_hwnd = None
         self._mon = None
         self._compat = False
@@ -1525,6 +1526,7 @@ class MirrorPanel(QWidget):
         if do_embed:
             self.status.setText("Starting mirror… embedding the scrcpy window.")
             self._embed_tries = 0
+            self._win_first_seen = 0.0
             self._embed_timer = QTimer(self)
             self._embed_timer.timeout.connect(self._try_embed)
             self._embed_timer.start(200)
@@ -1546,6 +1548,7 @@ class MirrorPanel(QWidget):
                 "Frame: ", "v4l2", "audio player")
     _STARTUP_TIMEOUT = 6.0        # no scrcpy window within this = hung/failed
     _STARTUP_GRACE = 5.0         # a mirror that dies this fast = failed start
+    _EMBED_SETTLE = 0.6          # let the window render its 1st frame before we adopt it
 
     def _scrcpy_window_up(self) -> bool:
         """True once scrcpy has actually put its window up — the reliable
@@ -1724,6 +1727,18 @@ class MirrorPanel(QWidget):
         except Exception:
             hwnd = None
         if hwnd:
+            # DON'T adopt the window the instant it appears — scrcpy's SDL is
+            # still bringing up its Direct3D swapchain and hasn't drawn its first
+            # frame yet; reparenting mid-init makes it lose the device and exit
+            # ~1-2s later (the "embedded then ended, works on the 2nd try" bug).
+            # Wait a beat after first sighting so the first frame is on screen,
+            # then adopt the now-settled window.
+            now = __import__("time").time()
+            if self._win_first_seen == 0.0:
+                self._win_first_seen = now
+                return
+            if now - self._win_first_seen < self._EMBED_SETTLE:
+                return
             self._child_hwnd = hwnd
             self._stop_embed_timer()
             try:
