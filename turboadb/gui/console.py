@@ -94,6 +94,29 @@ class AnsiConsole(QPlainTextEdit):
     _SUB = 16 * 1024             # max chars handed to _process at once
     _MAX_INQ = 8 * 1024 * 1024   # cap the ON-SCREEN backlog (disk archive is full)
 
+    def wheelEvent(self, event):
+        # Ctrl + wheel = zoom the terminal font (like every editor/terminal),
+        # persisted so new consoles open at the chosen size
+        if event.modifiers() & Qt.ControlModifier:
+            self.bump_font(1 if event.angleDelta().y() > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def bump_font(self, step):
+        f = self.font()
+        size = max(6, min(40, (f.pointSize() or 10) + step))
+        if size == f.pointSize():
+            return
+        f.setPointSize(size)
+        self.setFont(f)
+        try:
+            data = settings_mod.load()
+            data["term_font_size"] = size
+            settings_mod.save(data)
+        except Exception:
+            pass
+
     def _move_caret_end(self):
         if self.textCursor().hasSelection():
             return
@@ -376,6 +399,10 @@ class AnsiConsole(QPlainTextEdit):
             self._paste_into_line(); return
         if ctrl and key == Qt.Key_Insert:
             self.copy(); return
+        if ctrl and key in (Qt.Key_Plus, Qt.Key_Equal):
+            self.bump_font(1); return       # Ctrl+= / Ctrl++ : bigger text
+        if ctrl and key == Qt.Key_Minus:
+            self.bump_font(-1); return      # Ctrl+- : smaller text
         if not self._alive:                 # shell is down — ignore typing
             return
         if ctrl and key == Qt.Key_C:

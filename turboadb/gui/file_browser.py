@@ -72,20 +72,30 @@ class FileBrowser(QWidget):
 
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(self._open_item)
+        # multi-select: Ctrl/Shift-click ranges, Ctrl+A selects all; Delete key
+        # removes the selection (files AND folders)
+        self.list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list.itemSelectionChanged.connect(self._update_ops)
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        QShortcut(QKeySequence.Delete, self.list, activated=self._delete)
+        QShortcut(QKeySequence("F2"), self.list, activated=self._rename)
 
         ops = QHBoxLayout()
-        for label, slot, role in (("Download file", self._dl_file, "ok"),
-                                  ("Download folder", self._dl_folder, "ghost"),
-                                  ("Upload file", self._up_file, None),
-                                  ("Upload folder", self._up_folder, "ghost"),
-                                  ("Mkdir", self._mkdir, "ghost"),
-                                  ("Rename", self._rename, "ghost"),
-                                  ("Delete", self._delete, "danger")):
+        self._ops_btns = {}
+        for key, label, slot, role in (
+                ("dl_file", "⬇ Download", self._dl_file, "ok"),
+                ("upload", "⬆ Upload…", self._upload, None),
+                ("mkdir", "New folder", self._mkdir, "ghost"),
+                ("rename", "Rename", self._rename, "ghost"),
+                ("selall", "Select all", self.list.selectAll, "ghost"),
+                ("delete", "🗑 Delete", self._delete, "danger")):
             b = QPushButton(label)
             if role:
                 b.setProperty("role", role)
             b.clicked.connect(slot)
             ops.addWidget(b)
+            self._ops_btns[key] = b
 
         self.bar = QProgressBar(); self.bar.setVisible(False)
 
@@ -98,10 +108,11 @@ class FileBrowser(QWidget):
         self.list.setAcceptDrops(True)
         self.list.setDragDropMode(QListWidget.DropOnly)
         self.list.viewport().installEventFilter(self)
-        self._hint = QLabel("Tip: drag files or folders here to upload them to "
-                            "this directory.")
+        self._hint = QLabel("Tip: Ctrl/Shift-click to multi-select · Del deletes · "
+                            "F2 renames · drag files here to upload.")
         self._hint.setStyleSheet("color:#8a93a0; font-size:9pt;")
         lay.addWidget(self._hint)
+        self._update_ops()
         self.refresh()
 
     # ---- drag-and-drop upload ----
@@ -212,6 +223,26 @@ class FileBrowser(QWidget):
         it = self.list.currentItem()
         return it.data(Qt.UserRole) if it else (None, None)
 
+    def _selected_many(self):
+        """[(name, is_dir), …] for every selected real entry (never '..')."""
+        out = []
+        for it in self.list.selectedItems():
+            name, is_dir = it.data(Qt.UserRole)
+            if name and name != "..":
+                out.append((name, is_dir))
+        return out
+
+    def _update_ops(self):
+        """Enable/label the action buttons for the current selection."""
+        sel = self._selected_many()
+        n = len(sel)
+        b = self._ops_btns
+        b["dl_file"].setEnabled(n >= 1)
+        b["dl_file"].setText("⬇ Download" + (f" ({n})" if n > 1 else ""))
+        b["rename"].setEnabled(n == 1)          # rename is single-target
+        b["delete"].setEnabled(n >= 1)
+        b["delete"].setText("🗑 Delete" + (f" ({n})" if n > 1 else ""))
+
     # --- transfers ---
     def _run(self, direction, a, b, then=None):
         self.bar.setVisible(True); self.bar.setValue(0)
@@ -234,34 +265,57 @@ class FileBrowser(QWidget):
         self.refresh()
 
     def _dl_file(self):
-        name, is_dir = self._selected()
-        if not name or name == "..":
+        """Download the selection. One file → Save As; one folder or several
+        entries → pick a destination folder and pull each into it."""
+        sel = self._selected_many()
+        if not sel:
             return
-        if is_dir:
-            QMessageBox.information(self, "Download", "That's a folder — use Download folder.")
+        if len(sel) == 1 and not sel[0][1]:
+            name = sel[0][0]
+            local, _ = QFileDialog.getSaveFileName(self, "Save file as", name)
+            if local:
+                self._run("pull", posixpath.join(self.cwd, name), local)
             return
-        local, _ = QFileDialog.getSaveFileName(self, "Save file as", name)
-        if local:
-            self._run("pull", posixpath.join(self.cwd, name), local)
+        dest = QFileDialog.getExistingDirectory(
+            self, f"Download {len(sel)} item(s) into folder")
+        if not dest:
+            return
+        self._dl_queue = [posixpath.join(self.cwd, n) for n, _ in sel]
+        self._dl_dest = dest
+        self.log.emit(f"downloading {len(sel)} item(s) → {dest}…")
+        self._next_dl()
 
-    def _dl_folder(self):
-        name, is_dir = self._selected()
-        remote = posixpath.join(self.cwd, name) if (name and name != "..") else self.cwd
-        dest = QFileDialog.getExistingDirectory(self, "Download into folder")
-        if dest:
-            self._run("pull", remote, dest)
+    def _next_dl(self):
+        if not getattr(self, "_dl_queue", None):
+            self.bar.setVisible(False)
+            self.refresh()
+            return
+        remote = self._dl_queue.pop(0)
+        self._run("pull", remote, self._dl_dest, then=self._next_dl)
 
-    def _up_file(self):
-        local, _ = QFileDialog.getOpenFileName(self, "Upload file")
-        if local:
-            remote = posixpath.join(self.cwd, os.path.basename(local))
-            self._run("push", local, remote)
-
-    def _up_folder(self):
-        local = QFileDialog.getExistingDirectory(self, "Upload folder")
-        if local:
-            remote = posixpath.join(self.cwd, os.path.basename(local.rstrip("/\\")))
-            self._run("push", local, remote)
+    def _upload(self):
+        """Upload files and/or a folder — one chooser for files, plus a folder
+        option, into the current directory."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Upload")
+        box.setText("Upload files or a whole folder to\n" + self.cwd + " ?")
+        b_files = box.addButton("Choose files…", QMessageBox.AcceptRole)
+        b_folder = box.addButton("Choose a folder…", QMessageBox.ActionRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_files:
+            files, _ = QFileDialog.getOpenFileNames(self, "Upload files")
+            locals_ = [f for f in files if f]
+        elif clicked is b_folder:
+            d = QFileDialog.getExistingDirectory(self, "Upload folder")
+            locals_ = [d] if d else []
+        else:
+            return
+        if locals_:
+            self._drop_queue = list(locals_)
+            self.log.emit(f"uploading {len(locals_)} item(s) to {self.cwd}…")
+            self._next_drop()
 
     def _mkdir(self):
         name, ok = QInputDialog.getText(self, "New folder", "Name:")
@@ -270,9 +324,10 @@ class FileBrowser(QWidget):
                             f"mkdir -p {_q(posixpath.join(self.cwd, name))}")
 
     def _rename(self):
-        name, _ = self._selected()
-        if not name or name == "..":
+        sel = self._selected_many()
+        if len(sel) != 1:
             return
+        name = sel[0][0]
         new, ok = QInputDialog.getText(self, "Rename", "New name:", text=name)
         if ok and new:
             src = posixpath.join(self.cwd, name)
@@ -280,13 +335,26 @@ class FileBrowser(QWidget):
             self._run_shell(f"rename {name}", f"mv {_q(src)} {_q(dst)}")
 
     def _delete(self):
-        name, is_dir = self._selected()
-        if not name or name == "..":
+        sel = self._selected_many()
+        if not sel:
             return
-        if QMessageBox.question(self, "Delete", f"Delete {name}?") != QMessageBox.Yes:
+        n = len(sel)
+        folders = sum(1 for _, is_dir in sel if is_dir)
+        if n == 1:
+            what = ("folder '%s' and everything in it" % sel[0][0]) if folders \
+                else "'%s'" % sel[0][0]
+            msg = f"Delete {what}?"
+        else:
+            fbit = f" ({folders} folder(s), recursively)" if folders else ""
+            msg = f"Delete these {n} items{fbit}?\n\n" + \
+                  ", ".join(name for name, _ in sel[:12]) + \
+                  (" …" if n > 12 else "")
+        if QMessageBox.question(self, "Delete", msg,
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) != QMessageBox.Yes:
             return
-        target = posixpath.join(self.cwd, name)
-        self._run_shell(f"delete {name}", f"rm -rf {_q(target)}")
+        targets = " ".join(_q(posixpath.join(self.cwd, name)) for name, _ in sel)
+        self._run_shell(f"delete {n} item(s)", f"rm -rf {targets}")
 
     def _run_shell(self, label, cmd):
         """Run a one-shot device shell command on a worker thread, log the

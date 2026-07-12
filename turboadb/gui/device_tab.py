@@ -301,6 +301,37 @@ class ShellPanel(QWidget):
         if self.session and self.session.running:
             self.session.send(data)
 
+    def focus_terminal(self):
+        """Put keyboard focus in the console so typing + ↑/↓ history work."""
+        try:
+            self.term.setFocus(Qt.OtherFocusReason)
+        except Exception:
+            pass
+
+    def _reap_device_streamers(self):
+        """After tearing the shell down, a device-side streaming command (most
+        often ``logcat``) can be orphaned to init and keep spamming — killing
+        the local adb.exe does NOT reliably kill it on many devices/head units.
+        Reap the usual offenders over a SEPARATE short-lived adb connection so
+        Stop genuinely stops the output (which is also why the UI 'kept working'
+        after Stop)."""
+        h = self.handler
+        if h is None:
+            return
+        import threading
+
+        def work():
+            try:
+                # kill logcat + other common long-runners started from the shell;
+                # -f matches the full argv. Best-effort; ignore failures.
+                h.shell("pkill -f logcat 2>/dev/null; "
+                        "pkill logcat 2>/dev/null; "
+                        "pkill -f 'top -' 2>/dev/null; true",
+                        timeout=8, safe=True)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
     def interrupt(self):
         """Reliably stop a runaway command (e.g. `logcat`) even with no PTY and
         over a remote adb server: tear the shell down — which kills the device-side
@@ -331,6 +362,8 @@ class ShellPanel(QWidget):
         if self.reader:
             self.reader.stop(); self.reader.wait(800); self.reader = None
         self.session = None
+        # reap any orphaned device-side streamer (logcat) so it stops flooding
+        self._reap_device_streamers()
         self.term._echo("\n^C  — stopped\n", "#ff7a6e")
         self.term._last_feed = 0.0           # shell is idle again after the stop
         self.term._cwd = cwd                 # new prompt shows the right path
@@ -447,6 +480,7 @@ class DeviceTab(QWidget):
         self.inner.setElideMode(Qt.ElideNone)
         self.inner.setUsesScrollButtons(True)
         self.inner.tabBar().setExpanding(False)
+        self.inner.currentChanged.connect(self._on_subtab_changed)
         lay.addWidget(self.inner, 1)
         self._enable_actions(False)
 
@@ -686,6 +720,16 @@ class DeviceTab(QWidget):
         w = getattr(self, "_subtabs", {}).get(name)
         if self.handler and w is not None:
             self.inner.setCurrentWidget(w)
+
+    def _on_subtab_changed(self, *_):
+        """When the Shell tab becomes active, put the keyboard INTO the terminal
+        so ↑/↓ history and typing work straight away (Qt otherwise leaves focus
+        on the tab bar, so arrow keys went nowhere)."""
+        w = self.inner.currentWidget()
+        sh = getattr(self, "shell", None)
+        if sh is not None and w is sh:
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, sh.focus_terminal)
 
     # --- actions: the Mirror tab hosts scrcpy (separate window by default,
     #     or embedded inside the tab when you opt in) ---

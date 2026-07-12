@@ -29,7 +29,30 @@ class ReaderThread(QThread):
         self.encoding = encoding
         self.decode = decode
 
+    # Coalesce a burst of reads into ONE signal every ~40ms. Under a logcat
+    # flood adb hands us many chunks/sec; emitting a cross-thread signal for
+    # each floods the UI event queue (the "tool hangs" symptom). One batched
+    # emit per tick keeps the UI thread free while losing no data.
+    _FLUSH_S = 0.04
+    _MAX_BATCH = 1 << 20                # 1 MB — bound a single emit
+
     def run(self):
+        import time
+        parts = []
+        size = 0
+        last = time.monotonic()
+
+        def flush():
+            nonlocal parts, size
+            if not parts:
+                return
+            if self.decode:
+                self.data.emit("".join(parts))
+            else:
+                self.data.emit(b"".join(parts))
+            parts = []
+            size = 0
+
         while self._alive:
             try:
                 chunk = self._read()
@@ -38,11 +61,23 @@ class ReaderThread(QThread):
             if chunk is None:
                 break
             if chunk:
+                small = len(chunk) < 8192
                 if self.decode and isinstance(chunk, bytes):
                     chunk = chunk.decode(self.encoding, errors="replace")
-                self.data.emit(chunk)
+                parts.append(chunk)
+                size += len(chunk)
+                now = time.monotonic()
+                # coalesce only a genuine FLOOD (big back-to-back chunks); a
+                # small chunk means the burst is ebbing, so flush at once — this
+                # keeps interactive output instant while taming a logcat flood
+                if small or size >= self._MAX_BATCH or (now - last) >= self._FLUSH_S:
+                    flush()
+                    last = now
             else:
+                flush()
+                last = time.monotonic()
                 self.msleep(15)
+        flush()
         self.closed.emit()
 
     def stop(self):

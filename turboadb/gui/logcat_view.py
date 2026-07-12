@@ -82,6 +82,43 @@ class _LogcatThread(QThread):
                 pass
 
 
+class _ZoomEdit(QPlainTextEdit):
+    """A read-only log view whose font zooms with Ctrl+wheel / Ctrl+± — the
+    persisted size is shared with the terminal (same ``term_font_size``)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            self._bump(1 if event.angleDelta().y() > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def keyPressEvent(self, event):
+        m, k = event.modifiers(), event.key()
+        if m & Qt.ControlModifier and k in (Qt.Key_Plus, Qt.Key_Equal):
+            self._bump(1); return
+        if m & Qt.ControlModifier and k == Qt.Key_Minus:
+            self._bump(-1); return
+        super().keyPressEvent(event)
+
+    def _bump(self, step):
+        f = self.font()
+        size = max(6, min(40, (f.pointSize() or 10) + step))
+        if size == f.pointSize():
+            return
+        f.setPointSize(size); self.setFont(f)
+        try:
+            data = settings_mod.load()
+            data["term_font_size"] = size
+            settings_mod.save(data)
+        except Exception:
+            pass
+
+
 class LogcatPanel(QWidget):
     log = pyqtSignal(str)
 
@@ -175,7 +212,7 @@ class LogcatPanel(QWidget):
         ctrl.setStretch(5, 1)                  # the regex-filter box stretches
         lay.addLayout(ctrl)
 
-        self.view = QPlainTextEdit(); self.view.setReadOnly(True)
+        self.view = _ZoomEdit()
         fam = settings_mod.get("term_font") or "Consolas"
         self.view.setFont(QFont(fam, int(settings_mod.get("term_font_size") or 10)))
         # generous on-screen scrollback; trimmed lines are archived so a long

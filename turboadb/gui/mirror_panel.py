@@ -571,7 +571,8 @@ class MirrorPanel(QWidget):
         self._mon = None
         self._compat = False
         self._embed_on = False
-        self._retried = False
+        self._retry_count = 0
+        self._became_ready = False
         # device-side screen recording (independent of how you're viewing —
         # works with the scrcpy mirror OR Live View, over RDP / remote)
         self._recording = False
@@ -584,6 +585,7 @@ class MirrorPanel(QWidget):
         self._rec_wait = None
         self._shot = None
         self._live = None
+        self._closing = False        # guards deferred callbacks (retry timers)
         self._dev_w = self._dev_h = 0
         self._displays = []          # cached [{id,size}] from the last list
         self._multi = []             # ScrcpySessions when mirroring ALL displays
@@ -1307,7 +1309,11 @@ class MirrorPanel(QWidget):
 
     # ----- start / stop -----
     def start(self, display_id="__use_combo__", compat=None, embed=None,
-              record=None, record_format=None, camera=None):
+              record=None, record_format=None, camera=None, _retry=False):
+        if self._closing:                        # tab closed during a retry delay
+            return
+        if not _retry:
+            self._retry_count = 0                # a fresh manual start
         if self._live is not None:               # switch away from Live View
             self._stop_live()
         if self._scrcpy is not None:
@@ -1384,11 +1390,12 @@ class MirrorPanel(QWidget):
             return
         self._scrcpy = res.value if isinstance(res, OperationResult) else res
         self._start_t = __import__("time").time()
+        self._became_ready = False           # set once it renders / embeds
         self._refresh_buttons()
         # watch for the scrcpy window being closed so the buttons reset
         self._mon = QTimer(self)
         self._mon.timeout.connect(self._check_alive)
-        self._mon.start(800)
+        self._mon.start(500)
         if do_embed:
             self.status.setText("Starting mirror… embedding the scrcpy window.")
             self._embed_tries = 0
@@ -1401,18 +1408,29 @@ class MirrorPanel(QWidget):
                                 "(embedding off / not supported here).")
             self.log.emit("[OK] scrcpy launched in an external window")
 
+    # markers that prove scrcpy actually brought up video (so a later exit is a
+    # normal close, NOT a failed start)
+    _HEALTHY = ("Renderer:", "Texture:", "Recording started", "INFO: Renderer",
+                "New display", "Device:")
+
     def _check_alive(self):
-        """If scrcpy exited (window closed / crashed), reset — and if it died
-        immediately after starting, surface the error and auto-retry once in
-        compatibility mode (scrcpy 'sometimes doesn't start' is usually an
-        encoder/codec issue compat mode fixes)."""
+        """Poll the scrcpy process. While alive, note once it becomes 'ready'
+        (rendered or embedded). On exit: a start that NEVER became ready is a
+        failed start — auto-retry up to twice with progressively safer options,
+        then ALWAYS surface the exact reason. A ready→exit is a normal close."""
         if self._scrcpy is None:
             return
+        import time
+        err_live = self._scrcpy.read_log() or ""
+        if not self._became_ready and (self._child_hwnd is not None
+                                       or any(m in err_live for m in self._HEALTHY)):
+            self._became_ready = True
         if self._scrcpy.running:
             return
-        import time
-        died_fast = (time.time() - getattr(self, "_start_t", 0)) < 6
-        err = (self._scrcpy.read_log() or "").strip()
+
+        ran_s = time.time() - getattr(self, "_start_t", 0)
+        err = err_live.strip()
+        ready = self._became_ready or ran_s > 8      # ran a while = it worked
         self._scrcpy = None
         self._stop_embed_timer()
         self._child_hwnd = None
@@ -1421,29 +1439,44 @@ class MirrorPanel(QWidget):
         self._refresh_buttons()
         self.status.show()
 
-        # "healthy" markers mean scrcpy actually started and rendered/recorded —
-        # if it then exited it was closed on purpose (or by us), NOT a failed
-        # start, so we must NOT retry (retrying used to relaunch and corrupt a
-        # perfectly good recording).
-        healthy = any(m in err for m in ("Renderer:", "Texture:",
-                                         "Recording started", "INFO: Renderer"))
-        if (died_fast and not healthy and not getattr(self, "_retried", False)
-                and not self._compat):
-            self._retried = True
-            tail = " ".join(err.splitlines()[-2:])[:200]
-            self.log.emit(f"[WARNING] scrcpy didn't start ({tail or 'no output'}); "
-                          f"retrying in compatibility mode…")
-            self.status.setText("Retrying mirror in compatibility mode…")
-            self.start(compat=True, embed=self._embed_on)
-            return
-        self._retried = False
-        if died_fast and err:
-            self.log.emit("[ERROR] scrcpy: " + " ".join(err.splitlines()[-3:])[:300])
-            self.status.setText("Mirror couldn't start — see the scrcpy log below.")
-            self._show_scrcpy_log(err)
-        else:
-            self.status.setText("Mirror ended. Click “Start mirror” to view again.")
+        if ready:
+            self._retry_count = 0
+            self.status.setText("Mirror ended. Click “▶ Mirror” to view again.")
             self.log.emit("[OK] mirror ended")
+            return
+
+        # ---- failed to start: auto-retry with safer options, then explain ----
+        tries = getattr(self, "_retry_count", 0)
+        tail = " ".join(err.splitlines()[-2:])[:200] or "no output from scrcpy"
+        if tries == 0:
+            # 1st retry: compatibility profile (H.264 + caps + forward tunnel),
+            # which is what fixes most automotive/IVI encoder + reverse-tunnel
+            # failures that make the first attempt die
+            self._retry_count = 1
+            self.log.emit(f"[WARNING] scrcpy didn't start ({tail}); retrying in "
+                          f"compatibility mode…")
+            self.status.setText("Retrying in compatibility mode…")
+            QTimer.singleShot(400, lambda: self.start(compat=True,
+                                                      embed=self._embed_on,
+                                                      _retry=True))
+            return
+        if tries == 1:
+            # 2nd retry: compat AND a separate window (embedding can itself be the
+            # thing failing on some GPU/RDP sessions)
+            self._retry_count = 2
+            self.log.emit("[WARNING] still couldn't start; one more try in a "
+                          "separate window (no embed)…")
+            self.status.setText("Retrying in a separate window…")
+            QTimer.singleShot(400, lambda: self.start(compat=True, embed=False,
+                                                      _retry=True))
+            return
+        # gave up — ALWAYS show the concrete reason
+        self._retry_count = 0
+        self.log.emit("[ERROR] scrcpy could not start after 3 attempts: " + tail)
+        self.status.setText("Mirror couldn't start — see the reason below.")
+        self._show_scrcpy_log(err or "(scrcpy exited immediately with no output — "
+                              "it likely couldn't reach the device or open a "
+                              "video encoder on this display.)")
 
     def _show_scrcpy_log(self, err):
         """Show scrcpy's full output so a failure (esp. over RDP / on an IVI) is
@@ -1622,6 +1655,7 @@ class MirrorPanel(QWidget):
                 self._rec_thread.wait(8000)          # let screenrecord stop + pull
 
     def close_panel(self):
+        self._closing = True            # neutralise any pending retry timer
         self._stop_live()               # parks the thread if it's still running
         if self._key_pump is not None:
             self._key_pump.stop()

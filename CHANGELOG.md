@@ -3,6 +3,37 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.5
+
+A round of fixes from real usage — mirror reliability, the terminal, logcat,
+files, and tabs.
+
+- **scrcpy failures now tell you why.** A mirror that doesn't come up is
+  auto-retried (compatibility mode, then a separate window) and, if it still
+  won't start, a dialog shows scrcpy's **actual output and the exact reason**
+  instead of a silent "mirror ended".
+- **Flaky automotive start fixed.** A start that never renders is retried
+  automatically up to twice with progressively safer options — the "had to try
+  2–3 times" behaviour on head units is now done for you on the first click.
+- **Ctrl + mouse-wheel (and Ctrl +/−) zoom** the text size in the terminal and
+  the logcat view; the chosen size is remembered.
+- **Right-click a tab** for Close, Close others, Close to the left, Close to the
+  right, and Close all.
+- **Terminal ↑/↓ recall previous/next commands.** The console now takes keyboard
+  focus when you open the Shell tab, so the history keys (which were going
+  nowhere because focus sat on the tab bar) work.
+- **Files: multi-select and folder delete.** Ctrl/Shift-click to select several
+  entries (Ctrl+A for all), Delete removes them — files and whole folders,
+  recursively — in one confirmed step; F2 renames; a combined Upload picker for
+  files or a folder. Downloading several items pulls them into a chosen folder.
+- **`logcat` in the shell actually stops now.** Killing the local adb didn't
+  reliably kill an orphaned device-side `logcat`, so it kept streaming after
+  Stop; TurboADB now reaps it over a separate connection.
+- **No more UI hang under a flood.** The shell reader coalesces a burst of output
+  into a few batched updates instead of thousands of cross-thread signals
+  (interactive output stays instant), and stopping a runaway `logcat` (above)
+  removes the flood at its source.
+
 ## 1.1.4
 
 Makes typing actually work on every device, and de-clutters the mirror toolbar.

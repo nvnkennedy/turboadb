@@ -584,6 +584,10 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(lambda *_: self._update_status())
+        # right-click a tab for the standard close actions
+        tb = self.tabs.tabBar()
+        tb.setContextMenuPolicy(Qt.CustomContextMenu)
+        tb.customContextMenuRequested.connect(self._tab_context_menu)
         plus = QToolButton(); plus.setText("  +  "); plus.setToolTip("New device")
         plus.clicked.connect(self.new_session)
         self.tabs.setCornerWidget(plus, Qt.TopRightCorner)
@@ -1480,6 +1484,42 @@ class MainWindow(QMainWindow):
     def _close_current_tab(self):
         i = self.tabs.currentIndex()
         if i >= 0:
+            self._close_tab(i)
+
+    def _tab_context_menu(self, pos):
+        bar = self.tabs.tabBar()
+        idx = bar.tabAt(pos)
+        if idx < 0:
+            return
+        n = self.tabs.count()
+        menu = QMenu(self)
+        act_close = menu.addAction(theme.emoji_icon("✖"), "Close tab")
+        act_others = menu.addAction("Close other tabs")
+        act_left = menu.addAction("Close tabs to the left")
+        act_right = menu.addAction("Close tabs to the right")
+        menu.addSeparator()
+        act_all = menu.addAction(theme.emoji_icon("✖", theme.DANGER),
+                                 "Close all tabs")
+        act_others.setEnabled(n > 1)
+        act_left.setEnabled(idx > 0)
+        act_right.setEnabled(idx < n - 1)
+        chosen = menu.exec_(bar.mapToGlobal(pos))
+        if chosen is None:
+            return
+        # close by INDEX from the right so earlier indices stay valid
+        if chosen is act_close:
+            targets = [idx]
+        elif chosen is act_others:
+            targets = [i for i in range(n) if i != idx]
+        elif chosen is act_left:
+            targets = list(range(0, idx))
+        elif chosen is act_right:
+            targets = list(range(idx + 1, n))
+        elif chosen is act_all:
+            targets = list(range(n))
+        else:
+            return
+        for i in sorted(targets, reverse=True):
             self._close_tab(i)
 
     def _open_docs(self):
