@@ -3,6 +3,16 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.6
+
+- **A MobaXterm-style welcome header on every shell.** Opening a device's Shell
+  tab now greets you with a tidy coloured banner — the device model,
+  Android version + SDK, ABI, serial and how you're connected (USB / network /
+  remote adb server), plus a one-line reminder of the terminal shortcuts (↑/↓
+  history, Tab completion, Ctrl+wheel zoom, Stop halts logcat). Automotive/IVI
+  targets get a 🚗 badge and an "Android Automotive" note. Shown once per tab
+  (not on Stop→reopen), and included in the saved terminal log.
+
 ## 1.1.5
 
 A round of fixes from real usage — mirror reliability, the terminal, logcat,

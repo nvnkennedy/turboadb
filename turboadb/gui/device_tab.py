@@ -141,14 +141,16 @@ class ShellPanel(QWidget):
     log = pyqtSignal(str)
     disconnected = pyqtSignal()             # the shell died (reboot / unplug)
 
-    def __init__(self, handler, device_name="", parent=None):
+    def __init__(self, handler, device_name="", info=None, parent=None):
         super().__init__(parent)
         self.handler = handler
         self.device_name = device_name or (handler.serial or "android")
+        self._info = info or {}
         self.session = None
         self.reader = None
         self._pt = None
         self._closing = False
+        self._banner_shown = False
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
 
         # a slim action row — input goes INTO the terminal
@@ -258,11 +260,72 @@ class ShellPanel(QWidget):
         # slow over RDP, so we never leave a blank "$" waiting for it. (When
         # reopening after a disconnect, set_alive() draws the prompt instead.)
         self.term.set_prompt(self.device_name, root=False)
+        # a MobaXterm-style welcome header, once per shell tab (not on the
+        # Stop→reopen or reconnect paths, which would be noise)
+        if not self._banner_shown and self.term._alive:
+            self._banner_shown = True
+            try:
+                self.term.banner(self._welcome_banner())
+            except Exception:
+                pass
         if self.term._alive:
             self.term.show_prompt()
         self._pt = _PromptThread(self.handler, self.device_name)
         self._pt.ready.connect(self._on_prompt)
         self._pt.start()
+
+    def _welcome_banner(self) -> str:
+        """A coloured MobaXterm-style session header shown when the shell opens."""
+        try:
+            from .. import __version__ as ver
+        except Exception:
+            ver = ""
+        d = self._info
+        # ANSI: 36=cyan frame, 96=title, 97=label, 92=value, 90=dim
+        C, T, L, V, D, R = ("\x1b[36m", "\x1b[96m", "\x1b[97m", "\x1b[92m",
+                            "\x1b[90m", "\x1b[0m")
+        rule = C + "═" * 64 + R + "\n"
+        thin = D + "─" * 64 + R + "\n"
+
+        # how we're connected
+        cfg = getattr(self.handler, "config", None)
+        if cfg is not None and getattr(cfg, "adb_server_host", None):
+            via = (f"remote adb server {cfg.adb_server_host}:"
+                   f"{getattr(cfg, 'adb_server_port', 5037)}")
+        elif cfg is not None and getattr(cfg, "host", None):
+            via = f"network {cfg.host}:{getattr(cfg, 'port', 5555)}"
+        else:
+            via = "USB"
+
+        model = d.get("model") or self.device_name or "device"
+        brand = d.get("manufacturer") or d.get("brand") or ""
+        andro = d.get("android_version")
+        sdk = d.get("sdk")
+        abi = d.get("abi")
+        serial = self.handler.serial or d.get("serial") or ""
+
+        lines = [rule]
+        badge = "🚗 " if d.get("automotive") else "📱 "
+        lines.append(f"  {T}{badge}TurboADB {ver}{R}  {D}·{R}  device shell\n")
+        lines.append(rule)
+        title = (brand + " " + model).strip()
+        lines.append(f"  {L}Device {R}  {V}{title}{R}\n")
+        if andro:
+            sysline = f"Android {andro}" + (f" (SDK {sdk})" if sdk else "")
+            if d.get("automotive"):
+                sysline += "  ·  Android Automotive / IVI"
+            lines.append(f"  {L}System {R}  {V}{sysline}{R}\n")
+        if abi:
+            lines.append(f"  {L}ABI    {R}  {V}{abi}{R}\n")
+        if serial:
+            lines.append(f"  {L}Serial {R}  {V}{serial}{R}   {D}via {via}{R}\n")
+        else:
+            lines.append(f"  {L}Via    {R}  {V}{via}{R}\n")
+        lines.append(thin)
+        lines.append(f"  {D}↑/↓ history · Tab completes · Ctrl+wheel zooms · "
+                     f"Stop halts logcat · type a command below{R}\n")
+        lines.append(rule)
+        return "".join(lines)
 
     def _feed_from(self, reader, data):
         # only the CURRENT reader may write to the terminal — stragglers from a
@@ -594,9 +657,11 @@ class DeviceTab(QWidget):
                 self.title_changed.emit(name)
 
         dev_name = ""
+        binfo = {}
         if isinstance(info, OperationResult) and info.success:
             dev_name = info.value.get("device") or info.value.get("model") or ""
-        self.shell = ShellPanel(handler, device_name=dev_name)
+            binfo = dict(info.value)
+        self.shell = ShellPanel(handler, device_name=dev_name, info=binfo)
         self.shell.log.connect(self.log)
         self.shell.disconnected.connect(self._on_shell_lost)
         self.logcat = LogcatPanel(handler); self.logcat.log.connect(self.log)

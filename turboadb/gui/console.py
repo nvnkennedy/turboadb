@@ -188,6 +188,16 @@ class AnsiConsole(QPlainTextEdit):
             return "$ "
         return f"{self._host}:{self._cwd} {'#' if self._root else '$'} "
 
+    def banner(self, text):
+        """Render a pre-formatted welcome banner (may carry ANSI colour codes)
+        synchronously, before the first prompt — like MobaXterm's session
+        header. Archived to the full log too."""
+        if not text:
+            return
+        self._sb.archive(strip_ansi(text))
+        self._process(text)                 # the incremental ANSI parser colours it
+        self._wc.movePosition(QTextCursor.End)
+
     def show_prompt(self):
         """Print the prompt now (call once the shell is open)."""
         self._prompt_if_needed()
