@@ -275,7 +275,8 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self.refresh_sessions()
         self._update_status()
-        self.log_panel.append(f"[OK] TurboADB {self._version} ready")
+        # version is shown in the status bar only (not decorated elsewhere)
+        self.log_panel.append("[OK] TurboADB ready")
 
         # live adb-devices auto-refresh
         self._timer = QTimer(self)

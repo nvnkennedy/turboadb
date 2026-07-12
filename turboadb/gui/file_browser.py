@@ -76,6 +76,8 @@ class FileBrowser(QWidget):
         # removes the selection (files AND folders)
         self.list.setSelectionMode(QListWidget.ExtendedSelection)
         self.list.itemSelectionChanged.connect(self._update_ops)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
         from PyQt5.QtWidgets import QShortcut
         from PyQt5.QtGui import QKeySequence
         QShortcut(QKeySequence.Delete, self.list, activated=self._delete)
@@ -232,6 +234,60 @@ class FileBrowser(QWidget):
                 out.append((name, is_dir))
         return out
 
+    def _context_menu(self, pos):
+        from PyQt5.QtWidgets import QMenu
+        from . import theme
+        ico = theme.emoji_icon
+        sel = self._selected_many()
+        n = len(sel)
+        m = QMenu(self)
+        # open a folder if exactly one folder is under the cursor
+        if n == 1 and sel[0][1]:
+            m.addAction(ico("📂"), f"Open  “{sel[0][0]}”",
+                        lambda: self._open_named(sel[0][0]))
+            m.addSeparator()
+        act_dl = m.addAction(ico("⬇"), "Copy to my PC…"
+                             + (f"  ({n})" if n > 1 else ""))
+        act_dl.setEnabled(n >= 1)
+        act_dl.triggered.connect(self._dl_file)
+        act_rn = m.addAction(ico("✏"), "Rename…")
+        act_rn.setEnabled(n == 1)
+        act_rn.triggered.connect(self._rename)
+        m.addSeparator()
+        act_del = m.addAction(ico("🗑", theme.DANGER),
+                              "Delete" + (f"  ({n})" if n > 1 else ""))
+        act_del.setEnabled(n >= 1)
+        act_del.triggered.connect(self._delete)
+        act_delall = m.addAction(ico("🧨", theme.DANGER),
+                                 "Delete EVERYTHING in this folder…")
+        act_delall.triggered.connect(self._delete_all)
+        m.addSeparator()
+        m.addAction("Select all", self.list.selectAll)
+        m.addAction("Clear selection", self.list.clearSelection)
+        m.addSeparator()
+        m.addAction(ico("⬆"), "Upload here…", self._upload)
+        m.addAction(ico("📁"), "New folder…", self._mkdir)
+        m.addAction("Refresh", self.refresh)
+        m.exec_(self.list.viewport().mapToGlobal(pos))
+
+    def _open_named(self, name):
+        self.cwd = posixpath.join(self.cwd, name)
+        self.refresh()
+
+    def _delete_all(self):
+        """Empty the current directory (delete every entry in it)."""
+        if QMessageBox.question(
+                self, "Delete everything here",
+                f"Delete ALL files and folders inside\n{self.cwd} ?\n\n"
+                f"This cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        # rm the directory's CONTENTS (dotfiles included), not the dir itself
+        cmd = (f"cd {_q(self.cwd)} 2>/dev/null && rm -rf ./* ./.[!.]* ./..?* "
+               f"2>/dev/null; true")
+        self._run_shell("empty folder", cmd)
+
     def _update_ops(self):
         """Enable/label the action buttons for the current selection."""
         sel = self._selected_many()
@@ -270,14 +326,16 @@ class FileBrowser(QWidget):
         sel = self._selected_many()
         if not sel:
             return
+        from .fileutil import download_path, download_dir
         if len(sel) == 1 and not sel[0][1]:
             name = sel[0][0]
-            local, _ = QFileDialog.getSaveFileName(self, "Save file as", name)
+            local, _ = QFileDialog.getSaveFileName(self, "Save file as",
+                                                   download_path(name))
             if local:
                 self._run("pull", posixpath.join(self.cwd, name), local)
             return
         dest = QFileDialog.getExistingDirectory(
-            self, f"Download {len(sel)} item(s) into folder")
+            self, f"Download {len(sel)} item(s) into folder", download_dir())
         if not dest:
             return
         self._dl_queue = [posixpath.join(self.cwd, n) for n, _ in sel]

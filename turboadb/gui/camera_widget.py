@@ -685,9 +685,11 @@ class CameraPanel(QWidget):
         raw = self.reader.latest_raw() if self.reader else None
         if not raw:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save snapshot",
-                                              f"webcam-{int(time.time())}.jpg",
-                                              "Images (*.jpg *.png)")
+        from .fileutil import download_path
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save snapshot",
+            download_path(f"webcam-{int(time.time())}.jpg"),
+            "Images (*.jpg *.png)")
         if not path:
             return
         try:
@@ -711,9 +713,10 @@ class CameraPanel(QWidget):
         if not ff:
             QMessageBox.warning(self, "Recording", "ffmpeg isn't ready yet.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Record video to",
-                                              f"webcam-{int(time.time())}.mp4",
-                                              "Video (*.mp4)")
+        from .fileutil import download_path
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Record video to",
+            download_path(f"webcam-{int(time.time())}.mp4"), "Video (*.mp4)")
         if not path:
             return
         try:

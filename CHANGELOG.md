@@ -3,6 +3,28 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.7
+
+- **"scrcpy started but showed nothing" is fixed.** The success check was too
+  loose — scrcpy prints ``Device: …`` the instant it *connects*, before it opens
+  a decoder, so a connect-then-fail was treated as a working start and left
+  alone. Now only a real *renderer/texture/recording* line counts as up, so a
+  failed start is properly detected — and **auto-retried**: first the same way
+  (most first-launch failures, even on ordinary phones, are a transient
+  server-push race that a second attempt just fixes), then compatibility mode in
+  a separate window. If all three attempts fail you get scrcpy's **actual log
+  and the real reason**, never a silent "started".
+- **Saved files go to your Downloads folder** by default — screenshots,
+  recordings, pulled files, logcat/terminal logs, bugreports and webcam captures
+  — instead of an arbitrary location.
+- **Files: full right-click menu.** Open, Copy to my PC, Rename, Delete
+  (files *and* folders), **Delete EVERYTHING in this folder**, Select all / Clear
+  selection, Upload here, New folder, Refresh — alongside the existing
+  multi-select (Ctrl/Shift-click, Ctrl+A) and Delete-key support.
+- **Shell welcome banner redone** as a clean bordered box (device · system · ABI
+  · access), **without** the tips line, and the app **version now appears only in
+  the status bar** — not in the banner or the ready message.
+
 ## 1.1.6
 
 - **A MobaXterm-style welcome header on every shell.** Opening a device's Shell

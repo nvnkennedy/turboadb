@@ -274,58 +274,63 @@ class ShellPanel(QWidget):
         self._pt.ready.connect(self._on_prompt)
         self._pt.start()
 
+    # ANSI: cyan frame · bright-cyan title · white label · green value · dim
+    _BC, _BT, _BL, _BV, _BD, _BR = ("\x1b[36m", "\x1b[96m", "\x1b[97m",
+                                    "\x1b[92m", "\x1b[90m", "\x1b[0m")
+    _BOX_W = 60          # inner width between the │ borders
+
     def _welcome_banner(self) -> str:
-        """A coloured MobaXterm-style session header shown when the shell opens."""
-        try:
-            from .. import __version__ as ver
-        except Exception:
-            ver = ""
+        """A boxed MobaXterm-style session header shown when the shell opens.
+        No version (that lives only in the status bar) and no tips line."""
         d = self._info
-        # ANSI: 36=cyan frame, 96=title, 97=label, 92=value, 90=dim
-        C, T, L, V, D, R = ("\x1b[36m", "\x1b[96m", "\x1b[97m", "\x1b[92m",
-                            "\x1b[90m", "\x1b[0m")
-        rule = C + "═" * 64 + R + "\n"
-        thin = D + "─" * 64 + R + "\n"
+        C, T, L, V, Dm, R = (self._BC, self._BT, self._BL, self._BV,
+                             self._BD, self._BR)
+        W = self._BOX_W
+        top = f"{C}╭{'─' * W}╮{R}\n"
+        sep = f"{C}├{'─' * W}┤{R}\n"
+        bot = f"{C}╰{'─' * W}╯{R}\n"
+
+        def line(segs):
+            """segs: [(text, colour|None)] → one bordered, padded row."""
+            visible = sum(len(t) for t, _ in segs)
+            body = "".join((c + t + R) if c else t for t, c in segs)
+            pad = " " * max(0, W - 1 - visible)     # 1 leading space + body + pad
+            return f"{C}│{R} {body}{pad}{C}│{R}\n"
 
         # how we're connected
         cfg = getattr(self.handler, "config", None)
         if cfg is not None and getattr(cfg, "adb_server_host", None):
-            via = (f"remote adb server {cfg.adb_server_host}:"
+            via = (f"remote adb {cfg.adb_server_host}:"
                    f"{getattr(cfg, 'adb_server_port', 5037)}")
         elif cfg is not None and getattr(cfg, "host", None):
             via = f"network {cfg.host}:{getattr(cfg, 'port', 5555)}"
         else:
             via = "USB"
 
-        model = d.get("model") or self.device_name or "device"
-        brand = d.get("manufacturer") or d.get("brand") or ""
+        model = (((d.get("manufacturer") or d.get("brand") or "") + " " +
+                  (d.get("model") or self.device_name or "device")).strip())
         andro = d.get("android_version")
         sdk = d.get("sdk")
         abi = d.get("abi")
         serial = self.handler.serial or d.get("serial") or ""
 
-        lines = [rule]
-        badge = "🚗 " if d.get("automotive") else "📱 "
-        lines.append(f"  {T}{badge}TurboADB {ver}{R}  {D}·{R}  device shell\n")
-        lines.append(rule)
-        title = (brand + " " + model).strip()
-        lines.append(f"  {L}Device {R}  {V}{title}{R}\n")
+        def row(label, value):
+            return line([("  " + label.ljust(8), L), (value, V)])
+
+        out = [top,
+               line([("  TurboADB", T), ("  ·  device shell", None)]),
+               sep,
+               row("Device", model)]
         if andro:
-            sysline = f"Android {andro}" + (f" (SDK {sdk})" if sdk else "")
-            if d.get("automotive"):
-                sysline += "  ·  Android Automotive / IVI"
-            lines.append(f"  {L}System {R}  {V}{sysline}{R}\n")
+            out.append(row("System", f"Android {andro}"
+                           + (f"  (SDK {sdk})" if sdk else "")))
+        if d.get("automotive"):
+            out.append(row("Type", "Android Automotive / IVI"))
         if abi:
-            lines.append(f"  {L}ABI    {R}  {V}{abi}{R}\n")
-        if serial:
-            lines.append(f"  {L}Serial {R}  {V}{serial}{R}   {D}via {via}{R}\n")
-        else:
-            lines.append(f"  {L}Via    {R}  {V}{via}{R}\n")
-        lines.append(thin)
-        lines.append(f"  {D}↑/↓ history · Tab completes · Ctrl+wheel zooms · "
-                     f"Stop halts logcat · type a command below{R}\n")
-        lines.append(rule)
-        return "".join(lines)
+            out.append(row("ABI", abi))
+        out.append(row("Access", (serial + "   " if serial else "") + "via " + via))
+        out.append(bot)
+        return "".join(out)
 
     def _feed_from(self, reader, data):
         # only the CURRENT reader may write to the terminal — stragglers from a
@@ -813,8 +818,12 @@ class DeviceTab(QWidget):
     def screenshot(self):
         if not self.handler:
             return
+        import time as _t
+        from .fileutil import download_path
+        default = download_path("screenshot-" + _t.strftime("%Y%m%d-%H%M%S")
+                                + ".png")
         path, _ = QFileDialog.getSaveFileName(self, "Save screenshot",
-                                              "screenshot.png", "PNG (*.png)")
+                                              default, "PNG (*.png)")
         if not path:
             return
         t = _ActionThread(lambda: self.handler.screenshot(path, safe=False))
@@ -870,7 +879,8 @@ class DeviceTab(QWidget):
         if not self.handler:
             return
         import time as _t
-        default = _t.strftime("bugreport-%Y%m%d-%H%M%S.zip")
+        from .fileutil import download_path
+        default = download_path(_t.strftime("bugreport-%Y%m%d-%H%M%S.zip"))
         path, _ = QFileDialog.getSaveFileName(self, "Save bugreport", default,
                                               "Zip (*.zip);;All files (*)")
         if not path:

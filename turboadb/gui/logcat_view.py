@@ -444,7 +444,9 @@ class LogcatPanel(QWidget):
         cur.insertText(line[pos:] + "\n", base_fmt)
 
     def _save(self):
-        default = "turboadb-logcat-" + time.strftime("%Y%m%d-%H%M%S") + ".log"
+        from .fileutil import download_path
+        default = download_path("turboadb-logcat-"
+                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save logcat", default,
             "Log files (*.log);;Text files (*.txt);;All files (*)")

@@ -134,7 +134,9 @@ class LogPanel(QGroupBox):
         self.view.clear()
 
     def _save(self):
-        default = "turboadb-log-" + time.strftime("%Y%m%d-%H%M%S") + ".log"
+        from .fileutil import download_path
+        default = download_path("turboadb-log-"
+                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save log", default,
             "Log files (*.log);;Text files (*.txt);;All files (*)")

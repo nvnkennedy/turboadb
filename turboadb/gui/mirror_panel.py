@@ -184,8 +184,8 @@ def _bitrate_to_bps(value) -> str:
 
 
 def _default_save_dir() -> str:
-    d = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
-    return d or os.path.expanduser("~")
+    from .fileutil import download_dir      # save to the user's Downloads folder
+    return download_dir()
 
 
 def _open_path(path) -> None:
@@ -1408,10 +1408,14 @@ class MirrorPanel(QWidget):
                                 "(embedding off / not supported here).")
             self.log.emit("[OK] scrcpy launched in an external window")
 
-    # markers that prove scrcpy actually brought up video (so a later exit is a
-    # normal close, NOT a failed start)
+    # markers that prove scrcpy actually brought up VIDEO (so a later exit is a
+    # normal close, NOT a failed start). Deliberately NOT "Device:" / "New
+    # display" — scrcpy prints those the instant it CONNECTS, before it opens a
+    # decoder, so a connect-then-die failure used to look "started" and was left
+    # alone (the "fake started" bug). Only a renderer/texture/recording line
+    # means a frame actually flowed.
     _HEALTHY = ("Renderer:", "Texture:", "Recording started", "INFO: Renderer",
-                "New display", "Device:")
+                "Frame: ", "v4l2", "audio player")
 
     def _check_alive(self):
         """Poll the scrcpy process. While alive, note once it becomes 'ready'
@@ -1449,34 +1453,35 @@ class MirrorPanel(QWidget):
         tries = getattr(self, "_retry_count", 0)
         tail = " ".join(err.splitlines()[-2:])[:200] or "no output from scrcpy"
         if tries == 0:
-            # 1st retry: compatibility profile (H.264 + caps + forward tunnel),
-            # which is what fixes most automotive/IVI encoder + reverse-tunnel
-            # failures that make the first attempt die
+            # 1st retry: SAME settings. Most first-launch failures — on ordinary
+            # phones too — are transient: scrcpy pushing/starting its server on
+            # the device races the fresh adb connection, so a plain second
+            # attempt (server jar now in place) simply works. This IS the "starts
+            # on the 2nd try" behaviour, now done automatically.
             self._retry_count = 1
-            self.log.emit(f"[WARNING] scrcpy didn't start ({tail}); retrying in "
-                          f"compatibility mode…")
-            self.status.setText("Retrying in compatibility mode…")
-            QTimer.singleShot(400, lambda: self.start(compat=True,
-                                                      embed=self._embed_on,
-                                                      _retry=True))
+            self.log.emit(f"[WARNING] scrcpy didn't start ({tail}); retrying…")
+            self.status.setText("scrcpy didn't start — retrying…")
+            QTimer.singleShot(600, lambda: self.start(_retry=True))
             return
         if tries == 1:
-            # 2nd retry: compat AND a separate window (embedding can itself be the
-            # thing failing on some GPU/RDP sessions)
+            # 2nd retry: compatibility profile in a SEPARATE window (H.264 + caps
+            # + forward tunnel + no embed) — the safe fallback that fixes
+            # automotive/IVI encoder, reverse-tunnel and embed failures
             self._retry_count = 2
-            self.log.emit("[WARNING] still couldn't start; one more try in a "
-                          "separate window (no embed)…")
-            self.status.setText("Retrying in a separate window…")
-            QTimer.singleShot(400, lambda: self.start(compat=True, embed=False,
+            self.log.emit("[WARNING] still didn't start; one more try in "
+                          "compatibility mode, separate window…")
+            self.status.setText("Retrying in compatibility mode…")
+            QTimer.singleShot(600, lambda: self.start(compat=True, embed=False,
                                                       _retry=True))
             return
-        # gave up — ALWAYS show the concrete reason
+        # gave up after 3 real attempts — show scrcpy's ACTUAL output + reason
         self._retry_count = 0
-        self.log.emit("[ERROR] scrcpy could not start after 3 attempts: " + tail)
-        self.status.setText("Mirror couldn't start — see the reason below.")
-        self._show_scrcpy_log(err or "(scrcpy exited immediately with no output — "
-                              "it likely couldn't reach the device or open a "
-                              "video encoder on this display.)")
+        self.log.emit("[ERROR] scrcpy could not start after 3 attempts. "
+                      "Last output: " + tail)
+        self.status.setText("Mirror couldn't start — see the log below.")
+        self._show_scrcpy_log(err or "(scrcpy exited immediately with no output. "
+                              "It likely couldn't reach the device, or couldn't "
+                              "open a video encoder for this display.)")
 
     def _show_scrcpy_log(self, err):
         """Show scrcpy's full output so a failure (esp. over RDP / on an IVI) is

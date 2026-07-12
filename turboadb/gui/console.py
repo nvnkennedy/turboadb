@@ -530,7 +530,9 @@ class AnsiConsole(QPlainTextEdit):
 
     def _save_output(self):
         from PyQt5.QtWidgets import QFileDialog
-        default = "turboadb-shell-" + time.strftime("%Y%m%d-%H%M%S") + ".log"
+        from .fileutil import download_path
+        default = download_path("turboadb-shell-"
+                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save terminal output", default,
             "Log files (*.log);;Text files (*.txt);;All files (*)")

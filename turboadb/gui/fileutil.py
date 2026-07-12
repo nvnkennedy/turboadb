@@ -8,6 +8,27 @@ import sys
 import subprocess
 
 
+def download_dir() -> str:
+    """The user's Downloads folder — where saved files SHOULD land (screenshots,
+    recordings, pulled files, logs…), not some arbitrary place. Falls back to
+    ~/Downloads, then the home directory, and always returns a real directory."""
+    d = ""
+    try:
+        from PyQt5.QtCore import QStandardPaths
+        d = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or ""
+    except Exception:
+        d = ""
+    if not d or not os.path.isdir(d):
+        cand = os.path.join(os.path.expanduser("~"), "Downloads")
+        d = cand if os.path.isdir(cand) else os.path.expanduser("~")
+    return d
+
+
+def download_path(filename: str) -> str:
+    """A full path in the Downloads folder for *filename* (a bare name)."""
+    return os.path.join(download_dir(), filename)
+
+
 def open_path(path: str) -> None:
     """Open *path* with its default application."""
     try:
