@@ -968,18 +968,24 @@ class MirrorPanel(QWidget):
         """Single source of truth for button states: the two start buttons are
         enabled only when nothing is being viewed; Stop while viewing; Record
         while viewing OR already recording (it records device-side, so it can
-        run alongside Live View). The device-keyboard bar follows the session:
-        visible whenever something is being viewed."""
+        run alongside Live View)."""
         viewing = (self._scrcpy is not None) or (self._live is not None) \
             or bool(self._multi)
+        embedded = self._child_hwnd is not None
         self.btn_mirror.setEnabled(not viewing)
         self.btn_live.setEnabled(not viewing)
         self.act_mirror_all.setEnabled(not viewing and len(self._displays) > 1)
         self.btn_stop.setEnabled(viewing)
         self.btn_record.setEnabled(viewing or self._recording)
         self.btn_record.setText("⏹ Stop recording" if self._recording else "🔴 Record…")
-        self.kb_bar.setVisible(viewing)
-        self.btn_kb_focus.setVisible(self._child_hwnd is not None)
+        # The device-keyboard bar is only for cases where scrcpy's OWN native
+        # keyboard isn't available: the EMBEDDED window (foreign-window focus is
+        # unreliable) and Live View (screencap has no input at all). A separate
+        # scrcpy window types natively — just click it — so no bar is pushed on
+        # you there.
+        live = self._live is not None
+        self.kb_bar.setVisible(embedded or live)
+        self.btn_kb_focus.setVisible(embedded)
 
     # ----- mirror EVERY display, each in its own window -----
     def _mirror_all(self):
@@ -1406,9 +1412,11 @@ class MirrorPanel(QWidget):
             self._embed_timer.start(200)
             self.log.emit("[OK] scrcpy launching (embedded)…")
         else:
-            self.status.setText("Mirroring in a separate window "
-                                "(embedding off / not supported here).")
-            self.log.emit("[OK] scrcpy launched in an external window")
+            self.status.setText("Mirroring in a separate window — click it and "
+                                "type / use the mouse directly (native scrcpy).")
+            self.log.emit("[OK] scrcpy launched in a separate window — keyboard "
+                          "and mouse work DIRECTLY in that window, exactly like "
+                          "plain scrcpy (no need for the tool's keyboard bar)")
 
     # markers that prove scrcpy actually brought up VIDEO (so a later exit is a
     # normal close, NOT a failed start). Deliberately NOT "Device:" / "New

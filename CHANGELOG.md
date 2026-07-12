@@ -3,6 +3,20 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.9
+
+- **Type directly in the mirror again.** Native scrcpy keyboard/mouse was never
+  disabled — a mirror in its *own window* takes input directly, exactly like
+  plain scrcpy. The confusion was that the tool's keyboard bar was shown even
+  then, as if you had to use it. Now that bar only appears where scrcpy's own
+  keyboard genuinely isn't available — the **embedded** window (foreign-window
+  focus is unreliable) and **Live View** (a screencap stream has no input path).
+  A separate-window mirror shows **no** keyboard bar: just click it and type.
+  (Separate window remains the default for the ▶ Mirror button.)
+- **File-list checkboxes are themed.** The multi-select checkboxes used the raw
+  OS control, which looked out of place; they now match the app's styling in
+  both light and dark themes.
+
 ## 1.1.8
 
 - **Mirror starts on the first click now.** The real defect: scrcpy's log is

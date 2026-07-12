@@ -178,6 +178,18 @@ def stylesheet(name: str = "dark") -> str:
     }}
     QListWidget::item {{ padding: 5px 8px; border-radius: 6px; }}
     QListWidget::item:selected {{ background: {ACCENT}; color: #042830; }}
+    /* checkboxes on list items (e.g. the file browser) — themed to match the
+       app instead of the raw OS control that looked out of place */
+    QListWidget::indicator, QTreeWidget::indicator, QTreeView::indicator,
+    QListView::indicator {{
+        width: 16px; height: 16px; border: 2px solid {c['line']};
+        border-radius: 4px; background: {c['input']}; margin-right: 4px;
+    }}
+    QListWidget::indicator:hover, QTreeWidget::indicator:hover,
+    QListView::indicator:hover {{ border-color: {ACCENT}; }}
+    QListWidget::indicator:checked, QTreeWidget::indicator:checked,
+    QListView::indicator:checked {{
+        background: {ACCENT}; border-color: {ACCENT}; image: url({check}); }}
     QTableWidget, QTableView {{
         background: {c['raised']}; alternate-background-color: {c['panel']};
         color: {c['text']}; gridline-color: {c['border']};
