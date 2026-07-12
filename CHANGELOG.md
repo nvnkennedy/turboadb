@@ -3,6 +3,18 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.10
+
+- **Type directly into the EMBEDDED mirror now.** In the embedded (Control +
+  Mirror) view, mouse worked but keys didn't — because Windows routes clicks by
+  position but keyboard needs *focus*, and a reparented foreign window doesn't
+  hold it. TurboADB now **keeps keyboard focus on the embedded scrcpy window
+  while your pointer is over the screen** (and the app is active), so you can
+  type straight into the mirror — no more going through the tool's keyboard bar.
+  It's polite: it doesn't grab focus while you're deliberately using that bar or
+  clicking the controls, and the bar / 🎯 button remain as fallbacks. A
+  separate-window mirror was already fully native.
+
 ## 1.1.9
 
 - **Type directly in the mirror again.** Native scrcpy keyboard/mouse was never

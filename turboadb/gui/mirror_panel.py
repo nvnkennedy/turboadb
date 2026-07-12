@@ -74,6 +74,12 @@ def _win_api():
     u.SetForegroundWindow.argtypes = [wintypes.HWND]
     u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD,
                               ctypes.c_void_p]
+    u.GetFocus.restype = wintypes.HWND
+    u.GetFocus.argtypes = []
+    u.GetForegroundWindow.restype = wintypes.HWND
+    u.GetForegroundWindow.argtypes = []
+    u.IsChild.restype = wintypes.BOOL
+    u.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
     return ctypes, u
 
 
@@ -745,6 +751,46 @@ class MirrorPanel(QWidget):
 
     def _focus_embedded(self):
         _focus_window(self._child_hwnd)
+
+    def _keep_embed_focus(self):
+        """Keep keyboard focus on the embedded scrcpy window while the pointer is
+        over the mirror and TurboADB is the active app — so you type straight
+        into the screen. Cheap and non-intrusive: only acts over the mirror area,
+        and only calls SetFocus when the child isn't already focused (no Alt
+        nudge here, unlike the one-shot 🎯 button)."""
+        if not self._child_hwnd or not _IS_WIN:
+            return
+        try:
+            from PyQt5.QtGui import QCursor
+            from PyQt5.QtWidgets import QApplication
+            # if the user is deliberately typing in the tool's keyboard field,
+            # don't steal focus back to the mirror
+            if QApplication.focusWidget() is self.kb_input:
+                return
+            ctypes, u = _win_api()
+            top = int(self.window().winId())
+            fg = u.GetForegroundWindow()
+            # only when OUR window (or a child of it) is the foreground one
+            if fg != top and not u.IsChild(top, fg):
+                return
+            # only when the cursor is over the mirror container
+            gp = QCursor.pos()
+            tl = self.container.mapToGlobal(self.container.rect().topLeft())
+            br = self.container.mapToGlobal(self.container.rect().bottomRight())
+            if not (tl.x() <= gp.x() <= br.x() and tl.y() <= gp.y() <= br.y()):
+                return
+            k = ctypes.windll.kernel32
+            tid = u.GetWindowThreadProcessId(self._child_hwnd, None)
+            mytid = k.GetCurrentThreadId()
+            attached = False
+            if tid and tid != mytid:
+                attached = bool(u.AttachThreadInput(mytid, tid, True))
+            if u.GetFocus() != self._child_hwnd:      # avoid needless churn
+                u.SetFocus(self._child_hwnd)
+            if attached:
+                u.AttachThreadInput(mytid, tid, False)
+        except Exception:
+            pass
 
     def _send_key(self, kind, payload):
         """Forward one keyboard-bar event to the device via the pump thread
@@ -1608,8 +1654,9 @@ class MirrorPanel(QWidget):
                 # hand the keyboard straight to the mirror, so typing works
                 # immediately — exactly like clicking into native scrcpy
                 QTimer.singleShot(200, self._focus_embedded)
-                self.log.emit("[OK] scrcpy embedded — typing goes to the device "
-                              "(⌨ bar always works; 🎯 re-focuses the mirror)")
+                self.log.emit("[OK] scrcpy embedded — move the mouse over the "
+                              "screen and type: keys go straight to the device. "
+                              "(The ⌨ bar and 🎯 button remain as fallbacks.)")
                 # scrcpy/SDL resizes its own window to the video frame after the
                 # first frame — keep forcing it to fill the container for a few
                 # seconds so it doesn't shrink back to a tiny window.
@@ -1617,6 +1664,15 @@ class MirrorPanel(QWidget):
                 self._fit_timer.timeout.connect(self._fit)
                 self._fit_timer.start(500)     # keeps it filling the whole session
                 self._fit()
+                # KEYBOARD focus keeper: while the mouse is over the embedded
+                # mirror and TurboADB is the active app, keep the scrcpy child
+                # focused so you can type DIRECTLY into the screen (a reparented
+                # window doesn't hold keyboard focus on its own — that's why
+                # typing needed the bar). Runs only over the mirror, so clicking
+                # the controls / the ⌨ bar still works normally.
+                self._kbfocus_timer = QTimer(self)
+                self._kbfocus_timer.timeout.connect(self._keep_embed_focus)
+                self._kbfocus_timer.start(300)
             except Exception as exc:
                 self.log.emit(f"[WARNING] could not embed scrcpy: {exc} "
                               "(it stays in its own window)")
@@ -1659,6 +1715,9 @@ class MirrorPanel(QWidget):
         if getattr(self, "_fit_timer", None):
             self._fit_timer.stop()
             self._fit_timer = None
+        if getattr(self, "_kbfocus_timer", None):
+            self._kbfocus_timer.stop()
+            self._kbfocus_timer = None
 
     def stop(self):
         # the Stop button stops whatever you're VIEWING (mirror, Live View, or the
