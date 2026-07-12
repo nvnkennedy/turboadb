@@ -385,6 +385,33 @@ class _LiveView(QLabel):
         self._press = None
 
 
+class _EmbedContainer(QWidget):
+    """The native widget scrcpy is reparented into. It also CAPTURES keyboard and
+    forwards it to the device over adb — because getting keyboard focus into the
+    reparented foreign scrcpy window is unreliable across GPU/RDP sessions, but
+    an adb ``input`` path works on every device. scrcpy keeps video + mouse
+    (mouse goes to the window under the cursor regardless of focus); keyboard
+    comes here. Result: type directly on the embedded screen, reliably."""
+
+    def __init__(self, send_key, parent=None):
+        super().__init__(parent)
+        self._send_key = send_key
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Paste):
+            from PyQt5.QtWidgets import QApplication
+            txt = QApplication.clipboard().text()
+            if txt:
+                self._send_key("text", txt)
+            return
+        kind, payload = _DeviceKeyEdit.map_event(event.key(), event.text())
+        if kind is None:
+            super().keyPressEvent(event)
+            return
+        self._send_key(kind, payload)
+
+
 class _DeviceKeyEdit(QLineEdit):
     """A keyboard-capture field: every keystroke is forwarded to the device (via
     the panel's ``send`` callback) instead of edited locally, so typing here IS
@@ -725,12 +752,12 @@ class MirrorPanel(QWidget):
         lay.addWidget(self.kb_bar)
         self._key_pump = None
 
-        # native container that scrcpy gets reparented into
-        self.container = QWidget()
+        # native container that scrcpy gets reparented into — it also captures
+        # keyboard and forwards it to the device (see _EmbedContainer)
+        self.container = _EmbedContainer(self._send_key)
         self.container.setAttribute(Qt.WA_NativeWindow, True)
         self.container.setStyleSheet("background:#000;")
         self.container.setMinimumHeight(200)
-        self.container.setFocusPolicy(Qt.NoFocus)   # never steal from the child
         self.container.installEventFilter(self)     # click margins -> focus mirror
         lay.addWidget(self.container, 1)
 
@@ -769,45 +796,69 @@ class MirrorPanel(QWidget):
         return super().eventFilter(obj, event)
 
     def _focus_embedded(self):
-        _focus_window(self._child_hwnd)
+        """Put keyboard focus on OUR container (not the scrcpy child) so the
+        container captures keys and forwards them via adb — reliable everywhere.
+        Brings TurboADB to the foreground first (the 🎯 button one-shot)."""
+        if not self._child_hwnd or not _IS_WIN:
+            self.container.setFocus(Qt.OtherFocusReason)
+            return
+        try:
+            ctypes, u = _win_api()
+            top = u.GetAncestor(int(self.container.winId()), 2) \
+                if hasattr(u, "GetAncestor") else 0
+            if top:
+                u.keybd_event(0x12, 0, 0, 0); u.keybd_event(0x12, 0, 0x0002, 0)
+                u.SetForegroundWindow(top)
+        except Exception:
+            pass
+        self.container.setFocus(Qt.OtherFocusReason)
+        self._grab_container_focus()
+
+    def _grab_container_focus(self):
+        """Give the native container Win32 focus, detaching it from the scrcpy
+        window's input queue if needed, so Qt receives keystrokes there."""
+        if not _IS_WIN:
+            return
+        try:
+            ctypes, u = _win_api()
+            k = ctypes.windll.kernel32
+            cont = int(self.container.winId())
+            tid = u.GetWindowThreadProcessId(self._child_hwnd, None) \
+                if self._child_hwnd else 0
+            mytid = k.GetCurrentThreadId()
+            attached = False
+            if tid and tid != mytid:
+                attached = bool(u.AttachThreadInput(mytid, tid, True))
+            if u.GetFocus() != cont:
+                u.SetFocus(cont)
+            if attached:
+                u.AttachThreadInput(mytid, tid, False)
+        except Exception:
+            pass
 
     def _keep_embed_focus(self):
-        """Keep keyboard focus on the embedded scrcpy window while the pointer is
-        over the mirror and TurboADB is the active app — so you type straight
-        into the screen. Cheap and non-intrusive: only acts over the mirror area,
-        and only calls SetFocus when the child isn't already focused (no Alt
-        nudge here, unlike the one-shot 🎯 button)."""
+        """While the pointer is over the embedded mirror and TurboADB is active,
+        keep keyboard focus on OUR container so it captures typing and forwards
+        it via adb (typing straight on the screen). Polite: skips when the user
+        is in the keyboard field or off the mirror."""
         if not self._child_hwnd or not _IS_WIN:
             return
         try:
             from PyQt5.QtGui import QCursor
             from PyQt5.QtWidgets import QApplication
-            # if the user is deliberately typing in the tool's keyboard field,
-            # don't steal focus back to the mirror
             if QApplication.focusWidget() is self.kb_input:
                 return
             ctypes, u = _win_api()
             top = int(self.window().winId())
             fg = u.GetForegroundWindow()
-            # only when OUR window (or a child of it) is the foreground one
             if fg != top and not u.IsChild(top, fg):
                 return
-            # only when the cursor is over the mirror container
             gp = QCursor.pos()
             tl = self.container.mapToGlobal(self.container.rect().topLeft())
             br = self.container.mapToGlobal(self.container.rect().bottomRight())
             if not (tl.x() <= gp.x() <= br.x() and tl.y() <= gp.y() <= br.y()):
                 return
-            k = ctypes.windll.kernel32
-            tid = u.GetWindowThreadProcessId(self._child_hwnd, None)
-            mytid = k.GetCurrentThreadId()
-            attached = False
-            if tid and tid != mytid:
-                attached = bool(u.AttachThreadInput(mytid, tid, True))
-            if u.GetFocus() != self._child_hwnd:      # avoid needless churn
-                u.SetFocus(self._child_hwnd)
-            if attached:
-                u.AttachThreadInput(mytid, tid, False)
+            self._grab_container_focus()
         except Exception:
             pass
 
@@ -1494,6 +1545,7 @@ class MirrorPanel(QWidget):
     _HEALTHY = ("Renderer:", "Texture:", "Recording started", "INFO: Renderer",
                 "Frame: ", "v4l2", "audio player")
     _STARTUP_TIMEOUT = 6.0        # no scrcpy window within this = hung/failed
+    _STARTUP_GRACE = 5.0         # a mirror that dies this fast = failed start
 
     def _scrcpy_window_up(self) -> bool:
         """True once scrcpy has actually put its window up — the reliable
@@ -1549,7 +1601,15 @@ class MirrorPanel(QWidget):
             return
 
         err = (self._scrcpy.read_log() or "").strip()
-        ready = self._became_ready
+        # A mirror that DIED within a few seconds of starting is a failed start,
+        # even if it briefly showed a window — this is the "embedded, then ended
+        # 2s later, then works on the 2nd try" case. An EMBEDDED borderless
+        # window can only be closed via our Stop button (which sets _scrcpy=None
+        # and never reaches here), so any quick unexpected exit is a crash to
+        # retry. (A separate window the user can close whenever, so we respect
+        # its ready state.)
+        early_death = ran_s < self._STARTUP_GRACE
+        ready = self._became_ready and not (self._embed_on and early_death)
         self._scrcpy = None
         self._stop_embed_timer()
         self._child_hwnd = None
@@ -1676,8 +1736,8 @@ class MirrorPanel(QWidget):
                 # immediately — exactly like clicking into native scrcpy
                 QTimer.singleShot(200, self._focus_embedded)
                 self.log.emit("[OK] scrcpy embedded — move the mouse over the "
-                              "screen and type: keys go straight to the device. "
-                              "(The ⌨ bar and 🎯 button remain as fallbacks.)")
+                              "screen and type: keys go to the device via adb. "
+                              "(Click 🎯 if focus wanders; the ⌨ bar also works.)")
                 # scrcpy/SDL resizes its own window to the video frame after the
                 # first frame — keep forcing it to fill the container for a few
                 # seconds so it doesn't shrink back to a tiny window.

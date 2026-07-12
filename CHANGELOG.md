@@ -3,6 +3,26 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.12
+
+Two fixes from your logs.
+
+- **First-click mirror start (for real this time).** The log showed the mirror
+  *embedded and then ended ~2 s later*, and because it had briefly embedded we
+  wrongly treated that as a normal close and did **not** retry — so you had to
+  open it a second time. A mirror that dies within a few seconds of starting is
+  now correctly seen as a **failed start and auto-retried** (an embedded window
+  can only be closed via Stop, which is handled separately, so a quick
+  unexpected exit is always a crash to retry). The second attempt — which
+  already worked when you did it by hand — now happens automatically.
+- **Type directly on the embedded screen.** Getting keyboard *focus* into the
+  reparented foreign scrcpy window is unreliable across GPU/RDP sessions (that's
+  why you kept needing the field). So the embedded mirror's container now
+  **captures keyboard itself and sends it to the device over adb** — the same
+  path the keyboard bar proved works on your device — while scrcpy keeps the
+  video and the mouse. Move the mouse over the embedded screen and type: it goes
+  to the device. The ⌨ bar and 🎯 button remain as fallbacks.
+
 ## 1.1.11
 
 - **Type directly on the Live View image.** Live View is a screencap stream (a
