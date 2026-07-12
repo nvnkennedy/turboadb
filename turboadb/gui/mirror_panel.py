@@ -305,17 +305,34 @@ class _LiveThread(QThread):
 
 class _LiveView(QLabel):
     """Shows live frames scaled to fit, and turns clicks/drags on the image into
-    device taps/swipes (emitted as fractions 0..1 of the image)."""
+    device taps/swipes — and, once clicked, forwards KEYSTROKES to the device too
+    (so you type straight onto the Live View, no separate field needed)."""
     tapped = pyqtSignal(float, float)
     swiped = pyqtSignal(float, float, float, float)
+    key_typed = pyqtSignal(str, object)          # (kind, payload) → adb forward
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background:#000;")
         self.setMouseTracking(False)
+        # accept keyboard focus so typing on the image goes to the device
+        self.setFocusPolicy(Qt.StrongFocus)
         self._pm = None
         self._press = None
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Paste):
+            from PyQt5.QtWidgets import QApplication
+            txt = QApplication.clipboard().text()
+            if txt:
+                self.key_typed.emit("text", txt)
+            return
+        kind, payload = _DeviceKeyEdit.map_event(event.key(), event.text())
+        if kind is None:
+            super().keyPressEvent(event)
+            return
+        self.key_typed.emit(kind, payload)
 
     def set_frame(self, pm):
         self._pm = pm
@@ -354,6 +371,7 @@ class _LiveView(QLabel):
         return None
 
     def mousePressEvent(self, e):
+        self.setFocus(Qt.MouseFocusReason)       # clicking the image = ready to type
         self._press = self._frac(e.pos())
 
     def mouseReleaseEvent(self, e):
@@ -722,6 +740,7 @@ class MirrorPanel(QWidget):
         self.live_view.hide()
         self.live_view.tapped.connect(self._live_tap)
         self.live_view.swiped.connect(self._live_swipe)
+        self.live_view.key_typed.connect(self._send_key)   # type ON the image
         lay.addWidget(self.live_view, 1)
 
         # Load the display list LAZILY — only the first time this Mirror tab is
@@ -921,7 +940,9 @@ class MirrorPanel(QWidget):
         self.status.hide()
         self.container.hide()
         self.live_view.show()
-        self.log.emit("[OK] live view starting (screencap stream over adb)…")
+        self.live_view.setFocus(Qt.OtherFocusReason)   # ready to type immediately
+        self.log.emit("[OK] live view — click the image to tap/swipe, and just "
+                      "TYPE to send keys to the device (works on any device)")
         self._live = _LiveThread(self.handler, max_fps=10.0)
         self._live.target_w = max(0, self.live_view.width())
         self._live.target_h = max(0, self.live_view.height())

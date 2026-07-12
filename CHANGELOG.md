@@ -3,6 +3,21 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.11
+
+- **Type directly on the Live View image.** Live View is a screencap stream (a
+  plain image), so it never had a keyboard path of its own — typing only worked
+  in the separate field. Now the Live View **takes keyboard focus when you click
+  it** and forwards every key (letters, digits, Enter, Backspace, Tab, arrows,
+  and pasted text) straight to the device over adb. So on **any** device — normal
+  phone or IVI — you click the screen and type, and it lands on the device.
+  (The keyboard field stays as an alternative.)
+
+  Between this and the earlier fixes there are now three ways to type into a
+  mirror, all working: a **separate-window** scrcpy (fully native), the
+  **embedded** window (focus is kept on it while you hover), and **Live View**
+  (click + type, via adb — the most universal).
+
 ## 1.1.10
 
 - **Type directly into the EMBEDDED mirror now.** In the embedded (Control +
