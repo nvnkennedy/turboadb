@@ -592,7 +592,27 @@ class MainWindow(QMainWindow):
         plus = QToolButton(); plus.setText("  +  "); plus.setToolTip("New device")
         plus.clicked.connect(self.new_session)
         self.tabs.setCornerWidget(plus, Qt.TopRightCorner)
-        self.setCentralWidget(self.tabs)
+        # central STACK: a MobaXterm-style welcome page when nothing is open,
+        # the device tabs otherwise (so the app never shows a blank rectangle).
+        from PyQt5.QtWidgets import QStackedWidget
+        from .welcome import WelcomeScreen
+        self._center = QStackedWidget()
+        self.welcome = WelcomeScreen(self)
+        self._center.addWidget(self.welcome)      # index 0 — landing page
+        self._center.addWidget(self.tabs)         # index 1 — tabs
+        self.setCentralWidget(self._center)
+        self._update_center()
+
+    def _update_center(self):
+        """Show the welcome landing page while no device tab is open, and the tab
+        area as soon as one is. Never runs during Split (tiled) view."""
+        if getattr(self, "_tiled", False):
+            return
+        stack = getattr(self, "_center", None)
+        if stack is None:
+            return
+        stack.setCurrentWidget(self.welcome if self.tabs.count() == 0
+                               else self.tabs)
 
     def _build_log_dock(self):
         self.log_panel = LogPanel()
@@ -619,6 +639,8 @@ class MainWindow(QMainWindow):
 
     def _on_devices(self, devices):
         self._live_devices = devices
+        if hasattr(self, "welcome"):
+            self.welcome.refresh_status(devices)
         self.live_list.clear()
         if not devices:
             it = QListWidgetItem("— none connected —")
@@ -774,6 +796,7 @@ class MainWindow(QMainWindow):
         idx = self.tabs.addTab(w, name)
         self.tabs.setTabIcon(idx, theme.emoji_icon("📱"))
         self.tabs.setCurrentIndex(idx)
+        self._update_center()
         self.log_panel.append(f"Opening '{name}'…")
 
     def open_webcam_tab(self):
@@ -792,6 +815,7 @@ class MainWindow(QMainWindow):
         idx = self.tabs.addTab(cam, "Webcam")
         self.tabs.setTabIcon(idx, theme.emoji_icon("📹"))
         self.tabs.setCurrentIndex(idx)
+        self._update_center()
         self.log_panel.append("Opened the host Webcam (no device needed).")
 
     def _set_tab_title(self, widget, title):
@@ -1420,8 +1444,11 @@ class MainWindow(QMainWindow):
                 v.addWidget(w, 1)
                 cell.setMinimumSize(320, 240)
                 row.addWidget(cell)
-            self.tabs.setParent(None)
-            self.setCentralWidget(outer)
+            # show the tiled splitter as a page of the central stack (leaving the
+            # now-empty tab widget in place to restore into later)
+            self._center.addWidget(outer)
+            self._center.setCurrentWidget(outer)
+            self._tiled_outer = outer
             outer.show()
             # removeTab() leaves the page hidden — re-show each device widget now
             # that it lives inside the (visible) splitter, so panes aren't blank
@@ -1435,8 +1462,14 @@ class MainWindow(QMainWindow):
         else:
             for (w, title) in getattr(self, "_tiled_items", []):
                 self.tabs.addTab(w, title)
-            self.setCentralWidget(self.tabs)
             self._tiled = False
+            self._center.setCurrentWidget(self.tabs)
+            outer = getattr(self, "_tiled_outer", None)
+            if outer is not None:
+                self._center.removeWidget(outer)
+                outer.deleteLater()
+                self._tiled_outer = None
+            self._update_center()
             self.statusBar().showMessage("Tabbed view")
             self.log_panel.append("[OK] Back to tabbed view.")
 
@@ -1480,6 +1513,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.tabs.removeTab(index)
+        self._update_center()
         self._update_status()
 
     def _close_current_tab(self):

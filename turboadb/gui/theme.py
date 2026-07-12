@@ -297,6 +297,22 @@ def stylesheet(name: str = "dark") -> str:
     QMenu {{ background: {c['raised']}; border: 1px solid {c['border']}; }}
     QMenu::item:selected {{ background: {ACCENT}; color: #042830; }}
     QDialog {{ background: {c['win']}; }}
+    /* ---- welcome / start screen (shown when no device tab is open) ---- */
+    #welcomeCard {{ background: {c['panel']}; border: 1px solid {c['border']};
+        border-radius: 18px; }}
+    #welcomeLogo {{ color: {ACCENT}; font-size: 34pt; font-weight: 800;
+        letter-spacing: 1px; }}
+    #welcomeTag {{ color: {c['dim']}; font-size: 11.5pt; }}
+    #welcomeSection {{ color: {atext}; font-weight: 800; font-size: 9pt;
+        letter-spacing: 1px; }}
+    #welcomeHint {{ color: {c['dim']}; font-size: 10pt; }}
+    #welcomeFoot {{ color: {c['dim']}; font-size: 9.5pt; }}
+    QToolButton#welcomeTile {{ background: {c['raised']}; color: {c['text']};
+        border: 1px solid {c['border']}; border-radius: 12px;
+        padding: 13px 15px; text-align: left; font-size: 10.5pt; }}
+    QToolButton#welcomeTile:hover {{ border: 1px solid {ACCENT};
+        background: {c['sel']}; }}
+    QToolButton#welcomeTile:pressed {{ background: {c['panel']}; }}
     """
 
 

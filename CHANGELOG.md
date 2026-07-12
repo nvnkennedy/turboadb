@@ -3,6 +3,21 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.14
+
+- **Mirror opens embedded — no separate-window flash.** The mirror used to pop
+  up as its own top-level window for a moment and then jump into the tool. Now
+  scrcpy is launched **off-screen**, renders its first frame there, and is
+  adopted into the panel only once it has settled — so it appears *inside* the
+  tool from the start, with nothing flashing on screen first. (This reuses the
+  same off-screen trick already used for clean screen recording.)
+- **A proper welcome screen.** Instead of a blank rectangle when no device is
+  open, the central area now shows a MobaXterm-style start page: the TurboADB
+  banner, quick-start tiles (New target · Open selected · Host webcam · Get /
+  update tools), a few getting-started hints, and a live footer that reflects
+  how many devices are connected. It appears whenever the last tab is closed and
+  steps aside the moment you open a device.
+
 ## 1.1.13
 
 Native keyboard now types on the embedded screen (thank you for confirming) —

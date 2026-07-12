@@ -1496,7 +1496,11 @@ class MirrorPanel(QWidget):
         if do_embed:
             opts.window_title = f"turboadb-embed-{os.getpid()}-{id(self)}"
             opts.window_borderless = True
-            opts.window_x, opts.window_y = 0, 0
+            # Launch it OFF-SCREEN, not at (0,0). scrcpy renders its first frame
+            # into this hidden window; we then adopt it into the container once it
+            # has settled. That's what stops the mirror from flashing up as a
+            # separate top-level window for a moment before it embeds.
+            opts.window_x, opts.window_y = -32000, -32000
         # the EXACT window title we can later find to confirm scrcpy really put a
         # window up (readiness) and, when embedding, to reparent it
         self._win_title = opts.window_title
