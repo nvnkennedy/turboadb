@@ -1774,13 +1774,61 @@ class MirrorPanel(QWidget):
                 self._kbfocus_timer.timeout.connect(self._keep_embed_focus)
                 self._kbfocus_timer.start(300)
             except Exception as exc:
-                self.log.emit(f"[WARNING] could not embed scrcpy: {exc} "
-                              "(it stays in its own window)")
+                # embedding failed AFTER we launched off-screen — bring the
+                # window back on-screen so it's actually usable, don't strand it
+                self._rescue_offscreen()
+                self.log.emit(f"[WARNING] could not embed scrcpy: {exc} — showing "
+                              "it in its own window instead.")
             return
         if self._embed_tries > 50:        # ~10s
             self._stop_embed_timer()
+            # we launched scrcpy off-screen for a seamless embed but never managed
+            # to adopt its window — move it on-screen so it isn't stuck invisible
+            self._rescue_offscreen()
             self.status.setText("Couldn't embed the scrcpy window; it's running "
                                 "in its own window instead.")
+
+    def _rescue_offscreen(self):
+        """We launch scrcpy off-screen so it can render its first frame before we
+        embed it (no flash). If embedding then fails, the window would be stranded
+        at (-32000,-32000) — invisible. Detach it, give it a normal frame and move
+        it on-screen so it's usable as a plain scrcpy window."""
+        if not _IS_WIN:
+            return
+        try:
+            hwnd = self._child_hwnd or _find_window(self._win_title)
+        except Exception:
+            hwnd = None
+        if not hwnd:
+            return
+        try:
+            _ctypes, u = _win_api()
+            u.SetParent(hwnd, None)      # back to a real top-level window
+            getter = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+            setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+            style = getter(hwnd, _GWL_STYLE)
+            # give it a title bar + resize frame (it was launched borderless) so
+            # the user can move/resize/close it like any window
+            style = (style | _WS_POPUP | _WS_CAPTION | _WS_THICKFRAME) & ~_WS_CHILD
+            setter(hwnd, _GWL_STYLE, style)
+            w = max(720, self.container.width() or 0)
+            h = max(520, self.container.height() or 0)
+            u.SetWindowPos(hwnd, None, 120, 90, w, h,
+                           _SWP_NOZORDER | _SWP_FRAMECHANGED)
+            u.ShowWindow(hwnd, 5)         # SW_SHOW
+            try:
+                u.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            # it's a normal separate window now: forget the embed handle and clear
+            # the embed flag so a later close is a plain close (not a failed-embed
+            # retry that would relaunch off-screen and loop)
+            self._child_hwnd = None
+            self._embed_on = False
+            self._refresh_buttons()
 
     def _fit(self):
         """Force the embedded scrcpy window to fill the container (scrcpy/SDL

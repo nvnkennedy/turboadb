@@ -3,6 +3,17 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.15
+
+Hardening pass before a proper release.
+
+- **No more stranded mirror window.** 1.1.14 launches scrcpy off-screen so it can
+  embed without flashing. If embedding then failed (window couldn't be adopted,
+  or timed out), the window was left off-screen and invisible while the tool
+  claimed it was "running in its own window". It's now **rescued on-screen** with
+  a real title bar / resize frame so it's usable as a plain scrcpy window, and
+  the embed state is cleared so a later close doesn't trigger a relaunch loop.
+
 ## 1.1.14
 
 - **Mirror opens embedded — no separate-window flash.** The mirror used to pop
