@@ -66,7 +66,7 @@ class Scrollback:
         self._flush()
         if self._path and os.path.exists(self._path):
             shutil.copyfile(self._path, path)
-        else:                                   # nothing spilled to disk yet
+        else:  # nothing spilled to disk yet
             with open(path, "w", encoding="utf-8", newline="") as out:
                 out.write(self._edit.toPlainText())
 

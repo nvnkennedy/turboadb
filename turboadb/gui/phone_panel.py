@@ -5,10 +5,20 @@ from __future__ import annotations
 
 import time
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLineEdit, QLabel, QTabWidget, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QGroupBox)
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLineEdit,
+    QLabel,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QGroupBox,
+)
 
 
 class _Job(QThread):
@@ -61,13 +71,17 @@ class PhonePanel(QWidget):
         self.number = QLineEdit()
         self.number.setPlaceholderText("phone number, e.g. +1 555 0100")
         self.number.returnPressed.connect(self._dial)
-        b_dial = QPushButton("☎ Dial"); b_dial.setProperty("role", "ghost")
+        b_dial = QPushButton("☎ Dial")
+        b_dial.setProperty("role", "ghost")
         b_dial.clicked.connect(self._dial)
-        b_call = QPushButton("📞 Call"); b_call.setProperty("role", "ok")
+        b_call = QPushButton("📞 Call")
+        b_call.setProperty("role", "ok")
         b_call.clicked.connect(self._call)
-        b_ans = QPushButton("✅ Answer"); b_ans.setProperty("role", "ghost")
+        b_ans = QPushButton("✅ Answer")
+        b_ans.setProperty("role", "ghost")
         b_ans.clicked.connect(lambda: self._do("answer", lambda h: h.answer_call(safe=False)))
-        b_end = QPushButton("🔴 End"); b_end.setProperty("role", "danger")
+        b_end = QPushButton("🔴 End")
+        b_end.setProperty("role", "danger")
         b_end.clicked.connect(lambda: self._do("end call", lambda h: h.end_call(safe=False)))
         self.state = QLabel("—")
         for w in (self.number, b_dial, b_call, b_ans, b_end, self.state):
@@ -81,7 +95,7 @@ class PhonePanel(QWidget):
         self.tabs.addTab(self._sms_tab(), "💬 Messages")
         outer.addWidget(self.tabs, 1)
 
-        self._loaded = False        # load lazily on first view (keeps connect fast)
+        self._loaded = False  # load lazily on first view (keeps connect fast)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -93,11 +107,14 @@ class PhonePanel(QWidget):
 
     # ---- tabs ----
     def _calllog_tab(self):
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget()
+        v = QVBoxLayout(w)
         bar = QHBoxLayout()
-        r = QPushButton("Refresh"); r.setProperty("role", "ghost")
+        r = QPushButton("Refresh")
+        r.setProperty("role", "ghost")
         r.clicked.connect(self._load_calls)
-        bar.addWidget(r); bar.addStretch(1)
+        bar.addWidget(r)
+        bar.addStretch(1)
         v.addLayout(bar)
         self.calls = QTableWidget(0, 4)
         self.calls.setHorizontalHeaderLabels(["Type", "Number", "When", "Duration"])
@@ -110,14 +127,19 @@ class PhonePanel(QWidget):
         return w
 
     def _sms_tab(self):
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget()
+        v = QVBoxLayout(w)
         comp = QHBoxLayout()
-        self.sms_to = QLineEdit(); self.sms_to.setPlaceholderText("to (number)")
+        self.sms_to = QLineEdit()
+        self.sms_to.setPlaceholderText("to (number)")
         self.sms_to.setMaximumWidth(180)
-        self.sms_body = QLineEdit(); self.sms_body.setPlaceholderText("message…")
-        b_send = QPushButton("✉ Compose"); b_send.setProperty("role", "ok")
+        self.sms_body = QLineEdit()
+        self.sms_body.setPlaceholderText("message…")
+        b_send = QPushButton("✉ Compose")
+        b_send.setProperty("role", "ok")
         b_send.clicked.connect(self._send_sms)
-        r = QPushButton("Refresh"); r.setProperty("role", "ghost")
+        r = QPushButton("Refresh")
+        r.setProperty("role", "ghost")
         r.clicked.connect(self._load_sms)
         for x in (self.sms_to, self.sms_body, b_send, r):
             comp.addWidget(x)
@@ -136,11 +158,13 @@ class PhonePanel(QWidget):
     def _do(self, label, fn, refresh=False):
         self.log.emit(f"{label}…")
         j = _Job(lambda: fn(self.handler))
-        j.done.connect(lambda r: (self.log.emit(f"[OK] {label}"),
-                                  self.refresh() if refresh else None))
+        j.done.connect(
+            lambda r: (self.log.emit(f"[OK] {label}"), self.refresh() if refresh else None)
+        )
         j.fail.connect(lambda m: self.log.emit(f"[ERROR] {label}: {m}"))
         j.finished.connect(lambda: self._jobs.remove(j) if j in self._jobs else None)
-        self._jobs.append(j); j.start()
+        self._jobs.append(j)
+        j.start()
 
     def _dial(self):
         n = self.number.text().strip()
@@ -158,13 +182,14 @@ class PhonePanel(QWidget):
             self.number.setText(it.text())
 
     def _send_sms(self):
-        n = self.sms_to.text().strip(); b = self.sms_body.text()
+        n = self.sms_to.text().strip()
+        b = self.sms_body.text()
         if n:
             self._do(f"sms to {n}", lambda h: h.send_sms(n, b, safe=False))
 
     # ---- loaders ----
     def refresh(self):
-        self._do("call state", lambda h: h.call_state(safe=False))   # logs only
+        self._do("call state", lambda h: h.call_state(safe=False))  # logs only
         self._load_state()
         self._load_calls()
         self._load_sms()
@@ -174,20 +199,25 @@ class PhonePanel(QWidget):
         j.done.connect(lambda s: self.state.setText(f"call: {s}"))
         j.fail.connect(lambda m: None)
         j.finished.connect(lambda: self._jobs.remove(j) if j in self._jobs else None)
-        self._jobs.append(j); j.start()
+        self._jobs.append(j)
+        j.start()
 
     def _load_calls(self):
         j = _Job(lambda: self.handler.call_log(50, safe=False))
         j.done.connect(self._fill_calls)
         j.fail.connect(lambda m: self.log.emit("[ERROR] call log: " + m))
         j.finished.connect(lambda: self._jobs.remove(j) if j in self._jobs else None)
-        self._jobs.append(j); j.start()
+        self._jobs.append(j)
+        j.start()
 
     def _fill_calls(self, rows):
         self.calls.setRowCount(0)
         for d in rows:
-            r = self.calls.rowCount(); self.calls.insertRow(r)
-            self.calls.setItem(r, 0, QTableWidgetItem(_CALL_TYPE.get(d.get("type"), d.get("type", ""))))
+            r = self.calls.rowCount()
+            self.calls.insertRow(r)
+            self.calls.setItem(
+                r, 0, QTableWidgetItem(_CALL_TYPE.get(d.get("type"), d.get("type", "")))
+            )
             self.calls.setItem(r, 1, QTableWidgetItem(d.get("number", "")))
             self.calls.setItem(r, 2, QTableWidgetItem(_when(d.get("date"))))
             self.calls.setItem(r, 3, QTableWidgetItem(_dur(d.get("duration"))))
@@ -198,18 +228,28 @@ class PhonePanel(QWidget):
         j.done.connect(self._fill_sms)
         j.fail.connect(lambda m: self.log.emit("[ERROR] sms: " + m))
         j.finished.connect(lambda: self._jobs.remove(j) if j in self._jobs else None)
-        self._jobs.append(j); j.start()
+        self._jobs.append(j)
+        j.start()
 
     def _fill_sms(self, rows):
         self.sms.setRowCount(0)
         for d in rows:
-            r = self.sms.rowCount(); self.sms.insertRow(r)
-            self.sms.setItem(r, 0, QTableWidgetItem(_SMS_TYPE.get(d.get("type"), d.get("type", ""))))
+            r = self.sms.rowCount()
+            self.sms.insertRow(r)
+            self.sms.setItem(
+                r, 0, QTableWidgetItem(_SMS_TYPE.get(d.get("type"), d.get("type", "")))
+            )
             self.sms.setItem(r, 1, QTableWidgetItem(d.get("address", "")))
             self.sms.setItem(r, 2, QTableWidgetItem(_when(d.get("date"))))
             self.sms.setItem(r, 3, QTableWidgetItem((d.get("body") or "").replace("\n", " ")))
         self.log.emit(f"[OK] {len(rows)} message(s)")
 
     def close_panel(self):
+        from .qtutil import park_thread
+
         for j in list(self._jobs):
-            j.wait(700)
+            try:
+                j.wait(300)
+            except Exception:
+                pass
+            park_thread(j)

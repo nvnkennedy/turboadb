@@ -12,7 +12,7 @@ def list_attached():
 
 
 def usb_basics():
-    with ADBHandler() as dev:                      # only attached device
+    with ADBHandler() as dev:  # only attached device
         print(dev.device_info())
         print(dev.shell("getprop ro.build.version.release").text)
         dev.push("README.md", "/sdcard/README.md")
@@ -24,8 +24,13 @@ def network_head_unit():
     with ADBHandler(cfg) as hu:
         if hu.is_automotive():
             print("Android Automotive OS head unit detected")
-        hu.logcat(tag="CarService", match=r"ERROR|FATAL", on_line=print,
-                  save_to="car.log", stop_on_match=True)
+        hu.logcat(
+            tag="CarService",
+            match=r"ERROR|FATAL",
+            on_line=print,
+            save_to="car.log",
+            stop_on_match=True,
+        )
 
 
 def install_and_launch():

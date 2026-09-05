@@ -71,8 +71,7 @@ def resolve_target(arg: str, cur: str) -> str:
 
 def set_version(path: Path, pattern: str, new: str, label: str) -> None:
     text = path.read_text(encoding="utf-8")
-    new_text, n = re.subn(pattern, lambda m: m.group(0).replace(m.group(1), new),
-                          text, count=1)
+    new_text, n = re.subn(pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
     if n != 1:
         sys.exit(f"Could not update version in {label}")
     path.write_text(new_text, encoding="utf-8")
@@ -82,13 +81,16 @@ def set_version(path: Path, pattern: str, new: str, label: str) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Build and publish turboadb.")
     ap.add_argument("version", help="X.Y.Z, or patch/minor/major")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="build and twine check only; do not upload")
-    ap.add_argument("--test-pypi", action="store_true",
-                    help="upload to TestPyPI instead of PyPI")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="build and twine check only; do not upload"
+    )
+    ap.add_argument("--test-pypi", action="store_true", help="upload to TestPyPI instead of PyPI")
     ap.add_argument("--skip-tests", action="store_true")
-    ap.add_argument("--wheel-only", action="store_true",
-                    help="upload only the wheel (handy if sdist upload hangs)")
+    ap.add_argument(
+        "--wheel-only",
+        action="store_true",
+        help="upload only the wheel (handy if sdist upload hangs)",
+    )
     args = ap.parse_args(argv)
 
     cur = current_version()
@@ -101,10 +103,12 @@ def main(argv=None) -> int:
         # isn't installed, so a minimal env can still cut a release
         try:
             import pytest  # noqa: F401
+
             run([sys.executable, "-m", "pytest", "tests/", "-q"])
         except ImportError:
-            print("  (pytest not installed — skipping the pytest suite; "
-                  "pip install pytest to run it)")
+            print(
+                "  (pytest not installed — skipping the pytest suite; pip install pytest to run it)"
+            )
 
     print("\nUpdating version strings:")
     set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")

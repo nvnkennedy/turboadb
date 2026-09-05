@@ -16,16 +16,32 @@ import subprocess
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QTransform
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                             QComboBox, QCheckBox, QLineEdit, QFileDialog,
-                             QMessageBox, QSizePolicy, QProgressDialog, QMenu)
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QComboBox,
+    QCheckBox,
+    QLineEdit,
+    QFileDialog,
+    QMessageBox,
+    QSizePolicy,
+    QProgressDialog,
+    QMenu,
+)
 
+from ..tools import NO_WINDOW as _NO_WINDOW
 from . import ffmpeg_tools
 from . import theme
 
-_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-_RES = {"480p (640×480)": (640, 480), "540p (960×540)": (960, 540),
-        "720p (1280×720)": (1280, 720), "1080p (1920×1080)": (1920, 1080)}
+_RES = {
+    "480p (640×480)": (640, 480),
+    "540p (960×540)": (960, 540),
+    "720p (1280×720)": (1280, 720),
+    "1080p (1920×1080)": (1920, 1080),
+}
 
 
 class _FrameReader(threading.Thread):
@@ -54,7 +70,8 @@ class _FrameReader(threading.Thread):
             if data is None:
                 break
             if not data:
-                time.sleep(0.005); continue
+                time.sleep(0.005)
+                continue
             self._buf.extend(data)
             self._extract()
 
@@ -68,16 +85,16 @@ class _FrameReader(threading.Thread):
         while True:
             start = buf.find(b"\xff\xd8")
             if start == -1:
-                if len(buf) > 8 * 1024 * 1024:     # no SOI in a huge buffer -> trim
-                    del buf[:-1024 * 1024]
+                if len(buf) > 2 * 1024 * 1024:  # no SOI in a large buffer -> trim
+                    del buf[: -512 * 1024]
                 break
             end = buf.find(b"\xff\xd9", start + 2)
             if end == -1:
-                if start:                          # drop junk before the next SOI
+                if start:  # drop junk before the next SOI
                     del buf[:start]
                 break
-            frame = bytes(buf[start:end + 2])
-            del buf[:end + 2]
+            frame = bytes(buf[start : end + 2])
+            del buf[: end + 2]
             if rec is not None:
                 try:
                     rec.write(frame)
@@ -86,7 +103,7 @@ class _FrameReader(threading.Thread):
             last = frame
         if last is None:
             return
-        img = QImage.fromData(last, "JPG")          # decode here, not on the UI thread
+        img = QImage.fromData(last, "JPG")  # decode here, not on the UI thread
         if img.isNull():
             return
         with self._lock:
@@ -112,8 +129,9 @@ class _FrameReader(threading.Thread):
 class _LocalPrep(QThread):
     """Make sure ffmpeg is available (download once if needed) and list local
     cameras — off the UI thread so the app never freezes during the one-time fetch."""
+
     progress = pyqtSignal(str)
-    done = pyqtSignal(str, list)        # ffmpeg path, cameras
+    done = pyqtSignal(str, list)  # ffmpeg path, cameras
     fail = pyqtSignal(str)
 
     def run(self):
@@ -127,8 +145,9 @@ class _LocalPrep(QThread):
 class _RemotePrep(QThread):
     """List cameras on a remote Windows/RDP host over WinRM (NTLM), provisioning
     ffmpeg there (one-time download) if it's missing."""
+
     progress = pyqtSignal(str)
-    done = pyqtSignal(str, list, str)   # remote ffmpeg path, cameras, diag
+    done = pyqtSignal(str, list, str)  # remote ffmpeg path, cameras, diag
     fail = pyqtSignal(str)
 
     def __init__(self, host, login, password):
@@ -138,8 +157,10 @@ class _RemotePrep(QThread):
     def run(self):
         try:
             from . import remote_webcam
+
             cams, ffmpeg, diag = remote_webcam.list_remote_cameras(
-                self.host, self.login, self.password, log=self.progress.emit)
+                self.host, self.login, self.password, log=self.progress.emit
+            )
             self.done.emit(ffmpeg, cams, diag)
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
@@ -148,7 +169,8 @@ class _RemotePrep(QThread):
 class _RemoteStart(QThread):
     """Launch ffmpeg on the remote (WinRM) serving MJPEG on a TCP port, then connect
     a local socket to it — all off the UI thread (it takes a moment)."""
-    ok = pyqtSignal(int, object)        # remote pid, connected socket
+
+    ok = pyqtSignal(int, object)  # remote pid, connected socket
     fail = pyqtSignal(str)
 
     def __init__(self, host, login, password, camera, ffmpeg, w, h, fps, port):
@@ -161,9 +183,18 @@ class _RemoteStart(QThread):
         pid = None
         try:
             from . import remote_webcam
+
             pid = remote_webcam.start_remote_stream(
-                self.host, self.login, self.password, self.camera, self.ffmpeg,
-                width=self.w, height=self.h, fps=self.fps, stream_port=self.port)
+                self.host,
+                self.login,
+                self.password,
+                self.camera,
+                self.ffmpeg,
+                width=self.w,
+                height=self.h,
+                fps=self.fps,
+                stream_port=self.port,
+            )
             # ffmpeg opens the camera THEN binds the listen socket, so give it a
             # generous window (camera init can take a few seconds) before giving up
             sock = None
@@ -174,24 +205,27 @@ class _RemoteStart(QThread):
                     sock = socket.create_connection((self.host, self.port), timeout=4)
                     break
                 except Exception as exc:
-                    last = str(exc); sock = None; time.sleep(0.6)
+                    last = str(exc)
+                    sock = None
+                    time.sleep(0.6)
             if sock is None:
                 # ffmpeg never started listening — stop it (free the camera) and ask
                 # ffmpeg WHY via a short capture probe, so the error is actionable
                 try:
                     remote_webcam.stop_remote_stream(
-                        self.host, self.login, self.password, pid, stream_port=self.port)
+                        self.host, self.login, self.password, pid, stream_port=self.port
+                    )
                 except Exception:
                     pass
                 pid = None
                 diag = ""
                 try:
                     diag = remote_webcam.probe_remote_camera(
-                        self.host, self.login, self.password, self.camera, self.ffmpeg)
+                        self.host, self.login, self.password, self.camera, self.ffmpeg
+                    )
                 except Exception:
                     pass
-                msg = (f"couldn't connect to the remote video port "
-                       f"{self.host}:{self.port} ({last}).")
+                msg = f"couldn't connect to the remote video port {self.host}:{self.port} ({last})."
                 if diag:
                     msg += f"\n\nffmpeg on the remote reported:\n{diag[:1200]}"
                 raise RuntimeError(msg)
@@ -201,8 +235,8 @@ class _RemoteStart(QThread):
             if pid is not None:
                 try:
                     from . import remote_webcam
-                    remote_webcam.stop_remote_stream(self.host, self.login,
-                                                     self.password, pid)
+
+                    remote_webcam.stop_remote_stream(self.host, self.login, self.password, pid)
                 except Exception:
                     pass
             self.fail.emit(f"{type(exc).__name__}: {exc}")
@@ -213,11 +247,11 @@ class CameraPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ffmpeg = None              # local ffmpeg path
-        self._remote_ffmpeg = None       # remote ffmpeg path
-        self._proc = None                # local ffmpeg process
-        self._sock = None                # remote video socket
-        self._remote_pid = None          # remote ffmpeg pid (to stop)
+        self._ffmpeg = None  # local ffmpeg path
+        self._remote_ffmpeg = None  # remote ffmpeg path
+        self._proc = None  # local ffmpeg process
+        self._sock = None  # remote video socket
+        self._remote_pid = None  # remote ffmpeg pid (to stop)
         self.reader = None
         self._rec_proc = None
         self._rec_path = None
@@ -235,12 +269,15 @@ class CameraPanel(QWidget):
         self.source.currentIndexChanged.connect(self._source_changed)
         top.addWidget(self.source)
         top.addWidget(QLabel("Camera:"))
-        self.camera = QComboBox(); top.addWidget(self.camera, 2)
+        self.camera = QComboBox()
+        top.addWidget(self.camera, 2)
         top.addWidget(QLabel("Quality:"))
-        self.res = QComboBox(); self.res.addItems(list(_RES.keys()))
+        self.res = QComboBox()
+        self.res.addItems(list(_RES.keys()))
         self.res.setCurrentText("720p (1280×720)")
         top.addWidget(self.res)
-        self.fps = QComboBox(); self.fps.addItems(["15", "20", "25", "30"])
+        self.fps = QComboBox()
+        self.fps.addItems(["15", "20", "25", "30"])
         self.fps.setCurrentText("25")
         top.addWidget(self.fps)
         top.addWidget(QLabel("View:"))
@@ -248,33 +285,41 @@ class CameraPanel(QWidget):
         self.view_mode.addItem("Fill (no bars)", "fill")
         self.view_mode.addItem("Fit (whole frame)", "fit")
         self.view_mode.addItem("Stretch", "stretch")
-        self.view_mode.setToolTip("Fill = no black bars, edges may be cropped.\n"
-                                  "Fit = the whole frame, with thin bars where the "
-                                  "shape doesn't match.\nStretch = fill exactly "
-                                  "(slight distortion).")
+        self.view_mode.setToolTip(
+            "Fill = no black bars, edges may be cropped.\n"
+            "Fit = the whole frame, with thin bars where the "
+            "shape doesn't match.\nStretch = fill exactly "
+            "(slight distortion)."
+        )
         self.view_mode.currentIndexChanged.connect(lambda *_: self._repaint_now())
         top.addWidget(self.view_mode)
         self.refresh_btn = QPushButton("🔍 Scan cameras")
         self.refresh_btn.setProperty("role", "ghost")
         self.refresh_btn.setToolTip("Scan this source for available cameras.")
         self.refresh_btn.clicked.connect(self._refresh)
-        self.start_btn = QPushButton("▶ Start"); self.start_btn.setProperty("role", "ok")
+        self.start_btn = QPushButton("▶ Start")
+        self.start_btn.setProperty("role", "ok")
         self.start_btn.clicked.connect(self._toggle_start)
-        top.addWidget(self.refresh_btn); top.addWidget(self.start_btn)
+        top.addWidget(self.refresh_btn)
+        top.addWidget(self.start_btn)
         for _cb in (self.source, self.camera, self.res, self.fps, self.view_mode):
             _cb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.source.setMinimumWidth(150); self.camera.setMinimumWidth(140)
-        self.res.setMinimumWidth(95); self.fps.setMinimumWidth(55)
+        self.source.setMinimumWidth(150)
+        self.camera.setMinimumWidth(140)
+        self.res.setMinimumWidth(95)
+        self.fps.setMinimumWidth(55)
         self.view_mode.setMinimumWidth(95)
         lay.addLayout(top)
 
         # --- remote connection row (shown only when Source = Remote) ---
         self.remote_row = QWidget()
-        rl = QHBoxLayout(self.remote_row); rl.setContentsMargins(0, 0, 0, 0)
+        rl = QHBoxLayout(self.remote_row)
+        rl.setContentsMargins(0, 0, 0, 0)
         rl.addWidget(QLabel("RDP host:"))
         # remember the last host/user/domain (never the password) so they don't have
         # to be retyped every session
         from . import settings as _s
+
         _cfg = _s.load()
         self.r_host = QLineEdit(_cfg.get("webcam_remote_host", ""))
         self.r_host.setPlaceholderText("remote machine IP / hostname")
@@ -286,19 +331,25 @@ class CameraPanel(QWidget):
         self.r_pass = QLineEdit(_s.webcam_remote_password())
         self.r_pass.setEchoMode(QLineEdit.Password)
         self.r_pass.setPlaceholderText("password")
-        rl.addWidget(self.r_host, 2); rl.addWidget(QLabel("user:")); rl.addWidget(self.r_user, 1)
-        rl.addWidget(QLabel("domain:")); rl.addWidget(self.r_domain, 1)
-        rl.addWidget(QLabel("pass:")); rl.addWidget(self.r_pass, 1)
+        rl.addWidget(self.r_host, 2)
+        rl.addWidget(QLabel("user:"))
+        rl.addWidget(self.r_user, 1)
+        rl.addWidget(QLabel("domain:"))
+        rl.addWidget(self.r_domain, 1)
+        rl.addWidget(QLabel("pass:"))
+        rl.addWidget(self.r_pass, 1)
         self.remote_row.setVisible(False)
         lay.addWidget(self.remote_row)
 
         # --- the view (fills the tab) ---
-        self.view = QLabel("Pick a source, Scan, then Start.\n\nLocal works over RDP "
-                           "(this session's camera); Remote drives another Windows "
-                           "machine's camera over WinRM.")
+        self.view = QLabel(
+            "Pick a source, Scan, then Start.\n\nLocal works over RDP "
+            "(this session's camera); Remote drives another Windows "
+            "machine's camera over WinRM."
+        )
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.view.setMinimumSize(120, 90)        # small min so it resizes in a split
+        self.view.setMinimumSize(120, 90)  # small min so it resizes in a split
         self.view.setStyleSheet("background:#0d1014; color:#8a8a8a; border-radius:6px;")
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._view_menu)
@@ -306,34 +357,42 @@ class CameraPanel(QWidget):
 
         # --- bottom controls ---
         row = QHBoxLayout()
-        self.snap_btn = QPushButton("📷 Snapshot"); self.snap_btn.setProperty("role", "ghost")
-        self.rec_btn = QPushButton("⏺ Record"); self.rec_btn.setProperty("role", "ghost")
-        self.pause_btn = QPushButton("⏸ Pause"); self.pause_btn.setProperty("role", "ghost")
+        self.snap_btn = QPushButton("📷 Snapshot")
+        self.snap_btn.setProperty("role", "ghost")
+        self.rec_btn = QPushButton("⏺ Record")
+        self.rec_btn.setProperty("role", "ghost")
+        self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn.setProperty("role", "ghost")
         for b in (self.snap_btn, self.rec_btn, self.pause_btn):
             b.setEnabled(False)
         self.snap_btn.clicked.connect(self._snapshot)
         self.rec_btn.clicked.connect(self._toggle_record)
         self.pause_btn.clicked.connect(self._toggle_pause)
-        row.addWidget(self.snap_btn); row.addWidget(self.rec_btn); row.addWidget(self.pause_btn)
+        row.addWidget(self.snap_btn)
+        row.addWidget(self.rec_btn)
+        row.addWidget(self.pause_btn)
         row.addWidget(QLabel("Rotate:"))
         self.rotate = QComboBox()
         for label, deg in (("0°", 0), ("90°", 90), ("180°", 180), ("270°", 270)):
             self.rotate.addItem(label, deg)
-        self.rotate.setToolTip("Rotate the view (and snapshots) — useful for a camera "
-                               "mounted sideways or upside-down.")
+        self.rotate.setToolTip(
+            "Rotate the view (and snapshots) — useful for a camera mounted sideways or upside-down."
+        )
         self.rotate.currentIndexChanged.connect(lambda *_: self._repaint_now())
         row.addWidget(self.rotate)
         self.flip = QCheckBox("Flip")
         self.flip.setToolTip("Flip the image horizontally (mirror, selfie-style).")
         self.flip.stateChanged.connect(lambda *_: self._repaint_now())
         row.addWidget(self.flip)
-        self.fps_lbl = QLabel(""); self.fps_lbl.setStyleSheet("color:#8a8a8a;")
+        self.fps_lbl = QLabel("")
+        self.fps_lbl.setStyleSheet("color:#8a8a8a;")
         row.addWidget(self.fps_lbl)
         row.addStretch(1)
         self.status = QLabel("")
         row.addWidget(self.status)
         self._set_status("Pick a source, Scan, then Start.", "idle")
-        self.link = QLabel(""); self.link.setOpenExternalLinks(True)
+        self.link = QLabel("")
+        self.link.setOpenExternalLinks(True)
         self.link.setTextInteractionFlags(Qt.TextBrowserInteraction)
         row.addWidget(self.link)
         lay.addLayout(row)
@@ -341,19 +400,20 @@ class CameraPanel(QWidget):
         self._last_paint = 0
         self._fps_count = 0
         self._fps_t0 = time.time()
-        self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
         self._timer.start(30)
         # NOTE: no auto-scan on construction — the webcam touches ffmpeg/cameras
         # only when the user clicks Scan or Start, so opening a device starts nothing.
 
     # ---- status toast (coloured pill) ----
     _STATUS = {
-        "idle":  ("#9aa0a6", "transparent"),
-        "info":  ("#ffffff", "#1f6feb"),     # blue   — working / connecting
-        "ok":    ("#ffffff", "#238636"),     # green  — viewing / found
-        "rec":   ("#ffffff", "#cf222e"),     # red    — recording
-        "warn":  ("#241a00", "#d29922"),     # amber  — nothing found / attention
-        "error": ("#ffffff", "#cf222e"),     # red    — failure
+        "idle": ("#9aa0a6", "transparent"),
+        "info": ("#ffffff", "#1f6feb"),  # blue   — working / connecting
+        "ok": ("#ffffff", "#238636"),  # green  — viewing / found
+        "rec": ("#ffffff", "#cf222e"),  # red    — recording
+        "warn": ("#241a00", "#d29922"),  # amber  — nothing found / attention
+        "error": ("#ffffff", "#cf222e"),  # red    — failure
     }
 
     def _set_status(self, text, kind="idle"):
@@ -361,8 +421,9 @@ class CameraPanel(QWidget):
         if bg == "transparent":
             self.status.setStyleSheet(f"color:{fg}; padding:2px 4px;")
         else:
-            self.status.setStyleSheet(f"color:{fg}; background:{bg}; padding:2px 10px;"
-                                      f"border-radius:9px; font-weight:600;")
+            self.status.setStyleSheet(
+                f"color:{fg}; background:{bg}; padding:2px 10px;border-radius:9px; font-weight:600;"
+            )
         self.status.setText(text)
 
     # ---- one-time ffmpeg setup popup (local download) ----
@@ -374,6 +435,7 @@ class CameraPanel(QWidget):
             if self._dl_dialog is not None:
                 self._dl_dialog.setLabelText(msg)
                 import re
+
                 m = re.search(r"\((\d+)%\)", msg)
                 if m:
                     self._dl_dialog.setRange(0, 100)
@@ -388,7 +450,8 @@ class CameraPanel(QWidget):
         dlg.setWindowTitle("TurboADB — camera setup")
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
-        dlg.setAutoClose(False); dlg.setAutoReset(False)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
         dlg.setCancelButton(None)
         dlg.setValue(0)
         self._dl_dialog = dlg
@@ -461,12 +524,13 @@ class CameraPanel(QWidget):
     def _remote_ready(self, ffmpeg, cams, diag):
         self.refresh_btn.setEnabled(True)
         self._remote_ffmpeg = ffmpeg
-        self._save_remote_details()      # remember host/user/domain (not password)
+        self._save_remote_details()  # remember host/user/domain (not password)
         self._fill(cams, diag)
 
     def _save_remote_details(self):
         try:
             from . import settings as _s
+
             data = _s.load()
             data["webcam_remote_host"] = self.r_host.text().strip()
             data["webcam_remote_user"] = self.r_user.text().strip()
@@ -488,20 +552,24 @@ class CameraPanel(QWidget):
         elif self._is_remote():
             self._set_status("No cameras found on the remote machine.", "warn")
             QMessageBox.information(
-                self, "No camera on the remote machine",
+                self,
+                "No camera on the remote machine",
                 "ffmpeg didn't report a camera there. Its raw device listing is "
                 "below — check the camera is attached, Windows camera privacy allows "
-                "desktop apps, and nothing else is using it.\n\n" + (diag or "")[:3500])
+                "desktop apps, and nothing else is using it.\n\n" + (diag or "")[:3500],
+            )
         else:
             self._set_status("No cameras found.", "warn")
             QMessageBox.information(
-                self, "No camera found",
+                self,
+                "No camera found",
                 "ffmpeg didn't report a camera.\n\n"
                 "• Over Remote Desktop, enable camera redirection in the RDP client "
                 "(Local Resources → More… → Cameras) and reconnect.\n"
                 "• Turn ON Windows camera privacy ('Let desktop apps access your "
                 "camera').\n"
-                "• Make sure nothing else is using the camera.")
+                "• Make sure nothing else is using the camera.",
+            )
 
     def _prep_fail(self, msg):
         self._close_dl_dialog()
@@ -512,11 +580,14 @@ class CameraPanel(QWidget):
     # ---- start / stop ----
     def _toggle_start(self):
         if self.reader is not None:
-            self._stop_stream(); self.start_btn.setText("▶ Start"); return
+            self._stop_stream()
+            self.start_btn.setText("▶ Start")
+            return
         cam = self.camera.currentText().strip()
         if not cam:
             return
-        w, h = self._res(); fps = int(self.fps.currentText())
+        w, h = self._res()
+        fps = int(self.fps.currentText())
         if self._is_remote():
             self._start_remote(cam, w, h, fps)
         else:
@@ -524,13 +595,17 @@ class CameraPanel(QWidget):
 
     def _start_local(self, cam, w, h, fps):
         if not self._ffmpeg:
-            self._refresh(); return
+            self._refresh()
+            return
         try:
-            args = ffmpeg_tools.local_capture_args(self._ffmpeg, cam,
-                                                   width=w, height=h, fps=fps)
-            self._proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL,
-                                          bufsize=0, creationflags=_NO_WINDOW)
+            args = ffmpeg_tools.local_capture_args(self._ffmpeg, cam, width=w, height=h, fps=fps)
+            self._proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                creationflags=_NO_WINDOW,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Camera", f"Couldn't start the camera:\n\n{exc}")
             return
@@ -540,13 +615,23 @@ class CameraPanel(QWidget):
 
     def _start_remote(self, cam, w, h, fps):
         if not self._remote_ffmpeg:
-            self._refresh(); return
+            self._refresh()
+            return
         from . import remote_webcam
+
         self.start_btn.setEnabled(False)
         self._set_status(f"Starting {cam} on the remote machine…", "info")
         self._starter = _RemoteStart(
-            self.r_host.text().strip(), self._remote_login(), self.r_pass.text(),
-            cam, self._remote_ffmpeg, w, h, fps, remote_webcam.DEFAULT_STREAM_PORT)
+            self.r_host.text().strip(),
+            self._remote_login(),
+            self.r_pass.text(),
+            cam,
+            self._remote_ffmpeg,
+            w,
+            h,
+            fps,
+            remote_webcam.DEFAULT_STREAM_PORT,
+        )
         self._starter.ok.connect(lambda pid, sock, c=cam: self._remote_started(pid, sock, c))
         self._starter.fail.connect(self._remote_start_fail)
         self._starter.start()
@@ -559,11 +644,12 @@ class CameraPanel(QWidget):
         def read_fn(n, s=sock):
             try:
                 d = s.recv(n)
-                return d if d else None       # b"" from recv = peer closed
+                return d if d else None  # b"" from recv = peer closed
             except socket.timeout:
                 return b""
             except Exception:
                 return None
+
         self.reader = _FrameReader(read_fn)
         self.reader.start()
         self._after_start(cam)
@@ -572,17 +658,21 @@ class CameraPanel(QWidget):
     def _remote_start_fail(self, msg):
         self.start_btn.setEnabled(True)
         self._set_status("Couldn't start the remote camera", "error")
-        QMessageBox.warning(self, "Remote camera",
-                            f"Couldn't start the remote camera:\n\n{msg}\n\n"
-                            "Check WinRM is on (Enable-PSRemoting -Force), your "
-                            "account is a local admin, and ffmpeg is installed there.")
+        QMessageBox.warning(
+            self,
+            "Remote camera",
+            f"Couldn't start the remote camera:\n\n{msg}\n\n"
+            "Check WinRM is on (Enable-PSRemoting -Force), your "
+            "account is a local admin, and ffmpeg is installed there.",
+        )
 
     def _after_start(self, cam):
         self.start_btn.setText("⏹ Stop")
         for b in (self.snap_btn, self.rec_btn, self.pause_btn):
             b.setEnabled(True)
         self._set_status(f"● Viewing {cam}", "ok")
-        self._fps_count = 0; self._fps_t0 = time.time()
+        self._fps_count = 0
+        self._fps_t0 = time.time()
         if not self._is_remote():
             QTimer.singleShot(6000, lambda c=cam: self._check_no_video(c))
 
@@ -590,10 +680,9 @@ class CameraPanel(QWidget):
         if self.reader is None or self.reader.frames > 0:
             return
         if self._is_remote():
-            host, login, pw = (self.r_host.text().strip(), self._remote_login(),
-                               self.r_pass.text())
+            host, login, pw = (self.r_host.text().strip(), self._remote_login(), self.r_pass.text())
             ff = self._remote_ffmpeg
-            self._stop_stream()                 # release the camera before probing
+            self._stop_stream()  # release the camera before probing
             self._set_status("Diagnosing the remote camera…", "info")  # after stop
             self._probe = _RemoteProbe(host, login, pw, cam, ff)
             self._probe.done.connect(lambda out, c=cam: self._remote_no_video(c, out))
@@ -601,21 +690,25 @@ class CameraPanel(QWidget):
         else:
             self._set_status("No video from the camera", "error")
             QMessageBox.information(
-                self, "Camera — no video",
+                self,
+                "Camera — no video",
                 f"The camera “{cam}” opened but produced no video.\n\n"
                 "It's most likely in use by another app, blocked by Windows camera "
                 "privacy, or — over RDP — not redirected into this session. Close "
-                "other apps using it, check those settings, then Start again.")
+                "other apps using it, check those settings, then Start again.",
+            )
 
     def _remote_no_video(self, cam, detail):
         self._set_status("Remote camera: no video", "error")
         QMessageBox.information(
-            self, "Remote camera — no video",
+            self,
+            "Remote camera — no video",
             f"ffmpeg on the remote machine produced no video from “{cam}”. A short "
             f"diagnostic capture was run; its output is below.\n\n{detail}\n\n"
             "Most likely the camera is in use, blocked by Windows camera privacy, or "
             "is a camera redirected into someone's RDP session (only visible inside "
-            "that session — a physical USB camera on the machine works headlessly).")
+            "that session — a physical USB camera on the machine works headlessly).",
+        )
 
     # ---- orientation (shared by view, snapshot, copy) ----
     def _orient(self, img):
@@ -633,7 +726,7 @@ class CameraPanel(QWidget):
         if self._paused or self.reader is None:
             return
         n = self.reader.frames
-        if n == self._last_paint:            # no new frame -> don't rescale again
+        if n == self._last_paint:  # no new frame -> don't rescale again
             return
         self._last_paint = n
         img = self._orient(self.reader.latest_image())
@@ -657,7 +750,8 @@ class CameraPanel(QWidget):
         now = time.time()
         if now - self._fps_t0 >= 1.0:
             self.fps_lbl.setText(f"{self._fps_count} fps")
-            self._fps_count = 0; self._fps_t0 = now
+            self._fps_count = 0
+            self._fps_t0 = now
 
     # ---- context menu / snapshot / copy ----
     def _view_menu(self, pos):
@@ -665,7 +759,8 @@ class CameraPanel(QWidget):
         a_copy = m.addAction(theme.emoji_icon("📋"), "Copy image to clipboard")
         a_snap = m.addAction(theme.emoji_icon("📷"), "Save snapshot…")
         has = self.reader is not None and self.reader.latest_image() is not None
-        a_copy.setEnabled(has); a_snap.setEnabled(has)
+        a_copy.setEnabled(has)
+        a_snap.setEnabled(has)
         chosen = m.exec_(self.view.mapToGlobal(pos))
         if chosen == a_copy:
             self._copy_frame()
@@ -674,9 +769,11 @@ class CameraPanel(QWidget):
 
     def _copy_frame(self):
         from PyQt5.QtWidgets import QApplication
+
         img = self._orient(self.reader.latest_image() if self.reader else None)
         if img is None:
-            self._set_status("No frame to copy yet.", "warn"); return
+            self._set_status("No frame to copy yet.", "warn")
+            return
         QApplication.clipboard().setImage(img)
         self._set_status("Frame copied to clipboard ✓", "ok")
         self.log.emit("[OK] camera frame copied to clipboard")
@@ -686,10 +783,13 @@ class CameraPanel(QWidget):
         if not raw:
             return
         from .fileutil import download_path
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save snapshot",
+            self,
+            "Save snapshot",
             download_path(f"webcam-{int(time.time())}.jpg"),
-            "Images (*.jpg *.png)")
+            "Images (*.jpg *.png)",
+        )
         if not path:
             return
         try:
@@ -706,7 +806,8 @@ class CameraPanel(QWidget):
 
     def _toggle_record(self):
         if self._rec_proc is not None:
-            self._stop_record(); return
+            self._stop_record()
+            return
         if self.reader is None:
             return
         ff = ffmpeg_tools.cached_ffmpeg()
@@ -714,9 +815,13 @@ class CameraPanel(QWidget):
             QMessageBox.warning(self, "Recording", "ffmpeg isn't ready yet.")
             return
         from .fileutil import download_path
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "Record video to",
-            download_path(f"webcam-{int(time.time())}.mp4"), "Video (*.mp4)")
+            self,
+            "Record video to",
+            download_path(f"webcam-{int(time.time())}.mp4"),
+            "Video (*.mp4)",
+        )
         if not path:
             return
         try:
@@ -724,13 +829,33 @@ class CameraPanel(QWidget):
             # -use_wallclock_as_timestamps stamps each frame as it arrives, so the
             # recording runs at real speed even if the camera can't sustain the fps.
             self._rec_proc = subprocess.Popen(
-                [ff, "-y",
-                 "-f", "mjpeg", "-use_wallclock_as_timestamps", "1", "-i", "-",
-                 "-an", "-c:v", "libx264", "-preset", "veryfast",
-                 "-pix_fmt", "yuv420p", "-fps_mode", "vfr",
-                 "-movflags", "+faststart", path],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW)
+                [
+                    ff,
+                    "-y",
+                    "-f",
+                    "mjpeg",
+                    "-use_wallclock_as_timestamps",
+                    "1",
+                    "-i",
+                    "-",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-fps_mode",
+                    "vfr",
+                    "-movflags",
+                    "+faststart",
+                    path,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=_NO_WINDOW,
+            )
             self._rec_path = path
             self.reader.set_recorder(self._rec_proc.stdin)
             self.rec_btn.setText("⏺ Stop recording")
@@ -747,7 +872,7 @@ class CameraPanel(QWidget):
         if proc is None:
             return
         try:
-            proc.stdin.close()           # flush remaining frames + write the trailer
+            proc.stdin.close()  # flush remaining frames + write the trailer
         except Exception:
             pass
         try:
@@ -773,10 +898,12 @@ class CameraPanel(QWidget):
                 if self.reader is not None:
                     self._set_status("Recording saved ✓ — still viewing", "ok")
             else:
-                self.log.emit(f"[ERROR] the recording saved no data → {path} "
-                              "(the ffmpeg encoder didn't start; if a custom/"
-                              "older ffmpeg is set in Settings → Tools, clear "
-                              "it so the downloaded one is used)")
+                self.log.emit(
+                    f"[ERROR] the recording saved no data → {path} "
+                    "(the ffmpeg encoder didn't start; if a custom/"
+                    "older ffmpeg is set in Settings → Tools, clear "
+                    "it so the downloaded one is used)"
+                )
                 self._set_status("Recording failed (empty file)", "error")
 
     def _toggle_pause(self):
@@ -790,15 +917,20 @@ class CameraPanel(QWidget):
     # ---- teardown ----
     def _stop_stream(self):
         self._stop_record()
-        if self.reader:
+        r = self.reader
+        self.reader = None
+        if r:
             try:
-                self.reader.stop()
+                r.stop()
             except Exception:
                 pass
-        self.reader = None
         if self._proc is not None:
             try:
                 self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=2.0)
             except Exception:
                 pass
             self._proc = None
@@ -808,13 +940,23 @@ class CameraPanel(QWidget):
             except Exception:
                 pass
             self._sock = None
+        if r:
+            try:
+                r.join(timeout=1.0)
+            except Exception:
+                pass
         if self._remote_pid is not None:
             # kill the remote ffmpeg over WinRM, off the UI thread
-            host, login, pw, pid = (self.r_host.text().strip(), self._remote_login(),
-                                    self.r_pass.text(), self._remote_pid)
+            host, login, pw, pid = (
+                self.r_host.text().strip(),
+                self._remote_login(),
+                self.r_pass.text(),
+                self._remote_pid,
+            )
             self._remote_pid = None
-            threading.Thread(target=self._remote_kill, args=(host, login, pw, pid),
-                             daemon=True).start()
+            threading.Thread(
+                target=self._remote_kill, args=(host, login, pw, pid), daemon=True
+            ).start()
         for b in (self.snap_btn, self.rec_btn, self.pause_btn):
             b.setEnabled(False)
         self._paused = False
@@ -829,6 +971,7 @@ class CameraPanel(QWidget):
     def _remote_kill(host, login, pw, pid):
         try:
             from . import remote_webcam
+
             remote_webcam.stop_remote_stream(host, login, pw, pid)
         except Exception:
             pass
@@ -857,6 +1000,7 @@ class CameraPanel(QWidget):
 class _RemoteProbe(QThread):
     """Run a short verbose ffmpeg capture on the remote (WinRM) to explain a 'no
     video' case."""
+
     done = pyqtSignal(str)
 
     def __init__(self, host, login, password, camera, ffmpeg):
@@ -867,8 +1011,10 @@ class _RemoteProbe(QThread):
     def run(self):
         try:
             from . import remote_webcam
+
             out = remote_webcam.probe_remote_camera(
-                self.host, self.login, self.password, self.camera, self.ffmpeg)
+                self.host, self.login, self.password, self.camera, self.ffmpeg
+            )
         except Exception as exc:
             out = f"{type(exc).__name__}: {exc}"
         self.done.emit(out or "ffmpeg produced no output.")

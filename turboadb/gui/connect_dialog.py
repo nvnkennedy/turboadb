@@ -12,10 +12,23 @@ sidebar with a double-click."""
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-                             QLabel, QComboBox, QLineEdit, QSpinBox, QPushButton,
-                             QListWidget, QListWidgetItem, QStackedWidget,
-                             QDialogButtonBox, QWidget, QCheckBox)
+from PyQt5.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFormLayout,
+    QLabel,
+    QComboBox,
+    QLineEdit,
+    QSpinBox,
+    QPushButton,
+    QListWidget,
+    QListWidgetItem,
+    QStackedWidget,
+    QDialogButtonBox,
+    QWidget,
+    QCheckBox,
+)
 
 from . import settings as settings_mod
 
@@ -41,8 +54,8 @@ class _ScanThread(QThread):
     def run(self):
         try:
             from ..devices import list_devices
-            devs = list_devices(server_host=self.server_host,
-                                server_port=self.server_port)
+
+            devs = list_devices(server_host=self.server_host, server_port=self.server_port)
             self.done.emit(devs)
         except Exception as exc:
             self.fail.emit(str(exc))
@@ -58,8 +71,8 @@ class _ServeThread(QThread):
 
     def run(self):
         try:
-            from ..devices import (start_shared_server, install_startup,
-                                   open_firewall)
+            from ..devices import start_shared_server, install_startup, open_firewall
+
             msg = start_shared_server(port=self.port)
             msg += "  ·  " + open_firewall((self.port, 27184))
             if self.install_login:
@@ -81,9 +94,13 @@ class ConnectDialog(QDialog):
 
         top = QFormLayout()
         self.mode = QComboBox()
-        self.mode.addItems(["USB — device plugged into this PC",
-                            "Network — device reachable by IP (Wi-Fi/Ethernet)",
-                            "Remote — device on ANOTHER PC's adb server"])
+        self.mode.addItems(
+            [
+                "USB — device plugged into this PC",
+                "Network — device reachable by IP (Wi-Fi/Ethernet)",
+                "Remote — device on ANOTHER PC's adb server",
+            ]
+        )
         self.mode.currentIndexChanged.connect(self._on_mode)
         top.addRow("How is it connected?", self.mode)
         lay.addLayout(top)
@@ -97,13 +114,15 @@ class ConnectDialog(QDialog):
         save = QHBoxLayout()
         self.save_chk = QCheckBox("Save this target")
         self.save_chk.setChecked(True)
-        self.save_chk.setToolTip("Saved targets appear in the sidebar — "
-                                 "double-click to reconnect any time.")
+        self.save_chk.setToolTip(
+            "Saved targets appear in the sidebar — double-click to reconnect any time."
+        )
         self.save_name = QLineEdit()
         self.save_name.setPlaceholderText("name (auto)")
         self.save_name.textEdited.connect(lambda *_: setattr(self, "_name_locked", True))
         save.addWidget(self.save_chk)
-        save.addWidget(QLabel("as")); save.addWidget(self.save_name, 1)
+        save.addWidget(QLabel("as"))
+        save.addWidget(self.save_name, 1)
         lay.addLayout(save)
 
         btns = QDialogButtonBox()
@@ -118,50 +137,69 @@ class ConnectDialog(QDialog):
 
     # ---- pages ----
     def _usb_page(self):
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget()
+        v = QVBoxLayout(w)
         v.addWidget(QLabel("Devices plugged into this PC:"))
         self.usb_list = QListWidget()
         self.usb_list.currentItemChanged.connect(lambda *_: self._autoname())
         self.usb_list.itemDoubleClicked.connect(lambda _: self._accept())
         v.addWidget(self.usb_list, 1)
         row = QHBoxLayout()
-        r = QPushButton("Refresh"); r.setProperty("role", "ghost")
+        r = QPushButton("Refresh")
+        r.setProperty("role", "ghost")
         r.clicked.connect(self._scan_usb)
         self.usb_status = QLabel("")
-        row.addWidget(r); row.addWidget(self.usb_status, 1)
+        row.addWidget(r)
+        row.addWidget(self.usb_status, 1)
         v.addLayout(row)
-        v.addWidget(QLabel("No device? Enable USB debugging on the phone. "
-                           "Pick none to use the only device."))
+        v.addWidget(
+            QLabel(
+                "No device? Enable USB debugging on the phone. Pick none to use the only device."
+            )
+        )
         return w
 
     def _net_page(self):
-        w = QWidget(); f = QFormLayout(w)
-        self.net_host = QComboBox(); self.net_host.setEditable(True)
+        w = QWidget()
+        f = QFormLayout(w)
+        self.net_host = QComboBox()
+        self.net_host.setEditable(True)
         self.net_host.addItems(settings_mod.get("recent_network_hosts") or [])
         self.net_host.setCurrentText("")
         self.net_host.lineEdit().setPlaceholderText("192.168.1.50  or  my-headunit.local")
         self.net_host.editTextChanged.connect(lambda *_: self._autoname())
-        self.net_port = QSpinBox(); self.net_port.setRange(1, 65535); self.net_port.setValue(5555)
+        self.net_port = QSpinBox()
+        self.net_port.setRange(1, 65535)
+        self.net_port.setValue(5555)
         f.addRow("Device IP / hostname", self.net_host)
         f.addRow("Port", self.net_port)
-        f.addRow(QLabel("Enable wireless first: on the device (over USB once)\n"
-                        "run  adb tcpip 5555  — or use Android 11+ Wireless debugging."))
+        f.addRow(
+            QLabel(
+                "Enable wireless first: on the device (over USB once)\n"
+                "run  adb tcpip 5555  — or use Android 11+ Wireless debugging."
+            )
+        )
         return w
 
     def _remote_page(self):
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget()
+        v = QVBoxLayout(w)
         f = QFormLayout()
-        self.rem_host = QComboBox(); self.rem_host.setEditable(True)
+        self.rem_host = QComboBox()
+        self.rem_host.setEditable(True)
         self.rem_host.addItems(settings_mod.get("recent_remote_hosts") or [])
         self.rem_host.setCurrentText("")
         self.rem_host.lineEdit().setPlaceholderText("192.168.1.20  or  rdp-pc.corp.local")
         self.rem_host.editTextChanged.connect(lambda *_: self._autoname())
-        self.rem_port = QSpinBox(); self.rem_port.setRange(1, 65535); self.rem_port.setValue(5037)
+        self.rem_port = QSpinBox()
+        self.rem_port.setRange(1, 65535)
+        self.rem_port.setValue(5037)
         f.addRow("That PC's IP / hostname", self.rem_host)
         f.addRow("adb server port", self.rem_port)
         v.addLayout(f)
-        v.addWidget(QLabel("Hostnames work — they're resolved automatically for "
-                           "the mirror tunnel."))
+        v.addWidget(
+            QLabel("Hostnames work — they're resolved automatically for the mirror tunnel.")
+        )
 
         # If you're sitting at (or RDP'd into) the PC that has the device, this
         # starts its shared adb server for you — no more typing the nodaemon
@@ -169,22 +207,29 @@ class ConnectDialog(QDialog):
         srv = QHBoxLayout()
         self.btn_serve = QPushButton("Start shared server on THIS PC")
         self.btn_serve.setProperty("role", "ghost")
-        self.btn_serve.setToolTip("Run this ON the machine that has the device. "
-                                  "It exposes that PC's adb server to the network "
-                                  "so you can reach it from here. Replaces the "
-                                  "manual 'adb -a nodaemon server start'.")
+        self.btn_serve.setToolTip(
+            "Run this ON the machine that has the device. "
+            "It exposes that PC's adb server to the network "
+            "so you can reach it from here. Replaces the "
+            "manual 'adb -a nodaemon server start'."
+        )
         self.btn_serve.clicked.connect(self._start_shared)
         self.chk_login = QCheckBox("at login")
-        self.chk_login.setToolTip("Also start it automatically every Windows "
-                                  "login, so it never has to be done again.")
-        srv.addWidget(self.btn_serve); srv.addWidget(self.chk_login); srv.addStretch(1)
+        self.chk_login.setToolTip(
+            "Also start it automatically every Windows login, so it never has to be done again."
+        )
+        srv.addWidget(self.btn_serve)
+        srv.addWidget(self.chk_login)
+        srv.addStretch(1)
         v.addLayout(srv)
 
         row = QHBoxLayout()
-        scan = QPushButton("Scan devices there"); scan.setProperty("role", "ok")
+        scan = QPushButton("Scan devices there")
+        scan.setProperty("role", "ok")
         scan.clicked.connect(self._scan_remote)
         self.rem_status = QLabel("")
-        row.addWidget(scan); row.addWidget(self.rem_status, 1)
+        row.addWidget(scan)
+        row.addWidget(self.rem_status, 1)
         v.addLayout(row)
         self.rem_list = QListWidget()
         self.rem_list.currentItemChanged.connect(lambda *_: self._autoname())
@@ -196,7 +241,7 @@ class ConnectDialog(QDialog):
     def _on_mode(self, idx):
         self.stack.setCurrentIndex(idx)
         if idx == 2 and self.rem_host.currentText().strip():
-            self._scan_remote()                      # auto-scan a known remote host
+            self._scan_remote()  # auto-scan a known remote host
         self._autoname()
 
     # ---- auto name ----
@@ -222,8 +267,7 @@ class ConnectDialog(QDialog):
     def _start_shared(self):
         self.btn_serve.setEnabled(False)
         self.rem_status.setText("starting shared adb server here…")
-        self._serve = _ServeThread(self.rem_port.value(),
-                                   self.chk_login.isChecked())
+        self._serve = _ServeThread(self.rem_port.value(), self.chk_login.isChecked())
         self._serve.done.connect(self._served)
         self._serve.fail.connect(self._serve_failed)
         self._serve.start()
@@ -242,18 +286,20 @@ class ConnectDialog(QDialog):
 
     # ---- scanning ----
     def _scan_usb(self):
-        self.usb_status.setText("scanning…"); self.usb_list.clear()
+        self.usb_status.setText("scanning…")
+        self.usb_list.clear()
         self._start_scan(None, 5037, self._fill_usb, self.usb_status)
 
     def _scan_remote(self):
-        host, port = _split_host_port(self.rem_host.currentText(),
-                                      self.rem_port.value())
+        host, port = _split_host_port(self.rem_host.currentText(), self.rem_port.value())
         if not host:
-            self.rem_status.setText("enter the PC's IP first"); return
+            self.rem_status.setText("enter the PC's IP first")
+            return
         if port != self.rem_port.value():
-            self.rem_port.setValue(port)          # reflect a typed-in :port
+            self.rem_port.setValue(port)  # reflect a typed-in :port
             self.rem_host.setCurrentText(host)
-        self.rem_status.setText("scanning…"); self.rem_list.clear()
+        self.rem_status.setText("scanning…")
+        self.rem_list.clear()
         self._start_scan(host, port, self._fill_remote, self.rem_status)
 
     def _start_scan(self, host, port, on_done, status_label):
@@ -261,10 +307,11 @@ class ConnectDialog(QDialog):
             return
         self._scan = _ScanThread(host, port)
         from .qtutil import park_thread
-        park_thread(self._scan)     # survive the dialog closing mid-scan
-        self._scan.done.connect(lambda devs: (on_done(devs),
-                                              status_label.setText(
-                                                  f"{len(devs)} device(s)")))
+
+        park_thread(self._scan)  # survive the dialog closing mid-scan
+        self._scan.done.connect(
+            lambda devs: (on_done(devs), status_label.setText(f"{len(devs)} device(s)"))
+        )
         self._scan.fail.connect(lambda m: status_label.setText(m))
         self._scan.start()
 
@@ -278,10 +325,12 @@ class ConnectDialog(QDialog):
             widget.setCurrentRow(0)
 
     def _fill_usb(self, devs):
-        self._fill(self.usb_list, devs); self._autoname()
+        self._fill(self.usb_list, devs)
+        self._autoname()
 
     def _fill_remote(self, devs):
-        self._fill(self.rem_list, devs); self._autoname()
+        self._fill(self.rem_list, devs)
+        self._autoname()
 
     # ---- result ----
     def _accept(self):
@@ -294,21 +343,28 @@ class ConnectDialog(QDialog):
         name = self.save_name.text().strip() if self.save_chk.isChecked() else ""
         if m == 0:
             it = self.usb_list.currentItem()
-            return {"name": name, "type": "usb",
-                    "serial": (it.data(Qt.UserRole) if it else "") or ""}
+            return {
+                "name": name,
+                "type": "usb",
+                "serial": (it.data(Qt.UserRole) if it else "") or "",
+            }
         if m == 1:
-            host, port = _split_host_port(self.net_host.currentText(),
-                                         self.net_port.value())
+            host, port = _split_host_port(self.net_host.currentText(), self.net_port.value())
             if not host:
-                self.net_host.setFocus(); return None
+                self.net_host.setFocus()
+                return None
             settings_mod.add_recent("recent_network_hosts", host)
             return {"name": name, "type": "network", "host": host, "port": port}
-        host, port = _split_host_port(self.rem_host.currentText(),
-                                      self.rem_port.value())
+        host, port = _split_host_port(self.rem_host.currentText(), self.rem_port.value())
         it = self.rem_list.currentItem()
         if not host or it is None:
             self.rem_status.setText("enter the IP and Scan, then pick a device")
             return None
         settings_mod.add_recent("recent_remote_hosts", host)
-        return {"name": name, "type": "remote", "adb_host": host,
-                "adb_port": port, "serial": it.data(Qt.UserRole) or ""}
+        return {
+            "name": name,
+            "type": "remote",
+            "adb_host": host,
+            "adb_port": port,
+            "serial": it.data(Qt.UserRole) or "",
+        }

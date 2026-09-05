@@ -25,8 +25,8 @@ class ADBConfig:
     >>> ADBConfig(host="192.168.1.50", port=5555)  # a head unit over Wi-Fi/Ethernet
     """
 
-    serial: Optional[str] = None          # device serial (or "host:port" for TCP)
-    host: Optional[str] = None            # for network (TCP/IP) connect
+    serial: Optional[str] = None  # device serial (or "host:port" for TCP)
+    host: Optional[str] = None  # for network (TCP/IP) connect
     port: int = 5555
 
     # --- remote ADB server (drive a device plugged into ANOTHER machine) ---
@@ -41,31 +41,45 @@ class ADBConfig:
     scrcpy_path: Optional[str] = None
 
     # --- behaviour ---
-    command_timeout: Optional[float] = None   # default per-command timeout (s)
-    connect_timeout: float = 20.0             # wait-for-device window on connect
-    auto_connect: bool = True                 # run `adb connect` for network targets
-    auto_wait: bool = True                    # wait-for-device after connect
+    command_timeout: Optional[float] = None  # default per-command timeout (s)
+    connect_timeout: float = 20.0  # wait-for-device window on connect
+    auto_connect: bool = True  # run `adb connect` for network targets
+    auto_wait: bool = True  # wait-for-device after connect
     encoding: str = "utf-8"
 
     def __post_init__(self):
         # A bare "host:port" passed as serial is also a valid network target.
         if self.serial and self.host is None and ":" in self.serial:
-            h, _, p = self.serial.rpartition(":")
-            if p.isdigit():
-                self.host, self.port = h, int(p)
+            if self.serial.startswith("[") and "]" in self.serial:
+                b_end = self.serial.index("]")
+                h = self.serial[1:b_end]
+                rest = self.serial[b_end + 1 :]
+                if rest.startswith(":") and rest[1:].isdigit():
+                    self.host, self.port = h, int(rest[1:])
+            else:
+                h, _, p = self.serial.rpartition(":")
+                if p.isdigit() and ":" not in h:
+                    self.host, self.port = h, int(p)
         # Normalise a remote adb-server host given WITH a port (e.g. the user
-        # typed "10.232.10.199:5037"): split the port out so we never build a
+        # typed "10.232.10.199:5037" or "[::1]:5037"): split the port out so we never build a
         # doubled "host:port:port" address that scrcpy/adb rejects with
         # "no host in '…:5037:5037'".
         if self.adb_server_host:
             h = self.adb_server_host.strip()
-            while ":" in h:                      # strip ALL ":port" suffixes
+            if h.startswith("[") and "]" in h:
+                b_end = h.index("]")
+                host = h[1:b_end]
+                rest = h[b_end + 1 :]
+                if rest.startswith(":") and rest[1:].isdigit():
+                    self.adb_server_port = int(rest[1:])
+                self.adb_server_host = host
+            elif ":" in h:
                 host, _, p = h.rpartition(":")
-                if host and p.isdigit():
-                    h, self.adb_server_port = host, int(p)
+                if host and p.isdigit() and ":" not in host:
+                    self.adb_server_host = host
+                    self.adb_server_port = int(p)
                 else:
-                    break
-            self.adb_server_host = h
+                    self.adb_server_host = h
 
     @property
     def target(self) -> Optional[str]:
@@ -79,10 +93,15 @@ class ADBConfig:
         return bool(self.adb_server_host)
 
     def __repr__(self) -> str:
-        srv = (f", adb_server={self.adb_server_host}:{self.adb_server_port}"
-               if self.adb_server_host else "")
-        return (f"ADBConfig(target={self.target!r}{srv}, "
-                f"adb_path={self.adb_path!r}, scrcpy_path={self.scrcpy_path!r})")
+        srv = (
+            f", adb_server={self.adb_server_host}:{self.adb_server_port}"
+            if self.adb_server_host
+            else ""
+        )
+        return (
+            f"ADBConfig(target={self.target!r}{srv}, "
+            f"adb_path={self.adb_path!r}, scrcpy_path={self.scrcpy_path!r})"
+        )
 
 
 @dataclass
@@ -90,42 +109,44 @@ class ScrcpyOptions:
     """Options for a scrcpy mirroring/control session. All optional; sensible
     defaults mirror at the device's native size with audio off for low latency."""
 
-    max_size: Optional[int] = None        # --max-size (longest edge in px)
-    bit_rate: Optional[str] = None        # --video-bit-rate e.g. "8M"
-    max_fps: Optional[int] = None         # --max-fps
-    video_codec: Optional[str] = None     # --video-codec h264|h265|av1 (h264 = most
-                                          # compatible on automotive/IVI encoders)
-    render_driver: Optional[str] = None   # --render-driver (e.g. "software" — the
-                                          # reliable choice over Remote Desktop /
-                                          # GPU-less sessions where d3d/opengl fail)
-    crop: Optional[str] = None            # --crop WxH:X:Y (great for IVI displays)
-    display_id: Optional[int] = None      # --display-id (multi-display head units)
-    video_source: Optional[str] = None    # --video-source display|camera (scrcpy 2.2+)
-    camera_facing: Optional[str] = None   # --camera-facing front|back|external
-    camera_size: Optional[str] = None     # --camera-size WxH
-    record: Optional[str] = None          # --record FILE (mp4/mkv)
-    record_format: Optional[str] = None   # --record-format mp4|mkv
-    stay_awake: bool = True               # --stay-awake
-    turn_screen_off: bool = False         # --turn-screen-off
-    show_touches: bool = False            # --show-touches
-    fullscreen: bool = False              # --fullscreen
-    always_on_top: bool = False           # --always-on-top
-    window_borderless: bool = False       # --window-borderless (for GUI embedding)
-    window_x: Optional[int] = None        # --window-x
-    window_y: Optional[int] = None        # --window-y
-    no_audio: bool = False                # audio ON by default (scrcpy 2.0+,
-                                          # Android 11+); falls back to video-only
-                                          # automatically on devices without it
-    no_control: bool = False              # --no-control (view only)
-    keyboard_mode: Optional[str] = None   # --keyboard sdk|uhid|aoa — "uhid" is a
-                                          # virtual HARDWARE keyboard, which types
-                                          # where SDK key-injection is blocked
-                                          # (common over RDP / on IVIs)
-    force_adb_forward: bool = False       # --force-adb-forward: use a FORWARD
-                                          # tunnel instead of reverse — needed on
-                                          # head units/IVIs that block adb reverse
-    window_title: Optional[str] = None    # --window-title
-    extra_args: list = field(default_factory=list)   # any raw extra flags
+    max_size: Optional[int] = None  # --max-size (longest edge in px)
+    bit_rate: Optional[str] = None  # --video-bit-rate e.g. "8M"
+    max_fps: Optional[int] = None  # --max-fps
+    video_codec: Optional[str] = None  # --video-codec h264|h265|av1 (h264 = most
+    # compatible on automotive/IVI encoders)
+    render_driver: Optional[str] = None  # --render-driver (e.g. "software" — the
+    # reliable choice over Remote Desktop /
+    # GPU-less sessions where d3d/opengl fail)
+    crop: Optional[str] = None  # --crop WxH:X:Y (great for IVI displays)
+    display_id: Optional[int] = None  # --display-id (multi-display head units)
+    video_source: Optional[str] = None  # --video-source display|camera (scrcpy 2.2+)
+    camera_facing: Optional[str] = None  # --camera-facing front|back|external
+    camera_size: Optional[str] = None  # --camera-size WxH
+    record: Optional[str] = None  # --record FILE (mp4/mkv)
+    record_format: Optional[str] = None  # --record-format mp4|mkv
+    stay_awake: bool = True  # --stay-awake
+    turn_screen_off: bool = False  # --turn-screen-off
+    show_touches: bool = False  # --show-touches
+    fullscreen: bool = False  # --fullscreen
+    always_on_top: bool = False  # --always-on-top
+    window_borderless: bool = False  # --window-borderless (for GUI embedding)
+    window_x: Optional[int] = None  # --window-x
+    window_y: Optional[int] = None  # --window-y
+    no_audio: bool = False  # audio ON by default (scrcpy 2.0+,
+    # Android 11+); falls back to video-only
+    # automatically on devices without it
+    no_control: bool = False  # --no-control (view only)
+    keyboard_mode: Optional[str] = None  # --keyboard sdk|uhid|aoa — "uhid" is a
+    # virtual HARDWARE keyboard, which types
+    # where SDK key-injection is blocked
+    # (common over RDP / on IVIs)
+    force_adb_forward: bool = False  # --force-adb-forward: use a FORWARD
+    # tunnel instead of reverse — needed on
+    # head units/IVIs that block adb reverse
+    window_title: Optional[str] = None  # --window-title
+    no_playback: bool = False  # --no-playback (for headless recording)
+    extra_args: list = field(default_factory=list)  # any raw extra flags
+
 
     def to_args(self) -> list:
         """Translate the options into a scrcpy argv list."""
@@ -183,5 +204,8 @@ class ScrcpyOptions:
             args += ["--force-adb-forward"]
         if self.window_title:
             args += ["--window-title", str(self.window_title)]
+        if self.no_playback:
+            args += ["--no-playback"]
         args += list(self.extra_args or [])
         return args
+

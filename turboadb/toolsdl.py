@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 from .exceptions import ADBError, ADBNotFoundError
-from .tools import find_adb, find_scrcpy, NO_WINDOW
+from .tools import find_adb, find_scrcpy, NO_WINDOW, parse_version
 
 PLATFORM_TOOLS_REPO_XML = "https://dl.google.com/android/repository/repository2-3.xml"
 
@@ -123,19 +123,32 @@ def _extract_zip(zip_path: str, dest_parent: str, *, strip_top_to: str | None = 
             for member, name in zip(z.namelist(), names):
                 if name.endswith("/"):
                     continue
-                rel = name[len(top) + 1:] if top and name.startswith(top + "/") \
-                    else name
+                rel = name[len(top) + 1 :] if top and name.startswith(top + "/") else name
                 parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
                 if not parts:
                     continue
                 target = os.path.join(root, *parts)
                 if not os.path.realpath(target).startswith(root + os.sep):
-                    continue                      # zip-slip attempt — skip it
+                    continue  # zip-slip attempt — skip it
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with z.open(member) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
         else:
-            z.extractall(dest_parent)
+            os.makedirs(dest_parent, exist_ok=True)
+            root = os.path.realpath(dest_parent)
+            for member in z.namelist():
+                norm = member.replace("\\", "/")
+                if norm.endswith("/"):
+                    continue
+                parts = [p for p in norm.split("/") if p not in ("", ".", "..")]
+                if not parts:
+                    continue
+                target = os.path.join(root, *parts)
+                if not os.path.realpath(target).startswith(os.path.join(root, "")):
+                    continue  # zip-slip attempt — skip it
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with z.open(member) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
 
 
 def _kill_adb_server(adb_path: str | None = None) -> None:
@@ -148,8 +161,9 @@ def _kill_adb_server(adb_path: str | None = None) -> None:
     except Exception:
         return
     try:
-        subprocess.run([exe, "kill-server"], capture_output=True, timeout=15,
-                       creationflags=NO_WINDOW)
+        subprocess.run(
+            [exe, "kill-server"], capture_output=True, timeout=15, creationflags=NO_WINDOW
+        )
     except Exception:
         pass
 
@@ -170,13 +184,14 @@ def _swap_dir(new_dir: str, dest: str) -> None:
             raise ADBError(
                 f"cannot replace {dest} — a file in it is still in use "
                 f"(a running adb server or scrcpy/mirror session locks its exe; "
-                f"close mirrors/recordings and retry): {exc}") from exc
+                f"close mirrors/recordings and retry): {exc}"
+            ) from exc
     try:
         shutil.move(new_dir, dest)
     except Exception:
         if old and not os.path.isdir(dest):
             try:
-                os.rename(old, dest)          # roll the old version back
+                os.rename(old, dest)  # roll the old version back
             except OSError:
                 pass
         raise
@@ -211,21 +226,24 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "platform-tools.zip")
         _download(url, zip_path, on_progress)
-        _check_zip(zip_path)      # a truncated download must fail BEFORE the swap
+        _check_zip(zip_path)  # a truncated download must fail BEFORE the swap
         # the zip contains a top-level "platform-tools/" folder
         staging = os.path.join(tmp, "new")
         _extract_zip(zip_path, staging)
         new_dir = os.path.join(staging, "platform-tools")
         if not os.path.isfile(os.path.join(new_dir, _exe("adb"))):
-            raise ADBNotFoundError("platform-tools downloaded but adb was not "
-                                   "found in the archive (unexpected layout).")
+            raise ADBNotFoundError(
+                "platform-tools downloaded but adb was not "
+                "found in the archive (unexpected layout)."
+            )
         if existing:
-            _kill_adb_server(existing)     # unlock adb.exe before the swap
+            _kill_adb_server(existing)  # unlock adb.exe before the swap
         _swap_dir(new_dir, adb_dir())
     adb = managed_adb()
     if not adb:
-        raise ADBNotFoundError("platform-tools downloaded but adb was not found "
-                               "after install (unexpected layout).")
+        raise ADBNotFoundError(
+            "platform-tools downloaded but adb was not found after install (unexpected layout)."
+        )
     _chmod_x(adb)
     return adb
 
@@ -262,9 +280,9 @@ def _github_release_json(timeout: float = 30) -> dict:
         return data
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and cached and cached.get("data"):
-            return cached["data"]           # unchanged since last time
+            return cached["data"]  # unchanged since last time
         if cached and cached.get("data"):
-            return cached["data"]           # rate-limited etc. — use the cache
+            return cached["data"]  # rate-limited etc. — use the cache
         raise
     except Exception:
         if cached and cached.get("data"):
@@ -280,17 +298,20 @@ def _scrcpy_assets() -> tuple:
         raise ADBNotFoundError(
             "Prebuilt scrcpy is downloaded only on Windows. On macOS use "
             "'brew install scrcpy'; on Linux use 'apt install scrcpy' (or your "
-            "distro's package).")
+            "distro's package)."
+        )
     is64 = platform.machine().endswith("64") or sys.maxsize > 2**32
     want = "win64" if is64 else "win32"
     data = _github_release_json()
     assets = data.get("assets", [])
-    sums = next((a["browser_download_url"] for a in assets
-                 if a["name"].upper().startswith("SHA256SUMS")), None)
+    sums = next(
+        (a["browser_download_url"] for a in assets if a["name"].upper().startswith("SHA256SUMS")),
+        None,
+    )
     for a in assets:
         if a["name"].endswith(".zip") and want in a["name"]:
             return a["browser_download_url"], a["name"], sums
-    for a in assets:                        # fall back to any windows zip
+    for a in assets:  # fall back to any windows zip
         if a["name"].endswith(".zip") and "win" in a["name"]:
             return a["browser_download_url"], a["name"], sums
     raise ADBNotFoundError("No suitable scrcpy Windows release asset was found.")
@@ -301,12 +322,13 @@ def _verify_sha256(path: str, name: str, sums_url: str) -> None:
     Best-effort: if the sums file can't be fetched or has no entry, skip; a
     MISMATCH always raises (corrupt or tampered download)."""
     import hashlib
+
     try:
         req = urllib.request.Request(sums_url, headers=_UA)
         with urllib.request.urlopen(req, timeout=30) as resp:
             sums = resp.read().decode("utf-8", "replace")
     except Exception:
-        return                              # can't fetch the sums — skip check
+        return  # can't fetch the sums — skip check
     expected = None
     for line in sums.splitlines():
         parts = line.split()
@@ -320,8 +342,10 @@ def _verify_sha256(path: str, name: str, sums_url: str) -> None:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     if h.hexdigest().lower() != expected:
-        raise ADBError(f"SHA-256 mismatch for {name} — the download is corrupt "
-                       f"or tampered with; nothing was installed. Try again.")
+        raise ADBError(
+            f"SHA-256 mismatch for {name} — the download is corrupt "
+            f"or tampered with; nothing was installed. Try again."
+        )
 
 
 def _check_zip(path: str) -> None:
@@ -333,8 +357,9 @@ def _check_zip(path: str) -> None:
     except zipfile.BadZipFile as exc:
         raise ADBError(f"downloaded archive is not a valid zip: {exc}") from exc
     if bad:
-        raise ADBError(f"downloaded archive is corrupt (bad CRC: {bad}); "
-                       f"nothing was installed. Try again.")
+        raise ADBError(
+            f"downloaded archive is corrupt (bad CRC: {bad}); nothing was installed. Try again."
+        )
 
 
 def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
@@ -353,8 +378,9 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
         staging = os.path.join(tmp, "scrcpy-new")
         _extract_zip(zip_path, tmp, strip_top_to=staging)
         if not os.path.isfile(os.path.join(staging, _exe("scrcpy"))):
-            raise ADBNotFoundError("scrcpy downloaded but scrcpy.exe was not "
-                                   "found in the archive (unexpected layout).")
+            raise ADBNotFoundError(
+                "scrcpy downloaded but scrcpy.exe was not found in the archive (unexpected layout)."
+            )
         if existing:
             # the scrcpy folder bundles its own adb.exe, which may be running
             # as the server — stop it so the swap isn't blocked by a file lock
@@ -362,8 +388,9 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
         _swap_dir(staging, scrcpy_dir())
     scr = managed_scrcpy()
     if not scr:
-        raise ADBNotFoundError("scrcpy downloaded but scrcpy.exe was not found "
-                               "after install (unexpected layout).")
+        raise ADBNotFoundError(
+            "scrcpy downloaded but scrcpy.exe was not found after install (unexpected layout)."
+        )
     return scr
 
 
@@ -390,6 +417,7 @@ def _write_stamp(version: str) -> None:
 def _pkg_version() -> str:
     try:
         from . import __version__
+
         return __version__
     except Exception:
         return "?"
@@ -417,9 +445,15 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
     Disable entirely with the ``TURBOADB_AUTO_FETCH=0`` environment variable.
     """
     global _ensured
-    norm = lambda note, errors=None: {"note": note, "adb": managed_adb(),
-                                      "scrcpy": managed_scrcpy(),
-                                      "errors": errors or {}}
+
+    def norm(note, errors=None):
+        return {
+            "note": note,
+            "adb": managed_adb(),
+            "scrcpy": managed_scrcpy(),
+            "errors": errors or {},
+        }
+
     if _ensured:
         return norm("already-ensured")
     _ensured = True
@@ -437,10 +471,11 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
             # fresh install: download the latest tools
             note = "installed"
             if notify:
-                notify("Downloading latest platform-tools + scrcpy "
-                       "(one-time; set TURBOADB_AUTO_FETCH=0 to skip)…")
-            res = fetch_tools(adb=True, scrcpy=scrcpy, force=False,
-                              on_progress=on_progress)
+                notify(
+                    "Downloading latest platform-tools + scrcpy "
+                    "(one-time; set TURBOADB_AUTO_FETCH=0 to skip)…"
+                )
+            res = fetch_tools(adb=True, scrcpy=scrcpy, force=False, on_progress=on_progress)
             errors = res.get("errors", {})
         elif upgraded:
             # TurboADB itself was upgraded: check for newer adb/scrcpy and
@@ -458,9 +493,30 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
         # adb.exe still existed), so the update was never retried
         if managed_adb() and not errors:
             _write_stamp(version)
-    except Exception as exc:           # never let auto-fetch break a real command
+        _sync_scrcpy_adb()
+    except Exception as exc:  # never let auto-fetch break a real command
         errors["ensure"] = str(exc)
     return norm(note, errors)
+
+
+def _sync_scrcpy_adb() -> None:
+    """Ensure scrcpy's bundled adb on Windows matches platform-tools adb to eliminate daemon killing conflicts."""
+    if os.name != "nt":
+        return
+    m_adb = managed_adb()
+    s_dir = scrcpy_dir()
+    if not m_adb or not os.path.isdir(s_dir):
+        return
+    pt_dir = os.path.dirname(m_adb)
+    for name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+        src = os.path.join(pt_dir, name)
+        dst = os.path.join(s_dir, name)
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+
 
 
 # --------------------------------------------------------------------------- #
@@ -469,8 +525,9 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
 def installed_adb_version(adb_path: str | None = None) -> str | None:
     try:
         exe = adb_path or find_adb()
-        out = subprocess.run([exe, "version"], capture_output=True, text=True,
-                             timeout=15, creationflags=NO_WINDOW)
+        out = subprocess.run(
+            [exe, "version"], capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW
+        )
         m = re.search(r"Version\s+(\d+\.\d+\.\d+)", out.stdout or out.stderr or "")
         return m.group(1) if m else None
     except Exception:
@@ -485,8 +542,11 @@ def latest_adb_version() -> str | None:
         block = re.search(r'path="platform-tools".*?</revision>', xml, re.S)
         if not block:
             return None
-        rev = re.search(r"<major>(\d+)</major>\s*<minor>(\d+)</minor>"
-                        r"\s*<micro>(\d+)</micro>", block.group(0))
+        rev = re.search(
+            r"<major>(\d+)</major>\s*<minor>(\d+)</minor>"
+            r"\s*<micro>(\d+)</micro>",
+            block.group(0),
+        )
         return ".".join(rev.groups()) if rev else None
     except Exception:
         return None
@@ -495,8 +555,9 @@ def latest_adb_version() -> str | None:
 def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
     try:
         exe = scrcpy_path or find_scrcpy()
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                             timeout=15, creationflags=NO_WINDOW)
+        out = subprocess.run(
+            [exe, "--version"], capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW
+        )
         m = re.search(r"scrcpy\s+(\d+\.\d+(?:\.\d+)?)", out.stdout or out.stderr or "")
         return m.group(1) if m else None
     except Exception:
@@ -505,27 +566,14 @@ def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
 
 def latest_scrcpy_version() -> str | None:
     try:
-        data = _github_release_json()      # ETag-cached, rate-limit friendly
+        data = _github_release_json()  # ETag-cached, rate-limit friendly
         tag = (data.get("tag_name") or "").lstrip("vV")
         return tag or None
     except Exception:
         return None
 
 
-def _vtuple(v: str) -> tuple:
-    """A lenient numeric version tuple ('35.0.2-12147458' -> (35, 0, 2))."""
-    out = []
-    for part in str(v).split(".")[:4]:
-        digits = ""
-        for ch in part:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        out.append(int(digits) if digits else 0)
-    while len(out) < 3:
-        out.append(0)
-    return tuple(out)
+_vtuple = parse_version
 
 
 def _decide(installed: str | None, latest: str | None) -> bool | None:
@@ -533,9 +581,9 @@ def _decide(installed: str | None, latest: str | None) -> bool | None:
     Compares numerically so a formatting difference (or an installed version
     NEWER than the published one) never triggers a pointless re-download."""
     if installed is None:
-        return True                 # not installed -> "upgrade" means install
+        return True  # not installed -> "upgrade" means install
     if latest is None:
-        return None                 # can't reach the version source
+        return None  # can't reach the version source
     return _vtuple(latest) > _vtuple(installed)
 
 
@@ -551,10 +599,8 @@ def check_updates() -> dict:
     ai, al = installed_adb_version(a_path), latest_adb_version()
     si, sl = installed_scrcpy_version(s_path), latest_scrcpy_version()
     return {
-        "adb": {"installed": ai, "latest": al, "upgrade": _decide(ai, al),
-                "path": a_path},
-        "scrcpy": {"installed": si, "latest": sl, "upgrade": _decide(si, sl),
-                   "path": s_path},
+        "adb": {"installed": ai, "latest": al, "upgrade": _decide(ai, al), "path": a_path},
+        "scrcpy": {"installed": si, "latest": sl, "upgrade": _decide(si, sl), "path": s_path},
     }
 
 
@@ -572,23 +618,29 @@ def upgrade_tools(*, on_progress=None, notify=None) -> dict:
         # 'unknown' (couldn't reach the version source / GitHub rate limit) is
         # NOT the same as up to date — reporting it as such hid failed checks
         if unknown and notify:
-            notify("couldn't determine the latest " + "/".join(unknown) +
-                   " version (network / rate limit) — nothing was changed; "
-                   "try again in a while")
-        return {"checks": checks, "updated": {}, "errors": {},
-                "up_to_date": not unknown, "unknown": unknown}
+            notify(
+                "couldn't determine the latest "
+                + "/".join(unknown)
+                + " version (network / rate limit) — nothing was changed; "
+                "try again in a while"
+            )
+        return {
+            "checks": checks,
+            "updated": {},
+            "errors": {},
+            "up_to_date": not unknown,
+            "unknown": unknown,
+        }
     if notify:
         bits = []
         if want_adb:
             bits.append(f"adb {checks['adb']['installed']}→{checks['adb']['latest']}")
         if want_scrcpy:
-            bits.append(f"scrcpy {checks['scrcpy']['installed']}→"
-                        f"{checks['scrcpy']['latest']}")
+            bits.append(f"scrcpy {checks['scrcpy']['installed']}→{checks['scrcpy']['latest']}")
         notify("Updating " + ", ".join(bits) + " …")
     if want_adb:
         try:
-            updated["adb"] = download_platform_tools(force=True,
-                                                     on_progress=on_progress)
+            updated["adb"] = download_platform_tools(force=True, on_progress=on_progress)
         except Exception as exc:
             errors["adb"] = str(exc)
     if want_scrcpy:
@@ -596,12 +648,18 @@ def upgrade_tools(*, on_progress=None, notify=None) -> dict:
             updated["scrcpy"] = download_scrcpy(force=True, on_progress=on_progress)
         except Exception as exc:
             errors["scrcpy"] = str(exc)
-    return {"checks": checks, "updated": updated, "errors": errors,
-            "up_to_date": False, "unknown": unknown}
+    return {
+        "checks": checks,
+        "updated": updated,
+        "errors": errors,
+        "up_to_date": False,
+        "unknown": unknown,
+    }
 
 
-def fetch_tools(*, adb: bool = True, scrcpy: bool = True, force: bool = False,
-                on_progress=None, on_stage=None) -> dict:
+def fetch_tools(
+    *, adb: bool = True, scrcpy: bool = True, force: bool = False, on_progress=None, on_stage=None
+) -> dict:
     """Download whatever's requested into the cache. Returns
     ``{"adb": path|None, "scrcpy": path|None, "errors": {...}}``.
 
@@ -612,6 +670,7 @@ def fetch_tools(*, adb: bool = True, scrcpy: bool = True, force: bool = False,
     scrcpy bundles its own adb on Windows; downloading scrcpy alone is enough to
     get both, but fetching platform-tools gives you the latest standalone adb.
     """
+
     def stage(label):
         if on_stage:
             try:
@@ -624,8 +683,7 @@ def fetch_tools(*, adb: bool = True, scrcpy: bool = True, force: bool = False,
     if adb:
         stage(f"platform-tools / adb (1/{total})")
         try:
-            result["adb"] = download_platform_tools(force=force,
-                                                    on_progress=on_progress)
+            result["adb"] = download_platform_tools(force=force, on_progress=on_progress)
         except Exception as exc:
             result["errors"]["adb"] = str(exc)
     if scrcpy:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import Optional, Union
 
 
 # ANSI/VT escape sequences (CSI like ESC[1;32m, OSC like ESC]0;title BEL, etc.)
@@ -38,7 +38,7 @@ class CommandResult:
 
     command: str
     exit_code: int
-    stdout: str
+    stdout: Union[str, bytes]
     stderr: str
     duration: float
     device: str = ""
@@ -51,12 +51,19 @@ class CommandResult:
     @property
     def text(self) -> str:
         """stdout with surrounding whitespace/newlines stripped - print-ready."""
+        if isinstance(self.stdout, bytes):
+            return self.stdout.decode("utf-8", errors="replace").strip()
         return self.stdout.strip()
 
     @property
     def lines(self) -> list:
         """stdout split into non-empty stripped lines."""
-        return [ln for ln in self.stdout.splitlines() if ln.strip()]
+        raw = (
+            self.stdout.decode("utf-8", errors="replace")
+            if isinstance(self.stdout, bytes)
+            else self.stdout
+        )
+        return [ln for ln in raw.splitlines() if ln.strip()]
 
     def __bool__(self) -> bool:
         return self.ok
@@ -75,7 +82,7 @@ class TransferResult:
 
     source: str
     dest: str
-    direction: str           # "push" or "pull"
+    direction: str  # "push" or "pull"
     size_bytes: int
     duration: float
     files: int = 1
@@ -100,9 +107,11 @@ class TransferResult:
     def __str__(self) -> str:
         verb = "Pushed" if self.direction == "push" else "Pulled"
         files = f"{self.files} files, " if self.files != 1 else ""
-        return (f"{verb} {self.source} -> {self.dest}  "
-                f"({files}{self.human_size} in {self.duration:.2f}s, "
-                f"{self.human_speed})")
+        return (
+            f"{verb} {self.source} -> {self.dest}  "
+            f"({files}{self.human_size} in {self.duration:.2f}s, "
+            f"{self.human_speed})"
+        )
 
 
 @dataclass
@@ -122,8 +131,10 @@ class StreamResult:
         return self.matched
 
     def __str__(self) -> str:
-        return (f"<StreamResult lines={self.lines} matches={len(self.matches)} "
-                f"saved_to={self.saved_to!r}>")
+        return (
+            f"<StreamResult lines={self.lines} matches={len(self.matches)} "
+            f"saved_to={self.saved_to!r}>"
+        )
 
 
 @dataclass
@@ -140,6 +151,30 @@ class OperationResult:
 
     def __bool__(self) -> bool:
         return self.success
+
+    @property
+    def ok(self) -> bool:
+        return self.success
+
+    @property
+    def stdout(self) -> str:
+        if isinstance(self.value, CommandResult):
+            return str(self.value.stdout)
+        if isinstance(self.value, str):
+            return self.value
+        return ""
+
+    @property
+    def stderr(self) -> str:
+        if isinstance(self.value, CommandResult):
+            return str(self.value.stderr)
+        return str(self.error or "")
+
+    @property
+    def text(self) -> str:
+        if isinstance(self.value, CommandResult):
+            return self.value.text
+        return str(self.value or "")
 
     def unwrap(self):
         """Return value on success, else re-raise the captured error."""

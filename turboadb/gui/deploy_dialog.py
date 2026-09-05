@@ -5,9 +5,20 @@ pre-flight so you can see WinRM/credential problems before deploying."""
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QPlainTextEdit, QLineEdit, QCheckBox, QSpinBox,
-                             QPushButton, QLabel, QToolButton, QWidget)
+from PyQt5.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QPlainTextEdit,
+    QLineEdit,
+    QCheckBox,
+    QSpinBox,
+    QPushButton,
+    QLabel,
+    QToolButton,
+    QWidget,
+)
 
 from . import settings as settings_mod, theme
 
@@ -24,10 +35,17 @@ class _TestThread(QThread):
     def run(self):
         try:
             from ..remote_deploy import deploy_serve
-            deploy_serve(self.hosts, self.user, self.pw, port=self.port,
-                         test_only=True, use_ssl=self.use_ssl,
-                         winrm_port=5986 if self.use_ssl else 5985,
-                         on_status=self.line.emit)
+
+            deploy_serve(
+                self.hosts,
+                self.user,
+                self.pw,
+                port=self.port,
+                test_only=True,
+                use_ssl=self.use_ssl,
+                winrm_port=5986 if self.use_ssl else 5985,
+                on_status=self.line.emit,
+            )
         except Exception as exc:
             self.line.emit(f"[ERROR] test: {exc}")
         self.done.emit()
@@ -44,18 +62,23 @@ class DeployDialog(QDialog):
         root.setSpacing(10)
 
         title = QLabel("Start the adb server on another Windows PC")
-        title.setStyleSheet(f"font-size:13.5pt; font-weight:800; "
-                            f"color:{theme.accent_text(settings_mod.get('theme'))};")
+        title.setStyleSheet(
+            f"font-size:13.5pt; font-weight:800; "
+            f"color:{theme.accent_text(settings_mod.get('theme'))};"
+        )
         root.addWidget(title)
-        sub = QLabel("It runs <b>turboadb serve</b> on each host so that PC shares "
-                     "its plugged-in devices over the network — you can then "
-                     "Connect → Remote to them from here.")
+        sub = QLabel(
+            "It runs <b>turboadb serve</b> on each host so that PC shares "
+            "its plugged-in devices over the network — you can then "
+            "Connect → Remote to them from here."
+        )
         sub.setWordWrap(True)
         root.addWidget(sub)
 
         # ---- form (aligned grid, no wall of text) ----
         grid = QGridLayout()
-        grid.setVerticalSpacing(8); grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(10)
         grid.setColumnStretch(1, 1)
 
         grid.addWidget(self._lbl("Host(s)"), 0, 0, Qt.AlignTop)
@@ -73,58 +96,75 @@ class DeployDialog(QDialog):
         grid.addWidget(self.user, 1, 1)
 
         grid.addWidget(self._lbl("Password"), 2, 0)
-        pw_row = QHBoxLayout(); pw_row.setSpacing(6)
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
         # pre-filled from the OS credential vault so it isn't retyped every time
         self.pw = QLineEdit(settings_mod.deploy_password())
         self.pw.setEchoMode(QLineEdit.Password)
-        eye = QToolButton(); eye.setText("👁"); eye.setCheckable(True)
+        eye = QToolButton()
+        eye.setText("👁")
+        eye.setCheckable(True)
         eye.setToolTip("Show / hide password")
-        eye.toggled.connect(lambda on: self.pw.setEchoMode(
-            QLineEdit.Normal if on else QLineEdit.Password))
+        eye.toggled.connect(
+            lambda on: self.pw.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+        )
         self.remember = QCheckBox("Remember")
         self.remember.setChecked(bool(settings_mod.get("deploy_remember")))
         self.remember.setToolTip(
             "Remember these credentials for next time. The user is kept in "
             "settings; the password goes in the OS credential vault (Windows "
             "Credential Manager) — never in a plain file. Untick to forget "
-            "them on the next deploy.")
-        pw_row.addWidget(self.pw, 1); pw_row.addWidget(eye)
+            "them on the next deploy."
+        )
+        pw_row.addWidget(self.pw, 1)
+        pw_row.addWidget(eye)
         pw_row.addWidget(self.remember)
-        pw_w = QWidget(); pw_w.setLayout(pw_row)
+        pw_w = QWidget()
+        pw_w.setLayout(pw_row)
         grid.addWidget(pw_w, 2, 1)
 
         grid.addWidget(self._lbl("adb port"), 3, 0)
-        port_row = QHBoxLayout(); port_row.setSpacing(12)
-        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(5037)
+        port_row = QHBoxLayout()
+        port_row.setSpacing(12)
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(5037)
         self.port.setFixedWidth(90)
-        self.update = QCheckBox("Update turboadb on each host first")
-        self.update.setChecked(True)
+        self.chk_update = QCheckBox("Update turboadb on each host first")
+        self.chk_update.setChecked(True)
         self.https = QCheckBox("WinRM over HTTPS (5986)")
-        self.https.setToolTip("Use encrypted WinRM (port 5986) instead of plain "
-                              "HTTP (5985). The host must have an HTTPS WinRM "
-                              "listener configured.")
-        port_row.addWidget(self.port); port_row.addWidget(self.update)
+        self.https.setToolTip(
+            "Use encrypted WinRM (port 5986) instead of plain "
+            "HTTP (5985). The host must have an HTTPS WinRM "
+            "listener configured."
+        )
+        port_row.addWidget(self.port)
+        port_row.addWidget(self.chk_update)
         port_row.addWidget(self.https)
         port_row.addStretch(1)
-        port_w = QWidget(); port_w.setLayout(port_row)
+        port_w = QWidget()
+        port_w.setLayout(port_row)
         grid.addWidget(port_w, 3, 1)
         root.addLayout(grid)
 
         # ---- one-line prerequisite ----
-        need = QLabel("ⓘ Each host needs <b>WinRM</b> on (run "
-                      "<code>Enable-PSRemoting -Force</code> there once) and "
-                      "Python + turboadb installed.")
+        need = QLabel(
+            "ⓘ Each host needs <b>WinRM</b> on (run "
+            "<code>Enable-PSRemoting -Force</code> there once) and "
+            "Python + turboadb installed."
+        )
         need.setWordWrap(True)
         need.setStyleSheet("color:#8a93a0; font-size:9pt;")
         root.addWidget(need)
 
         # ---- live status (test / errors appear here) ----
-        self.status = QPlainTextEdit(); self.status.setReadOnly(True)
+        self.status = QPlainTextEdit()
+        self.status.setReadOnly(True)
         self.status.setFixedHeight(96)
-        self.status.setPlaceholderText("Click ‘Test connection’ to check WinRM "
-                                       "before deploying…")
-        self.status.setStyleSheet("QPlainTextEdit{background:#0b0b0d;"
-                                  "color:#cfe3f7;border:1px solid #2a2a2a;}")
+        self.status.setPlaceholderText("Click ‘Test connection’ to check WinRM before deploying…")
+        self.status.setStyleSheet(
+            "QPlainTextEdit{background:#0b0b0d;color:#cfe3f7;border:1px solid #2a2a2a;}"
+        )
         root.addWidget(self.status)
 
         # ---- buttons ----
@@ -139,25 +179,31 @@ class DeployDialog(QDialog):
         self.btn_deploy.setProperty("role", "ok")
         self.btn_deploy.setIcon(theme.emoji_icon("📡"))
         self.btn_deploy.clicked.connect(self._on_deploy)
-        cancel = QPushButton("Cancel"); cancel.setProperty("role", "ghost")
+        cancel = QPushButton("Cancel")
+        cancel.setProperty("role", "ghost")
         cancel.clicked.connect(self.reject)
-        btns.addWidget(self.btn_deploy); btns.addWidget(cancel)
+        btns.addWidget(self.btn_deploy)
+        btns.addWidget(cancel)
         root.addLayout(btns)
 
     @staticmethod
     def _lbl(text):
-        l = QLabel(text)
-        l.setStyleSheet("color:#c4ccd4; font-weight:600;")
-        return l
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#c4ccd4; font-weight:600;")
+        return lbl
 
     # ---- validation + values ----
     def values(self) -> dict:
         raw = self.hosts.toPlainText().replace(",", "\n")
         hosts = [h.strip() for h in raw.splitlines() if h.strip()]
-        return {"hosts": hosts, "user": self.user.text().strip(),
-                "password": self.pw.text(), "port": self.port.value(),
-                "update": self.update.isChecked(),
-                "use_ssl": self.https.isChecked()}
+        return {
+            "hosts": hosts,
+            "user": self.user.text().strip(),
+            "password": self.pw.text(),
+            "port": self.port.value(),
+            "update": self.chk_update.isChecked(),
+            "use_ssl": self.https.isChecked(),
+        }
 
     def _problem(self):
         v = self.values()
@@ -180,15 +226,16 @@ class DeployDialog(QDialog):
         v = self.values()
         self.status.clear()
         self._append(f"Testing WinRM on {len(v['hosts'])} host(s)…")
-        self.btn_test.setEnabled(False); self.btn_deploy.setEnabled(False)
-        self._test = _TestThread(v["hosts"], v["user"], v["password"], v["port"],
-                                 v["use_ssl"])
+        self.btn_test.setEnabled(False)
+        self.btn_deploy.setEnabled(False)
+        self._test = _TestThread(v["hosts"], v["user"], v["password"], v["port"], v["use_ssl"])
         self._test.line.connect(self._append)
         self._test.done.connect(self._test_done)
         self._test.start()
 
     def _test_done(self):
-        self.btn_test.setEnabled(True); self.btn_deploy.setEnabled(True)
+        self.btn_test.setEnabled(True)
+        self.btn_deploy.setEnabled(True)
         self._append("— test finished —")
 
     def _save_credentials(self):
@@ -203,7 +250,7 @@ class DeployDialog(QDialog):
                 settings_mod.set_deploy_password(v["password"])
             else:
                 data["deploy_user"] = ""
-                settings_mod.set_deploy_password("")   # delete from the vault
+                settings_mod.set_deploy_password("")  # delete from the vault
             settings_mod.save(data)
         except Exception:
             pass
@@ -219,6 +266,7 @@ class DeployDialog(QDialog):
     def _append(self, text):
         # strip the [LEVEL] tag for the compact in-dialog view
         import re
-        self.status.appendPlainText(re.sub(r"^\[(OK|ERROR|WARNING|INFO)\]\s*",
-                                           "", text))
-        sb = self.status.verticalScrollBar(); sb.setValue(sb.maximum())
+
+        self.status.appendPlainText(re.sub(r"^\[(OK|ERROR|WARNING|INFO)\]\s*", "", text))
+        sb = self.status.verticalScrollBar()
+        sb.setValue(sb.maximum())

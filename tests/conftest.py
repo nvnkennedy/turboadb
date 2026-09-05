@@ -1,9 +1,12 @@
 """Shared pytest fixtures: a fake adb that records argv and returns canned
 output, so the real ADBHandler code paths (arg building, parsing, safe-mode) run
 without a device or a real adb binary — portable across Linux/Windows CI."""
+import os
+import sys
 
-import subprocess
-import types
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if sys.path[0] != repo_root:
+    sys.path.insert(0, repo_root)
 
 import pytest
 
@@ -25,8 +28,8 @@ class FakeAdb:
     """
 
     def __init__(self):
-        self.calls = []            # list of argv lists
-        self.rules = []            # (predicate, (rc, out, err))
+        self.calls = []  # list of argv lists
+        self.rules = []  # (predicate, (rc, out, err))
 
     def add(self, needle, stdout=b"", returncode=0, stderr=b""):
         if isinstance(stdout, str):
@@ -36,7 +39,10 @@ class FakeAdb:
         if callable(needle):
             pred = needle
         else:
-            pred = lambda argv, n=needle: n in " ".join(argv)
+
+            def pred(argv, n=needle):
+                return n in " ".join(argv)
+
         self.rules.append((pred, (returncode, stdout, stderr)))
         return self
 
@@ -74,9 +80,20 @@ def fake_adb(monkeypatch, tmp_path):
     dummy = tmp_path / ("adb.exe" if __import__("os").name == "nt" else "adb")
     dummy.write_text("")
     monkeypatch.setenv("TURBOADB_ADB", str(dummy))
-    monkeypatch.setenv("TURBOADB_AUTO_FETCH", "0")   # never touch the network
+    monkeypatch.setenv("TURBOADB_AUTO_FETCH", "0")  # never touch the network
 
     fake = FakeAdb()
     monkeypatch.setattr(core.subprocess, "run", fake.run)
     monkeypatch.setattr(tools.subprocess, "run", fake.run)
     return fake
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(["turboadb-test"])
+    return app

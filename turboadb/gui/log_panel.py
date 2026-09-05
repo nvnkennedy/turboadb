@@ -13,35 +13,54 @@ import webbrowser
 from collections import deque
 
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
-from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QPlainTextEdit, QFileDialog, QComboBox, QLabel)
+from PyQt5.QtWidgets import (
+    QGroupBox,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QPlainTextEdit,
+    QFileDialog,
+    QComboBox,
+    QLabel,
+    QCheckBox,
+)
 
 from . import theme
+from . import settings as settings_mod
 
 DOCS_URL = "https://pypi.org/project/turboadb/"
 
 #   name -> (rank, 4-char badge, badge colour, message colour)
 _LEVELS = {
-    "DEBUG":   (0, "dbg ", "#7e8896", "#8b95a3"),
-    "INFO":    (1, "info", "#7fb2e8", "#cfe3f7"),
-    "OK":      (1, "ok  ", "#5be39a", "#bdebcf"),
+    "DEBUG": (0, "dbg ", "#7e8896", "#8b95a3"),
+    "INFO": (1, "info", "#7fb2e8", "#cfe3f7"),
+    "OK": (1, "ok  ", "#5be39a", "#bdebcf"),
     "WARNING": (2, "warn", "#ffc34d", "#ffe1a3"),
-    "ERROR":   (3, "err ", "#ff7a6e", "#ffb3aa"),
+    "ERROR": (3, "err ", "#ff7a6e", "#ffb3aa"),
 }
-_ALIASES = {"SUCCESS": "OK", "WARN": "WARNING", "STDERR": "WARNING",
-            "CRITICAL": "ERROR", "FATAL": "ERROR"}
-_FILTERS = [("Normal", 1), ("Verbose (adb commands)", 0),
-            ("Warnings + Errors", 2), ("Errors only", 3)]
+_ALIASES = {
+    "SUCCESS": "OK",
+    "WARN": "WARNING",
+    "STDERR": "WARNING",
+    "CRITICAL": "ERROR",
+    "FATAL": "ERROR",
+}
+_FILTERS = [
+    ("Normal", 1),
+    ("Verbose (adb commands)", 0),
+    ("Warnings + Errors", 2),
+    ("Errors only", 3),
+]
 _PREFIX_RE = re.compile(
-    r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|CRITICAL|FATAL|ERROR)\]\s*",
-    re.IGNORECASE)
+    r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|CRITICAL|FATAL|ERROR)\]\s*", re.IGNORECASE
+)
 
 
 class LogPanel(QGroupBox):
     def __init__(self, parent=None):
         super().__init__("Log", parent)
-        self._entries = deque(maxlen=20000)    # (ts, level, msg) — the full record
-        self._min_rank = 1                     # "Normal": hide DEBUG by default
+        self._entries = deque(maxlen=20000)  # (ts, level, msg) — the full record
+        self._min_rank = 1  # "Normal": hide DEBUG by default
 
         lay = QVBoxLayout(self)
         self.view = QPlainTextEdit()
@@ -49,31 +68,54 @@ class LogPanel(QGroupBox):
         self.view.setFont(QFont("Consolas", 9))
         self.view.setMaximumBlockCount(80000)
         # the log dock is DARK in both themes so its colour-coding stays readable
-        self.view.setStyleSheet("QPlainTextEdit{background:#0b0b0d;color:#cfe3f7;"
-                                "border:1px solid #2a2a2a;}")
+        self.view.setStyleSheet(
+            "QPlainTextEdit{background:#0b0b0d;color:#cfe3f7;border:1px solid #2a2a2a;}"
+        )
 
         row = QHBoxLayout()
-        lbl = QLabel("Show:"); lbl.setStyleSheet("color:#9aa4af;")
+        lbl = QLabel("Show:")
+        lbl.setStyleSheet("color:#9aa4af;")
         row.addWidget(lbl)
         self.level_box = QComboBox()
         self.level_box.addItems([f[0] for f in _FILTERS])
         self.level_box.setMaximumWidth(190)
-        self.level_box.setToolTip("Filter the log by level. 'Verbose' also shows "
-                                  "the raw adb commands.")
+        self.level_box.setToolTip(
+            "Filter the log by level. 'Verbose' also shows the raw adb commands."
+        )
         self.level_box.currentIndexChanged.connect(self._on_filter)
         row.addWidget(self.level_box)
+        self.chk_silent = QCheckBox("Silent (suppress popups while log open)")
+        self.chk_silent.setToolTip(
+            "When checked, critical error popups will not interrupt you when the log dock is open."
+        )
+        self.chk_silent.setChecked(bool(settings_mod.get("mute_popups_with_log", True)))
+        self.chk_silent.toggled.connect(self._on_silent_toggled)
+        row.addWidget(self.chk_silent)
         row.addStretch(1)
-        clear = QPushButton("Clear"); clear.setProperty("role", "ghost")
-        clear.setIcon(theme.emoji_icon("🧹")); clear.clicked.connect(self._clear)
-        save = QPushButton("Save log…"); save.setProperty("role", "ghost")
-        save.setIcon(theme.emoji_icon("💾")); save.clicked.connect(self._save)
-        docs = QPushButton("Help / Docs"); docs.setProperty("role", "ghost")
+        clear = QPushButton("Clear")
+        clear.setProperty("role", "ghost")
+        clear.setIcon(theme.emoji_icon("🧹"))
+        clear.clicked.connect(self._clear)
+        save = QPushButton("Save log…")
+        save.setProperty("role", "ghost")
+        save.setIcon(theme.emoji_icon("💾"))
+        save.clicked.connect(self._save)
+        docs = QPushButton("Help / Docs")
+        docs.setProperty("role", "ghost")
         docs.setIcon(theme.emoji_icon("❓"))
         docs.clicked.connect(lambda: webbrowser.open(DOCS_URL))
-        row.addWidget(clear); row.addWidget(save); row.addWidget(docs)
+        row.addWidget(clear)
+        row.addWidget(save)
+        row.addWidget(docs)
 
         lay.addWidget(self.view, 1)
         lay.addLayout(row)
+
+    def _on_silent_toggled(self, checked: bool):
+        try:
+            settings_mod.set("mute_popups_with_log", bool(checked))
+        except Exception:
+            pass
 
     # ---- public API ----
     def append(self, text: str):
@@ -97,7 +139,7 @@ class LogPanel(QGroupBox):
         if m:
             lvl = m.group(1).upper()
             lvl = _ALIASES.get(lvl, lvl)
-            return (lvl if lvl in _LEVELS else "INFO"), text[m.end():]
+            return (lvl if lvl in _LEVELS else "INFO"), text[m.end() :]
         # unprefixed: the raw command trace is DEBUG; everything else is INFO
         s = text.lstrip()
         if s.startswith("$ ") or s.startswith("-> ") or s.startswith("  -> "):
@@ -108,11 +150,15 @@ class LogPanel(QGroupBox):
     def _render(self, entry):
         ts, level, msg = entry
         _rank, badge, badge_col, msg_col = _LEVELS.get(level, _LEVELS["INFO"])
-        cur = self.view.textCursor(); cur.movePosition(QTextCursor.End)
-        tsfmt = QTextCharFormat(); tsfmt.setForeground(QColor("#6b7580"))
-        bfmt = QTextCharFormat(); bfmt.setForeground(QColor(badge_col))
+        cur = self.view.textCursor()
+        cur.movePosition(QTextCursor.End)
+        tsfmt = QTextCharFormat()
+        tsfmt.setForeground(QColor("#6b7580"))
+        bfmt = QTextCharFormat()
+        bfmt.setForeground(QColor(badge_col))
         bfmt.setFontWeight(QFont.Bold)
-        mfmt = QTextCharFormat(); mfmt.setForeground(QColor(msg_col))
+        mfmt = QTextCharFormat()
+        mfmt.setForeground(QColor(msg_col))
         cur.insertText(f"{ts} ", tsfmt)
         cur.insertText(f"{badge} ", bfmt)
         cur.insertText(msg + "\n", mfmt)
@@ -122,7 +168,8 @@ class LogPanel(QGroupBox):
         for entry in self._entries:
             if _LEVELS[entry[1]][0] >= self._min_rank:
                 self._render(entry)
-        sb = self.view.verticalScrollBar(); sb.setValue(sb.maximum())
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_filter(self, idx):
         self._min_rank = _FILTERS[idx][1]
@@ -135,11 +182,11 @@ class LogPanel(QGroupBox):
 
     def _save(self):
         from .fileutil import download_path
-        default = download_path("turboadb-log-"
-                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
+
+        default = download_path("turboadb-log-" + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save log", default,
-            "Log files (*.log);;Text files (*.txt);;All files (*)")
+            self, "Save log", default, "Log files (*.log);;Text files (*.txt);;All files (*)"
+        )
         if not path:
             return
         with open(path, "w", encoding="utf-8") as fh:
@@ -148,4 +195,5 @@ class LogPanel(QGroupBox):
                     fh.write(f"{ts} {_LEVELS[level][1].strip().upper():4} {msg}\n")
         self.append(f"[OK] Log saved to {path}")
         from .fileutil import saved_dialog
+
         saved_dialog(self, path, "log")

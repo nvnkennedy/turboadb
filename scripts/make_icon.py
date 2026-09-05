@@ -17,20 +17,21 @@ import math
 import os
 from PIL import Image, ImageDraw
 
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                   "turboadb", "assets")
+OUT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "turboadb", "assets"
+)
 
 # palette
 BG0 = (10, 10, 10, 255)
 BG1 = (22, 26, 22, 255)
-GREEN = (40, 194, 214, 255)   # cyan-teal gauge start       # android green
+GREEN = (40, 194, 214, 255)  # cyan-teal gauge start       # android green
 GREEN_D = (30, 150, 168, 255)
 AMBER = (255, 195, 77, 255)
 RED = (255, 94, 94, 255)
 DIM = (70, 78, 72, 255)
 WHITE = (235, 245, 238, 255)
-ROBOT = (226, 234, 240, 255)   # light robot — stands out from the cyan gauge
-GLOW = (40, 194, 214)          # cyan glow
+ROBOT = (226, 234, 240, 255)  # light robot — stands out from the cyan gauge
+GLOW = (40, 194, 214)  # cyan glow
 
 
 def _lerp(a, b, t):
@@ -49,8 +50,7 @@ def _rounded_bg(size):
     for i in range(28, 0, -1):
         rad = size * 0.5 * i / 28
         a = int(16 * (1 - i / 28))
-        gd.ellipse([cx - rad, cy - rad, cx + rad, cy + rad],
-                   fill=(GLOW[0], GLOW[1], GLOW[2], a))
+        gd.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(GLOW[0], GLOW[1], GLOW[2], a))
     img.alpha_composite(glow)
     # mask the glow to the rounded rect
     mask = Image.new("L", (size, size), 0)
@@ -66,7 +66,7 @@ def _gauge(d, size):
     cx, cy = size / 2, size / 2
     radius = size * 0.37
     width = int(size * 0.05)
-    start, end = 135, 405          # 270° sweep, gap at the bottom
+    start, end = 135, 405  # 270° sweep, gap at the bottom
     steps = 160
     for i in range(steps):
         t0 = i / steps
@@ -93,12 +93,11 @@ def _gauge(d, size):
 def _android(d, size, cx, cy, radius):
     """A bold, friendly Android robot head centred in the gauge."""
     hr = radius * 0.58
-    top = cy - hr * 0.30                 # head sits slightly high; body fills below
+    top = cy - hr * 0.30  # head sits slightly high; body fills below
     # dome
     d.pieslice([cx - hr, top - hr, cx + hr, top + hr], 180, 360, fill=ROBOT)
     # body (rounded rectangle just under the dome)
-    d.rounded_rectangle([cx - hr, top, cx + hr, top + hr * 0.92],
-                        radius=int(hr * 0.16), fill=ROBOT)
+    d.rounded_rectangle([cx - hr, top, cx + hr, top + hr * 0.92], radius=int(hr * 0.16), fill=ROBOT)
     # antennae
     aw = max(3, int(size * 0.012))
     for sx in (-0.42, 0.42):
@@ -135,8 +134,7 @@ def main():
     png = os.path.join(OUT, "icon.png")
     img.save(png)
     ico = os.path.join(OUT, "icon.ico")
-    img.save(ico, sizes=[(16, 16), (24, 24), (32, 32), (48, 48),
-                         (64, 64), (128, 128), (256, 256)])
+    img.save(ico, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     print(f"Wrote {png}")
     print(f"Wrote {ico}")
 

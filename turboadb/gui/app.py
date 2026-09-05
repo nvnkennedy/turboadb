@@ -16,7 +16,7 @@ from .main_window import MainWindow, ICON_PATH
 
 DOCS_URL = "https://pypi.org/project/turboadb/"
 _FLAG_DIR = os.path.join(os.path.expanduser("~"), ".turboadb")
-_window = None          # set after creation, used by the exception hook
+_window = None  # set after creation, used by the exception hook
 
 
 def _crash_log(text: str):
@@ -36,29 +36,37 @@ def _install_app_logging():
     import logging
     import logging.handlers
     import threading
+
     try:
         os.makedirs(_FLAG_DIR, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
-            os.path.join(_FLAG_DIR, "turboadb.log"), maxBytes=1_000_000,
-            backupCount=2, encoding="utf-8")
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            os.path.join(_FLAG_DIR, "turboadb.log"),
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
         root = logging.getLogger("turboadb")
         root.setLevel(logging.DEBUG)
         # avoid stacking duplicate handlers if main() is ever re-entered
-        if not any(isinstance(h, logging.handlers.RotatingFileHandler)
-                   for h in root.handlers):
+        if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
             root.addHandler(handler)
     except Exception:
         pass
     # worker-thread exceptions -> crash.log too (the Qt excepthook only covers
     # the UI thread)
     try:
+
         def _thread_hook(args):
             import traceback
-            _crash_log("[background thread] " + "".join(
-                traceback.format_exception(args.exc_type, args.exc_value,
-                                           args.exc_traceback)))
+
+            _crash_log(
+                "[background thread] "
+                + "".join(
+                    traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+                )
+            )
+
         threading.excepthook = _thread_hook
     except Exception:
         pass
@@ -67,6 +75,7 @@ def _install_app_logging():
 def _install_excepthook():
     """Uncaught GUI-thread errors -> log to the panel + a non-fatal popup,
     instead of crashing the app."""
+
     def hook(exc_type, exc, tb):
         msg = "".join(traceback.format_exception(exc_type, exc, tb))
         _crash_log(msg)
@@ -76,11 +85,14 @@ def _install_excepthook():
             except Exception:
                 pass
         try:
-            QMessageBox.warning(_window, "TurboADB — error",
-                                f"{exc_type.__name__}: {exc}\n\n"
-                                "The app stayed open; details are in the log.")
+            QMessageBox.warning(
+                _window,
+                "TurboADB — error",
+                f"{exc_type.__name__}: {exc}\n\nThe app stayed open; details are in the log.",
+            )
         except Exception:
             pass
+
     sys.excepthook = hook
 
 
@@ -89,6 +101,7 @@ def _sweep_stale_logs():
     linger in ~/.turboadb/logs forever — drop anything older than 3 days."""
     import glob
     import time
+
     try:
         cutoff = time.time() - 3 * 86400
         for p in glob.glob(os.path.join(_FLAG_DIR, "logs", "turboadb-*.log")):
@@ -106,6 +119,7 @@ def _first_run_tasks():
     are created/refreshed every launch by the main window, so they self-heal.)"""
     try:
         from . import settings as settings_mod
+
         cfg = settings_mod.load()
         os.makedirs(_FLAG_DIR, exist_ok=True)
         flag = os.path.join(_FLAG_DIR, "first-run-done")
@@ -127,8 +141,8 @@ def _set_app_user_model_id():
         return
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "TurboADB.DeviceToolkit")
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TurboADB.DeviceToolkit")
     except Exception:
         pass
 
@@ -142,11 +156,13 @@ def main():
         icon = QIcon(ICON_PATH)
         app.setWindowIcon(icon)
     from . import theme, settings as settings_mod
+
     app.setStyleSheet(theme.stylesheet(settings_mod.get("theme")))
     # placeholder text colour isn't reachable via stylesheet — set the palette
     # role so input hints are clearly visible (they were nearly invisible)
     try:
         from PyQt5.QtGui import QPalette, QColor
+
         pal = app.palette()
         pal.setColor(QPalette.PlaceholderText, QColor("#9aa0a6"))
         app.setPalette(pal)

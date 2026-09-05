@@ -23,24 +23,40 @@ def _ensure_winrm(say=None) -> bool:
     transparently `pip install pywinrm` on first use; the bundled exe ships it."""
     try:
         import winrm  # noqa: F401
+
         return True
     except Exception:
         pass
     if getattr(sys, "frozen", False):
         if say:
-            say("[ERROR] pywinrm isn't bundled in this build. Use the pip install, "
-                "or run:  pip install pywinrm")
+            say(
+                "[ERROR] pywinrm isn't bundled in this build. Use the pip install, "
+                "or run:  pip install pywinrm"
+            )
         return False
     if say:
         say("[INFO] Installing pywinrm (one-time, for WinRM remoting)…")
     try:
         from .tools import NO_WINDOW
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                        "--disable-pip-version-check", "pywinrm"],
-                       timeout=300, creationflags=NO_WINDOW)
+
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--disable-pip-version-check",
+                "pywinrm",
+            ],
+            timeout=300,
+            creationflags=NO_WINDOW,
+        )
         import importlib
+
         importlib.invalidate_caches()
         import winrm  # noqa: F401
+
         return True
     except Exception as exc:
         if say:
@@ -68,9 +84,19 @@ try {{
 """
 
 
-def _session(host, login, password, *, winrm_port=5985, use_ssl=False,
-             transport="ntlm", read_timeout=None, operation_timeout=None):
+def _session(
+    host,
+    login,
+    password,
+    *,
+    winrm_port=5985,
+    use_ssl=False,
+    transport="ntlm",
+    read_timeout=None,
+    operation_timeout=None,
+):
     import winrm
+
     scheme = "https" if use_ssl else "http"
     endpoint = f"{scheme}://{host}:{winrm_port}/wsman"
     # Bound the timeouts so an unreachable / non-responding host fails in a known
@@ -80,25 +106,38 @@ def _session(host, login, password, *, winrm_port=5985, use_ssl=False,
     op = operation_timeout if operation_timeout is not None else 120
     rd = read_timeout if read_timeout is not None else op + 30
     return winrm.Session(
-        endpoint, auth=(login, password), transport=transport,
+        endpoint,
+        auth=(login, password),
+        transport=transport,
         server_cert_validation="ignore" if use_ssl else "validate",
-        read_timeout_sec=rd, operation_timeout_sec=op)
+        read_timeout_sec=rd,
+        operation_timeout_sec=op,
+    )
 
 
 def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False):
-    r = _session(host, login, password, winrm_port=winrm_port,
-                 use_ssl=use_ssl).run_ps(script)
+    r = _session(host, login, password, winrm_port=winrm_port, use_ssl=use_ssl).run_ps(script)
     out = (r.std_out or b"").decode("utf-8", "replace").strip()
     err = (r.std_err or b"").decode("utf-8", "replace").strip()
     return r.status_code, out, err
 
 
-def deploy_serve(hosts, username, password, *, update=True, port=5037,
-                 test_only=False, winrm_port=5985, use_ssl=False,
-                 on_status=None) -> int:
+def deploy_serve(
+    hosts,
+    username,
+    password,
+    *,
+    update=True,
+    port=5037,
+    test_only=False,
+    winrm_port=5985,
+    use_ssl=False,
+    on_status=None,
+) -> int:
     """Deploy (or, with *test_only*, just verify WinRM/credentials on) *hosts* —
     one or many. *username* should be ``DOMAIN\\user``. Streams leveled status
     lines to *on_status*. Returns 0 if every host succeeded, else 1."""
+
     def say(m):
         if on_status:
             on_status(m)
@@ -115,38 +154,54 @@ def deploy_serve(hosts, username, password, *, update=True, port=5037,
         say(f"[INFO] {h}: connecting over WinRM (NTLM) as {username}…")
         try:
             if test_only:
-                code, out, err = _run_ps(h, username, password,
-                                         "'OK:'+$env:COMPUTERNAME",
-                                         winrm_port=winrm_port, use_ssl=use_ssl)
+                code, out, err = _run_ps(
+                    h,
+                    username,
+                    password,
+                    "'OK:'+$env:COMPUTERNAME",
+                    winrm_port=winrm_port,
+                    use_ssl=use_ssl,
+                )
                 if code == 0 and "OK:" in out:
                     name = out.split("OK:", 1)[1].strip().splitlines()[0]
-                    say(f"[OK] {h}: WinRM reachable, credentials accepted "
-                        f"(remote = {name})")
+                    say(f"[OK] {h}: WinRM reachable, credentials accepted (remote = {name})")
                 else:
-                    say(f"[ERROR] {h}: connected but check failed: "
-                        f"{(err or out)[:200]}")
+                    say(f"[ERROR] {h}: connected but check failed: {(err or out)[:200]}")
                     rc = 1
                 continue
 
             script = _DEPLOY_PS.format(upd="1" if update else "0", port=port)
-            code, out, err = _run_ps(h, username, password, script,
-                                     winrm_port=winrm_port, use_ssl=use_ssl)
+            code, out, err = _run_ps(
+                h, username, password, script, winrm_port=winrm_port, use_ssl=use_ssl
+            )
             ok = code == 0 and "STATUS:" in out and "ERROR:" not in out
             if ok:
-                detail = next((l[len("STATUS:"):].strip()
-                               for l in out.splitlines()
-                               if l.startswith("STATUS:")), "ok")
+                detail = next(
+                    (
+                        line[len("STATUS:") :].strip()
+                        for line in out.splitlines()
+                        if line.startswith("STATUS:")
+                    ),
+                    "ok",
+                )
                 say(f"[OK] {h}: serve started — {detail[:220]}")
             else:
-                emsg = next((l[len("ERROR:"):].strip()
-                             for l in out.splitlines()
-                             if l.startswith("ERROR:")), (err or out))
+                emsg = next(
+                    (
+                        line[len("ERROR:") :].strip()
+                        for line in out.splitlines()
+                        if line.startswith("ERROR:")
+                    ),
+                    (err or out),
+                )
                 say(f"[ERROR] {h}: {emsg[:240]}")
                 rc = 1
         except Exception as exc:
             say(f"[ERROR] {h}: WinRM failed: {exc}")
-            say(f"[INFO] {h}: make sure WinRM is on there (run on it as admin: "
+            say(
+                f"[INFO] {h}: make sure WinRM is on there (run on it as admin: "
                 f"Enable-PSRemoting -Force), your account is a local admin, and "
-                f"the user is in DOMAIN\\user form.")
+                f"the user is in DOMAIN\\user form."
+            )
             rc = 1
     return rc

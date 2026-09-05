@@ -18,7 +18,7 @@ import time
 from collections import deque
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
+from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor, QBrush
 from PyQt5.QtWidgets import QPlainTextEdit, QMenu, QApplication
 
 from ..results import strip_ansi
@@ -27,13 +27,19 @@ from .theme import TERM_BG
 from .scrollback import Scrollback
 
 _ANSI = {
-    30: "#1c1c1c", 31: "#e25c52", 32: "#3ddc84", 33: "#d4b86a",
-    34: "#4f9bea", 35: "#c678dd", 36: "#56c5d0", 37: "#cfd8e3",
-    90: "#5c6370", 91: "#ff7a6e", 92: "#5be39a", 93: "#ffd479",
-    94: "#6fb3ff", 95: "#d79bf0", 96: "#74dbe6", 97: "#ffffff",
+    30: "#0f172a", 31: "#ef4444", 32: "#22c55e", 33: "#f59e0b",
+    34: "#3b82f6", 35: "#a855f7", 36: "#06b6d4", 37: "#e2e8f0",
+    90: "#64748b", 91: "#f87171", 92: "#4ade80", 93: "#fbbf24",
+    94: "#60a5fa", 95: "#c084fc", 96: "#38bdf8", 97: "#ffffff",
 }
-_FG_DEFAULT = "#d7f5e3"
-_PROMPT_COLOR = "#28c2d6"
+_BG_ANSI = {
+    40: "#0f172a", 41: "#dc2626", 42: "#16a34a", 43: "#ca8a04",
+    44: "#2563eb", 45: "#9333ea", 46: "#0891b2", 47: "#cbd5e1",
+    100: "#475569", 101: "#ef4444", 102: "#22c55e", 103: "#f59e0b",
+    104: "#3b82f6", 105: "#a855f7", 106: "#06b6d4", 107: "#f8fafc",
+}
+_FG_DEFAULT = "#f1f5f9"
+_PROMPT_COLOR = "#38bdf8"
 
 
 class AnsiConsole(QPlainTextEdit):
@@ -50,20 +56,30 @@ class AnsiConsole(QPlainTextEdit):
         self._sb = Scrollback(self, display_cap=80000)
         fam = settings_mod.get("term_font") or "Consolas"
         size = int(settings_mod.get("term_font_size") or 10)
-        self.setFont(QFont(fam, size))
-        self.setStyleSheet(
-            f"QPlainTextEdit{{background:{TERM_BG};color:{_FG_DEFAULT};"
-            f"border:none;selection-background-color:#1f5f6e;}}")
+        font = QFont(fam, size)
+        font.setStyleHint(QFont.Monospace)
+        self.setFont(font)
+        self.document().setDefaultFont(font)
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._update_stylesheet(fam, size)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
+
+        self._prompt_provider_fn = None
 
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._wc = QTextCursor(self.document())
         self._wc.movePosition(QTextCursor.End)
-        self._fmt = QTextCharFormat(); self._fmt.setForeground(QColor(_FG_DEFAULT))
-        self._state = 0; self._csi = ""
+        self._fmt = QTextCharFormat()
+        self._fmt.setFont(self.font())
+        self._fmt.setForeground(QColor(_FG_DEFAULT))
+        self._state = 0
+        self._csi = ""
+        self._osc = ""
         # cooked line-editing state
         self._line = ""
+        self._cpos = 0
+        self._pending_echo = None
         self._need_prompt = True
         self._history = []
         self._hidx = 0
@@ -71,37 +87,57 @@ class AnsiConsole(QPlainTextEdit):
         self._host = ""
         self._root = False
         self._cwd = "/"
-        self._alive = True        # False after the shell dies (reboot/unplug)
-        self._completion_fn = None    # Tab path-completion provider
-        self._last_feed = 0.0         # monotonic time of the last output chunk
-        self._interrupt = None        # reliable stop (set by ShellPanel)
-        self._shown_prompt = ""       # the prompt text currently displayed
-        # after a command's output goes idle, auto-show the next prompt (so the
-        # device prompt + cursor are waiting, like a real terminal)
+        self._alive = True          # False after the shell dies (reboot/unplug)
+        self._completion_fn = None  # Tab path-completion provider
+        self._tab_cycle_opts = []   # Candidate completions for active tab cycling
+        self._tab_cycle_idx = -1
+        self._tab_replace_idx = 0
+        self._tab_base_line = ""
+        self._last_feed = 0.0       # monotonic time of the last output chunk
+        self._interrupt = None      # reliable stop (set by ShellPanel)
+        self._shown_prompt = ""     # the prompt text currently displayed
+        self._emulate_prompt = True
+
+
+        # after a command's output goes idle, auto-show the next prompt
         self._idle = QTimer(self)
         self._idle.setSingleShot(True)
         self._idle.timeout.connect(self._idle_prompt)
-        # ingestion is decoupled from rendering: feed() only enqueues + archives
-        # (both O(1)); this timer renders within a TIME BUDGET per tick so no flood
-        # can ever saturate the UI thread ("not responding")
-        self._inq = deque()           # queued text chunks awaiting render
+
+        # ingestion decoupled from rendering
+        self._inq = deque()         # queued text chunks awaiting render
         self._inq_len = 0
         self._drain = QTimer(self)
         self._drain.setInterval(15)
         self._drain.timeout.connect(self._drain_tick)
 
     _TICK_BUDGET = 0.030          # seconds of rendering per tick (keeps UI live)
-    _SUB = 16 * 1024             # max chars handed to _process at once
-    _MAX_INQ = 8 * 1024 * 1024   # cap the ON-SCREEN backlog (disk archive is full)
+    _SUB = 16 * 1024              # max chars handed to _process at once
+    _MAX_INQ = 8 * 1024 * 1024    # cap the ON-SCREEN backlog
 
     def wheelEvent(self, event):
-        # Ctrl + wheel = zoom the terminal font (like every editor/terminal),
-        # persisted so new consoles open at the chosen size
         if event.modifiers() & Qt.ControlModifier:
             self.bump_font(1 if event.angleDelta().y() > 0 else -1)
             event.accept()
             return
         super().wheelEvent(event)
+
+    def _update_stylesheet(self, fam=None, size=None):
+        if fam is None:
+            fam = self.font().family() or "Consolas"
+        if size is None:
+            size = self.font().pointSize() or 10
+        self.setStyleSheet(
+            f"QPlainTextEdit {{"
+            f"font-family: '{fam}', 'Cascadia Code', 'Consolas', monospace;"
+            f"font-size: {size}pt;"
+            f"background: {TERM_BG};"
+            f"color: {_FG_DEFAULT};"
+            f"border: none;"
+            f"selection-background-color: #2563eb;"
+            f"selection-color: #ffffff;"
+            f"}}"
+        )
 
     def bump_font(self, step):
         f = self.font()
@@ -110,6 +146,8 @@ class AnsiConsole(QPlainTextEdit):
             return
         f.setPointSize(size)
         self.setFont(f)
+        self.document().setDefaultFont(f)
+        self._update_stylesheet(size=size)
         try:
             data = settings_mod.load()
             data["term_font_size"] = size
@@ -120,17 +158,22 @@ class AnsiConsole(QPlainTextEdit):
     def _move_caret_end(self):
         if self.textCursor().hasSelection():
             return
-        c = self.textCursor(); c.movePosition(QTextCursor.End); self.setTextCursor(c)
+        c = self.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.setTextCursor(c)
 
     def _idle_prompt(self):
+        if not getattr(self, "_emulate_prompt", True):
+            return
         if self._alive and self._need_prompt and not self._line:
             self._prompt_if_needed()
             self._move_caret_end()
 
     def _consume_pending_prompt(self):
         """If a waiting prompt is currently shown and the user hasn't typed, remove
-        it so newly-arrived output doesn't get appended after a stray
-        ``device:/ $`` (which is what made the name appear mid-stream)."""
+        it so newly-arrived output doesn't get appended after a stray prompt."""
+        if not getattr(self, "_emulate_prompt", True):
+            return
         if self._need_prompt or self._line or not self._shown_prompt:
             return
         self._wc.movePosition(QTextCursor.End)
@@ -140,63 +183,183 @@ class AnsiConsole(QPlainTextEdit):
         self._need_prompt = True
 
     def set_interrupt_fn(self, fn):
-        """Provide a reliable 'stop the running command' callback (the shell has
-        no PTY, so Ctrl+C can't deliver a real SIGINT)."""
+        """Provide a reliable 'stop the running command' callback."""
         self._interrupt = fn
 
     def set_completion_fn(self, fn):
         """fn(line) -> (completed_line_or_None, options_list). Bound to Tab."""
         self._completion_fn = fn
 
-    def _do_complete(self):
+    def set_prompt_provider_fn(self, fn):
+        """fn() -> prompt string (e.g. for local shells)."""
+        self._prompt_provider_fn = fn
+
+    @staticmethod
+    def _format_columns(items, width=80):
+        if not items:
+            return ""
+        display_items = []
+        for s in items:
+            s_str = str(s)
+            clean = s_str.strip('"\'')
+            if clean.endswith("\\") or clean.endswith("/"):
+                display_items.append("📁 " + s_str)
+            else:
+                display_items.append(s_str)
+        max_len = max(len(s) for s in display_items)
+        eff_width = max(width, 24)
+        col_width = min(eff_width, max_len + 3)
+        cols = max(1, eff_width // max(1, col_width))
+        lines = []
+        for i in range(0, len(display_items), cols):
+            row = display_items[i : i + cols]
+            lines.append("".join(s.ljust(col_width) for s in row).rstrip())
+        return "\n".join(lines)
+
+    def paste_clipboard(self):
+        """Public alias for pasting clipboard text into the active input line."""
+        self._paste_into_line()
+
+    def _clear_tab_cycle(self):
+        self._tab_cycle_opts.clear()
+        self._tab_cycle_idx = -1
+        self._tab_replace_idx = 0
+        self._tab_base_line = ""
+
+    def _clear_viewport(self):
+        super().clear()
+        self._wc = QTextCursor(self.document())
+        self._wc.movePosition(QTextCursor.End)
+        self._line = ""
+        self._cpos = 0
+        self._pending_echo = None
+        self._state = 0
+        self._csi = ""
+        self._osc = ""
+        self._clear_tab_cycle()
+
+    def _do_complete(self, reverse: bool = False):
         if not self._completion_fn or not self._alive:
             return
+
+        # 1. If user presses Tab repeatedly, cycle through previous matches
+        if self._tab_cycle_opts:
+            step = -1 if reverse else 1
+            self._tab_cycle_idx = (self._tab_cycle_idx + step) % len(self._tab_cycle_opts)
+            cand = self._tab_cycle_opts[self._tab_cycle_idx]
+            new_line = self._tab_base_line[: self._tab_replace_idx] + cand
+            self._set_line(new_line)
+            return
+
+        # 2. First tab press: query completion provider
         try:
             newline, opts = self._completion_fn(self._line)
         except Exception:
             return
-        if newline is not None and newline != self._line:
+
+        if not opts and newline is not None and newline != self._line:
             self._set_line(newline)
-        elif opts:
-            self._echo("\n" + "   ".join(opts) + "\n")
-            self._need_prompt = True
-            self._prompt_if_needed()
+            return
+
+        if opts:
+            # Single option: complete directly
+            if len(opts) == 1:
+                if newline is not None and newline != self._line:
+                    self._set_line(newline)
+                else:
+                    cand = opts[0]
+                    tokens = self._line.split()
+                    if tokens and not self._line.endswith(" "):
+                        last_tok = tokens[-1]
+                        idx = self._line.rfind(last_tok)
+                        self._set_line(self._line[:idx] + cand)
+                    else:
+                        self._set_line(self._line + cand)
+                return
+
+            # Multiple options: apply common prefix if it extends current line
+            if newline is not None and len(newline) > len(self._line):
+                self._set_line(newline)
+
+            # Display options cleanly
+            formatted = self._format_columns(opts)
+            self._echo("\n" + formatted + "\n")
+            if getattr(self, "_emulate_prompt", True):
+                self._need_prompt = True
+                self._prompt_if_needed()
+            elif hasattr(self, "_prompt_provider_fn") and self._prompt_provider_fn:
+                prompt = self._prompt_provider_fn()
+                if prompt:
+                    self._echo(prompt, _PROMPT_COLOR)
             self._echo(self._line)
             self._move_caret_end()
 
+            # Store options for cycling on subsequent tabs
+            self._tab_cycle_opts = list(opts)
+            self._tab_cycle_idx = -1
+            self._tab_base_line = self._line
+            tokens = self._line.split()
+            if tokens and not self._line.endswith(" "):
+                last_tok = tokens[-1]
+                self._tab_replace_idx = self._line.rfind(last_tok)
+            else:
+                self._tab_replace_idx = len(self._line)
+
+
     def set_alive(self, alive: bool):
-        """Mark the shell connected/disconnected. When dead we stop emitting the
-        fake prompt and ignore typing; on reconnect we resume with a prompt."""
-        if alive and not self._alive:
+        """Mark the shell connected/disconnected."""
+        if alive:
             self._alive = True
             self._line = ""
-            self._need_prompt = True
-            self._echo("\n", _PROMPT_COLOR)
-            self.show_prompt()
+            if getattr(self, "_emulate_prompt", True):
+                self._need_prompt = True
+                self.show_prompt()
+            else:
+                self._need_prompt = False
+            self._move_caret_end()
         elif not alive and self._alive:
             self._alive = False
             self._idle.stop()
             self._echo("\n[shell disconnected]\n", "#ff7a6e")
 
-    # ===== prompt (mimics the real adb shell prompt) =====
+    def set_emulate_prompt(self, enabled: bool):
+        """Enable or disable synthetic Android shell prompt emulation."""
+        self._emulate_prompt = bool(enabled)
+        if not self._emulate_prompt:
+            self._need_prompt = False
+            self._shown_prompt = ""
+
     def set_prompt(self, host, root=False):
         self._host = host or ""
         self._root = bool(root)
 
     def _prompt_text(self):
-        if not self._host:
-            return "$ "
-        return f"{self._host}:{self._cwd} {'#' if self._root else '$'} "
+        import datetime
+        now = datetime.datetime.now()
+        d_s = now.strftime("%m-%d")
+        t_s = now.strftime("%H:%M")
+        cwd = getattr(self, "_cwd", "/") or "/"
+        arrow = "\u25b6"
+        return (
+            f"\x1b[30;46m 📅 {d_s} "
+            f"\x1b[36;42m{arrow}"
+            f"\x1b[30;42m 🕒 {t_s} "
+            f"\x1b[32;43m{arrow}"
+            f"\x1b[30;43m 📁 {cwd} "
+            f"\x1b[33;49m{arrow}\x1b[0m "
+        )
 
     def banner(self, text):
-        """Render a pre-formatted welcome banner (may carry ANSI colour codes)
-        synchronously, before the first prompt — like MobaXterm's session
-        header. Archived to the full log too."""
+        """Render a pre-formatted welcome banner synchronously."""
         if not text:
             return
         self._sb.archive(strip_ansi(text))
-        self._process(text)                 # the incremental ANSI parser colours it
+        self._process(text)
         self._wc.movePosition(QTextCursor.End)
+        if "\u25b6" in text and "📁" in text:
+            last_line = text.splitlines()[-1] if text.splitlines() else ""
+            self._shown_prompt = strip_ansi(last_line)
+            self._need_prompt = False
 
     def show_prompt(self):
         """Print the prompt now (call once the shell is open)."""
@@ -205,8 +368,10 @@ class AnsiConsole(QPlainTextEdit):
 
     def _apply_cd(self, cmd):
         import posixpath
-        rest = cmd.strip()[2:].strip()          # after 'cd'
-        arg = rest.split()[0] if rest else ""
+        rest = cmd.strip()[2:].strip()
+        tokens = rest.split() if rest else []
+        non_flags = [t for t in tokens if not t.startswith("-") or t in ("-", "--")]
+        arg = non_flags[0] if non_flags else ""
         arg = arg.strip("'\"")
         if not arg or arg == "~":
             new = "/"
@@ -218,22 +383,37 @@ class AnsiConsole(QPlainTextEdit):
             new = posixpath.normpath(posixpath.join(self._cwd, arg))
         self._cwd = new or "/"
 
-    # ===== output from the shell =====
     def feed(self, data):
-        """Cheap + non-blocking: capture everything to disk, queue for rendering.
-        The actual (potentially expensive) document work happens in bounded slices
-        in ``_drain_tick`` so the UI never freezes under a flood of output."""
+        """Enqueue text and flush to disk archive; renders asynchronously in slices."""
         text = data if isinstance(data, str) else self._decoder.decode(data)
         if not text:
             return
+        if getattr(self, "_pending_echo", None):
+            pe = self._pending_echo
+            if pe in ("\r\n", "\n"):
+                if text.startswith("\r\n"):
+                    text = text[2:]
+                elif text.startswith("\n"):
+                    text = text[1:]
+                self._pending_echo = None
+            elif text.startswith(pe):
+                text = text[len(pe):]
+                if text.startswith("\r\n"):
+                    text = text[2:]
+                elif text.startswith("\n"):
+                    text = text[1:]
+                self._pending_echo = None
+            elif pe.startswith(text):
+                self._pending_echo = pe[len(text):]
+                text = ""
+        if not text:
+            return
         self._last_feed = time.monotonic()
-        self._sb.archive(strip_ansi(text))     # COMPLETE capture, at the source
+        self._sb.archive(strip_ansi(text))
         self._idle.stop()
-        self._inq.append(text)                 # O(1) enqueue (no giant string copy)
+        self._inq.append(text)
         self._inq_len += len(text)
         if self._inq_len > self._MAX_INQ:
-            # extreme flood: drop the OLDEST queued text from the on-screen path
-            # (the saved log already has every byte) so memory stays bounded
             while self._inq_len > self._MAX_INQ and len(self._inq) > 1:
                 self._inq_len -= len(self._inq.popleft())
         if not self._drain.isActive():
@@ -243,19 +423,14 @@ class AnsiConsole(QPlainTextEdit):
         if not self._inq:
             self._drain.stop()
             if self._alive and self._need_prompt and not self._line:
-                self._idle.start(350)          # output stopped → show the prompt
+                self._idle.start(35)
             return
         sb = self.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 2
         deadline = time.monotonic() + self._TICK_BUDGET
         self.setUpdatesEnabled(False)
         try:
-            # a prompt shown during a lull in output must not sit in the MIDDLE of
-            # the stream — drop it before rendering the lines that just arrived
             self._consume_pending_prompt()
-            # render in small slices until the per-tick time budget is spent, then
-            # yield back to the event loop — so each tick is short and the UI stays
-            # responsive no matter how many million lines are queued
             while self._inq and time.monotonic() < deadline:
                 chunk = self._inq.popleft()
                 self._inq_len -= len(chunk)
@@ -265,15 +440,13 @@ class AnsiConsole(QPlainTextEdit):
                     self._inq.appendleft(rest)
                     self._inq_len += len(rest)
                 else:
-                    self._process(chunk)       # ANSI state persists across chunks
+                    self._process(chunk)
         finally:
             self.setUpdatesEnabled(True)
         if at_bottom:
             sb.setValue(sb.maximum())
 
     def _process(self, text):
-        # Batch runs of plain printable text into single inserts — inserting one
-        # char at a time was the slowness on large output (dumpsys, ls -R, cat …).
         run = []
 
         def flush():
@@ -284,15 +457,18 @@ class AnsiConsole(QPlainTextEdit):
         for ch in text:
             if self._state == 0:
                 if ch == "\x1b":
-                    flush(); self._state = 1
+                    flush()
+                    self._state = 1
                 elif ch == "\r":
-                    flush(); self._wc.movePosition(QTextCursor.StartOfBlock)
+                    flush()
+                    self._wc.movePosition(QTextCursor.StartOfBlock)
                 elif ch == "\n":
                     flush()
                     self._wc.movePosition(QTextCursor.End)
                     self._wc.insertText("\n", self._fmt)
                 elif ch == "\b":
-                    flush(); self._wc.movePosition(QTextCursor.Left)
+                    flush()
+                    self._wc.movePosition(QTextCursor.Left)
                 elif ch == "\t":
                     run.append("    ")
                 elif ord(ch) < 32:
@@ -300,22 +476,40 @@ class AnsiConsole(QPlainTextEdit):
                 else:
                     run.append(ch)
             elif self._state == 1:
-                self._state = 2 if ch == "[" else 0
-                self._csi = ""
+                if ch == "[":
+                    self._state = 2
+                    self._csi = ""
+                elif ch == "]":
+                    self._state = 3
+                    self._osc = ""
+                else:
+                    self._state = 0
             elif self._state == 2:
                 if "\x40" <= ch <= "\x7e":
-                    self._csi_dispatch(ch, self._csi); self._state = 0
+                    self._csi_dispatch(ch, self._csi)
+                    self._state = 0
                 else:
                     self._csi += ch
+            elif self._state == 3:
+                if ch == "\x07":
+                    self._state = 0
+                elif ch == "\x1b":
+                    self._state = 4
+                else:
+                    self._osc += ch
+            elif self._state == 4:
+                if ch == "\\":
+                    self._state = 0
+                else:
+                    self._state = 3
         flush()
 
     def _out(self, s):
         if not s:
             return
         if self._wc.atBlockEnd():
-            self._wc.insertText(s, self._fmt)          # fast path: append the run
+            self._wc.insertText(s, self._fmt)
             return
-        # overwrite within the current line, then append any remainder
         rem = s
         while rem and not self._wc.atBlockEnd():
             self._wc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
@@ -337,6 +531,16 @@ class AnsiConsole(QPlainTextEdit):
                 self._wc.movePosition(QTextCursor.StartOfBlock)
                 self._wc.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
                 self._wc.removeSelectedText()
+        elif final == "J":
+            n = params or "0"
+            if n in ("2", "3"):
+                self._clear_viewport()
+            elif n in ("0", ""):
+                self._wc.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+                self._wc.removeSelectedText()
+            elif n == "1":
+                self._wc.movePosition(QTextCursor.Start, QTextCursor.KeepAnchor)
+                self._wc.removeSelectedText()
 
     def _sgr(self, p):
         try:
@@ -344,47 +548,80 @@ class AnsiConsole(QPlainTextEdit):
         except ValueError:
             return
         if n == 0:
-            self._fmt = QTextCharFormat(); self._fmt.setForeground(QColor(_FG_DEFAULT))
+            self._fmt = QTextCharFormat()
+            self._fmt.setFont(self.font())
+            self._fmt.setForeground(QColor(_FG_DEFAULT))
+            self._fmt.setBackground(QBrush(Qt.NoBrush))
         elif n == 1:
-            self._fmt.setFontWeight(QFont.Bold)
+            f = self.font()
+            f.setBold(True)
+            self._fmt.setFont(f)
+        elif n == 22:
+            f = self.font()
+            f.setBold(False)
+            self._fmt.setFont(f)
         elif n == 39:
             self._fmt.setForeground(QColor(_FG_DEFAULT))
+        elif n == 49:
+            self._fmt.setBackground(QBrush(Qt.NoBrush))
         elif n in _ANSI:
             self._fmt.setForeground(QColor(_ANSI[n]))
+        elif n in _BG_ANSI:
+            self._fmt.setBackground(QColor(_BG_ANSI[n]))
 
-    # ===== local echo helpers =====
     def _echo(self, s, color=None):
         self._wc.movePosition(QTextCursor.End)
         fmt = self._fmt
         if color:
-            fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
+            fmt = QTextCharFormat()
+            fmt.setFont(self.font())
+            fmt.setForeground(QColor(color))
         self._wc.insertText(s, fmt)
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def _prompt_if_needed(self):
+        if not getattr(self, "_emulate_prompt", True):
+            return
         if self._need_prompt:
-            self._shown_prompt = self._prompt_text()
-            self._echo(self._shown_prompt, _PROMPT_COLOR)
+            p_ansi = self._prompt_text()
+            self._shown_prompt = strip_ansi(p_ansi)
+            if not self._wc.atBlockStart():
+                self._process("\n")
+            self._process(p_ansi)
+            self._wc.movePosition(QTextCursor.End)
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
             self._need_prompt = False
 
-    def _erase_input(self):
-        for _ in range(len(self._line)):
-            self._wc.movePosition(QTextCursor.End)
+    def _sync_cursor(self):
+        self._wc.movePosition(QTextCursor.End)
+        offset = len(self._line) - self._cpos
+        for _ in range(offset):
+            self._wc.movePosition(QTextCursor.Left)
+        self.setTextCursor(self._wc)
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+    def _redraw_line(self, old_len: int):
+        self._wc.movePosition(QTextCursor.End)
+        for _ in range(old_len):
             self._wc.deletePreviousChar()
+        self._wc.insertText(self._line, self._fmt)
+        self._sync_cursor()
+
+    def _erase_input(self):
+        old_len = len(self._line)
+        self._line = ""
+        self._cpos = 0
+        self._redraw_line(old_len)
 
     def _set_line(self, new):
         self._prompt_if_needed()
-        self._erase_input()
+        old_len = len(self._line)
         self._line = new
-        self._echo(new)
+        self._cpos = len(new)
+        self._redraw_line(old_len)
 
     @staticmethod
     def _columnize(cmd):
-        """A bare ``ls`` over a no-PTY pipe prints ONE entry per line (so 50 files
-        = 50 lines). Quietly run it multi-column (``ls -C``) like a real terminal
-        would — which also keeps the saved log compact. Only a plain ``ls`` /
-        ``ls <paths>`` with no flags and no shell pipe/redirect is touched, so
-        ``ls -l``, ``ls | grep``, ``ls > f`` etc. are left exactly as typed."""
         s = cmd.strip()
         parts = s.split()
         if not parts or parts[0] != "ls":
@@ -395,7 +632,6 @@ class AnsiConsole(QPlainTextEdit):
             return cmd
         return "ls -C" + s[2:]
 
-    # ===== keyboard: cooked line editing =====
     def keyPressEvent(self, event):
         if not self._send:
             return
@@ -404,62 +640,153 @@ class AnsiConsole(QPlainTextEdit):
         shift = bool(mods & Qt.ShiftModifier)
 
         if ctrl and shift and key == Qt.Key_C:
-            self.copy(); return
-        if (ctrl and shift and key == Qt.Key_V) or (shift and key == Qt.Key_Insert):
-            self._paste_into_line(); return
+            self.copy()
+            return
+        if (ctrl and shift and key == Qt.Key_V) or (ctrl and key == Qt.Key_V) or (shift and key == Qt.Key_Insert):
+            self._paste_into_line()
+            return
         if ctrl and key == Qt.Key_Insert:
-            self.copy(); return
+            self.copy()
+            return
         if ctrl and key in (Qt.Key_Plus, Qt.Key_Equal):
-            self.bump_font(1); return       # Ctrl+= / Ctrl++ : bigger text
+            self.bump_font(1)
+            return
         if ctrl and key == Qt.Key_Minus:
-            self.bump_font(-1); return      # Ctrl+- : smaller text
-        if not self._alive:                 # shell is down — ignore typing
+            self.bump_font(-1)
+            return
+        if not self._alive:
             return
         if ctrl and key == Qt.Key_C:
             if self.textCursor().hasSelection():
-                self.copy(); return
-            self._send(b"\x03")                 # honoured only if the device PTYs
-            if self._interrupt and (time.monotonic() - self._last_feed) < 2.0:
-                # output is actively flowing (e.g. logcat) and the no-PTY pipe
-                # ignores ^C — fall back to a reliable device-side stop
-                self._echo("^C\n")
-                self._interrupt()
+                self.copy()
                 return
-            self._echo("^C\n"); self._line = ""; self._need_prompt = True
-            self._idle.start(400); self._move_caret_end()
+            self._send(b"\x03")
+            self._echo("^C\n")
+            if self._interrupt and (time.monotonic() - self._last_feed) < 2.0:
+                self._interrupt()
+            self._line = ""
+            self._cpos = 0
+            self._need_prompt = True
+            self._idle.start(40)
+            self._move_caret_end()
             return
         if ctrl and key == Qt.Key_L:
-            self.clear(); return
+            self.clear()
+            return
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
-            self._prompt_if_needed()
-            self._echo("\n")
+            emulate = getattr(self, "_emulate_prompt", True)
             cmd = self._line
-            # record the command in the full log (the device, over a pipe, doesn't
-            # echo it back, so feed() alone wouldn't capture what was typed)
-            self._sb.archive(self._prompt_text() + cmd + "\n")
+
             if cmd.strip():
                 self._history.append(cmd)
-                if cmd.strip().split()[0] == "cd":
-                    self._apply_cd(cmd)          # keep the prompt's path in sync
             self._hidx = len(self._history)
-            self._last_feed = time.monotonic()   # treat the shell as busy now
-            try:
-                self._send((self._columnize(cmd) + "\n").encode("utf-8"))
-            except Exception:
-                pass
-            self._line = ""
-            self._need_prompt = True
+            self._last_feed = time.monotonic()
+
+            if emulate:
+                self._prompt_if_needed()
+                self._echo("\n")
+                self._sb.archive(strip_ansi(self._prompt_text()) + cmd + "\n")
+                if cmd.strip() and cmd.strip().split()[0] == "cd":
+                    self._apply_cd(cmd)
+                to_send = (self._columnize(cmd) + "\n").encode("utf-8")
+                try:
+                    self._send(to_send)
+                except Exception:
+                    pass
+                self._line = ""
+                self._cpos = 0
+                self._need_prompt = True
+                self._idle.start(40)
+            else:
+                # Local shell (PowerShell or CMD)
+                self._echo("\n")
+                self._sb.archive(cmd + "\n")
+                self._pending_echo = cmd
+                self._pending_echo = cmd if cmd else "\r\n"
+                try:
+                    self._send((cmd + "\r\n").encode("utf-8"))
+                except Exception:
+                    pass
+                self._line = ""
+                self._cpos = 0
+                self._need_prompt = False
+
             self._move_caret_end()
-            self._idle.start(400)              # prompt returns even if no output
             return
+
+        if key == Qt.Key_Left:
+            if ctrl:
+                p = self._cpos
+                while p > 0 and self._line[p - 1].isspace():
+                    p -= 1
+                while p > 0 and not self._line[p - 1].isspace():
+                    p -= 1
+                self._cpos = p
+            else:
+                if self._cpos > 0:
+                    self._cpos -= 1
+            self._sync_cursor()
+            return
+
+        if key == Qt.Key_Right:
+            if ctrl:
+                p = self._cpos
+                while p < len(self._line) and not self._line[p].isspace():
+                    p += 1
+                while p < len(self._line) and self._line[p].isspace():
+                    p += 1
+                self._cpos = p
+            else:
+                if self._cpos < len(self._line):
+                    self._cpos += 1
+            self._sync_cursor()
+            return
+
+        if key == Qt.Key_Home:
+            self._cpos = 0
+            self._sync_cursor()
+            return
+
+        if key == Qt.Key_End:
+            self._cpos = len(self._line)
+            self._sync_cursor()
+            return
+
+        if ctrl and key == Qt.Key_W:
+            p = self._cpos
+            while p > 0 and self._line[p - 1].isspace():
+                p -= 1
+            while p > 0 and not self._line[p - 1].isspace():
+                p -= 1
+            old_len = len(self._line)
+            self._line = self._line[:p] + self._line[self._cpos:]
+            self._cpos = p
+            self._redraw_line(old_len)
+            return
+
         if key == Qt.Key_Backspace:
-            if self._line:
-                self._line = self._line[:-1]
-                self._wc.movePosition(QTextCursor.End)
-                self._wc.deletePreviousChar()
-                self._move_caret_end()
+            if self._cpos > 0:
+                old_len = len(self._line)
+                self._line = self._line[:self._cpos - 1] + self._line[self._cpos:]
+                self._cpos -= 1
+                self._redraw_line(old_len)
             return
+
+        if key == Qt.Key_Delete:
+            if self._cpos < len(self._line):
+                old_len = len(self._line)
+                self._line = self._line[:self._cpos] + self._line[self._cpos + 1:]
+                self._redraw_line(old_len)
+            return
+
+        if key == Qt.Key_Escape:
+            old_len = len(self._line)
+            self._line = ""
+            self._cpos = 0
+            self._redraw_line(old_len)
+            return
+
         if key == Qt.Key_Up:
             if self._history and self._hidx > 0:
                 self._hidx -= 1
@@ -473,56 +800,87 @@ class AnsiConsole(QPlainTextEdit):
                 self._hidx = len(self._history)
                 self._set_line("")
             return
-        if key == Qt.Key_Tab:
-            self._do_complete()
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            self._do_complete(reverse=(shift or key == Qt.Key_Backtab))
             return
 
+        self._clear_tab_cycle()
+
         text = event.text()
+
         if text and text.isprintable():
             self._idle.stop()
-            self._prompt_if_needed()
-            self._line += text
-            self._echo(text)
-            self._move_caret_end()
+            if getattr(self, "_emulate_prompt", True):
+                self._prompt_if_needed()
+            old_len = len(self._line)
+            self._line = self._line[:self._cpos] + text + self._line[self._cpos:]
+            self._cpos += len(text)
+            self._redraw_line(old_len)
+            return
 
     def _paste_into_line(self):
         txt = QApplication.clipboard().text()
         if not txt:
             return
         txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+        emulate = getattr(self, "_emulate_prompt", True)
         if "\n" in txt:
-            # multi-line paste: send line by line as commands
             lines = txt.split("\n")
             for i, ln in enumerate(lines):
                 if i < len(lines) - 1:
-                    self._prompt_if_needed(); self._echo(ln + "\n")
-                    self._sb.archive(self._prompt_text() + ln + "\n")
-                    self._last_feed = time.monotonic()
-                    self._send((self._columnize(ln) + "\n").encode("utf-8"))
-                    self._line = ""; self._need_prompt = True
+                    if emulate:
+                        self._prompt_if_needed()
+                        self._echo(ln + "\n")
+                        self._sb.archive(strip_ansi(self._prompt_text()) + ln + "\n")
+                        self._last_feed = time.monotonic()
+                        self._send((self._columnize(ln) + "\n").encode("utf-8"))
+                        self._need_prompt = True
+                    else:
+                        self._echo(ln + "\n")
+                        self._sb.archive(ln + "\n")
+                        self._last_feed = time.monotonic()
+                        self._send((ln + "\r\n").encode("utf-8"))
+                        self._need_prompt = False
+                    self._line = ""
+                    self._cpos = 0
                 else:
                     if ln:
-                        self._prompt_if_needed(); self._line += ln; self._echo(ln)
+                        if emulate:
+                            self._prompt_if_needed()
+                        old_len = len(self._line)
+                        self._line = self._line[:self._cpos] + ln + self._line[self._cpos:]
+                        self._cpos += len(ln)
+                        self._redraw_line(old_len)
         else:
-            self._prompt_if_needed(); self._line += txt; self._echo(txt)
+            if emulate:
+                self._prompt_if_needed()
+            old_len = len(self._line)
+            self._line = self._line[:self._cpos] + txt + self._line[self._cpos:]
+            self._cpos += len(txt)
+            self._redraw_line(old_len)
+        self._move_caret_end()
 
     def _menu(self, pos):
         ico = theme.emoji_icon
         m = QMenu(self)
-        a = m.addAction(ico("📋"), "Copy"); a.setEnabled(self.textCursor().hasSelection())
+        a = m.addAction(ico("📋"), "Copy")
+        a.setEnabled(self.textCursor().hasSelection())
         a.triggered.connect(self.copy)
         m.addAction(ico("🗂"), "Copy all", lambda: (self.selectAll(), self.copy()))
         m.addAction(ico("📥"), "Paste", self._paste_into_line)
         m.addAction(ico("🔲"), "Select All", self.selectAll)
         m.addSeparator()
-        # Send key: control sequences for an interactive program in the shell
+
         keys = m.addMenu(ico("⌨"), "Send key")
-        for label, data in (("Enter (\\n)", b"\n"), ("Tab (\\t)", b"\t"),
-                            ("Esc", b"\x1b"), ("Ctrl+C", b"\x03"),
-                            ("Ctrl+D (EOF)", b"\x04"), ("Ctrl+Z", b"\x1a"),
-                            ("Up", b"\x1b[A"), ("Down", b"\x1b[B"),
-                            ("Backspace", b"\x7f")):
-            keys.addAction(label, lambda d=data: self._send(d) if self._send else None)
+        for label, data in (
+            ("Enter (\\n)", b"\n"), ("Tab (\\t)", b"\t"),
+            ("Esc", b"\x1b"), ("Ctrl+C", b"\x03"),
+            ("Ctrl+D (EOF)", b"\x04"), ("Ctrl+Z", b"\x1a"),
+            ("Up", b"\x1b[A"), ("Down", b"\x1b[B"),
+            ("Backspace", b"\x7f")
+        ):
+            keys.addAction(label, lambda *_, d=data: self._send(d) if self._send else None)
+
         m.addSeparator()
         m.addAction(ico("💾"), "Save full output to file…", self._save_output)
         m.addAction(ico("🧹"), "Clear", self.clear)
@@ -530,31 +888,35 @@ class AnsiConsole(QPlainTextEdit):
 
     def _save_output(self):
         from PyQt5.QtWidgets import QFileDialog
-        from .fileutil import download_path
-        default = download_path("turboadb-shell-"
-                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
+        from .fileutil import download_path, saved_dialog
+        default = download_path("turboadb-shell-" + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save terminal output", default,
-            "Log files (*.log);;Text files (*.txt);;All files (*)")
+            "Log files (*.log);;Text files (*.txt);;All files (*)"
+        )
         if path:
             self.save_output(path)
-            from .fileutil import saved_dialog
             saved_dialog(self, path, "terminal output")
 
-    # NOTE: saves the COMPLETE history (archived + on-screen), not just the
-    # visible tail — so nothing is lost even after a long flood of output.
     def save_output(self, path):
         self._sb.save_to(path)
 
     def clear(self):
         super().clear()
-        self._sb.reset()                 # clear forgets the archived history too
-        self._inq.clear(); self._inq_len = 0; self._drain.stop()
-        self._wc = QTextCursor(self.document()); self._wc.movePosition(QTextCursor.End)
-        self._line = ""; self._need_prompt = True
+        self._sb.reset()
+        self._inq.clear()
+        self._inq_len = 0
+        self._drain.stop()
+        self._wc = QTextCursor(self.document())
+        self._wc.movePosition(QTextCursor.End)
+        self._line = ""
+        self._cpos = 0
+        self._pending_echo = None
+        self._state = 0
+        self._csi = ""
+        self._osc = ""
+        self._need_prompt = True
 
     def close_archive(self):
         self._drain.stop()
         self._sb.close()
-
-    paste_clipboard = _paste_into_line

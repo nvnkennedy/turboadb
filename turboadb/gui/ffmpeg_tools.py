@@ -12,16 +12,18 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import zipfile
 import subprocess
 import urllib.request
+import zipfile
+
+from ..tools import NO_WINDOW as _NO_WINDOW
 
 _CACHE = os.path.join(os.path.expanduser("~"), ".turboadb", "ffmpeg")
 # BtbN's FFmpeg-Builds "latest" release — a stable, public Windows build URL.
-_FFMPEG_URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-               "ffmpeg-master-latest-win64-gpl.zip")
-
-_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+_FFMPEG_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+    "ffmpeg-master-latest-win64-gpl.zip"
+)
 
 
 def parse_dshow_devices(text: str) -> list:
@@ -43,14 +45,15 @@ def parse_dshow_devices(text: str) -> list:
         if not m:
             continue
         name = m.group(1)
-        if name.startswith("@device"):       # alt-name device path, skip
+        if name.startswith("@device"):  # alt-name device path, skip
             continue
         if "(video)" in low or in_video:
             cams.append(name)
     seen, out = set(), []
     for c in cams:
         if c not in seen:
-            seen.add(c); out.append(c)
+            seen.add(c)
+            out.append(c)
     return out
 
 
@@ -59,6 +62,7 @@ def cached_ffmpeg() -> str | None:
     path, our cache, or an ffmpeg already on PATH."""
     try:
         from . import settings as _s
+
         manual = (_s.get("ffmpeg_path") or "").strip()
         if manual and os.path.exists(manual):
             return manual
@@ -67,7 +71,7 @@ def cached_ffmpeg() -> str | None:
     p = os.path.join(_CACHE, "ffmpeg.exe")
     if os.path.exists(p):
         return p
-    return shutil.which("ffmpeg")            # already installed system-wide?
+    return shutil.which("ffmpeg")  # already installed system-wide?
 
 
 def ensure_local_ffmpeg(log=lambda m: None) -> str:
@@ -79,7 +83,8 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
     if os.name != "nt":
         raise RuntimeError(
             "ffmpeg wasn't found. Install it (so it's on PATH) or set its path in "
-            "Settings → ffmpeg path. (Auto-download is Windows-only.)")
+            "Settings → ffmpeg path. (Auto-download is Windows-only.)"
+        )
     os.makedirs(_CACHE, exist_ok=True)
     zip_path = os.path.join(_CACHE, "ffmpeg.zip")
     log("Downloading ffmpeg (one-time, ~160 MB — please wait)…")
@@ -95,20 +100,20 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
                 fh.write(chunk)
                 got += len(chunk)
                 mb = got // (1024 * 1024)
-                if mb >= last + 5:           # report every ~5 MB
+                if mb >= last + 5:  # report every ~5 MB
                     last = mb
                     pct = f" ({got * 100 // total}%)" if total else ""
                     log(f"Downloading ffmpeg… {mb} MB{pct}")
     except Exception as exc:
         raise RuntimeError(
             f"Couldn't download ffmpeg ({exc}). Install ffmpeg (so it's on PATH) "
-            f"or set its path in Settings → ffmpeg path.")
+            f"or set its path in Settings → ffmpeg path."
+        )
     log("Extracting ffmpeg…")
     try:
         with zipfile.ZipFile(zip_path) as z:
             member = next(n for n in z.namelist() if n.endswith("/bin/ffmpeg.exe"))
-            with z.open(member) as src, \
-                    open(os.path.join(_CACHE, "ffmpeg.exe"), "wb") as dst:
+            with z.open(member) as src, open(os.path.join(_CACHE, "ffmpeg.exe"), "wb") as dst:
                 dst.write(src.read())
     except Exception as exc:
         raise RuntimeError(f"Couldn't extract ffmpeg from the download: {exc}")
@@ -126,20 +131,51 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
 def list_local_cameras(ffmpeg: str) -> list:
     """List DirectShow cameras on THIS machine (Windows)."""
     try:
-        p = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true",
-                            "-f", "dshow", "-i", "dummy"],
-                           capture_output=True, text=True, timeout=20,
-                           creationflags=_NO_WINDOW)
+        p = subprocess.run(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=_NO_WINDOW,
+        )
         return parse_dshow_devices((p.stdout or "") + "\n" + (p.stderr or ""))
     except Exception:
         return []
 
 
-def local_capture_args(ffmpeg: str, camera: str, *, width: int = 1280,
-                       height: int = 720, fps: int = 25, quality: int = 6) -> list:
+def local_capture_args(
+    ffmpeg: str,
+    camera: str,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 25,
+    quality: int = 6,
+) -> list:
     """ffmpeg argv to capture a LOCAL camera and emit MJPEG on stdout, low-delay."""
-    return [ffmpeg, "-hide_banner", "-loglevel", "error",
-            "-fflags", "nobuffer", "-flags", "low_delay",
-            "-f", "dshow", "-rtbufsize", "16M", "-i", f"video={camera}",
-            "-an", "-vf", f"scale={int(width)}:{int(height)}", "-r", str(int(fps)),
-            "-f", "mjpeg", "-q:v", str(int(quality)), "-"]
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "dshow",
+        "-rtbufsize",
+        "16M",
+        "-i",
+        f"video={camera}",
+        "-an",
+        "-vf",
+        f"scale={int(width)}:{int(height)}",
+        "-r",
+        str(int(fps)),
+        "-f",
+        "mjpeg",
+        "-q:v",
+        str(int(quality)),
+        "-",
+    ]

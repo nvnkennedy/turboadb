@@ -3,6 +3,24 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 1.1.16
+
+Comprehensive architectural hardening, concurrency safety, and code quality pass.
+
+- **Instant Event-Driven Device Detection:** Added `_DeviceTracker` socket stream on `host:track-devices-l`. Devices are detected and reported in ~1.3ms the moment they are plugged in or unplugged, eliminating the 2-second polling latency.
+- **ADB Server Daemon Stability Fix:** Detached Windows daemon process launch (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) preventing fatal pipe ACK aborts (`cannot write ACK to handle The pipe is being closed (232)`).
+- **TCP RST Abort Elimination:** Removed `SO_LINGER(1, 0)` from socket queries to prevent Windows Winsock `WSAECONNRESET` disconnects on port 5037.
+- **Smart UI Debouncing & Shell Reconnect:** Added signature caching in `MainWindow._on_devices()` to eliminate list flicker and required 2 consecutive empty polls before declaring devices disconnected. Guarded `_on_shell_lost()` with device state check to restart shell cleanly without disabling UI actions.
+- **Pixel-Perfect Monospace Welcome Banner:** Exact unicode character width calculation and strict monospace CSS rules ensuring pristine right-border alignment on terminal banners.
+- **Lazy Remote File Browser:** Remote directory listing deferred until the Files subtab is viewed, keeping USB bandwidth free during shell startup.
+- **Fully Enclosed Terminal Welcome Boxes:** Replaced unclosed right ASCII borders on terminal welcome boxes with ANSI-aware enclosed boxes (`┌─ ┐`, `│ │`, `└─ ┘`) across Android Shell, PowerShell, and Command Prompt sessions.
+- **Autonomous Tool-Side ADB Server Lifecycle:** TurboADB now self-starts and verifies the local ADB daemon on application launch in a background worker (`_AdbInitThread`), eliminating reliance on external commands or pre-running daemons. Added immediate `Detecting devices…` visual feedback in the sidebar and Welcome screen.
+- **Zero-Freeze GUI:** Synchronous ADB execution (`device_info`, scrcpy mirror start, and logcat buffer clearing) offloaded to background threads. Tab-completion in the terminal capped with a 1.5s timeout and safe fallback.
+- **Process & Handle Leak Elimination:** Fixed child process reaping across `ShellSession`, `iter_lines`, and `ScrcpySession` by ensuring OS pipe handles are explicitly closed and child processes waited on.
+- **Qt Memory Leak Protection:** Tabs closed in the GUI now destroy underlying C++ Qt widgets (`deleteLater()`). Circular `QThread` lambda closures across all panels replaced with structured tracking to avoid retaining worker threads.
+- **Zip-Slip & Path Traversal Hardening:** Archive extraction in `toolsdl` fully sanitized across all extraction paths.
+- **Type Safety & Data Handling:** `CommandResult.stdout` supports both `str` and raw `bytes`, with safe decoding in `text` and `lines` properties. IPv6 bracketed hosts and port extraction normalized without corrupting hexadecimal segments.
+
 ## 1.1.15
 
 Hardening pass before a proper release.

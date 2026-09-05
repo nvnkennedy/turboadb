@@ -15,6 +15,7 @@ def download_dir() -> str:
     d = ""
     try:
         from PyQt5.QtCore import QStandardPaths
+
         d = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or ""
     except Exception:
         d = ""
@@ -33,7 +34,7 @@ def open_path(path: str) -> None:
     """Open *path* with its default application."""
     try:
         if sys.platform == "win32":
-            os.startfile(path)                       # type: ignore[attr-defined]
+            os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             subprocess.Popen(["open", path])
         else:
@@ -62,6 +63,7 @@ def saved_dialog(parent, path: str, what: str = "file") -> None:
     Open file / Open folder / Close buttons."""
     from PyQt5.QtCore import Qt
     from PyQt5.QtWidgets import QMessageBox, QLabel
+
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Information)
     box.setWindowTitle("Saved")
@@ -72,8 +74,7 @@ def saved_dialog(parent, path: str, what: str = "file") -> None:
     # make the file link actually clickable (opens the file in its default app)
     for lbl in box.findChildren(QLabel):
         lbl.setOpenExternalLinks(True)
-        lbl.setTextInteractionFlags(lbl.textInteractionFlags()
-                                    | Qt.TextBrowserInteraction)
+        lbl.setTextInteractionFlags(lbl.textInteractionFlags() | Qt.TextBrowserInteraction)
     b_open = box.addButton("Open file", QMessageBox.AcceptRole)
     b_folder = box.addButton("Open folder", QMessageBox.ActionRole)
     box.addButton("Close", QMessageBox.RejectRole)

@@ -17,8 +17,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
 _BTN_MIN_H = 32        # compact enough that a 3x2 grid fits a restored window…
 _BTN_MAX_H = 96        # …yet grows to fill a card when the window is large
 _INPUT_H = 34
-_GROUP_W = 260         # px budget per column — low enough that restored windows
-                       # still get the uniform 3x2 layout (not an uneven 2x3)
+_GROUP_W = 320         # px budget per column — generous enough to avoid truncation
 _MAX_COLS = 3          # 6 cards tile cleanly as 1x6 / 2x3 / 3x2 — never leave gaps
 
 
@@ -54,7 +53,7 @@ class ControlsPanel(QWidget):
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._scroll = scroll
 
         # Six balanced cards. Each fills its grid cell (Expanding both ways), so the
@@ -70,9 +69,9 @@ class ControlsPanel(QWidget):
         host_lay = QVBoxLayout(host)
         host_lay.setContentsMargins(8, 8, 8, 8); host_lay.setSpacing(0)
         self._grid_host = QWidget()            # ONE persistent host; rebuilt in place
-        self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(8); self._grid.setVerticalSpacing(8)
+        self._card_grid = QGridLayout(self._grid_host)
+        self._card_grid.setContentsMargins(0, 0, 0, 0)
+        self._card_grid.setHorizontalSpacing(8); self._card_grid.setVerticalSpacing(8)
         host_lay.addWidget(self._grid_host, 1)
         scroll.setWidget(host)
         outer.addWidget(scroll)
@@ -83,12 +82,15 @@ class ControlsPanel(QWidget):
 
     _MAX_RC = 16        # generous bound when clearing old row/column stretches
 
+    def _grid(self, ncols=1):
+        return self._relayout(ncols)
+
     def _relayout(self, ncols):
         ncols = max(1, ncols)
         if ncols == self._ncols:
             return
         self._ncols = ncols
-        grid = self._grid
+        grid = self._card_grid
         for g in self._groups:                # detach (kept alive by self._groups)
             grid.removeWidget(g)
             g.setParent(None)
@@ -132,20 +134,28 @@ class ControlsPanel(QWidget):
             return f"[WARNING] {label}: {r}"
         return f"[OK] {label}: {r}"
 
+    def _track_thread(self, t):
+        self._threads.append(t)
+        t.finished.connect(t.deleteLater)
+        t.finished.connect(self._on_thread_finished)
+
+    def _on_thread_finished(self):
+        t = self.sender()
+        if t in self._threads:
+            self._threads.remove(t)
+
     def _run(self, label, fn):
         t = _Runner(lambda: fn(self.handler))
         t.done.connect(lambda r: self.log.emit(self._result_msg(label, r)))
         t.fail.connect(lambda m: self.log.emit(f"[ERROR] {label}: {m}"))
-        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
-        self._threads.append(t); t.start()
+        self._track_thread(t); t.start()
 
     def _run_info(self, label, fn):
         self.log.emit(f"{label}…")
         t = _Runner(lambda: fn(self.handler))
         t.done.connect(lambda r: self._show_info(label, r))
         t.fail.connect(lambda m: self.log.emit(f"[ERROR] {label}: {m}"))
-        t.finished.connect(lambda: self._threads.remove(t) if t in self._threads else None)
-        self._threads.append(t); t.start()
+        self._track_thread(t); t.start()
 
     def _show_info(self, title, text):
         dlg = QDialog(self); dlg.setWindowTitle(title); dlg.resize(640, 460)
@@ -218,13 +228,30 @@ class ControlsPanel(QWidget):
 
     def _media_group(self):
         g, v = self._card("Media controls")
-        grid = self._grid(3)
-        grid.addWidget(self._key_btn("🔉 Vol −", "vol_down"), 0, 0)
-        grid.addWidget(self._key_btn("🔇 Mute", "vol_mute"), 0, 1)
-        grid.addWidget(self._key_btn("🔊 Vol +", "vol_up"), 0, 2)
-        grid.addWidget(self._btn("⏮ Prev", lambda h: h.media("previous", safe=False)), 1, 0)
-        grid.addWidget(self._btn("⏯ Play", lambda h: h.media("play-pause", safe=False), "ok"), 1, 1)
-        grid.addWidget(self._btn("⏭ Next", lambda h: h.media("next", safe=False)), 1, 2)
+        ncols = 2 if self._compact else 3
+        grid = self._grid(ncols)
+        items = [
+            ("🔉 Vol −", "vol_down", True),
+            ("🔊 Vol +", "vol_up", True),
+            ("🔇 Mute", "vol_mute", True),
+            ("⏯ Play", lambda h: h.media("play-pause", safe=False), False),
+            ("⏮ Prev", lambda h: h.media("previous", safe=False), False),
+            ("⏭ Next", lambda h: h.media("next", safe=False), False),
+        ] if self._compact else [
+            ("🔉 Vol −", "vol_down", True),
+            ("🔇 Mute", "vol_mute", True),
+            ("🔊 Vol +", "vol_up", True),
+            ("⏮ Prev", lambda h: h.media("previous", safe=False), False),
+            ("⏯ Play", lambda h: h.media("play-pause", safe=False), False),
+            ("⏭ Next", lambda h: h.media("next", safe=False), False),
+        ]
+        for idx, item in enumerate(items):
+            r, c = divmod(idx, ncols)
+            text = item[0]
+            if item[2]:
+                grid.addWidget(self._key_btn(text, item[1]), r, c)
+            else:
+                grid.addWidget(self._btn(text, item[1]), r, c)
         self._fill_rows(grid); v.addLayout(grid, 1)
         return g
 
@@ -236,7 +263,7 @@ class ControlsPanel(QWidget):
         grid.addWidget(self._btn("☀ Screen on", lambda h: h.screen_on(safe=False)), 1, 0)
         grid.addWidget(self._btn("🌙 Screen off", lambda h: h.screen_off(safe=False)), 1, 1)
         grid.addWidget(self._btn("⚙ Settings", lambda h: h.open_settings(safe=False)), 2, 0)
-        grid.addWidget(self._btn("⟳ Reboot", lambda h: h.reboot(safe=False), "danger"), 2, 1)
+        grid.addWidget(self._btn("⟳ Reboot", lambda h: h.reboot(safe=False)), 2, 1)
         self._fill_rows(grid); v.addLayout(grid, 1)
         return g
 
@@ -247,10 +274,12 @@ class ControlsPanel(QWidget):
                 ("Wi-Fi Off", lambda h: h.set_wifi(False, safe=False), 0, 1),
                 ("BT On", lambda h: h.set_bluetooth(True, safe=False), 1, 0),
                 ("BT Off", lambda h: h.set_bluetooth(False, safe=False), 1, 1),
-                ("Airplane On", lambda h: h.set_airplane(True, safe=False), 2, 0),
-                ("Airplane Off", lambda h: h.set_airplane(False, safe=False), 2, 1),
-                ("Hotspot On", lambda h: h.set_hotspot(True, safe=False), 3, 0),
-                ("Hotspot Off", lambda h: h.set_hotspot(False, safe=False), 3, 1)]
+                ("Data On", lambda h: h.set_mobile_data(True, safe=False), 2, 0),
+                ("Data Off", lambda h: h.set_mobile_data(False, safe=False), 2, 1),
+                ("Airplane On", lambda h: h.set_airplane(True, safe=False), 3, 0),
+                ("Airplane Off", lambda h: h.set_airplane(False, safe=False), 3, 1),
+                ("Hotspot On", lambda h: h.set_hotspot(True, safe=False), 4, 0),
+                ("Hotspot Off", lambda h: h.set_hotspot(False, safe=False), 4, 1)]
         for text, fn, r, c in defs:
             grid.addWidget(self._btn(text, fn), r, c)
         self._fill_rows(grid); v.addLayout(grid, 1)
@@ -261,13 +290,14 @@ class ControlsPanel(QWidget):
         row = QHBoxLayout()
         self.url = QLineEdit()
         self.url.setPlaceholderText("URL or search…")
-        self.url.setMinimumWidth(60); self.url.setFixedHeight(_INPUT_H)
+        self.url.setMinimumWidth(50); self.url.setFixedHeight(_INPUT_H)
         self.url.returnPressed.connect(self._open_url)
         row.addWidget(self.url, 1)
-        row.addWidget(self._local_btn("Open", self._open_url, "ok"))
+        row.addWidget(self._local_btn("Open", self._open_url))
         row.addWidget(self._local_btn("Search", self._search))
         v.addLayout(row)
-        grid = self._grid(3)             # 3x3 keeps this (tallest) card short
+        ncols = 2 if self._compact else 3
+        grid = self._grid(ncols)
         items = [
             ("🌐 Browser", lambda h: h.open_url("https://www.google.com", safe=False)),
             ("▶ YouTube", lambda h: h.open_url("https://www.youtube.com", safe=False)),
@@ -280,7 +310,7 @@ class ControlsPanel(QWidget):
             ("⚙ Settings", lambda h: h.open_settings(safe=False)),
         ]
         for i, (text, fn) in enumerate(items):
-            grid.addWidget(self._btn(text, fn), i // 3, i % 3)
+            grid.addWidget(self._btn(text, fn), i // ncols, i % ncols)
         self._fill_rows(grid); v.addLayout(grid, 1)
         return g
 
@@ -301,16 +331,17 @@ class ControlsPanel(QWidget):
         row = QHBoxLayout()
         self.text = QLineEdit()
         self.text.setPlaceholderText("type, then Send…")
-        self.text.setMinimumWidth(60); self.text.setFixedHeight(_INPUT_H)
+        self.text.setMinimumWidth(50); self.text.setFixedHeight(_INPUT_H)
         self.text.returnPressed.connect(self._send_text)
         row.addWidget(self.text, 1)
         row.addWidget(self._local_btn("Send", self._send_text, "ok"))
         v.addLayout(row)
-        grid = self._grid(3)             # 3x2 keeps the keyboard card short
+        ncols = 2 if self._compact else 3
+        grid = self._grid(ncols)
         for i, (text, key) in enumerate((("⏎ Enter", "enter"), ("⌫ Backspace", "del"),
                                          ("␣ Space", "space"), ("⇥ Tab", "tab"),
                                          ("Esc", "esc"), ("🔍 Search", "search"))):
-            grid.addWidget(self._key_btn(text, key), i // 3, i % 3)
+            grid.addWidget(self._key_btn(text, key), i // ncols, i % ncols)
         self._fill_rows(grid); v.addLayout(grid, 1)
         return g
 

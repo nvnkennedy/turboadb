@@ -16,7 +16,7 @@ class Device:
     """One entry from ``adb devices -l``."""
 
     serial: str
-    state: str                       # device | offline | unauthorized | no permissions
+    state: str  # device | offline | unauthorized | no permissions
     model: str = ""
     product: str = ""
     device: str = ""
@@ -62,15 +62,67 @@ def _parse_line(line: str) -> Optional[Device]:
             k, _, v = tok.partition(":")
             extra[k] = v
     return Device(
-        serial=serial, state=state,
-        model=extra.get("model", ""), product=extra.get("product", ""),
-        device=extra.get("device", ""), transport_id=extra.get("transport_id", ""),
+        serial=serial,
+        state=state,
+        model=extra.get("model", ""),
+        product=extra.get("product", ""),
+        device=extra.get("device", ""),
+        transport_id=extra.get("transport_id", ""),
         extra=extra,
     )
 
 
-def list_devices(adb_path: str | None = None, timeout: float = 15.0,
-                 server_host: str | None = None, server_port: int = 5037) -> list:
+def _list_devices_socket(host: str = "127.0.0.1", port: int = 5037, timeout: float = 1.0) -> list[Device] | None:
+    """Query connected devices directly via ADB server socket protocol.
+
+    Fast path (~10-15ms) that avoids spawning adb.exe subprocesses repeatedly on Windows.
+    Returns None if the server is not reachable so caller can fall back to CLI.
+    """
+    import socket
+
+    s = None
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # Command is "000ehost:devices-l" (14 chars = 0x000e)
+        s.sendall(b"000ehost:devices-l")
+        status = s.recv(4)
+        if status != b"OKAY":
+            return None
+        hex_len = s.recv(4)
+        if len(hex_len) < 4:
+            return None
+        length = int(hex_len, 16)
+        data = b""
+        while len(data) < length:
+            chunk = s.recv(min(4096, length - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        text = data.decode("utf-8", errors="replace")
+        devices = []
+        for line in text.splitlines():
+            dev = _parse_line(line)
+            if dev is not None:
+                devices.append(dev)
+        return devices
+    except Exception:
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def list_devices(
+    adb_path: str | None = None,
+    timeout: float = 15.0,
+    server_host: str | None = None,
+    server_port: int = 5037,
+) -> list:
     """Return a list of :class:`Device` for every attached/known target.
 
     With *server_host* set, the query is sent to a **remote** machine's adb
@@ -81,6 +133,26 @@ def list_devices(adb_path: str | None = None, timeout: float = 15.0,
     runs but nothing is connected. Raises ConnectionError if a remote server is
     requested but unreachable.
     """
+    target_host = server_host or "127.0.0.1"
+    is_local = target_host in ("127.0.0.1", "localhost")
+    sock_timeout = 0.25 if is_local else min(2.0, timeout)
+    sock_timeout = 1.0 if is_local else min(2.5, timeout)
+    sock_devs = _list_devices_socket(target_host, server_port, timeout=sock_timeout)
+    if sock_devs is not None:
+        return sock_devs
+
+    if is_local:
+        try:
+            from .tools import is_adb_server_alive, ensure_adb_server
+            if not is_adb_server_alive():
+                ensure_adb_server(adb_path, timeout=8.0)
+            sock_devs = _list_devices_socket(target_host, server_port, timeout=0.25)
+            sock_devs = _list_devices_socket(target_host, server_port, timeout=1.0)
+            if sock_devs is not None:
+                return sock_devs
+        except Exception:
+            pass
+
     adb = find_adb(adb_path)
     cmd = [adb]
     if server_host:
@@ -89,17 +161,18 @@ def list_devices(adb_path: str | None = None, timeout: float = 15.0,
     _unreachable = (
         f"Could not reach the adb server at {server_host}:{server_port}. On that "
         f"machine run:  adb -a nodaemon server start  (and allow TCP {server_port} "
-        f"through its firewall).")
+        f"through its firewall)."
+    )
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=timeout, creationflags=NO_WINDOW)
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW
+        )
     except subprocess.TimeoutExpired as exc:
-        if server_host:                 # a hung connection = unreachable server
+        if server_host:  # a hung connection = unreachable server
             raise ConnectionError(_unreachable) from exc
         raise
     text = (out.stdout or "") + (out.stderr or "")
-    if server_host and ("cannot connect" in text.lower()
-                        or "failed to connect" in text.lower()):
+    if server_host and ("cannot connect" in text.lower() or "failed to connect" in text.lower()):
         raise ConnectionError(_unreachable)
     devices = []
     for line in (out.stdout or "").splitlines():
@@ -109,8 +182,7 @@ def list_devices(adb_path: str | None = None, timeout: float = 15.0,
     return devices
 
 
-def remote_devices(server_host: str, server_port: int = 5037,
-                   adb_path: str | None = None) -> list:
+def remote_devices(server_host: str, server_port: int = 5037, adb_path: str | None = None) -> list:
     """Convenience: list devices attached to a remote machine's adb server."""
     return list_devices(adb_path, server_host=server_host, server_port=server_port)
 
@@ -137,10 +209,8 @@ def _parse_mdns_line(line: str) -> Optional[dict]:
     host, _, port = addr.rpartition(":")
     if not host or not port.isdigit():
         return None
-    kind = ("connect" if "connect" in service
-            else "pairing" if "pairing" in service else service)
-    return {"name": name, "service": kind, "host": host, "port": int(port),
-            "address": addr}
+    kind = "connect" if "connect" in service else "pairing" if "pairing" in service else service
+    return {"name": name, "service": kind, "host": host, "port": int(port), "address": addr}
 
 
 def mdns_devices(adb_path: str | None = None, timeout: float = 10.0) -> list:
@@ -153,9 +223,13 @@ def mdns_devices(adb_path: str | None = None, timeout: float = 10.0) -> list:
     never raises for those cases (only for adb itself being missing)."""
     adb = find_adb(adb_path)
     try:
-        out = subprocess.run([adb, "mdns", "services"], capture_output=True,
-                             text=True, timeout=timeout,
-                             creationflags=NO_WINDOW)
+        out = subprocess.run(
+            [adb, "mdns", "services"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=NO_WINDOW,
+        )
     except Exception:
         return []
     found = []
@@ -176,19 +250,24 @@ def server_is_shared(port: int = 5037, adb_path: str | None = None) -> bool:
     also does — it never really tested the ``-a`` binding.)"""
     adb = find_adb(adb_path)
     try:
-        out = subprocess.run([adb, "-P", str(port), "devices"],
-                             capture_output=True, text=True, timeout=10,
-                             creationflags=NO_WINDOW)
+        out = subprocess.run(
+            [adb, "-P", str(port), "devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=NO_WINDOW,
+        )
         if out.returncode != 0 or "daemon not running" in (out.stderr or ""):
             return False
     except Exception:
         return False
     # a server answered on loopback — now try it via this machine's LAN address
     import socket
+
     try:
-        lan_ips = {info[4][0]
-                   for info in socket.getaddrinfo(socket.gethostname(), None,
-                                                  socket.AF_INET)}
+        lan_ips = {
+            info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        }
         lan_ips.discard("127.0.0.1")
         for ip in lan_ips:
             try:
@@ -213,27 +292,49 @@ def open_firewall(ports=(5037, 27184)) -> str:
         rule = f"TurboADB TCP {p}"
         try:
             # remove any old rule, then add (idempotent)
-            subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule",
-                            f"name={rule}"], capture_output=True, timeout=15,
-                           creationflags=NO_WINDOW)
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
+                capture_output=True,
+                timeout=15,
+                creationflags=NO_WINDOW,
+            )
             r = subprocess.run(
-                ["netsh", "advfirewall", "firewall", "add", "rule", f"name={rule}",
-                 "dir=in", "action=allow", "protocol=TCP", f"localport={p}"],
-                capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW)
+                [
+                    "netsh",
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    f"name={rule}",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    f"localport={p}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=NO_WINDOW,
+            )
             (opened if r.returncode == 0 else failed).append(p)
         except Exception:
             failed.append(p)
     if opened and not failed:
         return f"firewall: opened TCP {', '.join(map(str, opened))}"
     if opened:
-        return (f"firewall: opened {opened}; could NOT open {failed} "
-                "(run as Administrator to allow those)")
-    return ("firewall: could not open ports (run TurboADB/`turboadb serve` as "
-            "Administrator, or open TCP 5037 + 27184 manually)")
+        return (
+            f"firewall: opened {opened}; could NOT open {failed} "
+            "(run as Administrator to allow those)"
+        )
+    return (
+        "firewall: could not open ports (run TurboADB/`turboadb serve` as "
+        "Administrator, or open TCP 5037 + 27184 manually)"
+    )
 
 
-def start_shared_server(port: int = 5037, adb_path: str | None = None,
-                        *, restart: bool = True) -> str:
+def start_shared_server(
+    port: int = 5037, adb_path: str | None = None, *, restart: bool = True
+) -> str:
     """Start an adb server that listens on **all** network interfaces so other
     machines can drive this PC's devices via ``adb -H thispc -P {port}``.
 
@@ -247,8 +348,12 @@ def start_shared_server(port: int = 5037, adb_path: str | None = None,
     adb = find_adb(adb_path)
     if restart:
         # drop any localhost-only server so the new one can bind all interfaces
-        subprocess.run([adb, "-P", str(port), "kill-server"],
-                       capture_output=True, timeout=15, creationflags=NO_WINDOW)
+        subprocess.run(
+            [adb, "-P", str(port), "kill-server"],
+            capture_output=True,
+            timeout=15,
+            creationflags=NO_WINDOW,
+        )
     flags = NO_WINDOW
     extra = {}
     if os.name == "nt":
@@ -256,27 +361,36 @@ def start_shared_server(port: int = 5037, adb_path: str | None = None,
         flags |= 0x00000008 | 0x00000200
     else:
         extra["start_new_session"] = True
-    subprocess.Popen([adb, "-a", "-P", str(port), "nodaemon", "server", "start"],
-                     creationflags=flags, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **extra)
+    subprocess.Popen(
+        [adb, "-a", "-P", str(port), "nodaemon", "server", "start"],
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **extra,
+    )
     # give it a moment, then confirm it answers
     last = ""
     for _ in range(10):
         time.sleep(0.4)
         try:
-            out = subprocess.run([adb, "-P", str(port), "devices"],
-                                 capture_output=True, text=True, timeout=10,
-                                 creationflags=NO_WINDOW)
+            out = subprocess.run(
+                [adb, "-P", str(port), "devices"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=NO_WINDOW,
+            )
             if out.returncode == 0:
-                n = len([d for d in (out.stdout or "").splitlines()
-                         if _parse_line(d)])
-                return (f"shared adb server is listening on 0.0.0.0:{port} "
-                        f"({n} device(s) attached here)")
+                n = len([d for d in (out.stdout or "").splitlines() if _parse_line(d)])
+                return (
+                    f"shared adb server is listening on 0.0.0.0:{port} "
+                    f"({n} device(s) attached here)"
+                )
             last = (out.stderr or out.stdout or "").strip()
         except Exception as exc:
             last = str(exc)
-    raise RuntimeError(f"adb server did not come up on port {port}: "
-                       f"{last or 'no response'}")
+    raise RuntimeError(f"adb server did not come up on port {port}: {last or 'no response'}")
 
 
 def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
@@ -285,18 +399,20 @@ def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
     to localhost again, so this PC keeps working but no longer shares its devices.
     Best-effort; returns a short status string."""
     adb = find_adb(adb_path)
-    subprocess.run([adb, "-P", str(port), "kill-server"],
-                   capture_output=True, timeout=15, creationflags=NO_WINDOW)
-    subprocess.run([adb, "start-server"],
-                   capture_output=True, timeout=15, creationflags=NO_WINDOW)
+    subprocess.run(
+        [adb, "-P", str(port), "kill-server"],
+        capture_output=True,
+        timeout=15,
+        creationflags=NO_WINDOW,
+    )
+    subprocess.run([adb, "start-server"], capture_output=True, timeout=15, creationflags=NO_WINDOW)
     return "shared adb server stopped — back to local-only (localhost)"
 
 
 def _startup_dir() -> str:
     """The current user's Windows Startup folder (programs run at login)."""
     appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
-                        "Programs", "Startup")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
 
 
 def install_startup(port: int = 5037) -> str:
@@ -309,8 +425,7 @@ def install_startup(port: int = 5037) -> str:
     os.makedirs(d, exist_ok=True)
     bat = os.path.join(d, "turboadb-shared-adb.bat")
     # pythonw -m turboadb serve, detached, no window
-    line = (f'@echo off\r\n'
-            f'start "" /b "{_pythonw()}" -m turboadb serve --port {port}\r\n')
+    line = f'@echo off\r\nstart "" /b "{_pythonw()}" -m turboadb serve --port {port}\r\n'
     with open(bat, "w", encoding="utf-8") as fh:
         fh.write(line)
     return bat
@@ -330,6 +445,7 @@ def uninstall_startup() -> bool:
 def _pythonw() -> str:
     """Best windowless Python to run the background server with."""
     import sys
+
     exe = sys.executable or "python"
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
     return cand if os.path.exists(cand) else exe
@@ -347,12 +463,33 @@ def install_serve_task(port: int = 5037, *, run_now: bool = True) -> str:
     if os.name != "nt":
         raise RuntimeError("Scheduled-task install is Windows-only.")
     tr = f'"{_pythonw()}" -m turboadb serve --port {port}'
-    subprocess.run(["schtasks", "/create", "/tn", _SERVE_TASK, "/tr", tr,
-                    "/sc", "onstart", "/ru", "SYSTEM", "/rl", "highest", "/f"],
-                   capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    subprocess.run(
+        [
+            "schtasks",
+            "/create",
+            "/tn",
+            _SERVE_TASK,
+            "/tr",
+            tr,
+            "/sc",
+            "onstart",
+            "/ru",
+            "SYSTEM",
+            "/rl",
+            "highest",
+            "/f",
+        ],
+        capture_output=True,
+        timeout=30,
+        creationflags=NO_WINDOW,
+    )
     if run_now:
-        subprocess.run(["schtasks", "/run", "/tn", _SERVE_TASK],
-                       capture_output=True, timeout=30, creationflags=NO_WINDOW)
+        subprocess.run(
+            ["schtasks", "/run", "/tn", _SERVE_TASK],
+            capture_output=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
     return _SERVE_TASK
 
 
@@ -360,6 +497,10 @@ def uninstall_serve_task() -> bool:
     """Remove the startup Scheduled Task if present."""
     if os.name != "nt":
         return False
-    r = subprocess.run(["schtasks", "/delete", "/tn", _SERVE_TASK, "/f"],
-                       capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    r = subprocess.run(
+        ["schtasks", "/delete", "/tn", _SERVE_TASK, "/f"],
+        capture_output=True,
+        timeout=30,
+        creationflags=NO_WINDOW,
+    )
     return r.returncode == 0

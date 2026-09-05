@@ -19,12 +19,13 @@ from .theme import TERM_BG
 class ReaderThread(QThread):
     """Pumps bytes from a read callable and emits them. With ``decode=False`` the
     raw bytes are emitted (for a VT100 widget); otherwise they're decoded to str."""
+
     data = pyqtSignal(object)
     closed = pyqtSignal()
 
     def __init__(self, read_fn, encoding="utf-8", decode=True):
         super().__init__()
-        self._read = read_fn          # callable() -> bytes (b"" idle, None/EOF stops)
+        self._read = read_fn  # callable() -> bytes (b"" idle, None/EOF stops)
         self._alive = True
         self.encoding = encoding
         self.decode = decode
@@ -34,10 +35,11 @@ class ReaderThread(QThread):
     # each floods the UI event queue (the "tool hangs" symptom). One batched
     # emit per tick keeps the UI thread free while losing no data.
     _FLUSH_S = 0.04
-    _MAX_BATCH = 1 << 20                # 1 MB — bound a single emit
+    _MAX_BATCH = 1 << 20  # 1 MB — bound a single emit
 
     def run(self):
         import time
+
         parts = []
         size = 0
         last = time.monotonic()
@@ -84,14 +86,29 @@ class ReaderThread(QThread):
         self._alive = False
 
 
-_CTRL = {Qt.Key_C: b"\x03", Qt.Key_D: b"\x04", Qt.Key_Z: b"\x1a",
-         Qt.Key_A: b"\x01", Qt.Key_E: b"\x05", Qt.Key_K: b"\x0b",
-         Qt.Key_L: b"\x0c", Qt.Key_U: b"\x15", Qt.Key_W: b"\x17"}
+_CTRL = {
+    Qt.Key_C: b"\x03",
+    Qt.Key_D: b"\x04",
+    Qt.Key_Z: b"\x1a",
+    Qt.Key_A: b"\x01",
+    Qt.Key_E: b"\x05",
+    Qt.Key_K: b"\x0b",
+    Qt.Key_L: b"\x0c",
+    Qt.Key_U: b"\x15",
+    Qt.Key_W: b"\x17",
+}
 
-_KEYS = {Qt.Key_Return: b"\n", Qt.Key_Enter: b"\n", Qt.Key_Backspace: b"\x7f",
-         Qt.Key_Tab: b"\t", Qt.Key_Escape: b"\x1b",
-         Qt.Key_Up: b"\x1b[A", Qt.Key_Down: b"\x1b[B",
-         Qt.Key_Right: b"\x1b[C", Qt.Key_Left: b"\x1b[D"}
+_KEYS = {
+    Qt.Key_Return: b"\n",
+    Qt.Key_Enter: b"\n",
+    Qt.Key_Backspace: b"\x7f",
+    Qt.Key_Tab: b"\t",
+    Qt.Key_Escape: b"\x1b",
+    Qt.Key_Up: b"\x1b[A",
+    Qt.Key_Down: b"\x1b[B",
+    Qt.Key_Right: b"\x1b[C",
+    Qt.Key_Left: b"\x1b[D",
+}
 
 
 class TerminalView(QPlainTextEdit):
@@ -122,16 +139,18 @@ class TerminalView(QPlainTextEdit):
             return
         mods, key = event.modifiers(), event.key()
         try:
-            if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) \
-                    and key == Qt.Key_C:
-                self.copy(); return
-            if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) \
-                    and key == Qt.Key_V:
-                self.paste_clipboard(); return
+            if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_C:
+                self.copy()
+                return
+            if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_V:
+                self.paste_clipboard()
+                return
             if (mods & Qt.ControlModifier) and key in _CTRL:
-                self._send(_CTRL[key]); return
+                self._send(_CTRL[key])
+                return
             if key in _KEYS:
-                self._send(_KEYS[key]); return
+                self._send(_KEYS[key])
+                return
             text = event.text()
             if text:
                 self._send(text.encode("utf-8"))
@@ -140,6 +159,7 @@ class TerminalView(QPlainTextEdit):
 
     def paste_clipboard(self):
         from PyQt5.QtWidgets import QApplication
+
         txt = QApplication.clipboard().text()
         if txt and self._send:
             self._send(txt.encode("utf-8"))

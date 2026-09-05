@@ -30,22 +30,27 @@ def resolve_host(host: Optional[str]) -> Optional[str]:
     if not host:
         return host
     host = host.strip()
-    # drop ANY number of accidental ":port" suffixes ("ip:5037:5037" -> "ip")
-    while ":" in host:
+    if host.startswith("[") and "]" in host:
+        b_end = host.index("]")
+        host = host[1:b_end]
+    elif ":" in host:
         h, _, p = host.rpartition(":")
-        if h and p.isdigit():
+        if h and p.isdigit() and ":" not in h:
             host = h
-        else:
-            break
     try:
-        socket.inet_aton(host)               # already a dotted IPv4 — keep as-is
+        socket.inet_aton(host)  # already a dotted IPv4 — keep as-is
         return host
     except OSError:
         pass
     try:
-        return socket.gethostbyname(host)    # DNS / hosts-file lookup
+        socket.inet_pton(socket.AF_INET6, host)  # already an IPv6 — keep as-is
+        return host
+    except (OSError, AttributeError):
+        pass
+    try:
+        return socket.gethostbyname(host)  # DNS / hosts-file lookup
     except OSError:
-        return host                          # let adb try; we did our best
+        return host  # let adb try; we did our best
 
 
 def is_local_host(host: Optional[str]) -> bool:
@@ -56,7 +61,7 @@ def is_local_host(host: Optional[str]) -> bool:
     which is exactly how running scrcpy directly there works."""
     if not host:
         return True
-    h = resolve_host(host)                       # strip :port, resolve name → IP
+    h = resolve_host(host)  # strip :port, resolve name → IP
     if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
         return True
     try:
@@ -81,6 +86,7 @@ def is_remote_session() -> bool:
         return False
     try:
         import ctypes
+
         return bool(ctypes.windll.user32.GetSystemMetrics(0x1000))  # SM_REMOTESESSION
     except Exception:
         return False
@@ -101,7 +107,7 @@ def _server_env(host: Optional[str], port: int, adb_path: Optional[str] = None):
         env = os.environ.copy()
         env["ADB"] = adb_path
     if host:
-        ip = resolve_host(host)                      # clean IP, no :port suffix
+        ip = resolve_host(host)  # clean IP, no :port suffix
         env = env or os.environ.copy()
         # Point scrcpy's adb at the remote server. VERIFIED against adb v37:
         # ANDROID_ADB_SERVER_ADDRESS must be the **bare host** (just the IP) —
@@ -115,11 +121,15 @@ def _server_env(host: Optional[str], port: int, adb_path: Optional[str] = None):
     return env
 
 
-def list_displays(serial: Optional[str] = None, *,
-                  scrcpy_path: Optional[str] = None, timeout: float = 25.0,
-                  adb_server_host: Optional[str] = None,
-                  adb_server_port: int = 5037,
-                  adb_path: Optional[str] = None) -> list:
+def list_displays(
+    serial: Optional[str] = None,
+    *,
+    scrcpy_path: Optional[str] = None,
+    timeout: float = 25.0,
+    adb_server_host: Optional[str] = None,
+    adb_server_port: int = 5037,
+    adb_path: Optional[str] = None,
+) -> list:
     """Enumerate the device's displays via ``scrcpy --list-displays`` — essential
     on Android Automotive / IVI head units, which expose several displays
     (center stack, cluster, passenger). Returns ``[{"id": int, "size": str}, …]``.
@@ -134,10 +144,14 @@ def list_displays(serial: Optional[str] = None, *,
         cmd += ["--tunnel-host", resolve_host(adb_server_host)]
     cmd += ["--list-displays"]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                             creationflags=NO_WINDOW,
-                             env=_server_env(adb_server_host, adb_server_port,
-                                             adb_path))
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=NO_WINDOW,
+            env=_server_env(adb_server_host, adb_server_port, adb_path),
+        )
     except subprocess.TimeoutExpired as exc:
         raise ScrcpyError("scrcpy --list-displays timed out") from exc
     text = (out.stdout or "") + "\n" + (out.stderr or "")
@@ -149,16 +163,22 @@ def list_displays(serial: Optional[str] = None, *,
             seen.add(did)
             displays.append({"id": did, "size": (m.group(2) or "").strip()})
     if not displays and out.returncode != 0:
-        raise ScrcpyError("scrcpy could not list displays: "
-                          f"{text.strip()[:400] or 'no device reachable'}")
+        raise ScrcpyError(
+            f"scrcpy could not list displays: {text.strip()[:400] or 'no device reachable'}"
+        )
     return displays
 
 
 class ScrcpySession:
     """A running scrcpy process. Call :meth:`stop` to close the mirror window."""
 
-    def __init__(self, proc: subprocess.Popen, serial: Optional[str],
-                 log_path: Optional[str] = None, logfh=None):
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        serial: Optional[str],
+        log_path: Optional[str] = None,
+        logfh=None,
+    ):
         self._proc = proc
         self.serial = serial
         self.log_path = log_path
@@ -188,9 +208,27 @@ class ScrcpySession:
     def stop(self) -> None:
         try:
             if self.running:
-                self._proc.terminate()
+                if os.name == "nt":
+                    import signal
+
+                    try:
+                        self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        self._proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                if self.running:
+                    self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3.0)
+            except Exception:
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=1.0)
+                except Exception:
+                    pass
         except Exception:
             pass
+
         try:
             if self._logfh:
                 self._logfh.close()
@@ -208,13 +246,16 @@ class ScrcpySession:
         return f"<ScrcpySession serial={self.serial!r} pid={self.pid} {state}>"
 
 
-def launch_scrcpy(serial: Optional[str] = None,
-                  options: Optional[ScrcpyOptions] = None, *,
-                  scrcpy_path: Optional[str] = None,
-                  adb_server_host: Optional[str] = None,
-                  adb_server_port: int = 5037,
-                  log_path: Optional[str] = None,
-                  adb_path: Optional[str] = None) -> ScrcpySession:
+def launch_scrcpy(
+    serial: Optional[str] = None,
+    options: Optional[ScrcpyOptions] = None,
+    *,
+    scrcpy_path: Optional[str] = None,
+    adb_server_host: Optional[str] = None,
+    adb_server_port: int = 5037,
+    log_path: Optional[str] = None,
+    adb_path: Optional[str] = None,
+) -> ScrcpySession:
     """
     Start scrcpy for *serial* (or the only device) with *options*. Returns a
     :class:`ScrcpySession` immediately; the mirror runs in its own window.
@@ -236,8 +277,7 @@ def launch_scrcpy(serial: Optional[str] = None,
         # machine (--tunnel-host + --tunnel-port) instead of a random one, so it
         # can be opened in that machine's firewall. (Resolve a hostname → IP;
         # scrcpy's tunnel won't resolve names itself.)
-        cmd += [f"--tunnel-host={resolve_host(adb_server_host)}",
-                f"--tunnel-port={TUNNEL_PORT}"]
+        cmd += [f"--tunnel-host={resolve_host(adb_server_host)}", f"--tunnel-port={TUNNEL_PORT}"]
     cmd += opts.to_args()
 
     env = _server_env(adb_server_host, adb_server_port, adb_path)
@@ -259,18 +299,28 @@ def launch_scrcpy(serial: Optional[str] = None,
             # record EXACTLY what we run, so a failure is fully diagnosable
             logfh.write("TurboADB launched scrcpy as:\n  " + " ".join(cmd) + "\n")
             if env and env.get("ANDROID_ADB_SERVER_ADDRESS"):
-                logfh.write("  adb server = tcp:{}:{}\n".format(
-                    env["ANDROID_ADB_SERVER_ADDRESS"],
-                    env.get("ANDROID_ADB_SERVER_PORT", "5037")))
+                logfh.write(
+                    "  adb server = tcp:{}:{}\n".format(
+                        env["ANDROID_ADB_SERVER_ADDRESS"],
+                        env.get("ANDROID_ADB_SERVER_PORT", "5037"),
+                    )
+                )
             logfh.write("-" * 60 + "\n")
             logfh.flush()
         except Exception:
             logfh = None
+    flags = NO_WINDOW
+    if os.name == "nt":
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         proc = subprocess.Popen(
-            cmd, creationflags=NO_WINDOW, env=env,
+            cmd,
+            creationflags=flags,
+            env=env,
             stdout=(logfh or None),
-            stderr=(subprocess.STDOUT if logfh else None))
+            stderr=(subprocess.STDOUT if logfh else None),
+        )
+
     except Exception as exc:  # pragma: no cover
         raise ScrcpyError(f"Failed to launch scrcpy: {exc}") from exc
     return ScrcpySession(proc, serial, log_path=log_path, logfh=logfh)

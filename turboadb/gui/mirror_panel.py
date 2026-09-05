@@ -14,12 +14,25 @@ import sys
 import time
 import subprocess
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QStandardPaths
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLabel, QComboBox, QCheckBox, QInputDialog,
-                             QLineEdit, QMessageBox, QFileDialog, QToolButton,
-                             QMenu)
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QComboBox,
+    QCheckBox,
+    QInputDialog,
+    QLineEdit,
+    QMessageBox,
+    QFileDialog,
+    QToolButton,
+    QMenu,
+    QTabBar,
+    QAction,
+)
 
 from ..config import ScrcpyOptions
 from ..results import OperationResult
@@ -36,13 +49,20 @@ _IS_WIN = os.name == "nt"
 def _win_api():
     import ctypes
     from ctypes import wintypes
+
     u = ctypes.windll.user32
     u.FindWindowW.restype = wintypes.HWND
     u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
     u.SetParent.restype = wintypes.HWND
     u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-    u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                             ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    u.MoveWindow.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.BOOL,
+    ]
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     # declare argtypes explicitly: without them ctypes defaults the HWND arg to
     # a 32-bit int and truncates a 64-bit handle on win64
@@ -57,23 +77,26 @@ def _win_api():
     set_l.restype = long_ptr
     set_l.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
     u.SetWindowPos.restype = wintypes.BOOL
-    u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                               ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                               wintypes.UINT]
+    u.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
     u.SetFocus.restype = wintypes.HWND
     u.SetFocus.argtypes = [wintypes.HWND]
     u.GetWindowThreadProcessId.restype = wintypes.DWORD
-    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
-                                           ctypes.POINTER(wintypes.DWORD)]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     u.AttachThreadInput.restype = wintypes.BOOL
-    u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD,
-                                    wintypes.BOOL]
+    u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     u.GetAncestor.restype = wintypes.HWND
     u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     u.SetForegroundWindow.restype = wintypes.BOOL
     u.SetForegroundWindow.argtypes = [wintypes.HWND]
-    u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD,
-                              ctypes.c_void_p]
+    u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
     u.GetFocus.restype = wintypes.HWND
     u.GetFocus.argtypes = []
     u.GetForegroundWindow.restype = wintypes.HWND
@@ -114,9 +137,8 @@ def _reparent(child_hwnd, parent_hwnd, w, h):
     style = getter(child_hwnd, _GWL_STYLE)
     style = (style | _WS_CHILD) & ~(_WS_POPUP | _WS_CAPTION | _WS_THICKFRAME)
     setter(child_hwnd, _GWL_STYLE, style)
-    u.SetWindowPos(child_hwnd, None, 0, 0, max(1, w), max(1, h),
-                   _SWP_NOZORDER | _SWP_FRAMECHANGED)
-    u.ShowWindow(child_hwnd, 5)   # SW_SHOW
+    u.SetWindowPos(child_hwnd, None, 0, 0, max(1, w), max(1, h), _SWP_NOZORDER | _SWP_FRAMECHANGED)
+    u.ShowWindow(child_hwnd, 5)  # SW_SHOW
 
 
 def _focus_window(hwnd) -> None:
@@ -137,8 +159,8 @@ def _focus_window(hwnd) -> None:
         #    foreground-change rule for our own process)
         top = u.GetAncestor(hwnd, 2) if hasattr(u, "GetAncestor") else 0  # GA_ROOT
         if top:
-            u.keybd_event(0x12, 0, 0, 0)          # VK_MENU down
-            u.keybd_event(0x12, 0, 0x0002, 0)     # VK_MENU up
+            u.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+            u.keybd_event(0x12, 0, 0x0002, 0)  # VK_MENU up
             u.SetForegroundWindow(top)
         # 2) attach to the scrcpy thread's input queue, then focus its window
         target_tid = u.GetWindowThreadProcessId(hwnd, None)
@@ -162,15 +184,17 @@ def _post_close(title) -> bool:
     """Ask a window (by title) to close politely — WM_CLOSE. scrcpy treats this
     like Ctrl+C and **finalizes the recording file** before exiting, so the mp4
     is never corrupt. Returns True if the window was found and messaged."""
+    if not _IS_WIN:
+        return False
     from ctypes import wintypes
+
     _ctypes, u = _win_api()
     hwnd = u.FindWindowW(None, title)
     if not hwnd:
         return False
-    u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
-                               wintypes.WPARAM, wintypes.LPARAM]
+    u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     u.PostMessageW.restype = wintypes.BOOL
-    u.PostMessageW(hwnd, 0x0010, 0, 0)        # WM_CLOSE
+    u.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
     return True
 
 
@@ -190,14 +214,15 @@ def _bitrate_to_bps(value) -> str:
 
 
 def _default_save_dir() -> str:
-    from .fileutil import download_dir      # save to the user's Downloads folder
+    from .fileutil import download_dir  # save to the user's Downloads folder
+
     return download_dir()
 
 
 def _open_path(path) -> None:
     try:
         if _IS_WIN:
-            os.startfile(path)                # type: ignore[attr-defined]  # Windows-only
+            os.startfile(path)  # type: ignore[attr-defined]  # Windows-only
         elif sys.platform == "darwin":
             subprocess.Popen(["open", path])
         else:
@@ -250,7 +275,8 @@ class _LiveThread(QThread):
     already-scaled QImage, so painting is cheap and the app never stutters
     under the stream (which it did when every frame was decoded + smoothly
     rescaled on the UI thread)."""
-    frame = pyqtSignal(object, int, int)   # pre-scaled QImage, device W, H
+
+    frame = pyqtSignal(object, int, int)  # pre-scaled QImage, device W, H
     note = pyqtSignal(str)
 
     def __init__(self, handler, max_fps: float = 10.0):
@@ -265,11 +291,12 @@ class _LiveThread(QThread):
 
     def run(self):
         from PyQt5.QtGui import QImage
+
         first = True
         while not self._stop:
             t0 = time.time()
             try:
-                data = self.handler.screenshot(None, safe=False)   # PNG bytes
+                data = self.handler.screenshot(None, safe=False)  # PNG bytes
                 if isinstance(data, (bytes, bytearray)) and data[:4] == b"\x89PNG":
                     img = QImage.fromData(bytes(data), "PNG")
                     if not img.isNull():
@@ -277,16 +304,18 @@ class _LiveThread(QThread):
                         tw, th = self.target_w, self.target_h
                         if tw > 0 and th > 0 and (dev_w > tw or dev_h > th):
                             # smooth-downscale ONCE here, from the native frame
-                            img = img.scaled(tw, th, Qt.KeepAspectRatio,
-                                             Qt.SmoothTransformation)
+                            img = img.scaled(tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         self.frame.emit(img, dev_w, dev_h)
                         if first:
-                            self.note.emit("[OK] live view streaming (adaptive "
-                                           "rate — as fast as this link allows)")
+                            self.note.emit(
+                                "[OK] live view streaming (adaptive "
+                                "rate — as fast as this link allows)"
+                            )
                             first = False
                 elif first:
-                    self.note.emit("[WARNING] live view: screencap returned no "
-                                   "image on this device")
+                    self.note.emit(
+                        "[WARNING] live view: screencap returned no image on this device"
+                    )
                     first = False
             except Exception as exc:
                 if first:
@@ -297,7 +326,8 @@ class _LiveThread(QThread):
             # back-to-back — no artificial 0.5 s wait on top
             rem = self.min_interval - (time.time() - t0)
             while rem > 0 and not self._stop:
-                time.sleep(min(0.05, rem)); rem -= 0.05
+                time.sleep(min(0.05, rem))
+                rem -= 0.05
 
     def stop(self):
         self._stop = True
@@ -307,9 +337,10 @@ class _LiveView(QLabel):
     """Shows live frames scaled to fit, and turns clicks/drags on the image into
     device taps/swipes — and, once clicked, forwards KEYSTROKES to the device too
     (so you type straight onto the Live View, no separate field needed)."""
+
     tapped = pyqtSignal(float, float)
     swiped = pyqtSignal(float, float, float, float)
-    key_typed = pyqtSignal(str, object)          # (kind, payload) → adb forward
+    key_typed = pyqtSignal(str, object)  # (kind, payload) → adb forward
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -324,6 +355,7 @@ class _LiveView(QLabel):
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Paste):
             from PyQt5.QtWidgets import QApplication
+
             txt = QApplication.clipboard().text()
             if txt:
                 self.key_typed.emit("text", txt)
@@ -343,15 +375,14 @@ class _LiveView(QLabel):
             return
         # frames arrive pre-scaled to this view — when they already fit, show
         # them as-is instead of smooth-rescaling a full pixmap every frame
-        if (self._pm.width() <= self.width() and
-                self._pm.height() <= self.height()):
+        if self._pm.width() <= self.width() and self._pm.height() <= self.height():
             self.setPixmap(self._pm)
             return
-        self.setPixmap(self._pm.scaled(self.size(), Qt.KeepAspectRatio,
-                                       Qt.SmoothTransformation))
+        self.setPixmap(self._pm.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def resizeEvent(self, e):
-        super().resizeEvent(e); self._draw()
+        super().resizeEvent(e)
+        self._draw()
 
     def _frac(self, pos):
         # measure the pixmap that is ACTUALLY displayed (centred, unscaled by
@@ -371,13 +402,14 @@ class _LiveView(QLabel):
         return None
 
     def mousePressEvent(self, e):
-        self.setFocus(Qt.MouseFocusReason)       # clicking the image = ready to type
+        self.setFocus(Qt.MouseFocusReason)  # clicking the image = ready to type
         self._press = self._frac(e.pos())
 
     def mouseReleaseEvent(self, e):
         rel = self._frac(e.pos())
         if self._press and rel:
-            dx = abs(rel[0] - self._press[0]); dy = abs(rel[1] - self._press[1])
+            dx = abs(rel[0] - self._press[0])
+            dy = abs(rel[1] - self._press[1])
             if dx < 0.02 and dy < 0.02:
                 self.tapped.emit(rel[0], rel[1])
             else:
@@ -401,6 +433,7 @@ class _EmbedContainer(QWidget):
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Paste):
             from PyQt5.QtWidgets import QApplication
+
             txt = QApplication.clipboard().text()
             if txt:
                 self._send_key("text", txt)
@@ -419,16 +452,25 @@ class _DeviceKeyEdit(QLineEdit):
     stays empty (it's a wire, not a buffer)."""
 
     _KEYMAP = {
-        Qt.Key_Return: 66, Qt.Key_Enter: 66, Qt.Key_Backspace: 67,
-        Qt.Key_Tab: 61, Qt.Key_Escape: 111, Qt.Key_Delete: 112,
-        Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Left: 21, Qt.Key_Right: 22,
-        Qt.Key_Home: 122, Qt.Key_End: 123,
-        Qt.Key_PageUp: 92, Qt.Key_PageDown: 93,
+        Qt.Key_Return: 66,
+        Qt.Key_Enter: 66,
+        Qt.Key_Backspace: 67,
+        Qt.Key_Tab: 61,
+        Qt.Key_Escape: 111,
+        Qt.Key_Delete: 112,
+        Qt.Key_Up: 19,
+        Qt.Key_Down: 20,
+        Qt.Key_Left: 21,
+        Qt.Key_Right: 22,
+        Qt.Key_Home: 122,
+        Qt.Key_End: 123,
+        Qt.Key_PageUp: 92,
+        Qt.Key_PageDown: 93,
     }
 
     def __init__(self, send, parent=None):
         super().__init__(parent)
-        self._send = send                # send("text", str) / send("key", code)
+        self._send = send  # send("text", str) / send("key", code)
 
     @classmethod
     def map_event(cls, key, text):
@@ -443,13 +485,14 @@ class _DeviceKeyEdit(QLineEdit):
         # paste lands as one text batch
         if event.matches(QKeySequence.Paste):
             from PyQt5.QtWidgets import QApplication
+
             txt = QApplication.clipboard().text()
             if txt:
                 self._send("text", txt)
             return
         kind, payload = self.map_event(event.key(), event.text())
         if kind is None:
-            super().keyPressEvent(event)     # let Qt handle what we don't map
+            super().keyPressEvent(event)  # let Qt handle what we don't map
             return
         self._send(kind, payload)
 
@@ -458,12 +501,14 @@ class _KeyPumpThread(QThread):
     """Serialises the keyboard-bar events into adb calls off the UI thread,
     coalescing bursts of printable characters into single ``input text`` calls
     so fast typing stays fluid."""
+
     note = pyqtSignal(str)
 
     def __init__(self, handler):
         super().__init__()
         self.handler = handler
         import queue
+
         self._q = queue.Queue()
         self._stop = False
 
@@ -476,6 +521,7 @@ class _KeyPumpThread(QThread):
 
     def run(self):
         import queue
+
         while not self._stop:
             item = self._q.get()
             if item is None or self._stop:
@@ -496,7 +542,8 @@ class _KeyPumpThread(QThread):
                         if nxt[0] == "text":
                             buf += nxt[1]
                         else:
-                            self._flush_text(buf); buf = ""
+                            self._flush_text(buf)
+                            buf = ""
                             self._do_key(nxt[1])
                     if buf:
                         self._flush_text(buf)
@@ -514,50 +561,69 @@ class _KeyPumpThread(QThread):
 
 
 class _RecWaitThread(QThread):
-    """Wait for the recording scrcpy process to finish writing the file after a
-    polite WM_CLOSE. If it doesn't exit in time, force it. Emits whether it ended
-    cleanly (clean = the file was finalized properly)."""
+    """Wait for the recording scrcpy process to finish writing the file cleanly.
+    Emits whether it ended cleanly (clean = the file was finalized properly)."""
+
     done = pyqtSignal(bool)
 
-    def __init__(self, session, graceful: bool):
+    def __init__(self, session, graceful: bool = True):
         super().__init__()
         self.session = session
         self.graceful = graceful
 
     def run(self):
         try:
-            self.session.wait(timeout=10 if self.graceful else 4)
-            self.done.emit(True)
-            return
-        except Exception:
-            pass
-        # never exited on its own — force it (file may be truncated)
-        try:
-            self.session.stop()
-        except Exception:
-            pass
-        try:
-            self.session.wait(timeout=3)
+            if self.session:
+                self.session.stop()
+                self.done.emit(True)
+                return
         except Exception:
             pass
         self.done.emit(False)
+
+
+class _MirrorLaunchThread(QThread):
+    done = pyqtSignal(object)
+    fail = pyqtSignal(str)
+
+    def __init__(self, handler, opts, compat, log_path):
+        super().__init__()
+        self.handler = handler
+        self.opts = opts
+        self.compat = compat
+        self.log_path = log_path
+
+    def run(self):
+        try:
+            res = self.handler.mirror(
+                self.opts, compat=self.compat, log_path=self.log_path, safe=True
+            )
+            if isinstance(res, OperationResult) and not res.success:
+                self.fail.emit(str(res.error))
+            else:
+                sess = res.value if isinstance(res, OperationResult) else res
+                self.done.emit(sess)
+        except Exception as exc:
+            self.fail.emit(str(exc))
 
 
 class _ShotThread(QThread):
     done = pyqtSignal(str)
     fail = pyqtSignal(str)
 
-    def __init__(self, handler, path):
+    def __init__(self, handler, path, display_id=None):
         super().__init__()
         self.handler = handler
         self.path = path
+        self.display_id = display_id
 
     def run(self):
         try:
-            self.handler.screenshot(self.path, safe=False)
+            self.handler.screenshot(self.path, display_id=self.display_id, safe=False)
             self.done.emit(self.path)
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
+
 
 
 class _RecordThread(QThread):
@@ -565,16 +631,18 @@ class _RecordThread(QThread):
     pull the file. No video tunnel and no GPU needed, so it works while using
     Live View, over a remote adb server / RDP / IVI — anywhere the adb
     connection works. (screenrecord caps at ~3 min and has no audio.)"""
-    done = pyqtSignal(list)      # the saved part file(s)
-    fail = pyqtSignal(str)
-    part = pyqtSignal(int)       # a new part started (Android's 3-min cap)
 
-    def __init__(self, handler, path, stop_event, bit_rate=None):
+    done = pyqtSignal(list)  # the saved part file(s)
+    fail = pyqtSignal(str)
+    part = pyqtSignal(int)  # a new part started (Android's 3-min cap)
+
+    def __init__(self, handler, path, stop_event, bit_rate=None, display_id=None):
         super().__init__()
         self.handler = handler
         self.path = path
         self.stop_event = stop_event
         self.bit_rate = bit_rate
+        self.display_id = display_id
 
     def run(self):
         # A single device-side screenrecord is capped at ~3 min by Android. Rather
@@ -588,9 +656,14 @@ class _RecordThread(QThread):
                 seg = self.path if n == 0 else f"{base}-part{n + 1:02d}{ext}"
                 if n > 0:
                     self.part.emit(n + 1)
-                self.handler.screen_record(seg, time_limit=180,
-                                           bit_rate=self.bit_rate,
-                                           stop_event=self.stop_event, safe=False)
+                self.handler.screen_record(
+                    seg,
+                    time_limit=180,
+                    bit_rate=self.bit_rate,
+                    display_id=self.display_id,
+                    stop_event=self.stop_event,
+                    safe=False,
+                )
                 if os.path.exists(seg) and os.path.getsize(seg) > 0:
                     parts.append(seg)
                 n += 1
@@ -599,7 +672,7 @@ class _RecordThread(QThread):
             self.done.emit(parts)
         except Exception as exc:
             if parts:
-                self.done.emit(parts)        # keep whatever was captured
+                self.done.emit(parts)  # keep whatever was captured
             else:
                 self.fail.emit(f"{type(exc).__name__}: {exc}")
 
@@ -607,8 +680,7 @@ class _RecordThread(QThread):
 class MirrorPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, session, automotive=False, prefer_embed=False,
-                 parent=None):
+    def __init__(self, handler, session, automotive=False, prefer_embed=False, parent=None):
         super().__init__(parent)
         self.handler = handler
         self.session_dict = session
@@ -631,100 +703,100 @@ class MirrorPanel(QWidget):
         self._rec_path = None
         self._rec_thread = None
         self._rec_stop = None
-        self._rec_mode = None        # "scrcpy" (clean, preferred) | "device" (fallback)
-        self._rec_scrcpy = None      # the off-screen scrcpy --record session
+        self._rec_mode = None  # "scrcpy" (clean, preferred) | "device" (fallback)
+        self._rec_scrcpy = None  # the off-screen scrcpy --record session
         self._rec_title = None
         self._rec_wait = None
         self._shot = None
         self._live = None
-        self._closing = False        # guards deferred callbacks (retry timers)
+        self._closing = False  # guards deferred callbacks (retry timers)
         self._dev_w = self._dev_h = 0
-        self._displays = []          # cached [{id,size}] from the last list
-        self._multi = []             # ScrcpySessions when mirroring ALL displays
+        self._displays = []  # cached [{id,size}] from the last list
+        self._multi = []  # ScrcpySessions when mirroring ALL displays
 
         from .flowlayout import FlowLayout
+
         self._rdp = is_remote_session()
         lay = QVBoxLayout(self)
-        bar_w = QWidget()                         # toolbar wraps when narrow, so
-        bar = FlowLayout(bar_w, hspacing=6, vspacing=4)   # the window can shrink
+        bar_w = QWidget()  # toolbar wraps when narrow, so
+        bar = FlowLayout(bar_w, hspacing=6, vspacing=4)  # the window can shrink
 
-        # ---- two clear action buttons + a separate ⚙ options menu ----
-        self.btn_mirror = QPushButton("▶ Mirror"); self.btn_mirror.setProperty("role", "ok")
-        self.btn_mirror.setToolTip("Full-speed scrcpy mirror & control — best "
-                                   "quality and real touch/keyboard. Needs a "
-                                   "working video path (great on local/USB).")
+        # ---- Primary Mirror Start & Pop Out Buttons ----
+        self.btn_mirror = QPushButton("▶ Start Mirror")
+        self.btn_mirror.setProperty("role", "ok")
+        self.btn_mirror.setToolTip("Start full-speed scrcpy mirror (embedded in this tab)")
         self.btn_mirror.clicked.connect(lambda: self.start())
-        self.btn_live = QPushButton("🖥 Live View"); self.btn_live.setProperty("role", "ok")
-        self.btn_live.setToolTip("Reliable screen stream over the adb connection "
-                                 "— works over remote / RDP / IVI where scrcpy "
-                                 "can't. Lower FPS; click/drag the image to "
-                                 "tap/swipe.")
-        self.btn_live.clicked.connect(self._start_live)
 
-        self.btn_stop = QPushButton("■ Stop"); self.btn_stop.setProperty("role", "danger")
-        self.btn_stop.clicked.connect(self.stop); self.btn_stop.setEnabled(False)
-        self.cmb_display = QComboBox(); self.cmb_display.addItem("default display", None)
-        # don't truncate display labels: size the box (and its popup) to the
-        # longest entry, and give it room in the toolbar
+        self.btn_popout = QPushButton("🗖 Pop Out Window")
+        self.btn_popout.setProperty("role", "ghost")
+        self.btn_popout.setToolTip(
+            "Launch scrcpy in a dedicated, native full-size floating window with 60 FPS GPU acceleration"
+        )
+        self.btn_popout.clicked.connect(self._popout_mirror)
+
+        self.btn_stop = QPushButton("■ Stop")
+        self.btn_stop.setProperty("role", "danger")
+        self.btn_stop.clicked.connect(self.stop)
+        self.btn_stop.setEnabled(False)
+
+        self.cmb_display = QComboBox()
+        self.cmb_display.addItem("default display", None)
         self.cmb_display.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.cmb_display.setMinimumWidth(160)
-        self.cmb_display.setToolTip("Which display to mirror. Head units expose "
-                                    "several (cluster, centre stack, passenger); "
-                                    "this list fills in automatically on connect.")
-        self.btn_record = QPushButton("🔴 Record…"); self.btn_record.setProperty("role", "ghost")
-        self.btn_record.setToolTip("Record the device screen to a video file. "
-                                   "Records on the device itself, so it works "
-                                   "while mirroring OR Live View, over RDP / "
-                                   "remote. Click again to stop & save.")
-        self.btn_record.setEnabled(False)        # while mirror or Live View is on
+        self.cmb_display.setMinimumWidth(150)
+        self.cmb_display.setToolTip(
+            "Which display to mirror. Multi-display head units expose cluster, center console, etc."
+        )
+        self.cmb_display.activated.connect(self._on_display_combo_changed)
+
+        self.btn_shot = QPushButton("📸 Screenshot")
+        self.btn_shot.setProperty("role", "ghost")
+        self.btn_shot.setToolTip("Capture a PNG screenshot of the device screen")
+        self.btn_shot.clicked.connect(self._take_screenshot)
+
+        self.btn_record = QPushButton("🔴 Record…")
+        self.btn_record.setProperty("role", "ghost")
+        self.btn_record.setToolTip(
+            "Record the device screen to a video file. Click again to stop & save."
+        )
+        self.btn_record.setEnabled(True)
         self.btn_record.clicked.connect(self._toggle_record)
 
-        # options live in a proper POPOVER panel (see _build_options_menu) —
-        # the old checkable-menu tick list read poorly and its stay-open hack
-        # felt broken; a real panel with checkboxes/radios + hints reads right
-        self.btn_opts = QToolButton(); self.btn_opts.setText("⚙ Options")
+        self.btn_opts = QToolButton()
+        self.btn_opts.setText("⚙ Options")
         self.btn_opts.setProperty("role", "ghost")
         self.btn_opts.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.btn_opts.setPopupMode(QToolButton.InstantPopup)
-        self.btn_opts.setToolTip("Mirror options (audio, IVI compatibility, "
-                                 "software rendering, embed, keyboard, camera).")
+        self.btn_opts.setToolTip(
+            "Mirror options (audio, IVI compatibility, software rendering, embed, keyboard, camera)."
+        )
         self.btn_opts.setMenu(self._build_options_menu(automotive, prefer_embed))
-        self.btn_shot = QPushButton("📸 Screenshot"); self.btn_shot.setProperty("role", "ghost")
-        self.btn_shot.setToolTip("Capture a PNG of the screen (works on any "
-                                 "device — phone, tablet or head unit).")
-        self.btn_shot.clicked.connect(self._take_screenshot)
-        # secondary actions live in ONE ⋯ More menu — thirteen buttons in a
-        # wrapping row was the "cluttered" look; the toolbar is now 8 items
-        self.btn_more = QToolButton(); self.btn_more.setText("⋯ More")
-        self.btn_more.setProperty("role", "ghost")
-        self.btn_more.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.btn_more.setPopupMode(QToolButton.InstantPopup)
-        mmore = QMenu(self.btn_more)
-        mmore.addAction("📷  Mirror the device camera", self._mirror_camera)
-        self.act_mirror_all = mmore.addAction(
-            "▦  Mirror ALL displays (each in its own window)", self._mirror_all)
-        self.act_mirror_all.setEnabled(False)
-        mmore.addAction("↻  Re-scan displays", self.refresh_displays)
-        mmore.addSeparator()
-        mmore.addAction("⌨  Type / paste a block of text…", self._type_text)
-        mmore.addSeparator()
-        self.act_max = mmore.addAction("⛶  Max view (hide side panels)")
+
+        self.act_max = QAction("⛶  Max view (hide side panels)", self)
         self.act_max.setCheckable(True)
         self.act_max.toggled.connect(self._toggle_max)
-        self.btn_more.setMenu(mmore)
 
-        for w in (self.btn_mirror, self.btn_live, self.btn_stop,
-                  self.btn_record, self.btn_shot,
-                  QLabel("Display:"), self.cmb_display,
-                  self.btn_opts, self.btn_more):
+        for w in (
+            self.btn_mirror,
+            self.btn_popout,
+            self.btn_stop,
+            self.btn_shot,
+            self.btn_record,
+            QLabel("Display:"),
+            self.cmb_display,
+            self.btn_opts,
+        ):
             bar.addWidget(w)
         lay.addWidget(bar_w)
 
-        self.status = QLabel("▶ Mirror = full scrcpy (best local/USB) · "
-                             "🖥 Live View = works anywhere (RDP / IVI) · "
-                             "settings under ⚙ Options")
+        self.display_tabs = QTabBar()
+        self.display_tabs.setDocumentMode(True)
+        self.display_tabs.currentChanged.connect(self._on_display_tab_changed)
+        self.display_tabs.hide()
+        lay.addWidget(self.display_tabs)
+
+        self.status = QLabel("")
         self.status.setAlignment(Qt.AlignCenter)
-        self.status.setWordWrap(True)
+        self.status.setVisible(False)
         lay.addWidget(self.status)
 
         # ---- the DEVICE KEYBOARD bar (shown while mirroring / Live View) ----
@@ -734,18 +806,21 @@ class MirrorPanel(QWidget):
         # appears when the mirror is embedded and hands it the real keyboard.
         self.kb_bar = QWidget()
         eb = QHBoxLayout(self.kb_bar)
-        eb.setContentsMargins(4, 2, 4, 2); eb.setSpacing(8)
+        eb.setContentsMargins(4, 2, 4, 2)
+        eb.setSpacing(8)
         self.kb_input = _DeviceKeyEdit(self._send_key)
         self.kb_input.setPlaceholderText(
             "⌨ click here, then type — every key goes live to the device "
-            "(Enter, Backspace, arrows too)")
+            "(Enter, Backspace, arrows too)"
+        )
         eb.addWidget(self.kb_input, 1)
         self.btn_kb_focus = QPushButton("🎯 Mirror keys")
         self.btn_kb_focus.setProperty("role", "ghost")
         self.btn_kb_focus.setToolTip(
             "Hand the REAL keyboard back to the embedded mirror window (scrcpy "
             "then injects keys itself). The field on the left always works "
-            "regardless.")
+            "regardless."
+        )
         self.btn_kb_focus.clicked.connect(self._focus_embedded)
         self.btn_kb_focus.hide()
         eb.addWidget(self.btn_kb_focus)
@@ -759,7 +834,7 @@ class MirrorPanel(QWidget):
         self.container.setAttribute(Qt.WA_NativeWindow, True)
         self.container.setStyleSheet("background:#000;")
         self.container.setMinimumHeight(200)
-        self.container.installEventFilter(self)     # click margins -> focus mirror
+        self.container.installEventFilter(self)  # click margins -> focus mirror
         lay.addWidget(self.container, 1)
 
         # screencap-based live view (shown instead of the container when active)
@@ -768,7 +843,7 @@ class MirrorPanel(QWidget):
         self.live_view.hide()
         self.live_view.tapped.connect(self._live_tap)
         self.live_view.swiped.connect(self._live_swipe)
-        self.live_view.key_typed.connect(self._send_key)   # type ON the image
+        self.live_view.key_typed.connect(self._send_key)  # type ON the image
         lay.addWidget(self.live_view, 1)
 
         # Load the display list LAZILY — only the first time this Mirror tab is
@@ -791,8 +866,8 @@ class MirrorPanel(QWidget):
         # a click on the container (its margins around the embedded child)
         # forwards keyboard focus to the mirror — matches what users expect
         from PyQt5.QtCore import QEvent
-        if obj is self.container and event.type() == QEvent.MouseButtonPress \
-                and self._child_hwnd:
+
+        if obj is self.container and event.type() == QEvent.MouseButtonPress and self._child_hwnd:
             self._focus_embedded()
         return super().eventFilter(obj, event)
 
@@ -805,10 +880,10 @@ class MirrorPanel(QWidget):
             return
         try:
             ctypes, u = _win_api()
-            top = u.GetAncestor(int(self.container.winId()), 2) \
-                if hasattr(u, "GetAncestor") else 0
+            top = u.GetAncestor(int(self.container.winId()), 2) if hasattr(u, "GetAncestor") else 0
             if top:
-                u.keybd_event(0x12, 0, 0, 0); u.keybd_event(0x12, 0, 0x0002, 0)
+                u.keybd_event(0x12, 0, 0, 0)
+                u.keybd_event(0x12, 0, 0x0002, 0)
                 u.SetForegroundWindow(top)
         except Exception:
             pass
@@ -824,8 +899,7 @@ class MirrorPanel(QWidget):
             ctypes, u = _win_api()
             k = ctypes.windll.kernel32
             cont = int(self.container.winId())
-            tid = u.GetWindowThreadProcessId(self._child_hwnd, None) \
-                if self._child_hwnd else 0
+            tid = u.GetWindowThreadProcessId(self._child_hwnd, None) if self._child_hwnd else 0
             mytid = k.GetCurrentThreadId()
             attached = False
             if tid and tid != mytid:
@@ -847,6 +921,7 @@ class MirrorPanel(QWidget):
         try:
             from PyQt5.QtGui import QCursor
             from PyQt5.QtWidgets import QApplication
+
             if QApplication.focusWidget() is self.kb_input:
                 return
             ctypes, u = _win_api()
@@ -884,8 +959,9 @@ class MirrorPanel(QWidget):
         old checkable menu whose tiny tick marks and stay-open hack read as
         broken. Toggling anything keeps the popover open; click outside (or the
         Done button) to dismiss."""
-        from PyQt5.QtWidgets import (QWidgetAction, QRadioButton, QButtonGroup)
+        from PyQt5.QtWidgets import QWidgetAction, QRadioButton, QButtonGroup, QGridLayout
         from . import theme, settings as _s
+
         _name = _s.get("theme")
         atext = theme.accent_text(_name)
         raised = theme.THEMES.get(_name, theme.THEMES["dark"])["raised"]
@@ -902,9 +978,11 @@ class MirrorPanel(QWidget):
 
         def section(text):
             lab = QLabel(text.upper())
-            lab.setStyleSheet(f"color:{atext}; font-weight:800; "
-                              f"font-size:8.5pt; letter-spacing:1px; "
-                              f"padding-top:8px;")
+            lab.setStyleSheet(
+                f"color:{atext}; font-weight:800; "
+                f"font-size:8.5pt; letter-spacing:1px; "
+                f"padding-top:8px;"
+            )
             v.addWidget(lab)
 
         def hint(text):
@@ -945,8 +1023,7 @@ class MirrorPanel(QWidget):
         self._kb_group.addButton(self.act_kb_uhid)
         v.addWidget(self.act_kb_sdk)
         v.addWidget(self.act_kb_uhid)
-        hint("UHID only if standard typing is ignored — most IVI kernels "
-             "don't support it")
+        hint("UHID only if standard typing is ignored — most IVI kernels don't support it")
 
         section("Camera source")
         cam_row = QHBoxLayout()
@@ -963,6 +1040,49 @@ class MirrorPanel(QWidget):
         cam_row.addStretch(1)
         v.addLayout(cam_row)
         hint("used by the 📷 Camera button (scrcpy 2.2+, Android 12+)")
+
+        section("Tools & Extras")
+        extra_grid = QGridLayout()
+        extra_grid.setSpacing(6)
+
+        self.btn_live = QPushButton("🖥 Live View (Fallback)")
+        self.btn_live.setProperty("role", "ghost")
+        self.btn_live.setToolTip("ADB screencap streaming fallback for restricted/RDP devices")
+        self.btn_live.clicked.connect(lambda: (menu.close(), self._start_live()))
+        extra_grid.addWidget(self.btn_live, 0, 0)
+
+        btn_cam = QPushButton("📷 Mirror Camera")
+        btn_cam.setProperty("role", "ghost")
+        btn_cam.setToolTip("Mirror front/back device camera via scrcpy")
+        btn_cam.clicked.connect(lambda: (menu.close(), self._mirror_camera()))
+        extra_grid.addWidget(btn_cam, 0, 1)
+
+        self.act_mirror_all = QPushButton("📱 Displays & Recording…")
+        self.act_mirror_all.setProperty("role", "ghost")
+        self.act_mirror_all.setEnabled(True)
+        self.act_mirror_all.setToolTip("View all displays with per-display Mirror & Record options")
+        self.act_mirror_all.clicked.connect(lambda: (menu.close(), self._show_display_manager()))
+        extra_grid.addWidget(self.act_mirror_all, 1, 0)
+
+        btn_scan = QPushButton("↻ Re-scan Displays")
+        btn_scan.setProperty("role", "ghost")
+        btn_scan.setToolTip("Query connected device displays")
+        btn_scan.clicked.connect(lambda: (menu.close(), self.refresh_displays()))
+        extra_grid.addWidget(btn_scan, 1, 1)
+
+        btn_text = QPushButton("⌨ Type / Paste Text…")
+        btn_text.setProperty("role", "ghost")
+        btn_text.setToolTip("Send multiline text block directly to device")
+        btn_text.clicked.connect(lambda: (menu.close(), self._type_text()))
+        extra_grid.addWidget(btn_text, 2, 0)
+
+        self.btn_toggle_max = QPushButton("⛶ Maximize View")
+        self.btn_toggle_max.setProperty("role", "ghost")
+        self.btn_toggle_max.setToolTip("Toggle hiding/restoring side panels")
+        self.btn_toggle_max.clicked.connect(lambda: (menu.close(), self.act_max.toggle()))
+        extra_grid.addWidget(self.btn_toggle_max, 2, 1)
+
+        v.addLayout(extra_grid)
 
         done_row = QHBoxLayout()
         done_row.addStretch(1)
@@ -985,16 +1105,18 @@ class MirrorPanel(QWidget):
             self._start_live()
 
     def _start_live(self):
-        if self._scrcpy is not None:             # switch away from scrcpy mirror
+        if self._scrcpy is not None:  # switch away from scrcpy mirror
             self.stop()
         if self._live is not None:
             return
         self.status.hide()
         self.container.hide()
         self.live_view.show()
-        self.live_view.setFocus(Qt.OtherFocusReason)   # ready to type immediately
-        self.log.emit("[OK] live view — click the image to tap/swipe, and just "
-                      "TYPE to send keys to the device (works on any device)")
+        self.live_view.setFocus(Qt.OtherFocusReason)  # ready to type immediately
+        self.log.emit(
+            "[OK] live view — click the image to tap/swipe, and just "
+            "TYPE to send keys to the device (works on any device)"
+        )
         self._live = _LiveThread(self.handler, max_fps=10.0)
         self._live.target_w = max(0, self.live_view.width())
         self._live.target_h = max(0, self.live_view.height())
@@ -1007,14 +1129,15 @@ class MirrorPanel(QWidget):
         if self._live is not None:
             live, self._live = self._live, None
             live.stop()
-            try:                       # ignore late frames from a mid-flight
-                live.frame.disconnect()          # screencap after we've stopped
+            try:  # ignore late frames from a mid-flight
+                live.frame.disconnect()  # screencap after we've stopped
             except Exception:
                 pass
             if not live.wait(900):
                 # a slow remote screencap is still running — DON'T drop the ref
                 # (a GC of a live QThread hard-crashes); park it until it exits
                 from .qtutil import park_thread
+
                 park_thread(live)
         self.live_view.hide()
         self.container.show()
@@ -1026,12 +1149,13 @@ class MirrorPanel(QWidget):
         # img arrives DECODED and pre-scaled from the worker — turning it into a
         # pixmap is the only work left on the UI thread, so no more stutter
         from PyQt5.QtGui import QPixmap
-        self._dev_w, self._dev_h = dev_w, dev_h    # native size for tap mapping
+
+        self._dev_w, self._dev_h = dev_w, dev_h  # native size for tap mapping
         pm = QPixmap.fromImage(img)
         if not pm.isNull():
             self.live_view.set_frame(pm)
-        if self._live is not None:                 # track view resizes for the
-            self._live.target_w = self.live_view.width()      # next frame
+        if self._live is not None:  # track view resizes for the
+            self._live.target_w = self.live_view.width()  # next frame
             self._live.target_h = self.live_view.height()
 
     def _live_tap(self, fx, fy):
@@ -1050,16 +1174,18 @@ class MirrorPanel(QWidget):
     def _live_input(self, fn):
         """Fire a tap/swipe without blocking the UI (a quick adb round-trip)."""
         import threading
-        threading.Thread(
-            target=lambda: self._safe(lambda: fn(self.handler)), daemon=True).start()
+
+        threading.Thread(target=lambda: self._safe(lambda: fn(self.handler)), daemon=True).start()
 
     def _type_text(self):
         """Type text into the device's focused field via adb (`input text`).
         Reliable for entering a URL etc. when the mirror's keyboard won't type."""
         text, ok = QInputDialog.getText(
-            self, "Type into the device",
+            self,
+            "Type into the device",
             "Text to send to the focused field on the device\n"
-            "(tap the field in the mirror FIRST so it has the cursor):")
+            "(tap the field in the mirror FIRST so it has the cursor):",
+        )
         if not ok or not text:
             return
         self.log.emit(f"sending text to device: {text!r}")
@@ -1068,12 +1194,16 @@ class MirrorPanel(QWidget):
         def work():
             try:
                 r = self.handler.input_text(text, safe=False)
-                self.log.emit("[OK] text sent" if r else
-                              "[WARNING] the device didn't accept injected text — "
-                              "make sure a text field is focused (tap it in the "
-                              "mirror first)")
+                self.log.emit(
+                    "[OK] text sent"
+                    if r
+                    else "[WARNING] the device didn't accept injected text — "
+                    "make sure a text field is focused (tap it in the "
+                    "mirror first)"
+                )
             except Exception as exc:
                 self.log.emit(f"[ERROR] type: {exc}")
+
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
@@ -1088,23 +1218,25 @@ class MirrorPanel(QWidget):
         enabled only when nothing is being viewed; Stop while viewing; Record
         while viewing OR already recording (it records device-side, so it can
         run alongside Live View)."""
-        viewing = (self._scrcpy is not None) or (self._live is not None) \
-            or bool(self._multi)
+        viewing = (self._scrcpy is not None) or (self._live is not None) or bool(self._multi)
         embedded = self._child_hwnd is not None
         self.btn_mirror.setEnabled(not viewing)
-        self.btn_live.setEnabled(not viewing)
-        self.act_mirror_all.setEnabled(not viewing and len(self._displays) > 1)
+        if hasattr(self, "btn_popout"):
+            self.btn_popout.setEnabled(not viewing or embedded)
+            self.btn_popout.setText("🗖 Detach to Window" if embedded else "🗖 Pop Out Window")
+        if hasattr(self, "btn_live"):
+            self.btn_live.setEnabled(not viewing)
+        self.act_mirror_all.setEnabled(True)
         self.btn_stop.setEnabled(viewing)
-        self.btn_record.setEnabled(viewing or self._recording)
+        self.btn_record.setEnabled(True)
         self.btn_record.setText("⏹ Stop recording" if self._recording else "🔴 Record…")
-        # The device-keyboard bar is only for cases where scrcpy's OWN native
-        # keyboard isn't available: the EMBEDDED window (foreign-window focus is
-        # unreliable) and Live View (screencap has no input at all). A separate
-        # scrcpy window types natively — just click it — so no bar is pushed on
-        # you there.
-        live = self._live is not None
-        self.kb_bar.setVisible(embedded or live)
         self.btn_kb_focus.setVisible(embedded)
+
+    def _popout_mirror(self):
+        """Launch scrcpy in a dedicated, native full-size floating window."""
+        if self._scrcpy is not None:
+            self.stop()
+        self.start(embed=False)
 
     # ----- mirror EVERY display, each in its own window -----
     def _mirror_all(self):
@@ -1115,7 +1247,7 @@ class MirrorPanel(QWidget):
             self.stop()
         self._stop_multi()
         st = settings_mod.load()
-        name = self.session_dict.get("name") or "turboadb"
+        name = (self.session_dict or {}).get("name") or "turboadb"
         launched = 0
         for d in self._displays:
             opts = ScrcpyOptions(
@@ -1126,23 +1258,27 @@ class MirrorPanel(QWidget):
                 no_audio=True,
                 display_id=d["id"],
                 keyboard_mode=self._kb_mode(),
-                window_title=f"{name} — display {d['id']}")
+                window_title=f"{name} — display {d['id']}",
+            )
             self._tune(opts)
             try:
-                res = self.handler.mirror(opts, compat=self.act_compat.isChecked(),
-                                          safe=True)
+                res = self.handler.mirror(opts, compat=self.act_compat.isChecked(), safe=True)
                 sess = res.value if isinstance(res, OperationResult) else res
                 if sess is not None:
-                    self._multi.append(sess); launched += 1
+                    self._multi.append(sess)
+                    launched += 1
             except Exception as exc:
                 self.log.emit(f"[WARNING] display {d['id']}: {exc}")
         if launched:
-            self.status.setText(f"Mirroring {launched} display(s), each in its own "
-                                f"window. “■ Stop” closes them all.")
+            self.status.setText(
+                f"Mirroring {launched} display(s), each in its own "
+                f"window. “■ Stop” closes them all."
+            )
             self.log.emit(f"[OK] mirroring {launched} display(s) in separate windows")
         else:
-            self.log.emit("[ERROR] could not mirror any display (try local/USB, or "
-                          "compatibility mode)")
+            self.log.emit(
+                "[ERROR] could not mirror any display (try local/USB, or compatibility mode)"
+            )
         self._refresh_buttons()
 
     def _stop_multi(self):
@@ -1166,6 +1302,7 @@ class MirrorPanel(QWidget):
         """Hide/show the main window's docks so the mirror gets the whole window
         — the practical way to make a portrait device screen big and readable."""
         from PyQt5.QtWidgets import QMainWindow, QDockWidget
+
         win = self.window()
         if not isinstance(win, QMainWindow):
             return
@@ -1174,8 +1311,7 @@ class MirrorPanel(QWidget):
         if on:
             # only hide docks that are showing, and restore exactly those —
             # blanket-showing everything un-hid docks the user had closed
-            self._max_hidden = [d for d in win.findChildren(QDockWidget)
-                                if d.isVisible()]
+            self._max_hidden = [d for d in win.findChildren(QDockWidget) if d.isVisible()]
             for d in self._max_hidden:
                 d.setVisible(False)
         else:
@@ -1185,9 +1321,21 @@ class MirrorPanel(QWidget):
                 except RuntimeError:
                     pass
             self._max_hidden = []
-        self.act_max.setText("⛶  Restore side panels" if on
-                             else "⛶  Max view (hide side panels)")
-        QTimer.singleShot(200, self._fit)       # re-fit the embed to the new size
+        self.act_max.setText("⛶  Restore side panels" if on else "⛶  Max view (hide side panels)")
+        QTimer.singleShot(200, self._fit)  # re-fit the embed to the new size
+
+    def _suspend_max(self):
+        """Temporarily restore docks when switching away from the mirror tab."""
+        for d in getattr(self, "_max_hidden", []):
+            try:
+                d.setVisible(True)
+            except Exception:
+                pass
+
+    def _resume_max(self):
+        """Re-hide docks when switching back to the mirror tab if max view is active."""
+        if hasattr(self, "act_max") and self.act_max.isChecked():
+            self._toggle_max(True)
 
     # ----- display list -----
     def refresh_displays(self):
@@ -1199,7 +1347,7 @@ class MirrorPanel(QWidget):
 
     def _got_displays(self, displays):
         self._displays = list(displays or [])
-        keep = self.cmb_display.currentData()       # preserve the user's choice
+        keep = self.cmb_display.currentData()  # preserve the user's choice
         self.cmb_display.clear()
         self.cmb_display.addItem("default display", None)
         for d in self._displays:
@@ -1208,25 +1356,229 @@ class MirrorPanel(QWidget):
         idx = self.cmb_display.findData(keep)
         if idx >= 0:
             self.cmb_display.setCurrentIndex(idx)
-        # let several IVI displays sit side by side
-        self.act_mirror_all.setEnabled(len(self._displays) > 1)
+        # Displays & Recording option is always enabled
+        self.act_mirror_all.setEnabled(True)
+
+        # Multi-display tab bar
+        if len(self._displays) > 1:
+            self.display_tabs.blockSignals(True)
+            while self.display_tabs.count():
+                self.display_tabs.removeTab(0)
+            for d in self._displays:
+                label = f"📱 Display {d['id']}" + (f" ({d['size']})" if d.get("size") else "")
+                t_idx = self.display_tabs.addTab(label)
+                self.display_tabs.setTabData(t_idx, d["id"])
+            cur_tab = 0
+            if keep is not None:
+                for i in range(self.display_tabs.count()):
+                    if self.display_tabs.tabData(i) == keep:
+                        cur_tab = i
+                        break
+            self.display_tabs.setCurrentIndex(cur_tab)
+            self.display_tabs.blockSignals(False)
+            self.display_tabs.show()
+        else:
+            self.display_tabs.hide()
+
         self.log.emit(f"[OK] {len(self._displays)} display(s) found")
 
+    def _on_display_tab_changed(self, idx: int):
+        if idx < 0:
+            return
+        disp_id = self.display_tabs.tabData(idx)
+        c_idx = self.cmb_display.findData(disp_id)
+        if c_idx >= 0:
+            self.cmb_display.blockSignals(True)
+            self.cmb_display.setCurrentIndex(c_idx)
+            self.cmb_display.blockSignals(False)
+        if self._scrcpy is not None:
+            self.stop()
+            self.start(display_id=disp_id)
+
+    def _on_display_combo_changed(self, idx: int):
+        if idx < 0:
+            return
+        disp_id = self.cmb_display.itemData(idx)
+        if hasattr(self, "display_tabs") and self.display_tabs.isVisible():
+            for i in range(self.display_tabs.count()):
+                if self.display_tabs.tabData(i) == disp_id:
+                    self.display_tabs.blockSignals(True)
+                    self.display_tabs.setCurrentIndex(i)
+                    self.display_tabs.blockSignals(False)
+                    break
+        if self._scrcpy is not None:
+            self.stop()
+            self.start(display_id=disp_id)
+
+    def _show_display_manager(self):
+        """Open an interactive dialog showing all detected displays, allowing the user
+        to select, mirror, record, or screenshot each display individually."""
+        from PyQt5.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Connected Displays & Recording")
+        dlg.setMinimumWidth(620)
+        vl = QVBoxLayout(dlg)
+        vl.setContentsMargins(18, 16, 18, 16)
+        vl.setSpacing(10)
+
+        title = QLabel("Device Displays & Multi-Screen Tools")
+        title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        vl.addWidget(title)
+
+        info = QLabel(
+            "Select any display to mirror, record, or screenshot independently. "
+            "Multi-display IVI units expose center console, cluster, passenger screen, etc."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #94a3b8; font-size: 9pt;")
+        vl.addWidget(info)
+
+        lbl_status = QLabel("")
+        lbl_status.setStyleSheet("font-size: 8.5pt; color: #64748b;")
+        vl.addWidget(lbl_status)
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Display ID", "Resolution", "Status", "Actions"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        vl.addWidget(table)
+
+        def populate():
+            current_disp = self.cmb_display.currentData()
+            displays_list = self._displays if self._displays else [{"id": 0, "size": "primary"}]
+            table.setRowCount(len(displays_list))
+
+            for row, d in enumerate(displays_list):
+                disp_id = d.get("id", row)
+                size = d.get("size", "") or "default"
+                name = f"Display {disp_id}" + (" (Primary)" if disp_id == 0 else "")
+                table.setItem(row, 0, QTableWidgetItem(name))
+                table.setItem(row, 1, QTableWidgetItem(str(size)))
+
+                is_active = (current_disp == disp_id) or (current_disp is None and disp_id == 0)
+                status_text = "🟢 Active" if is_active else "⚪ Available"
+                table.setItem(row, 2, QTableWidgetItem(status_text))
+
+                act_w = QWidget()
+                hl = QHBoxLayout(act_w)
+                hl.setContentsMargins(4, 2, 4, 2)
+                hl.setSpacing(6)
+
+                btn_m = QPushButton("▶ Mirror")
+                btn_m.setProperty("role", "ghost")
+                btn_m.setToolTip(f"Mirror Display {disp_id}")
+                btn_m.clicked.connect(lambda _=False, did=disp_id: (dlg.accept(), self._select_and_mirror(did)))
+                hl.addWidget(btn_m)
+
+                btn_r = QPushButton("🔴 Record")
+                btn_r.setProperty("role", "ghost")
+                btn_r.setToolTip(f"Record Display {disp_id}")
+                btn_r.clicked.connect(lambda _=False, did=disp_id: (dlg.accept(), self._select_and_record(did)))
+                hl.addWidget(btn_r)
+
+                btn_s = QPushButton("📸 Shot")
+                btn_s.setProperty("role", "ghost")
+                btn_s.setToolTip(f"Screenshot Display {disp_id}")
+                btn_s.clicked.connect(lambda _=False, did=disp_id: (dlg.accept(), self._take_screenshot(display_id=did)))
+                hl.addWidget(btn_s)
+
+                table.setCellWidget(row, 3, act_w)
+
+        populate()
+
+        btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("↻ Refresh Displays")
+        dlg_alive = True
+
+        def on_dlg_finished():
+            nonlocal dlg_alive
+            dlg_alive = False
+
+        dlg.finished.connect(on_dlg_finished)
+
+        def on_refresh_clicked():
+            if not dlg_alive:
+                return
+            btn_refresh.setEnabled(False)
+            lbl_status.setText("⏳ Querying device displays...")
+            self.refresh_displays()
+            if hasattr(self, "_dt") and self._dt is not None:
+                def on_done(disps=None):
+                    if not dlg_alive:
+                        return
+                    populate()
+                    lbl_status.setText(f"✔ Found {len(self._displays)} display(s)")
+                    btn_refresh.setEnabled(True)
+                def on_fail(err):
+                    if not dlg_alive:
+                        return
+                    lbl_status.setText(f"Display query error: {err}")
+                    btn_refresh.setEnabled(True)
+                self._dt.done.connect(on_done)
+                self._dt.fail.connect(on_fail)
+            else:
+                populate()
+                btn_refresh.setEnabled(True)
+
+        btn_refresh.clicked.connect(on_refresh_clicked)
+        btn_row.addWidget(btn_refresh)
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        vl.addLayout(btn_row)
+
+        if not self._displays:
+            on_refresh_clicked()
+
+        dlg.exec_()
+
+    def _sync_display_selection(self, disp_id):
+        c_idx = self.cmb_display.findData(disp_id)
+        if c_idx >= 0:
+            self.cmb_display.blockSignals(True)
+            self.cmb_display.setCurrentIndex(c_idx)
+            self.cmb_display.blockSignals(False)
+        if hasattr(self, "display_tabs") and self.display_tabs.isVisible():
+            for i in range(self.display_tabs.count()):
+                if self.display_tabs.tabData(i) == disp_id:
+                    self.display_tabs.blockSignals(True)
+                    self.display_tabs.setCurrentIndex(i)
+                    self.display_tabs.blockSignals(False)
+                    break
+
+    def _select_and_mirror(self, disp_id):
+        self._sync_display_selection(disp_id)
+        if self._scrcpy is not None:
+            self.stop()
+        self.start(display_id=disp_id)
+
+    def _select_and_record(self, disp_id):
+        self._sync_display_selection(disp_id)
+        self._begin_record(display_id=disp_id)
+
+
     def _tune(self, opts):
-        """Apply the 'software render (RDP)' choice and, in that mode, sensible
-        caps so the picture stays smooth over a remote/GPU-less link. The old
-        1024 px / 4M caps looked visibly soft and blocky — 1280 px / 8M is still
-        smooth in software rendering (with linear SDL scaling set at launch) but
-        markedly sharper. Settings → scrcpy overrides these when set."""
+        """Apply performance and quality tuning. Over GPU-accelerated local sessions,
+        preserves native resolution and high 16M bitrate identical to native scrcpy.
+        Over Remote Desktop, applies software rendering and sensible caps."""
         if self.act_soft.isChecked():
             opts.render_driver = "software"
             opts.max_size = opts.max_size or 1280
             opts.bit_rate = opts.bit_rate or "8M"
             opts.max_fps = opts.max_fps or 30
             if not opts.no_audio:
-                self.log.emit("[INFO] tip: untick ⚙ Options → Forward audio for "
-                              "an even smoother mirror over Remote Desktop "
-                              "(audio costs extra CPU + bandwidth there)")
+                self.log.emit(
+                    "[INFO] tip: untick ⚙ Options → Forward audio for "
+                    "an even smoother mirror over Remote Desktop "
+                    "(audio costs extra CPU + bandwidth there)"
+                )
+        else:
+            if not opts.bit_rate:
+                opts.bit_rate = "16M"
         return opts
 
     # ----- screen recording (device-side; works with mirror OR Live View) -----
@@ -1236,22 +1588,23 @@ class MirrorPanel(QWidget):
         else:
             self._begin_record()
 
-    def _begin_record(self):
-        if self._scrcpy is None and self._live is None:
-            QMessageBox.information(
-                self, "Record",
-                "Start the mirror (▶ Mirror) or Live View first, then Record.\n\n"
-                "Recording captures what you're viewing on the device.")
-            return
-        default = os.path.join(_default_save_dir(),
-                               time.strftime("recording-%Y%m%d-%H%M%S.mp4"))
+    def _begin_record(self, display_id="__use_combo__"):
+        if display_id == "__use_combo__":
+            disp_id = self.cmb_display.currentData()
+        else:
+            disp_id = display_id
+        disp_lbl = f"Display {disp_id}" if disp_id is not None else "Device Screen"
+        tag = f"disp{disp_id}-" if disp_id is not None else ""
+        default = os.path.join(_default_save_dir(), time.strftime(f"recording-{tag}%Y%m%d-%H%M%S.mp4"))
         path, _sel = QFileDialog.getSaveFileName(
-            self, "Record the device screen to…", default, "MP4 video (*.mp4)")
+            self, f"Record {disp_lbl} to…", default, "MP4 video (*.mp4)"
+        )
         if not path:
             return
         if not path.lower().endswith(".mp4"):
             path += ".mp4"
         self._rec_path = path
+        self._rec_display_id = disp_id
         self._recording = True
         # Prefer scrcpy --record: it muxes the H.264 stream from the first REAL
         # frame, so there's no encoder warm-up black frame, no 3-min cap, and it's
@@ -1260,42 +1613,49 @@ class MirrorPanel(QWidget):
         # REMOTE adb server, scrcpy's tunnel is fragile, so use the device-side
         # screenrecord (universal, auto-continues past the 3-min cap).
         cfg = getattr(self.handler, "config", None)
-        remote = bool(cfg and cfg.adb_server_host) \
-            and not is_local_host(cfg.adb_server_host)
+        remote = bool(cfg and cfg.adb_server_host) and not is_local_host(cfg.adb_server_host)
         if (not remote) and scrcpy_available(cfg.scrcpy_path if cfg else None):
-            self._record_scrcpy(path)
+            self._record_scrcpy(path, display_id=disp_id)
         else:
-            self._record_device(path)
+            self._record_device(path, display_id=disp_id)
         self._refresh_buttons()
 
-    def _record_scrcpy(self, path):
+    def _record_scrcpy(self, path, display_id=None):
         """Record via an OFF-SCREEN scrcpy --record window — clean (no black start),
         sharp, no time limit. Stopped politely so the mp4 is finalized."""
         self._rec_mode = "scrcpy"
         self._rec_title = f"turboadb-rec-{os.getpid()}-{id(self)}"
         st = settings_mod.load()
+        disp_id = display_id if display_id is not None else getattr(self, "_rec_display_id", None)
+        if disp_id is None:
+            disp_id = self.cmb_display.currentData()
+        disp_str = f" Display {disp_id}" if disp_id is not None else ""
         opts = ScrcpyOptions(
             max_size=(st.get("scrcpy_max_size") or None),
             bit_rate=st.get("scrcpy_bit_rate") or None,
             video_codec=(st.get("scrcpy_video_codec") or None),
-            no_audio=True, no_control=True, stay_awake=True,
-            display_id=self.cmb_display.currentData(),
-            record=path, record_format="mp4",
-            window_title=self._rec_title, window_borderless=True,
-            window_x=-32000, window_y=-32000)        # off-screen: no window shows
+            no_audio=True,
+            no_control=True,
+            stay_awake=True,
+            display_id=disp_id,
+            record=path,
+            record_format="mp4",
+            no_playback=True,
+        )
         self._tune(opts)
-        res = self.handler.mirror(opts, compat=self.act_compat.isChecked(),
-                                  safe=True)
+        res = self.handler.mirror(opts, compat=self.act_compat.isChecked(), safe=True)
         sess = res.value if isinstance(res, OperationResult) else res
         if sess is None or (isinstance(res, OperationResult) and not res.success):
-            self.log.emit("[WARNING] scrcpy recorder didn't start — using the "
-                          "device-side recorder instead")
-            self._record_device(path)
+            self.log.emit(
+                "[WARNING] scrcpy recorder didn't start — using the device-side recorder instead"
+            )
+            self._record_device(path, display_id=disp_id)
             return
         self._rec_scrcpy = sess
-        self.status.setText(f"● Recording (scrcpy — sharp, no time limit) → {path}")
-        self.log.emit(f"[OK] recording with scrcpy: no black warm-up frame, no "
-                      f"3-min limit → {path}")
+        self.status.setText(f"● Recording{disp_str} (scrcpy) → {path}")
+        self.log.emit(
+            f"[OK] recording{disp_str} with scrcpy: no black warm-up frame, no 3-min limit → {path}"
+        )
         QTimer.singleShot(2500, self._check_rec_scrcpy)
 
     def _check_rec_scrcpy(self):
@@ -1305,30 +1665,38 @@ class MirrorPanel(QWidget):
         if self._rec_mode != "scrcpy" or not self._recording:
             return
         if self._rec_scrcpy is not None and not self._rec_scrcpy.running:
-            self.log.emit("[WARNING] scrcpy recorder stopped early — switching to "
-                          "device-side recording")
+            self.log.emit(
+                "[WARNING] scrcpy recorder stopped early — switching to device-side recording"
+            )
             self._rec_scrcpy = None
             if self._recording:
-                self._record_device(self._rec_path)
+                disp_id = getattr(self, "_rec_display_id", None)
+                self._record_device(self._rec_path, display_id=disp_id)
 
-    def _record_device(self, path):
+    def _record_device(self, path, display_id=None):
         """Record on the device (``screenrecord``) and pull it — works everywhere
         (Live View, remote/RDP), auto-continuing past Android's ~3-min cap."""
         import threading
+
         self._rec_mode = "device"
         st = settings_mod.load()
         br = st.get("scrcpy_bit_rate") or "16M"
         bits = _bitrate_to_bps(br)
+        disp_id = display_id if display_id is not None else getattr(self, "_rec_display_id", None)
+        if disp_id is None:
+            disp_id = self.cmb_display.currentData()
+        disp_str = f" Display {disp_id}" if disp_id is not None else ""
         self._rec_stop = threading.Event()
-        self._rec_thread = _RecordThread(self.handler, path, self._rec_stop,
-                                         bit_rate=bits)
+        self._rec_thread = _RecordThread(self.handler, path, self._rec_stop, bit_rate=bits, display_id=disp_id)
         self._rec_thread.done.connect(self._record_finished)
         self._rec_thread.fail.connect(self._record_failed)
         self._rec_thread.part.connect(self._record_part)
         self._rec_thread.start()
-        self.status.setText(f"● Recording the device screen → {path}")
-        self.log.emit(f"[OK] recording at {br} (device-side; auto-continues past "
-                      f"the ~3-min Android cap) → {path}")
+        self.status.setText(f"● Recording{disp_str} the device screen → {path}")
+        self.log.emit(
+            f"[OK] recording{disp_str} at {br} (device-side; auto-continues past "
+            f"the ~3-min Android cap) → {path}"
+        )
 
     def _stop_record(self):
         if not self._recording:
@@ -1338,48 +1706,53 @@ class MirrorPanel(QWidget):
         self.log.emit("Finishing the recording (saving to your PC)…")
         self.status.setText("Finishing the recording…")
         if self._rec_mode == "scrcpy" and self._rec_scrcpy is not None:
-            # WM_CLOSE -> scrcpy finalizes the mp4 cleanly; wait for it off-thread
-            _post_close(self._rec_title)
             sess, self._rec_scrcpy = self._rec_scrcpy, None
             self._rec_wait = _RecWaitThread(sess, graceful=True)
             self._rec_wait.done.connect(self._on_rec_wait_done)
             self._rec_wait.start()
         elif self._rec_stop is not None:
-            self._rec_stop.set()             # tell screenrecord to stop & pull
+            self._rec_stop.set()  # tell screenrecord to stop & pull
 
     def _on_rec_wait_done(self, clean):
         if not clean:
-            self.log.emit("[WARNING] the recorder didn't close cleanly and had "
-                          "to be force-stopped — the video file may be "
-                          "truncated; check it plays before relying on it")
+            self.log.emit(
+                "[WARNING] the recorder didn't close cleanly and had "
+                "to be force-stopped — the video file may be "
+                "truncated; check it plays before relying on it"
+            )
         self._record_finished([self._rec_path])
 
     def _record_part(self, n):
-        self.status.setText(f"● Recording — part {n} (Android caps each clip at "
-                            f"~3 min; the previous part was saved)…")
+        self.status.setText(
+            f"● Recording — part {n} (Android caps each clip at "
+            f"~3 min; the previous part was saved)…"
+        )
         self.log.emit(f"[INFO] 3-min cap reached — continuing in part {n}")
 
     def _record_finished(self, parts):
         self._recording = False
         self._refresh_buttons()
         self.status.show()
-        parts = [p for p in (parts or [])
-                 if p and os.path.exists(p) and os.path.getsize(p) > 0]
+        parts = [p for p in (parts or []) if p and os.path.exists(p) and os.path.getsize(p) > 0]
         if not parts:
             bad = self._rec_path or ""
             self.log.emit(f"[ERROR] recording file is empty → {bad}")
-            QMessageBox.warning(self, "Recording",
-                                f"The recording didn't save any data:\n{bad}\n\n"
-                                "Some head units block screenrecord (secure "
-                                "surface). Try a screenshot instead.")
+            QMessageBox.warning(
+                self,
+                "Recording",
+                f"The recording didn't save any data:\n{bad}\n\n"
+                "Some head units block screenrecord (secure "
+                "surface). Try a screenshot instead.",
+            )
             return
         if len(parts) == 1:
             self.log.emit(f"[OK] recording saved → {parts[0]}")
             self._saved_popup("Recording", parts[0])
         else:
             names = ", ".join(os.path.basename(p) for p in parts)
-            self.log.emit(f"[OK] long recording saved in {len(parts)} parts "
-                          f"(Android's 3-min cap): {names}")
+            self.log.emit(
+                f"[OK] long recording saved in {len(parts)} parts (Android's 3-min cap): {names}"
+            )
             self._saved_popup(f"Recording — {len(parts)} parts", parts[0])
 
     def _record_failed(self, msg):
@@ -1389,18 +1762,22 @@ class MirrorPanel(QWidget):
         QMessageBox.warning(self, "Recording", f"Recording failed:\n{msg}")
 
     # ----- screenshot -----
-    def _take_screenshot(self):
-        default = os.path.join(_default_save_dir(),
-                               time.strftime("screenshot-%Y%m%d-%H%M%S.png"))
+    def _take_screenshot(self, display_id=None):
+        if display_id is None:
+            display_id = self.cmb_display.currentData()
+        disp_tag = f"-disp{display_id}" if display_id is not None else ""
+        default = os.path.join(_default_save_dir(), time.strftime(f"screenshot{disp_tag}-%Y%m%d-%H%M%S.png"))
         path, _sel = QFileDialog.getSaveFileName(
-            self, "Save a screenshot to…", default, "PNG image (*.png)")
+            self, "Save a screenshot to…", default, "PNG image (*.png)"
+        )
         if not path:
             return
         if not path.lower().endswith(".png"):
             path += ".png"
         self.btn_shot.setEnabled(False)
-        self.log.emit("Capturing screenshot…")
-        self._shot = _ShotThread(self.handler, path)
+        disp_lbl = f" Display {display_id}" if display_id is not None else ""
+        self.log.emit(f"Capturing screenshot{disp_lbl}…")
+        self._shot = _ShotThread(self.handler, path, display_id=display_id)
         self._shot.done.connect(self._shot_done)
         self._shot.fail.connect(self._shot_fail)
         self._shot.start()
@@ -1433,13 +1810,21 @@ class MirrorPanel(QWidget):
             _reveal_path(path)
 
     # ----- start / stop -----
-    def start(self, display_id="__use_combo__", compat=None, embed=None,
-              record=None, record_format=None, camera=None, _retry=False):
-        if self._closing:                        # tab closed during a retry delay
+    def start(
+        self,
+        display_id="__use_combo__",
+        compat=None,
+        embed=None,
+        record=None,
+        record_format=None,
+        camera=None,
+        _retry=False,
+    ):
+        if self._closing:  # tab closed during a retry delay
             return
         if not _retry:
-            self._retry_count = 0                # a fresh manual start
-        if self._live is not None:               # switch away from Live View
+            self._retry_count = 0  # a fresh manual start
+        if self._live is not None:  # switch away from Live View
             self._stop_live()
         if self._scrcpy is not None:
             self.stop()
@@ -1462,9 +1847,11 @@ class MirrorPanel(QWidget):
         if self.act_soft.isChecked():
             compat = True
             if embed:
-                self.log.emit("[INFO] embedding over Remote Desktop — if the "
-                              "picture stays black, untick “Embed window in "
-                              "this tab” and mirror in a separate window")
+                self.log.emit(
+                    "[INFO] embedding over Remote Desktop — if the "
+                    "picture stays black, untick “Embed window in "
+                    "this tab” and mirror in a separate window"
+                )
 
         st = settings_mod.load()
         opts = ScrcpyOptions(
@@ -1474,23 +1861,29 @@ class MirrorPanel(QWidget):
             stay_awake=st.get("scrcpy_stay_awake", True),
             turn_screen_off=st.get("scrcpy_turn_screen_off", False),
             no_audio=not self.act_audio.isChecked(),
-            record=record, record_format=record_format,
+            record=record,
+            record_format=record_format,
             display_id=display_id,
             video_source=("camera" if camera else None),
             camera_facing=(camera or None),
             keyboard_mode=self._kb_mode(),
-            window_title=self.session_dict.get("name") or "turboadb")
+            window_title=(self.session_dict or {}).get("name") or "turboadb",
+        )
         self._tune(opts)
         if camera:
             self.status.setText(f"Camera ({camera}) — live view")
         if opts.render_driver == "software":
-            self.log.emit("[INFO] using software rendering (Remote Desktop / "
-                          "GPU-less) — capped to keep it smooth")
+            self.log.emit(
+                "[INFO] using software rendering (Remote Desktop / "
+                "GPU-less) — capped to keep it smooth"
+            )
         if opts.keyboard_mode == "uhid":
-            self.log.emit("[WARNING] keyboard = UHID (explicitly selected). Most "
-                          "IVI/head-unit kernels have NO uhid support — if typing "
-                          "does nothing, switch ⚙ Options → Keyboard mode back to "
-                          "Standard (SDK), which is what plain scrcpy uses.")
+            self.log.emit(
+                "[WARNING] keyboard = UHID (explicitly selected). Most "
+                "IVI/head-unit kernels have NO uhid support — if typing "
+                "does nothing, switch ⚙ Options → Keyboard mode back to "
+                "Standard (SDK), which is what plain scrcpy uses."
+            )
 
         do_embed = embed and _IS_WIN
         if do_embed:
@@ -1506,22 +1899,26 @@ class MirrorPanel(QWidget):
         self._win_title = opts.window_title
 
         import tempfile
-        self._log_path = os.path.join(tempfile.gettempdir(),
-                                      f"turboadb-scrcpy-{os.getpid()}.log")
+
+        self._log_path = os.path.join(tempfile.gettempdir(), f"turboadb-scrcpy-{os.getpid()}.log")
         self._compat = compat
         self._embed_on = do_embed
-        res = self.handler.mirror(opts, compat=compat, log_path=self._log_path,
-                                  safe=True)
-        if isinstance(res, OperationResult) and not res.success:
-            self.status.setText("Mirror failed.")
-            self.log.emit(f"[ERROR] scrcpy: {res.error}")
-            QMessageBox.warning(self, "scrcpy", f"{res.error}\n\nTip: try compat "
-                                "mode, a specific display, or check that scrcpy is "
-                                "installed (ribbon → Get tools).")
+        self.status.setText("Launching scrcpy…")
+        self._launch_thread = _MirrorLaunchThread(self.handler, opts, compat, self._log_path)
+        self._launch_thread.done.connect(
+            lambda sess, emb=do_embed: self._on_mirror_launched(sess, emb)
+        )
+        self._launch_thread.fail.connect(self._on_mirror_launch_failed)
+        self._launch_thread.finished.connect(self._launch_thread.deleteLater)
+        self._launch_thread.start()
+
+    def _on_mirror_launched(self, sess, do_embed):
+        if sess is None:
+            self._on_mirror_launch_failed("No scrcpy session created")
             return
-        self._scrcpy = res.value if isinstance(res, OperationResult) else res
-        self._start_t = __import__("time").time()
-        self._became_ready = False           # set once it renders / embeds
+        self._scrcpy = sess
+        self._start_t = time.time()
+        self._became_ready = False  # set once it renders / embeds
         self._refresh_buttons()
         # watch for the scrcpy window being closed so the buttons reset
         self._mon = QTimer(self)
@@ -1536,11 +1933,27 @@ class MirrorPanel(QWidget):
             self._embed_timer.start(200)
             self.log.emit("[OK] scrcpy launching (embedded)…")
         else:
-            self.status.setText("Mirroring in a separate window — click it and "
-                                "type / use the mouse directly (native scrcpy).")
-            self.log.emit("[OK] scrcpy launched in a separate window — keyboard "
-                          "and mouse work DIRECTLY in that window, exactly like "
-                          "plain scrcpy (no need for the tool's keyboard bar)")
+            self.status.setText(
+                "Mirroring in a separate window — click it and "
+                "type / use the mouse directly (native scrcpy)."
+            )
+            self.log.emit(
+                "[OK] scrcpy launched in a separate window — keyboard "
+                "and mouse work DIRECTLY in that window, exactly like "
+                "plain scrcpy (no need for the tool's keyboard bar)"
+            )
+
+    def _on_mirror_launch_failed(self, error):
+        self.status.setText("Mirror failed.")
+        self.log.emit(f"[ERROR] scrcpy: {error}")
+        QMessageBox.warning(
+            self,
+            "scrcpy",
+            f"{error}\n\nTip: try compat "
+            "mode, a specific display, or check that scrcpy is "
+            "installed (ribbon → Get tools).",
+        )
+        self._refresh_buttons()
 
     # markers that prove scrcpy actually brought up VIDEO (so a later exit is a
     # normal close, NOT a failed start). Deliberately NOT "Device:" / "New
@@ -1548,11 +1961,18 @@ class MirrorPanel(QWidget):
     # decoder, so a connect-then-die failure used to look "started" and was left
     # alone (the "fake started" bug). Only a renderer/texture/recording line
     # means a frame actually flowed.
-    _HEALTHY = ("Renderer:", "Texture:", "Recording started", "INFO: Renderer",
-                "Frame: ", "v4l2", "audio player")
-    _STARTUP_TIMEOUT = 6.0        # no scrcpy window within this = hung/failed
-    _STARTUP_GRACE = 5.0         # a mirror that dies this fast = failed start
-    _EMBED_SETTLE = 0.6          # let the window render its 1st frame before we adopt it
+    _HEALTHY = (
+        "Renderer:",
+        "Texture:",
+        "Recording started",
+        "INFO: Renderer",
+        "Frame: ",
+        "v4l2",
+        "audio player",
+    )
+    _STARTUP_TIMEOUT = 6.0  # no scrcpy window within this = hung/failed
+    _STARTUP_GRACE = 5.0  # a mirror that dies this fast = failed start
+    _EMBED_SETTLE = 0.6  # let the window render its 1st frame before we adopt it
 
     def _scrcpy_window_up(self) -> bool:
         """True once scrcpy has actually put its window up — the reliable
@@ -1564,6 +1984,7 @@ class MirrorPanel(QWidget):
         if not _IS_WIN:
             # no cheap window probe off Windows — fall back to a time grace
             import time
+
             return (time.time() - getattr(self, "_start_t", 0)) > self._STARTUP_TIMEOUT
         title = getattr(self, "_win_title", None)
         if not title:
@@ -1582,12 +2003,14 @@ class MirrorPanel(QWidget):
         if self._scrcpy is None:
             return
         import time
+
         err_live = self._scrcpy.read_log() or ""
         # readiness = the window is up (fast, while running) OR a video marker is
         # in the log (a fallback that lands at exit, when the buffered log flushes
         # — covers scrcpy builds whose window title we can't match)
-        if not self._became_ready and (self._scrcpy_window_up()
-                or any(m in err_live for m in self._HEALTHY)):
+        if not self._became_ready and (
+            self._scrcpy_window_up() or any(m in err_live for m in self._HEALTHY)
+        ):
             self._became_ready = True
 
         running = self._scrcpy.running
@@ -1596,9 +2019,11 @@ class MirrorPanel(QWidget):
         # server-push race can leave scrcpy waiting forever) — kill it so the
         # retry path runs instead of the user staring at nothing
         if running and not self._became_ready and ran_s > self._STARTUP_TIMEOUT:
-            self.log.emit(f"[WARNING] scrcpy didn't show a window within "
-                          f"{int(self._STARTUP_TIMEOUT)}s — treating as a failed "
-                          f"start and retrying.")
+            self.log.emit(
+                f"[WARNING] scrcpy didn't show a window within "
+                f"{int(self._STARTUP_TIMEOUT)}s — treating as a failed "
+                f"start and retrying."
+            )
             try:
                 self._scrcpy.stop()
             except Exception:
@@ -1621,7 +2046,8 @@ class MirrorPanel(QWidget):
         self._stop_embed_timer()
         self._child_hwnd = None
         if getattr(self, "_mon", None):
-            self._mon.stop(); self._mon = None
+            self._mon.stop()
+            self._mon = None
         self._refresh_buttons()
         self.status.show()
 
@@ -1650,34 +2076,39 @@ class MirrorPanel(QWidget):
             # + forward tunnel + no embed) — the safe fallback that fixes
             # automotive/IVI encoder, reverse-tunnel and embed failures
             self._retry_count = 2
-            self.log.emit("[WARNING] still didn't start; one more try in "
-                          "compatibility mode, separate window…")
+            self.log.emit(
+                "[WARNING] still didn't start; one more try in compatibility mode, separate window…"
+            )
             self.status.setText("Retrying in compatibility mode…")
-            QTimer.singleShot(600, lambda: self.start(compat=True, embed=False,
-                                                      _retry=True))
+            QTimer.singleShot(600, lambda: self.start(compat=True, embed=False, _retry=True))
             return
         # gave up after 3 real attempts — show scrcpy's ACTUAL output + reason
         self._retry_count = 0
-        self.log.emit("[ERROR] scrcpy could not start after 3 attempts. "
-                      "Last output: " + tail)
+        self.log.emit("[ERROR] scrcpy could not start after 3 attempts. Last output: " + tail)
         self.status.setText("Mirror couldn't start — see the log below.")
-        self._show_scrcpy_log(err or "(scrcpy exited immediately with no output. "
-                              "It likely couldn't reach the device, or couldn't "
-                              "open a video encoder for this display.)")
+        self._show_scrcpy_log(
+            err
+            or "(scrcpy exited immediately with no output. "
+            "It likely couldn't reach the device, or couldn't "
+            "open a video encoder for this display.)"
+        )
 
     def _show_scrcpy_log(self, err):
         """Show scrcpy's full output so a failure (esp. over RDP / on an IVI) is
         diagnosable instead of a one-line 'failed'."""
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QPlainTextEdit,
-                                     QDialogButtonBox, QLabel)
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QDialogButtonBox, QLabel
         from PyQt5.QtGui import QFont
-        dlg = QDialog(self); dlg.setWindowTitle("scrcpy couldn't start")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("scrcpy couldn't start")
         dlg.resize(720, 460)
         v = QVBoxLayout(dlg)
         low = err.lower()
-        is_remote = bool(getattr(self.handler, "config", None)
-                         and self.handler.config.adb_server_host)
+        is_remote = bool(
+            getattr(self.handler, "config", None) and self.handler.config.adb_server_host
+        )
         from ..scrcpy import TUNNEL_PORT
+
         if is_remote:
             hint = (
                 "Mirroring a device on a REMOTE adb server is the hard case: "
@@ -1692,23 +2123,36 @@ class MirrorPanel(QWidget):
                 "MOST RELIABLE: run TurboADB ON that PC (e.g. via RDP) and "
                 "connect to the device locally (USB/Network) — then there's no "
                 "network video tunnel at all. Mirroring a remote device's screen "
-                "across the network is inherently fragile.")
-        elif ("start-server" in low or "server connection" in low
-              or "no host" in low or "could not start adb" in low):
-            hint = ("scrcpy couldn't reach the adb server. Try the Devices ▾ menu "
-                    "→ “Restart ADB server”, then mirror again. The exact command "
-                    "and server address are at the top of the log below.")
+                "across the network is inherently fragile."
+            )
+        elif (
+            "start-server" in low
+            or "server connection" in low
+            or "no host" in low
+            or "could not start adb" in low
+        ):
+            hint = (
+                "scrcpy couldn't reach the adb server. Try the Devices ▾ menu "
+                "→ “Restart ADB server”, then mirror again. The exact command "
+                "and server address are at the top of the log below."
+            )
         else:
-            hint = ("Tips: tick “compat (IVI)” and “software render (RDP)”, use a "
-                    "separate window (untick embed), and try a specific display. "
-                    "The exact scrcpy command is at the top of the log below.")
-        lab = QLabel(hint); lab.setWordWrap(True); v.addWidget(lab)
-        view = QPlainTextEdit(); view.setReadOnly(True)
+            hint = (
+                "Tips: tick “compat (IVI)” and “software render (RDP)”, use a "
+                "separate window (untick embed), and try a specific display. "
+                "The exact scrcpy command is at the top of the log below."
+            )
+        lab = QLabel(hint)
+        lab.setWordWrap(True)
+        v.addWidget(lab)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
         view.setFont(QFont("Consolas", 9))
         view.setPlainText(err or "(scrcpy produced no output)")
         v.addWidget(view, 1)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
-        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
         v.addWidget(bb)
         dlg.exec_()
 
@@ -1716,9 +2160,11 @@ class MirrorPanel(QWidget):
         self._embed_tries += 1
         if self._scrcpy is None or not self._scrcpy.running:
             self._stop_embed_timer()
-            self.status.setText("scrcpy exited before it could be embedded. "
-                                "Try compat mode, or “Open in window”. Over Remote "
-                                "Desktop, scrcpy may need a local GPU.")
+            self.status.setText(
+                "scrcpy exited before it could be embedded. "
+                "Try compat mode, or “Open in window”. Over Remote "
+                "Desktop, scrcpy may need a local GPU."
+            )
             self._scrcpy = None
             self._refresh_buttons()
             return
@@ -1746,23 +2192,29 @@ class MirrorPanel(QWidget):
             self._child_hwnd = hwnd
             self._stop_embed_timer()
             try:
-                _reparent(hwnd, int(self.container.winId()),
-                          self.container.width(), self.container.height())
+                _reparent(
+                    hwnd,
+                    int(self.container.winId()),
+                    self.container.width(),
+                    self.container.height(),
+                )
                 self.status.setText("")
                 self.status.hide()
-                self._refresh_buttons()          # shows the 🎯 Mirror keys button
+                self._refresh_buttons()  # shows the 🎯 Mirror keys button
                 # hand the keyboard straight to the mirror, so typing works
                 # immediately — exactly like clicking into native scrcpy
                 QTimer.singleShot(200, self._focus_embedded)
-                self.log.emit("[OK] scrcpy embedded — move the mouse over the "
-                              "screen and type: keys go to the device via adb. "
-                              "(Click 🎯 if focus wanders; the ⌨ bar also works.)")
+                self.log.emit(
+                    "[OK] scrcpy embedded — move the mouse over the "
+                    "screen and type: keys go to the device via adb. "
+                    "(Click 🎯 if focus wanders; the ⌨ bar also works.)"
+                )
                 # scrcpy/SDL resizes its own window to the video frame after the
                 # first frame — keep forcing it to fill the container for a few
                 # seconds so it doesn't shrink back to a tiny window.
                 self._fit_timer = QTimer(self)
                 self._fit_timer.timeout.connect(self._fit)
-                self._fit_timer.start(500)     # keeps it filling the whole session
+                self._fit_timer.start(500)  # keeps it filling the whole session
                 self._fit()
                 # KEYBOARD focus keeper: while the mouse is over the embedded
                 # mirror and TurboADB is the active app, keep the scrcpy child
@@ -1777,16 +2229,19 @@ class MirrorPanel(QWidget):
                 # embedding failed AFTER we launched off-screen — bring the
                 # window back on-screen so it's actually usable, don't strand it
                 self._rescue_offscreen()
-                self.log.emit(f"[WARNING] could not embed scrcpy: {exc} — showing "
-                              "it in its own window instead.")
+                self.log.emit(
+                    f"[WARNING] could not embed scrcpy: {exc} — showing "
+                    "it in its own window instead."
+                )
             return
-        if self._embed_tries > 50:        # ~10s
+        if self._embed_tries > 50:  # ~10s
             self._stop_embed_timer()
             # we launched scrcpy off-screen for a seamless embed but never managed
             # to adopt its window — move it on-screen so it isn't stuck invisible
             self._rescue_offscreen()
-            self.status.setText("Couldn't embed the scrcpy window; it's running "
-                                "in its own window instead.")
+            self.status.setText(
+                "Couldn't embed the scrcpy window; it's running in its own window instead."
+            )
 
     def _rescue_offscreen(self):
         """We launch scrcpy off-screen so it can render its first frame before we
@@ -1803,7 +2258,7 @@ class MirrorPanel(QWidget):
             return
         try:
             _ctypes, u = _win_api()
-            u.SetParent(hwnd, None)      # back to a real top-level window
+            u.SetParent(hwnd, None)  # back to a real top-level window
             getter = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
             setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
             style = getter(hwnd, _GWL_STYLE)
@@ -1813,9 +2268,8 @@ class MirrorPanel(QWidget):
             setter(hwnd, _GWL_STYLE, style)
             w = max(720, self.container.width() or 0)
             h = max(520, self.container.height() or 0)
-            u.SetWindowPos(hwnd, None, 120, 90, w, h,
-                           _SWP_NOZORDER | _SWP_FRAMECHANGED)
-            u.ShowWindow(hwnd, 5)         # SW_SHOW
+            u.SetWindowPos(hwnd, None, 120, 90, w, h, _SWP_NOZORDER | _SWP_FRAMECHANGED)
+            u.ShowWindow(hwnd, 5)  # SW_SHOW
             try:
                 u.SetForegroundWindow(hwnd)
             except Exception:
@@ -1843,11 +2297,12 @@ class MirrorPanel(QWidget):
         try:
             import ctypes
             from ctypes import wintypes
+
             _c, u = _win_api()
             rect = wintypes.RECT()
             if u.GetWindowRect(self._child_hwnd, ctypes.byref(rect)):
                 if (rect.right - rect.left) == w and (rect.bottom - rect.top) == h:
-                    return                       # already the right size
+                    return  # already the right size
             u.MoveWindow(self._child_hwnd, 0, 0, w, h, True)
         except Exception:
             pass
@@ -1880,7 +2335,8 @@ class MirrorPanel(QWidget):
             return
         self._stop_embed_timer()
         if getattr(self, "_mon", None):
-            self._mon.stop(); self._mon = None
+            self._mon.stop()
+            self._mon = None
         self._child_hwnd = None
         if self._scrcpy is not None:
             try:
@@ -1899,28 +2355,25 @@ class MirrorPanel(QWidget):
             return
         self._recording = False
         if self._rec_mode == "scrcpy" and self._rec_scrcpy is not None:
-            _post_close(self._rec_title)             # finalize the mp4
             try:
-                self._rec_scrcpy.wait(timeout=8)
+                self._rec_scrcpy.stop()
             except Exception:
-                try:
-                    self._rec_scrcpy.stop()
-                except Exception:
-                    pass
+                pass
             self._rec_scrcpy = None
         else:
             if self._rec_stop is not None:
                 self._rec_stop.set()
             if self._rec_thread is not None:
-                self._rec_thread.wait(8000)          # let screenrecord stop + pull
+                self._rec_thread.wait(8000)  # let screenrecord stop + pull
 
     def close_panel(self):
-        self._closing = True            # neutralise any pending retry timer
-        self._stop_live()               # parks the thread if it's still running
+        self._closing = True  # neutralise any pending retry timer
+        self._stop_live()  # parks the thread if it's still running
         if self._key_pump is not None:
             self._key_pump.stop()
             if not self._key_pump.wait(700):
                 from .qtutil import park_thread
+
                 park_thread(self._key_pump)
             self._key_pump = None
         self._finalize_rec_sync()
@@ -1928,6 +2381,7 @@ class MirrorPanel(QWidget):
             self._shot.wait(700)
         # keep still-running worker threads alive past this widget's destruction
         from .qtutil import park_thread
+
         park_thread(getattr(self, "_dt", None))
         park_thread(getattr(self, "_rec_wait", None))
         park_thread(getattr(self, "_rec_thread", None))

@@ -10,15 +10,15 @@ _DIR = os.path.join(os.path.expanduser("~"), ".turboadb")
 _FILE = os.path.join(_DIR, "settings.json")
 
 DEFAULTS = {
-    "theme": "dark",                 # "dark" | "light"
+    "theme": "dark",  # "dark" | "light"
     "term_font": "Consolas",
     "term_font_size": 10,
-    "adb_path": "",                  # blank = auto-detect
-    "scrcpy_path": "",               # blank = auto-detect
-    "ffmpeg_path": "",               # blank = auto (cache/PATH); for the Webcam tab
-    "scrcpy_max_size": 0,            # 0 = native
-    "scrcpy_bit_rate": "8M",
-    "scrcpy_video_codec": "",        # "" = auto; h264 is most IVI-compatible
+    "adb_path": "",  # blank = auto-detect
+    "scrcpy_path": "",  # blank = auto-detect
+    "ffmpeg_path": "",  # blank = auto (cache/PATH); for the Webcam tab
+    "scrcpy_max_size": 0,  # 0 = native
+    "scrcpy_bit_rate": "16M",
+    "scrcpy_video_codec": "",  # "" = auto; h264 is most IVI-compatible
     "scrcpy_turn_screen_off": False,
     "scrcpy_stay_awake": True,
     "logcat_format": "threadtime",
@@ -27,7 +27,7 @@ DEFAULTS = {
     "compact_ribbon": True,
     "open_docs_first_run": True,
     "make_shortcut_first_run": True,
-    "auto_update": True,             # check PyPI for a newer TurboADB at launch
+    "auto_update": True,  # check PyPI for a newer TurboADB at launch
     "recent_network_hosts": [],
     "recent_remote_hosts": [],
     # remembered Remote-webcam connection (host/user/domain only — never the password)
@@ -38,6 +38,7 @@ DEFAULTS = {
     # The user is stored here; the PASSWORD goes in the OS credential vault.
     "deploy_user": "",
     "deploy_remember": True,
+    "mute_popups_with_log": True,
 }
 
 
@@ -50,6 +51,7 @@ _KR_WEBCAM = ("turboadb-webcam", "::remote-default")
 def webcam_remote_password() -> str:
     try:
         import keyring
+
         return keyring.get_password(*_KR_WEBCAM) or ""
     except Exception:
         return ""
@@ -63,6 +65,7 @@ _KR_DEPLOY = ("turboadb-deploy", "::default")
 def deploy_password() -> str:
     try:
         import keyring
+
         return keyring.get_password(*_KR_DEPLOY) or ""
     except Exception:
         return ""
@@ -71,6 +74,7 @@ def deploy_password() -> str:
 def set_deploy_password(value: str) -> None:
     try:
         import keyring
+
         if value:
             keyring.set_password(_KR_DEPLOY[0], _KR_DEPLOY[1], value)
         else:
@@ -85,6 +89,7 @@ def set_deploy_password(value: str) -> None:
 def set_webcam_remote_password(value: str) -> None:
     try:
         import keyring
+
         if value:
             keyring.set_password(_KR_WEBCAM[0], _KR_WEBCAM[1], value)
         else:
@@ -128,5 +133,18 @@ def save(data: dict) -> None:
         pass
 
 
-def get(key):
-    return load().get(key, DEFAULTS.get(key))
+def get(key: str, default=None):
+    loaded = load()
+    if key in loaded:
+        return loaded[key]
+    if default is not None:
+        return default
+    return DEFAULTS.get(key)
+
+
+def set(key: str, value) -> None:
+    """Persist a single setting value."""
+    data = load()
+    data[key] = value
+    save(data)
+

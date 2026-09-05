@@ -10,16 +10,26 @@ Three connection modes — only the fields for the chosen mode are enabled:
 
 from __future__ import annotations
 
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
-                             QSpinBox, QComboBox, QDialogButtonBox, QGroupBox,
-                             QLabel, QHBoxLayout, QPushButton, QWidget,
-                             QMessageBox)
+from PyQt5.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QFormLayout,
+    QLineEdit,
+    QSpinBox,
+    QComboBox,
+    QDialogButtonBox,
+    QGroupBox,
+    QLabel,
+    QHBoxLayout,
+    QPushButton,
+    QWidget,
+    QMessageBox,
+)
 
 from .connect_dialog import _ScanThread
 from .qtutil import park_thread
 
-_MODES = ["USB device", "Network device (Wi-Fi / Ethernet)",
-          "Remote ADB server (another PC)"]
+_MODES = ["USB device", "Network device (Wi-Fi / Ethernet)", "Remote ADB server (another PC)"]
 _TYPE = {0: "usb", 1: "network", 2: "remote"}
 _INDEX = {"usb": 0, "network": 1, "remote": 2}
 
@@ -33,7 +43,8 @@ class SessionDialog(QDialog):
 
         form = QFormLayout()
         self.name = QLineEdit()
-        self.mode = QComboBox(); self.mode.addItems(_MODES)
+        self.mode = QComboBox()
+        self.mode.addItems(_MODES)
         self.mode.currentIndexChanged.connect(self._sync)
         form.addRow("Name", self.name)
         form.addRow("Connection", self.mode)
@@ -43,18 +54,24 @@ class SessionDialog(QDialog):
         self.usb_box = QGroupBox("USB device")
         uf = QFormLayout(self.usb_box)
         row = QHBoxLayout()
-        self.serial = QComboBox(); self.serial.setEditable(True)
-        pick = QPushButton("Detect"); pick.setProperty("role", "ghost")
+        self.serial = QComboBox()
+        self.serial.setEditable(True)
+        pick = QPushButton("Detect")
+        pick.setProperty("role", "ghost")
         pick.clicked.connect(self._detect)
-        row.addWidget(self.serial, 1); row.addWidget(pick)
+        row.addWidget(self.serial, 1)
+        row.addWidget(pick)
         uf.addRow("Serial", _wrap(row))
         lay.addWidget(self.usb_box)
 
         # Network device
         self.net_box = QGroupBox("Network device")
         nf = QFormLayout(self.net_box)
-        self.host = QLineEdit(); self.host.setPlaceholderText("192.168.1.50")
-        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(5555)
+        self.host = QLineEdit()
+        self.host.setPlaceholderText("192.168.1.50")
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(5555)
         nf.addRow("Host / IP", self.host)
         nf.addRow("Port", self.port)
         lay.addWidget(self.net_box)
@@ -62,24 +79,32 @@ class SessionDialog(QDialog):
         # Remote adb server
         self.rem_box = QGroupBox("Remote ADB server")
         rf = QFormLayout(self.rem_box)
-        self.srv_host = QLineEdit(); self.srv_host.setPlaceholderText("192.168.1.20")
-        self.srv_port = QSpinBox(); self.srv_port.setRange(1, 65535); self.srv_port.setValue(5037)
+        self.srv_host = QLineEdit()
+        self.srv_host.setPlaceholderText("192.168.1.20")
+        self.srv_port = QSpinBox()
+        self.srv_port.setRange(1, 65535)
+        self.srv_port.setValue(5037)
         rowr = QHBoxLayout()
-        self.rserial = QComboBox(); self.rserial.setEditable(True)
+        self.rserial = QComboBox()
+        self.rserial.setEditable(True)
         self.rserial.setToolTip("Device serial on that machine (blank = only device)")
-        rpick = QPushButton("List"); rpick.setProperty("role", "ghost")
+        rpick = QPushButton("List")
+        rpick.setProperty("role", "ghost")
         rpick.clicked.connect(self._detect_remote)
-        rowr.addWidget(self.rserial, 1); rowr.addWidget(rpick)
+        rowr.addWidget(self.rserial, 1)
+        rowr.addWidget(rpick)
         rf.addRow("Server host / IP", self.srv_host)
         rf.addRow("Server port", self.srv_port)
         rf.addRow("Device serial", _wrap(rowr))
         lay.addWidget(self.rem_box)
 
-        lay.addWidget(QLabel("Remote server: on that machine run once →  "
-                             "adb -a nodaemon server start"))
+        lay.addWidget(
+            QLabel("Remote server: on that machine run once →  adb -a nodaemon server start")
+        )
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
         if existing:
@@ -104,7 +129,7 @@ class SessionDialog(QDialog):
         combo.clear()
         combo.setEditText("scanning…")
         self._scan = _ScanThread(host, port)
-        park_thread(self._scan)             # survive the dialog closing mid-scan
+        park_thread(self._scan)  # survive the dialog closing mid-scan
 
         def done(devs):
             combo.clear()
@@ -155,5 +180,6 @@ class SessionDialog(QDialog):
 
 
 def _wrap(layout):
-    w = QWidget(); w.setLayout(layout)
+    w = QWidget()
+    w.setLayout(layout)
     return w

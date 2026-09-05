@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import re
 import time
-import threading
 
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLineEdit, QComboBox, QCheckBox, QLabel,
-                             QPlainTextEdit, QFileDialog, QMenu)
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLineEdit,
+    QComboBox,
+    QCheckBox,
+    QLabel,
+    QPlainTextEdit,
+    QFileDialog,
+    QMenu,
+)
 
 from . import theme, settings as settings_mod
 from .scrollback import Scrollback
@@ -28,14 +37,20 @@ class _LogcatThread(QThread):
     _FLUSH_S = 0.20
     _MAX_BATCH = 1000
 
-    def __init__(self, handler, args):
+    def __init__(self, handler, args, clear_first: bool = False):
         super().__init__()
         self.handler = handler
         self.args = args
+        self.clear_first = clear_first
         self.proc = None
         self._stopping = False
 
     def run(self):
+        if self.clear_first:
+            try:
+                self.handler.logcat_clear()
+            except Exception:
+                pass
         try:
             self.proc = self.handler.popen(self.args)
         except Exception as exc:
@@ -49,22 +64,26 @@ class _LogcatThread(QThread):
             while True:
                 chunk = self.proc.stdout.read(65536)
                 if not chunk:
-                    break                       # EOF or pipe closed by stop()
+                    break  # EOF or pipe closed by stop()
                 buf += chunk
                 parts = buf.split(b"\n")
                 buf = parts.pop()
                 for ln in parts:
                     pending.append(ln.decode("utf-8", "replace").rstrip("\r"))
                 now = time.monotonic()
-                if pending and (len(pending) >= self._MAX_BATCH
-                                or (now - last) >= self._FLUSH_S):
+                if pending and (len(pending) >= self._MAX_BATCH or (now - last) >= self._FLUSH_S):
                     self.batch.emit(pending)
                     pending = []
                     last = now
         except Exception:
-            pass                                # closed pipe on stop -> just end
+            pass  # closed pipe on stop -> just end
         if pending:
             self.batch.emit(pending)
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=2.0)
+            except Exception:
+                pass
         self.stopped.emit()
 
     def stop(self):
@@ -100,9 +119,11 @@ class _ZoomEdit(QPlainTextEdit):
     def keyPressEvent(self, event):
         m, k = event.modifiers(), event.key()
         if m & Qt.ControlModifier and k in (Qt.Key_Plus, Qt.Key_Equal):
-            self._bump(1); return
+            self._bump(1)
+            return
         if m & Qt.ControlModifier and k == Qt.Key_Minus:
-            self._bump(-1); return
+            self._bump(-1)
+            return
         super().keyPressEvent(event)
 
     def _bump(self, step):
@@ -110,7 +131,8 @@ class _ZoomEdit(QPlainTextEdit):
         size = max(6, min(40, (f.pointSize() or 10) + step))
         if size == f.pointSize():
             return
-        f.setPointSize(size); self.setFont(f)
+        f.setPointSize(size)
+        self.setFont(f)
         try:
             data = settings_mod.load()
             data["term_font_size"] = size
@@ -122,8 +144,14 @@ class _ZoomEdit(QPlainTextEdit):
 class LogcatPanel(QWidget):
     log = pyqtSignal(str)
 
-    _LEVEL_COLOR = {"E": "#ff7a6e", "F": "#ff5e8a", "W": "#ffc34d",
-                    "I": "#7ee2a4", "D": "#9fb4c9", "V": "#8b95a3"}
+    _LEVEL_COLOR = {
+        "E": "#ff7a6e",
+        "F": "#ff5e8a",
+        "W": "#ffc34d",
+        "I": "#7ee2a4",
+        "D": "#9fb4c9",
+        "V": "#8b95a3",
+    }
 
     def __init__(self, handler, parent=None):
         super().__init__(parent)
@@ -132,10 +160,10 @@ class LogcatPanel(QWidget):
         self._paused = False
         self._use_crash_buffers = False
         self._filter_re = None
-        self._hl_re = None            # keyword/regex to highlight (None = off)
-        self._hl_fmt = None           # the highlight char-format (lazy)
-        self._fmt_cache = {}          # color -> QTextCharFormat (reused per batch)
-        self._pending = []            # lines waiting to be drawn (coalesced)
+        self._hl_re = None  # keyword/regex to highlight (None = off)
+        self._hl_fmt = None  # the highlight char-format (lazy)
+        self._fmt_cache = {}  # color -> QTextCharFormat (reused per batch)
+        self._pending = []  # lines waiting to be drawn (coalesced)
         # A GUI-side timer paints at a FIXED low rate, decoupled from how fast
         # logcat arrives. Over RDP each repaint is a slow remote screen update,
         # so this is what stops the window going "not responding" under a flood.
@@ -151,8 +179,7 @@ class LogcatPanel(QWidget):
         lay = QVBoxLayout(self)
         ctrl = QHBoxLayout()
         self.level = QComboBox()
-        self.level.addItems(["Verbose (all)", "Debug", "Info", "Warn",
-                            "Error", "Fatal"])
+        self.level.addItems(["Verbose (all)", "Debug", "Info", "Warn", "Error", "Fatal"])
         # a manual level change clears the crash preset (so it isn't stuck on
         # the crash buffers after the user moves on); guarded during the preset
         self._applying_preset = False
@@ -171,45 +198,67 @@ class LogcatPanel(QWidget):
             "streaming live.\n\n'Live only' starts from NOW — no cached "
             "backlog. Without this, adb dumps the device's entire in-memory "
             "log cache first (easily 100,000+ old lines), which floods the "
-            "view the moment you press Start.")
-        self.tag = QLineEdit(); self.tag.setPlaceholderText("tag (optional)")
+            "view the moment you press Start."
+        )
+        self.tag = QLineEdit()
+        self.tag.setPlaceholderText("tag (optional)")
         self.tag.setMaximumWidth(160)
-        self.filt = QLineEdit(); self.filt.setPlaceholderText("regex filter (live)…")
+        self.filt = QLineEdit()
+        self.filt.setPlaceholderText("regex filter (live)…")
         self.filt.textChanged.connect(self._set_filter)
         # a crash preset: switch to the crash buffer + Error level in one click
         self.btn_crash = QPushButton(" Crashes")
         self.btn_crash.setProperty("role", "ghost")
-        self.btn_crash.setToolTip("Show only crashes & ANRs: the 'crash' buffer "
-                                  "at Error level, highlighting FATAL/ANR. Click "
-                                  "Start after.")
+        self.btn_crash.setToolTip(
+            "Show only crashes & ANRs: the 'crash' buffer "
+            "at Error level, highlighting FATAL/ANR. Click "
+            "Start after."
+        )
         self.btn_crash.clicked.connect(self._crash_preset)
         self.hl = QLineEdit()
         self.hl.setPlaceholderText("highlight (e.g. error|anr|crash)…")
-        self.hl.setToolTip("Highlight matches in-line (case-insensitive regex) "
-                           "without hiding the rest — great for spotting "
-                           "errors/ANRs/your tag in a flood. The Level colours "
-                           "still apply; matches get a bright marker.")
+        self.hl.setToolTip(
+            "Highlight matches in-line (case-insensitive regex) "
+            "without hiding the rest — great for spotting "
+            "errors/ANRs/your tag in a flood. The Level colours "
+            "still apply; matches get a bright marker."
+        )
         self.hl.setMaximumWidth(220)
         self.hl.textChanged.connect(self._set_highlight)
         self.clear_first = QCheckBox("clear first")
-        self.btn_start = QPushButton(" Start"); self.btn_start.setProperty("role", "ok")
+        self.btn_start = QPushButton(" Start")
+        self.btn_start.setProperty("role", "ok")
         self.btn_start.setIcon(theme.emoji_icon("▶"))
         self.btn_start.clicked.connect(self.toggle)
-        self.btn_pause = QPushButton(" Pause"); self.btn_pause.setProperty("role", "ghost")
+        self.btn_pause = QPushButton(" Pause")
+        self.btn_pause.setProperty("role", "ghost")
         self.btn_pause.setIcon(theme.emoji_icon("⏸"))
         self.btn_pause.clicked.connect(self._toggle_pause)
-        self.btn_clear = QPushButton(" Clear"); self.btn_clear.setProperty("role", "ghost")
+        self.btn_clear = QPushButton(" Clear")
+        self.btn_clear.setProperty("role", "ghost")
         self.btn_clear.setIcon(theme.emoji_icon("🧹"))
         self.btn_clear.clicked.connect(self._clear_view)
-        self.btn_save = QPushButton(" Save…"); self.btn_save.setProperty("role", "ghost")
+        self.btn_save = QPushButton(" Save…")
+        self.btn_save.setProperty("role", "ghost")
         self.btn_save.setIcon(theme.emoji_icon("💾"))
         self.btn_save.clicked.connect(self._save)
-        for w in (QLabel("Level:"), self.level, QLabel("History:"), self.hist,
-                  self.tag, self.filt, self.hl, self.btn_crash,
-                  self.clear_first, self.btn_start, self.btn_pause,
-                  self.btn_clear, self.btn_save):
+        for w in (
+            QLabel("Level:"),
+            self.level,
+            QLabel("History:"),
+            self.hist,
+            self.tag,
+            self.filt,
+            self.hl,
+            self.btn_crash,
+            self.clear_first,
+            self.btn_start,
+            self.btn_pause,
+            self.btn_clear,
+            self.btn_save,
+        ):
             ctrl.addWidget(w)
-        ctrl.setStretch(5, 1)                  # the regex-filter box stretches
+        ctrl.setStretch(5, 1)  # the regex-filter box stretches
         lay.addLayout(ctrl)
 
         self.view = _ZoomEdit()
@@ -231,8 +280,7 @@ class LogcatPanel(QWidget):
         a = m.addAction(ico("📋"), "Copy")
         a.setEnabled(self.view.textCursor().hasSelection())
         a.triggered.connect(self.view.copy)
-        m.addAction(ico("🗂"), "Copy all",
-                    lambda: (self.view.selectAll(), self.view.copy()))
+        m.addAction(ico("🗂"), "Copy all", lambda: (self.view.selectAll(), self.view.copy()))
         m.addAction(ico("🔲"), "Select All", self.view.selectAll)
         m.addSeparator()
         m.addAction(ico("💾"), "Save full logcat to file…", self._save)
@@ -254,8 +302,10 @@ class LogcatPanel(QWidget):
         self.tag.clear()
         self.hl.setText("FATAL|ANR|Exception|crash")
         self._use_crash_buffers = True
-        self.log.emit("[INFO] crash preset set — press Start to stream crashes "
-                      "& ANRs (crash buffer, Error level)")
+        self.log.emit(
+            "[INFO] crash preset set — press Start to stream crashes "
+            "& ANRs (crash buffer, Error level)"
+        )
 
     # --- filter ---
     def _set_filter(self, text):
@@ -263,7 +313,7 @@ class LogcatPanel(QWidget):
             self._filter_re = re.compile(text) if text else None
         except re.error:
             self._filter_re = None
-        self._refilter_timer.start(300)          # debounced re-filter
+        self._refilter_timer.start(300)  # debounced re-filter
 
     def _refilter_view(self):
         """Re-apply the live regex filter to what's ALREADY on screen, so
@@ -293,9 +343,10 @@ class LogcatPanel(QWidget):
         try:
             self._hl_re = re.compile(text, re.IGNORECASE) if text else None
         except re.error:
-            self._hl_re = None       # keep typing a partial regex without errors
-        self.hl.setStyleSheet("" if self._hl_re or not text
-                              else "QLineEdit{color:%s;}" % theme.DANGER)
+            self._hl_re = None  # keep typing a partial regex without errors
+        self.hl.setStyleSheet(
+            "" if self._hl_re or not text else "QLineEdit{color:%s;}" % theme.DANGER
+        )
 
     # --- start/stop ---
     def toggle(self):
@@ -307,22 +358,24 @@ class LogcatPanel(QWidget):
     def start(self):
         if self.thread and self.thread.isRunning():
             return
-        _letter = {"Verbose": "V", "Debug": "D", "Info": "I", "Warn": "W",
-                   "Error": "E", "Fatal": "F"}
+        _letter = {
+            "Verbose": "V",
+            "Debug": "D",
+            "Info": "I",
+            "Warn": "W",
+            "Error": "E",
+            "Fatal": "F",
+        }
         lvl = _letter.get(self.level.currentText().split()[0], "V")
         tag = self.tag.text().strip()
         fmt = settings_mod.get("logcat_format") or "threadtime"
-        if self.clear_first.isChecked():
-            try:
-                self.handler.logcat_clear()
-            except Exception:
-                pass
+        clear_it = self.clear_first.isChecked()
         args = ["logcat", "-v", fmt]
         if self._use_crash_buffers:
             for b in self._CRASH_BUFFERS:
                 args += ["-b", b]
         tailn = self.hist.currentData()
-        if tailn:                              # None = full cached buffer
+        if tailn:  # None = full cached buffer
             args += ["-T", str(tailn)]
         if tag and lvl != "V":
             args += [f"{tag}:{lvl}", "*:S"]
@@ -330,11 +383,13 @@ class LogcatPanel(QWidget):
             args += [f"{tag}:V", "*:S"]
         elif lvl != "V":
             args += [f"*:{lvl}"]
-        self.thread = _LogcatThread(self.handler, args)
+        self.thread = _LogcatThread(self.handler, args, clear_first=clear_it)
+        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.batch.connect(self._on_batch)
         self.thread.stopped.connect(self._on_stopped)
         self.thread.start()
-        self.btn_start.setText("Stop"); self.btn_start.setProperty("role", "danger")
+        self.btn_start.setText("Stop")
+        self.btn_start.setProperty("role", "danger")
         self._restyle(self.btn_start)
         self.log.emit("[OK] logcat started")
 
@@ -343,7 +398,8 @@ class LogcatPanel(QWidget):
             self.thread.stop()
 
     def _on_stopped(self):
-        self.btn_start.setText("Start"); self.btn_start.setProperty("role", "ok")
+        self.btn_start.setText("Start")
+        self.btn_start.setProperty("role", "ok")
         self._restyle(self.btn_start)
         self.log.emit("[OK] logcat stopped")
 
@@ -353,7 +409,7 @@ class LogcatPanel(QWidget):
 
     def _clear_view(self):
         self.view.clear()
-        self._sb.reset()                 # clear forgets the archived history too
+        self._sb.reset()  # clear forgets the archived history too
 
     def _on_batch(self, lines):
         """Buffer lines only — the render timer paints them. Keeps the worker and
@@ -370,8 +426,9 @@ class LogcatPanel(QWidget):
         # GUI fall behind (the archive above already has every line)
         if len(self._pending) > 6000:
             drop = len(self._pending) - 6000
-            self._pending = ([f"… ({drop} lines skipped on screen — saved log has all)"]
-                             + self._pending[-6000:])
+            self._pending = [
+                f"… ({drop} lines skipped on screen — saved log has all)"
+            ] + self._pending[-6000:]
 
     def _render_pending(self):
         """Paint whatever has accumulated since the last tick — one insert, one
@@ -407,7 +464,8 @@ class LogcatPanel(QWidget):
                     break
             fmt = fmt_cache.get(color)
             if fmt is None:
-                fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(color))
                 fmt_cache[color] = fmt
             # Fast path (the common case): no highlight, or this line has no match
             # — a single insertText keeps the flood cheap. Only split a line into
@@ -435,7 +493,7 @@ class LogcatPanel(QWidget):
         pos = 0
         for m in hre.finditer(line):
             s, e = m.start(), m.end()
-            if e == s:                       # skip zero-width matches
+            if e == s:  # skip zero-width matches
                 continue
             if s > pos:
                 cur.insertText(line[pos:s], base_fmt)
@@ -445,23 +503,31 @@ class LogcatPanel(QWidget):
 
     def _save(self):
         from .fileutil import download_path
-        default = download_path("turboadb-logcat-"
-                                + time.strftime("%Y%m%d-%H%M%S") + ".log")
+
+        default = download_path("turboadb-logcat-" + time.strftime("%Y%m%d-%H%M%S") + ".log")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save logcat", default,
-            "Log files (*.log);;Text files (*.txt);;All files (*)")
+            self, "Save logcat", default, "Log files (*.log);;Text files (*.txt);;All files (*)"
+        )
         if path:
-            self._sb.save_to(path)           # COMPLETE log, not just the tail
+            self._sb.save_to(path)  # COMPLETE log, not just the tail
             self.log.emit(f"[OK] logcat saved to {path}")
             from .fileutil import saved_dialog
+
             saved_dialog(self, path, "logcat")
 
     @staticmethod
     def _restyle(w):
-        w.style().unpolish(w); w.style().polish(w)
+        w.style().unpolish(w)
+        w.style().polish(w)
 
     def close_panel(self):
         self.stop()
         if self.thread:
-            self.thread.wait(700)
-        self._sb.close()                     # drop the temp scrollback file
+            try:
+                self.thread.wait(300)
+            except Exception:
+                pass
+            from .qtutil import park_thread
+
+            park_thread(self.thread)
+        self._sb.close()  # drop the temp scrollback file

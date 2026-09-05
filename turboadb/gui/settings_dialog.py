@@ -4,11 +4,26 @@ moment you pick it. Persisted to ~/.turboadb/settings.json."""
 
 from __future__ import annotations
 
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-                             QComboBox, QSpinBox, QFontComboBox, QCheckBox,
-                             QDialogButtonBox, QLabel, QLineEdit, QPushButton,
-                             QFileDialog, QWidget, QListWidget, QListWidgetItem,
-                             QStackedWidget, QApplication)
+from PyQt5.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFormLayout,
+    QComboBox,
+    QSpinBox,
+    QFontComboBox,
+    QCheckBox,
+    QDialogButtonBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QFileDialog,
+    QWidget,
+    QListWidget,
+    QListWidgetItem,
+    QStackedWidget,
+    QApplication,
+)
 from PyQt5.QtGui import QFont
 
 from . import settings as settings_mod
@@ -16,7 +31,8 @@ from . import theme as theme_mod
 
 
 def _hint(text: str) -> QLabel:
-    lab = QLabel(text); lab.setWordWrap(True)
+    lab = QLabel(text)
+    lab.setWordWrap(True)
     lab.setStyleSheet("color:#8a8a8a;")
     return lab
 
@@ -30,7 +46,8 @@ class SettingsDialog(QDialog):
         self._orig_theme = self.cfg.get("theme", "dark")
 
         outer = QVBoxLayout(self)
-        body = QHBoxLayout(); outer.addLayout(body, 1)
+        body = QHBoxLayout()
+        outer.addLayout(body, 1)
         self.nav = QListWidget()
         self.nav.setFixedWidth(150)
         body.addWidget(self.nav)
@@ -46,16 +63,19 @@ class SettingsDialog(QDialog):
         self.nav.setCurrentRow(0)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
         outer.addWidget(btns)
 
     def _add_page(self, name, content):
         self.nav.addItem(QListWidgetItem(name))
-        page = QWidget(); v = QVBoxLayout(page)
+        page = QWidget()
+        v = QVBoxLayout(page)
         v.setContentsMargins(18, 6, 8, 8)
         title = QLabel(name)
-        title.setStyleSheet(f"color:{theme_mod.accent_text(self._orig_theme)};"
-                            f"font-size:14pt; font-weight:700;")
+        title.setStyleSheet(
+            f"color:{theme_mod.accent_text(self._orig_theme)};font-size:14pt; font-weight:700;"
+        )
         v.addWidget(title)
         v.addWidget(content)
         v.addStretch(1)
@@ -63,26 +83,31 @@ class SettingsDialog(QDialog):
 
     # ---- pages ----
     def _page_appearance(self):
-        w = QWidget(); f = QFormLayout(w)
-        self.theme = QComboBox(); self.theme.addItems(["dark", "light"])
+        w = QWidget()
+        f = QFormLayout(w)
+        self.theme = QComboBox()
+        self.theme.addItems(["dark", "light"])
         self.theme.setCurrentText(self._orig_theme)
         # live preview: changing the theme applies it to the whole app immediately
         self.theme.currentTextChanged.connect(
-            lambda name: QApplication.instance().setStyleSheet(
-                theme_mod.stylesheet(name)))
-        self.font = QFontComboBox()
-        self.font.setCurrentFont(QFont(self.cfg.get("term_font", "Consolas")))
-        self.font_size = QSpinBox(); self.font_size.setRange(7, 28)
+            lambda name: QApplication.instance().setStyleSheet(theme_mod.stylesheet(name))
+        )
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont(self.cfg.get("term_font", "Consolas")))
+        self.font_size = QSpinBox()
+        self.font_size.setRange(7, 28)
         self.font_size.setValue(self.cfg.get("term_font_size", 10))
         f.addRow("Theme", self.theme)
-        f.addRow("Terminal font", self.font)
+        f.addRow("Terminal font", self.font_combo)
         f.addRow("Terminal font size", self.font_size)
-        f.addRow("", _hint("Theme & font apply immediately. Open tabs keep their "
-                           "font until reopened."))
+        f.addRow(
+            "", _hint("Theme & font apply immediately. Open tabs keep their font until reopened.")
+        )
         return w
 
     def _page_tools(self):
-        w = QWidget(); f = QFormLayout(w)
+        w = QWidget()
+        f = QFormLayout(w)
         self.adb_path = QLineEdit(self.cfg.get("adb_path", ""))
         self.scrcpy_path = QLineEdit(self.cfg.get("scrcpy_path", ""))
         self.ffmpeg_path = QLineEdit(self.cfg.get("ffmpeg_path", ""))
@@ -92,13 +117,20 @@ class SettingsDialog(QDialog):
         f.addRow("adb path", _browse_row(self.adb_path, self))
         f.addRow("scrcpy path", _browse_row(self.scrcpy_path, self))
         f.addRow("ffmpeg path", _browse_row(self.ffmpeg_path, self))
-        f.addRow("", _hint("Leave blank to let TurboADB find or download each tool. "
-                           "ffmpeg powers the Webcam tab."))
+        f.addRow(
+            "",
+            _hint(
+                "Leave blank to let TurboADB find or download each tool. "
+                "ffmpeg powers the Webcam tab."
+            ),
+        )
         return w
 
     def _page_scrcpy(self):
-        w = QWidget(); f = QFormLayout(w)
-        self.max_size = QSpinBox(); self.max_size.setRange(0, 8192)
+        w = QWidget()
+        f = QFormLayout(w)
+        self.max_size = QSpinBox()
+        self.max_size.setRange(0, 8192)
         self.max_size.setValue(int(self.cfg.get("scrcpy_max_size", 0)))
         self.max_size.setSpecialValueText("native")
         self.bit_rate = QLineEdit(self.cfg.get("scrcpy_bit_rate", "8M"))
@@ -118,26 +150,34 @@ class SettingsDialog(QDialog):
         return w
 
     def _page_logcat(self):
-        w = QWidget(); f = QFormLayout(w)
+        w = QWidget()
+        f = QFormLayout(w)
         self.logfmt = QComboBox()
         self.logfmt.addItems(["threadtime", "brief", "time", "long", "tag"])
         self.logfmt.setCurrentText(self.cfg.get("logcat_format", "threadtime"))
         f.addRow("Logcat format", self.logfmt)
-        f.addRow("", _hint("'threadtime' shows the pid/tid + timestamp most logcat "
-                           "filters expect."))
+        f.addRow(
+            "", _hint("'threadtime' shows the pid/tid + timestamp most logcat filters expect.")
+        )
         return w
 
     def _page_startup(self):
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget()
+        v = QVBoxLayout(w)
         self.docs = QCheckBox("Open docs on first run")
         self.docs.setChecked(self.cfg.get("open_docs_first_run", True))
-        self.shortcut = QCheckBox("Keep the Desktop + Start-menu shortcuts "
-                                  "(recreated at every launch, self-healing)")
+        self.shortcut = QCheckBox(
+            "Keep the Desktop + Start-menu shortcuts (recreated at every launch, self-healing)"
+        )
         self.shortcut.setChecked(self.cfg.get("make_shortcut_first_run", True))
-        self.autoupd = QCheckBox("Check PyPI for a newer TurboADB at launch "
-                                 "(notify in the log only — never auto-installs)")
+        self.autoupd = QCheckBox(
+            "Check PyPI for a newer TurboADB at launch "
+            "(notify in the log only — never auto-installs)"
+        )
         self.autoupd.setChecked(self.cfg.get("auto_update", True))
-        v.addWidget(self.docs); v.addWidget(self.shortcut); v.addWidget(self.autoupd)
+        v.addWidget(self.docs)
+        v.addWidget(self.shortcut)
+        v.addWidget(self.autoupd)
         return w
 
     def reject(self):
@@ -150,36 +190,44 @@ class SettingsDialog(QDialog):
         # (recent hosts, ribbon density, remembered webcam login, …) survive —
         # returning only the dialog's keys used to reset them all on every OK
         out = dict(self.cfg)
-        out.update({
-            "theme": self.theme.currentText(),
-            "term_font": self.font.currentFont().family(),
-            "term_font_size": self.font_size.value(),
-            "adb_path": self.adb_path.text().strip(),
-            "scrcpy_path": self.scrcpy_path.text().strip(),
-            "ffmpeg_path": self.ffmpeg_path.text().strip(),
-            "scrcpy_max_size": self.max_size.value(),
-            "scrcpy_bit_rate": self.bit_rate.text().strip(),
-            "scrcpy_video_codec": ("" if self.codec.currentText() == "auto"
-                                   else self.codec.currentText()),
-            "scrcpy_stay_awake": self.stay.isChecked(),
-            "scrcpy_turn_screen_off": self.tso.isChecked(),
-            "logcat_format": self.logfmt.currentText(),
-            "open_docs_first_run": self.docs.isChecked(),
-            "make_shortcut_first_run": self.shortcut.isChecked(),
-            "auto_update": self.autoupd.isChecked(),
-        })
+        out.update(
+            {
+                "theme": self.theme.currentText(),
+                "term_font": self.font_combo.currentFont().family(),
+                "term_font_size": self.font_size.value(),
+                "adb_path": self.adb_path.text().strip(),
+                "scrcpy_path": self.scrcpy_path.text().strip(),
+                "ffmpeg_path": self.ffmpeg_path.text().strip(),
+                "scrcpy_max_size": self.max_size.value(),
+                "scrcpy_bit_rate": self.bit_rate.text().strip(),
+                "scrcpy_video_codec": (
+                    "" if self.codec.currentText() == "auto" else self.codec.currentText()
+                ),
+                "scrcpy_stay_awake": self.stay.isChecked(),
+                "scrcpy_turn_screen_off": self.tso.isChecked(),
+                "logcat_format": self.logfmt.currentText(),
+                "open_docs_first_run": self.docs.isChecked(),
+                "make_shortcut_first_run": self.shortcut.isChecked(),
+                "auto_update": self.autoupd.isChecked(),
+            }
+        )
         return out
 
 
 def _browse_row(line_edit: QLineEdit, parent) -> QWidget:
-    row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
-    btn = QPushButton("Browse…"); btn.setProperty("role", "ghost")
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    btn = QPushButton("Browse…")
+    btn.setProperty("role", "ghost")
 
     def pick():
         path, _ = QFileDialog.getOpenFileName(parent, "Select executable")
         if path:
             line_edit.setText(path)
+
     btn.clicked.connect(pick)
-    row.addWidget(line_edit, 1); row.addWidget(btn)
-    w = QWidget(); w.setLayout(row)
+    row.addWidget(line_edit, 1)
+    row.addWidget(btn)
+    w = QWidget()
+    w.setLayout(row)
     return w

@@ -22,8 +22,7 @@ def _make_zip(path, members):
 
 def test_extract_strip_top_flattens(tmp_path):
     zp = tmp_path / "s.zip"
-    _make_zip(zp, {"scrcpy-win64/scrcpy.exe": "x",
-                   "scrcpy-win64/lib/a.dll": "y"})
+    _make_zip(zp, {"scrcpy-win64/scrcpy.exe": "x", "scrcpy-win64/lib/a.dll": "y"})
     dest = tmp_path / "flat"
     toolsdl._extract_zip(str(zp), str(tmp_path), strip_top_to=str(dest))
     assert (dest / "scrcpy.exe").read_text() == "x"
@@ -57,11 +56,11 @@ def test_swap_dir_replaces_and_cleans(tmp_path):
     (staged / "adb.exe").write_text("new")
     toolsdl._swap_dir(str(staged), str(live))
     assert (live / "adb.exe").read_text() == "new"
-    assert not (live / "stale.dll").exists()      # old content fully replaced
+    assert not (live / "stale.dll").exists()  # old content fully replaced
 
 
 def test_swap_dir_into_empty_target(tmp_path):
-    dest = tmp_path / "dest"                       # does not exist yet
+    dest = tmp_path / "dest"  # does not exist yet
     staged = tmp_path / "staged"
     staged.mkdir()
     (staged / "adb.exe").write_text("new")
@@ -69,13 +68,13 @@ def test_swap_dir_into_empty_target(tmp_path):
     assert (dest / "adb.exe").read_text() == "new"
 
 
-@pytest.mark.skipif(os.name != "nt",
-                    reason="only Windows locks an open file's directory")
+@pytest.mark.skipif(os.name != "nt", reason="only Windows locks an open file's directory")
 def test_swap_dir_locked_file_raises_and_rolls_back(tmp_path):
     live = tmp_path / "live"
     live.mkdir()
     fh = open(live / "adb.exe", "w")
-    fh.write("old"); fh.flush()
+    fh.write("old")
+    fh.flush()
     staged = tmp_path / "staged"
     staged.mkdir()
     (staged / "adb.exe").write_text("new")

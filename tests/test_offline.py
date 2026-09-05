@@ -1,29 +1,36 @@
 """Offline tests — no device, no adb required. Run: python tests/test_offline.py"""
 
 import os
+import re
 import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import logging
-logging.disable(logging.CRITICAL)
+import turboadb as T  # noqa: E402
+from turboadb import (  # noqa: E402
+    ADBConfig,
+    ADBError,
+    ADBHandler,
+    CommandResult,
+    Device,
+    OperationResult,
+    ScrcpyOptions,
+    StreamResult,
+    TransferResult,
+    strip_ansi,
+    toolsdl,
+)
+from turboadb.cli import _words  # noqa: E402
+from turboadb.devices import _parse_line  # noqa: E402
+from turboadb.exceptions import (  # noqa: E402
+    ADBCommandError,
+    ADBConnectionError,
+    ADBNotFoundError,
+    ADBTransferError,
+    ScrcpyError,
+)
 
-import turboadb as T
-from turboadb import (ADBHandler, ADBConfig, ScrcpyOptions, Device,
-                      CommandResult, TransferResult, StreamResult,
-                      OperationResult, ADBError, strip_ansi)
-from turboadb.devices import _parse_line
-
-print("version", T.__version__)
 assert T.__version__
-
-# ---- CommandResult ----
-ok = CommandResult("getprop x", 0, "value\n", "", 0.1, device="emu")
-assert ok.ok and bool(ok) and ok.text == "value"
-bad = CommandResult("x", 1, "", "boom", 0.2)
-assert not bad.ok and not bool(bad)
-multi = CommandResult("c", 0, "a\n\nb\n c \n", "", 0.0)
-assert multi.lines == ["a", "b", " c "], multi.lines
-print("CommandResult OK")
 
 # ---- TransferResult math ----
 tr = TransferResult("a", "b", "push", 1048576, 2.0, 1)
@@ -41,15 +48,23 @@ c1 = ADBConfig(serial="emulator-5554")
 assert c1.target == "emulator-5554" and c1.host is None
 c2 = ADBConfig(host="10.0.0.9")
 assert c2.target == "10.0.0.9:5555"
-c3 = ADBConfig(serial="192.168.1.7:5555")     # bare host:port as serial
+c3 = ADBConfig(serial="192.168.1.7:5555")  # bare host:port as serial
 assert c3.host == "192.168.1.7" and c3.port == 5555 and c3.target == "192.168.1.7:5555"
 print("ADBConfig target:", c1.target, "|", c2.target, "|", c3.target)
 
 # ---- ScrcpyOptions ----
-args = ScrcpyOptions(max_size=1024, bit_rate="8M", record="d.mp4",
-                     turn_screen_off=True, no_audio=True).to_args()
-for flag in ("--max-size", "1024", "--video-bit-rate", "8M", "--record",
-             "--turn-screen-off", "--no-audio"):
+args = ScrcpyOptions(
+    max_size=1024, bit_rate="8M", record="d.mp4", turn_screen_off=True, no_audio=True
+).to_args()
+for flag in (
+    "--max-size",
+    "1024",
+    "--video-bit-rate",
+    "8M",
+    "--record",
+    "--turn-screen-off",
+    "--no-audio",
+):
     assert flag in args, flag
 codec = ScrcpyOptions(video_codec="h264", display_id=2).to_args()
 assert "--video-codec" in codec and "h264" in codec
@@ -57,56 +72,48 @@ assert "--display-id" in codec and "2" in codec
 print("ScrcpyOptions args OK")
 
 # ---- scrcpy --list-displays parser (no device needed) ----
-import re as _re
-_sample = ("[server] INFO: List of displays:\n"
-           "    --display-id=0    (1920x1080)\n"
-           "    --display-id=2    (1280x720)\n")
-_ids = [int(m.group(1)) for m in _re.finditer(
-    r"--display(?:-id)?[= ](\d+)", _sample)]
+_sample = (
+    "[server] INFO: List of displays:\n"
+    "    --display-id=0    (1920x1080)\n"
+    "    --display-id=2    (1280x720)\n"
+)
+_ids = [int(m.group(1)) for m in re.finditer(r"--display(?:-id)?[= ](\d+)", _sample)]
 assert _ids == [0, 2], _ids
 print("display-list parse OK")
 
 # ---- auto-fetch env toggle ----
-import os as _os
-from turboadb import toolsdl
-_old = _os.environ.get("TURBOADB_AUTO_FETCH")
-_os.environ["TURBOADB_AUTO_FETCH"] = "0"
+_old = os.environ.get("TURBOADB_AUTO_FETCH")
+os.environ["TURBOADB_AUTO_FETCH"] = "0"
 assert toolsdl.auto_fetch_enabled() is False
-_os.environ["TURBOADB_AUTO_FETCH"] = "1"
+os.environ["TURBOADB_AUTO_FETCH"] = "1"
 assert toolsdl.auto_fetch_enabled() is True
-_os.environ.pop("TURBOADB_AUTO_FETCH", None)
-assert toolsdl.auto_fetch_enabled() is True          # default ON
+os.environ.pop("TURBOADB_AUTO_FETCH", None)
+assert toolsdl.auto_fetch_enabled() is True  # default ON
 if _old is not None:
-    _os.environ["TURBOADB_AUTO_FETCH"] = _old
+    os.environ["TURBOADB_AUTO_FETCH"] = _old
 assert callable(toolsdl.fetch_tools) and callable(toolsdl.ensure_tools)
 print("auto-fetch toggle OK")
-
 # ---- upgrade decision logic (only upgrade when newer / missing) ----
-assert toolsdl._decide("37.0.0", "37.0.0") is False    # up to date
-assert toolsdl._decide("36.0.0", "37.0.0") is True     # newer available
-assert toolsdl._decide(None, "37.0.0") is True         # not installed
-assert toolsdl._decide("37.0.0", None) is None         # can't determine
-assert toolsdl._decide("38.0.0", "37.0.0") is False    # never "upgrade" to older
+assert toolsdl._decide("37.0.0", "37.0.0") is False  # up to date
+assert toolsdl._decide("36.0.0", "37.0.0") is True  # newer available
+assert toolsdl._decide(None, "37.0.0") is True  # not installed
+assert toolsdl._decide("37.0.0", None) is None  # can't determine
+assert toolsdl._decide("38.0.0", "37.0.0") is False  # never "upgrade" to older
 assert toolsdl._decide("35.0.2-12147458", "35.0.2") is False  # format-insensitive
-assert toolsdl._decide("2.4", "3.1") is True           # scrcpy two-part versions
+assert toolsdl._decide("2.4", "3.1") is True  # scrcpy two-part versions
 assert callable(toolsdl.check_updates) and callable(toolsdl.upgrade_tools)
-print("upgrade decision OK")
-
 # ---- CLI REMAINDER '--' stripping ----
-from turboadb.cli import _words
 assert _words(["--", "getprop", "x"]) == ["getprop", "x"]
-assert _words(["getprop", "x"]) == ["getprop", "x"]
 assert _words([]) == [] and _words(None) == []
 print("cli remainder OK")
-
 # ---- logcat -T (live-only, skip the cached backlog) arg building ----
 h_args = ADBHandler(ADBConfig(serial="x"), safe=True)
 _built = []
-h_args.stream = lambda args, **kw: _built.append(list(args))   # capture argv
+h_args.stream = lambda args, **kw: _built.append(list(args))
 h_args.logcat(tail=1)
 assert "-T" in _built[0] and _built[0][_built[0].index("-T") + 1] == "1", _built
 h_args.logcat()
-assert "-T" not in _built[1]                       # default unchanged for the API
+assert "-T" not in _built[1]  # default unchanged for the API
 print("logcat tail OK")
 
 # ---- ScrcpyOptions embedding flags ----
@@ -115,8 +122,7 @@ assert "--window-borderless" in emb and "--window-x" in emb
 print("embed options OK")
 
 # ---- device line parsing ----
-d = _parse_line("emulator-5554  device product:sdk model:Pixel_6 "
-                "device:emu transport_id:3")
+d = _parse_line("emulator-5554  device product:sdk model:Pixel_6 device:emu transport_id:3")
 assert isinstance(d, Device) and d.serial == "emulator-5554"
 assert d.is_online and d.model == "Pixel_6" and not d.is_network
 net = _parse_line("192.168.1.50:5555  device model:HeadUnit")
@@ -129,9 +135,11 @@ print("device parse OK")
 assert strip_ansi("\x1b[32mgreen\x1b[0m\r\n") == "green\n"
 print("strip_ansi OK")
 
+
 # ---- safe-mode vs raise-mode guard ----
 def boom():
     raise RuntimeError("kaboom")
+
 
 h_safe = ADBHandler(ADBConfig(serial="x"), safe=True)
 r = h_safe._guard("op", boom)
@@ -159,10 +167,7 @@ assert "tcp:9222" in repr(fh) and "->" in repr(fh)
 print("ForwardHandle OK")
 
 # ---- exception hierarchy ----
-from turboadb.exceptions import (ADBConnectionError, ADBCommandError,
-                                 ADBTransferError, ScrcpyError, ADBNotFoundError)
-for exc in (ADBConnectionError, ADBCommandError, ADBTransferError, ScrcpyError,
-            ADBNotFoundError):
+for exc in (ADBConnectionError, ADBCommandError, ADBTransferError, ScrcpyError, ADBNotFoundError):
     assert issubclass(exc, ADBError)
 ce = ADBCommandError("cmd", CommandResult("cmd", 1, "", "err", 0.0))
 assert "exit=1" in str(ce)

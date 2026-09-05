@@ -7,7 +7,7 @@ button on-screen."""
 from __future__ import annotations
 
 from PyQt5.QtCore import QPoint, QRect, QSize, Qt
-from PyQt5.QtWidgets import QLayout, QSizePolicy
+from PyQt5.QtWidgets import QLayout
 
 
 class FlowLayout(QLayout):

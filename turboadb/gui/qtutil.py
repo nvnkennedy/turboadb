@@ -5,7 +5,11 @@ from __future__ import annotations
 # Threads parked here stay referenced until they finish, so their QThread C++
 # object is never destroyed mid-run (which hard-crashes Qt with
 # "QThread: Destroyed while thread is still running").
-_parked = []
+_parked = set()
+
+
+def _unpark(t) -> None:
+    _parked.discard(t)
 
 
 def park_thread(t) -> None:
@@ -17,9 +21,10 @@ def park_thread(t) -> None:
         return
     try:
         finished = t.isFinished()
-    except RuntimeError:            # the C++ object is already gone
+    except RuntimeError:  # the C++ object is already gone
         return
     if finished:
         return
-    _parked.append(t)
-    t.finished.connect(lambda: _parked.remove(t) if t in _parked else None)
+    _parked.add(t)
+    t.finished.connect(t.deleteLater)
+    t.finished.connect(lambda: _unpark(t))

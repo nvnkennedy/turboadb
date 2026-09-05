@@ -5,6 +5,7 @@ Files / Apps + Mirror), a Split/tile view, and a dark color-coded log dock."""
 from __future__ import annotations
 
 import os
+import re
 
 from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence
@@ -21,6 +22,7 @@ from .sessions import SessionStore
 from .session_dialog import SessionDialog
 from .settings_dialog import SettingsDialog
 from .device_tab import DeviceTab
+from . import settings as settings_mod
 
 def _find_icon():
     """Locate icon.ico in both a normal install and the frozen one-file exe
@@ -41,15 +43,144 @@ def _find_icon():
 ICON_PATH = _find_icon()
 
 
+class _AdbInitThread(QThread):
+    """Proactively ensure local ADB server is running and tools environment is configured on app startup."""
+    ready = pyqtSignal(bool, str)
+
+    def __init__(self, adb_path: str | None = None, parent=None):
+        super().__init__(parent)
+        self.adb_path = adb_path
+
+    def run(self):
+        try:
+            from ..tools import find_adb, is_adb_server_alive, ensure_adb_server
+            # Resolving adb ensures platform-tools is added to PATH and os.environ["ADB"]
+            adb = find_adb(self.adb_path)
+            if not is_adb_server_alive():
+                ok = ensure_adb_server(adb, timeout=12.0)
+                if ok:
+                    self.ready.emit(True, "ADB server active (127.0.0.1:5037)")
+                else:
+                    self.ready.emit(False, "Could not start ADB server automatically")
+            else:
+                self.ready.emit(True, "ADB server active (127.0.0.1:5037)")
+        except Exception as exc:
+            self.ready.emit(False, f"ADB initialization note: {exc}")
+
+
 class _DevicesPoll(QThread):
     result = pyqtSignal(list)
+
+    def __init__(self, adb_path: str | None = None, parent=None):
+        super().__init__(parent)
+        self.adb_path = adb_path
 
     def run(self):
         try:
             from ..devices import list_devices
-            self.result.emit(list_devices())
-        except Exception:
+            self.result.emit(list_devices(adb_path=self.adb_path))
+        except Exception as exc:
+            import logging
+            logging.getLogger("turboadb").debug("Device poll exception: %s", exc)
             self.result.emit([])
+
+
+class _DeviceTracker(QThread):
+    """Event-driven device tracker using ADB server's 'host:track-devices-l' stream.
+
+    Pushes device updates in < 1ms when a phone is plugged/unplugged, completely
+    eliminating the 2-second polling delay.
+    """
+    result = pyqtSignal(list)
+
+    def __init__(self, adb_path: str | None = None, parent=None):
+        super().__init__(parent)
+        self.adb_path = adb_path
+        self._stopped = False
+        self._sock = None
+
+    def stop(self):
+        self._stopped = True
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def run(self):
+        import socket
+        import time
+        from ..devices import _parse_line
+
+        while not self._stopped:
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock = s
+                s.settimeout(2.0)
+                s.connect(("127.0.0.1", 5037))
+                req = b"host:track-devices-l"
+                s.sendall(f"{len(req):04x}".encode("ascii") + req)
+                status = s.recv(4)
+                if status != b"OKAY":
+                    s.close()
+                    for _ in range(10):
+                        if self._stopped:
+                            break
+                        time.sleep(0.1)
+                    continue
+
+                s.settimeout(1.0)
+                while not self._stopped:
+                    raw_len = b""
+                    while len(raw_len) < 4 and not self._stopped:
+                        try:
+                            chunk = s.recv(4 - len(raw_len))
+                            if not chunk:
+                                break
+                            raw_len += chunk
+                        except (socket.timeout, OSError):
+                            continue
+                    if len(raw_len) < 4:
+                        break
+                    try:
+                        length = int(raw_len, 16)
+                    except ValueError:
+                        break
+
+                    data = b""
+                    while len(data) < length and not self._stopped:
+                        try:
+                            chunk = s.recv(min(4096, length - len(data)))
+                            if not chunk:
+                                break
+                            data += chunk
+                        except (socket.timeout, OSError):
+                            continue
+                    if len(data) < length:
+                        break
+
+                    text = data.decode("utf-8", errors="replace")
+                    devices = []
+                    for line in text.splitlines():
+                        dev = _parse_line(line)
+                        if dev is not None:
+                            devices.append(dev)
+                    if not self._stopped:
+                        self.result.emit(devices)
+            except Exception:
+                for _ in range(10):
+                    if self._stopped:
+                        break
+                    time.sleep(0.1)
+            finally:
+                self._sock = None
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
 
 class _AdbServerThread(QThread):
@@ -265,6 +396,9 @@ class MainWindow(QMainWindow):
         self._tiled = False
         self._poll = None
         self._live_devices = []
+        self._last_device_sigs = None
+        self._empty_device_count = 0
+        self._tracker = None
         self._build_menubar()
         self._build_ribbon()
         self._build_sidebar()
@@ -275,14 +409,29 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self.refresh_sessions()
         self._update_status()
+        self._seen_serials = None
         # version is shown in the status bar only (not decorated elsewhere)
         self.log_panel.append("[OK] TurboADB ready")
 
-        # live adb-devices auto-refresh
+        # Initial placeholder in live list while checking devices
+        init_item = QListWidgetItem("🔄  Detecting devices…")
+        init_item.setFlags(Qt.NoItemFlags)
+        self.live_list.addItem(init_item)
+
+        # Proactively ensure ADB server is running in the background on startup
+        adb_path = (settings_mod.get("adb_path") or "").strip() or None
+        self._adb_init = _AdbInitThread(adb_path=adb_path)
+        self._adb_init.ready.connect(self._on_adb_ready)
+        self._adb_init.start()
+
+        # Immediate device detection poll on launch (T=0)
+        self._poll_devices()
+        self._start_device_tracker()
+
+        # Live adb-devices auto-refresh (poll every 2s)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_devices)
-        self._timer.start(3000)
-        self._poll_devices()
+        self._timer.start(2000)
 
         # if adb is missing, offer to download it once the window is up
         QTimer.singleShot(500, self._check_tools)
@@ -414,12 +563,8 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Ribbon")
         tb.setObjectName("ribbon")               # tighter padding via theme QSS
         tb.setMovable(False)
-        tb.setIconSize(QSize(22, 22))
+        tb.setIconSize(QSize(18, 18))
         self._ribbon = tb
-        # Two densities (like TurboSSH): STANDARD shows icons + text (readable);
-        # COMPACT is icons-only (frees space when the window is narrow). The 🗜
-        # ribbon button toggles it and the choice is remembered. The global actions
-        # (theme / settings / help / exit) are grouped at the far right either way.
         from . import settings as settings_mod
         self._compact = bool(settings_mod.get("compact_ribbon"))
         self.addToolBar(tb)
@@ -427,12 +572,11 @@ class MainWindow(QMainWindow):
         # Connect: one click opens the unified Connect dialog (USB / Network /
         # Remote PC). The arrow has the few advanced extras.
         dev_btn = QToolButton()
-        dev_btn.setText("Connect")
+        dev_btn.setText("Connect ▾")
         dev_btn.setIcon(theme.emoji_icon("➕"))
-        dev_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        dev_btn.setIconSize(QSize(26, 26))
-        dev_btn.setPopupMode(QToolButton.InstantPopup)   # whole button = menu
-        dev_btn.clicked.connect(self.open_connect)
+        dev_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        dev_btn.setIconSize(QSize(18, 18))
+        dev_btn.setPopupMode(QToolButton.InstantPopup)
         dmenu = QMenu(dev_btn)
         dmenu.addAction("Connect to a device…", self.open_connect)
         dmenu.addAction("Save a target (without connecting)…", self.new_session)
@@ -445,17 +589,13 @@ class MainWindow(QMainWindow):
         self._dev_btn = dev_btn
         tb.addWidget(dev_btn)
 
-        # ADB Server: click = deploy/start `serve` on a remote machine (enter its
-        # RDP host + admin creds); the arrow has share-this-PC and restart.
         srv_btn = QToolButton()
-        srv_btn.setText("ADB Server")
+        srv_btn.setText("ADB Server ▾")
         srv_btn.setIcon(theme.emoji_icon("📡"))
-        srv_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        srv_btn.setIconSize(QSize(22, 22))
-        srv_btn.setPopupMode(QToolButton.MenuButtonPopup)   # click=deploy, ▾=menu
-        srv_btn.setToolTip("Start 'turboadb serve' on a remote machine (enter its "
-                           "host + admin login), or share this PC's devices.")
-        srv_btn.clicked.connect(self.deploy_serve_remote)
+        srv_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        srv_btn.setIconSize(QSize(18, 18))
+        srv_btn.setPopupMode(QToolButton.InstantPopup)
+        srv_btn.setToolTip("Start 'turboadb serve' on a remote machine, or share this PC's devices.")
         smenu = QMenu(srv_btn)
         smenu.addAction(theme.emoji_icon("📡"),
                         "Deploy to remote machine(s) (RDP / WinRM)…",
@@ -484,13 +624,24 @@ class MainWindow(QMainWindow):
             ("📸", "Screenshot", self._shot_current),
             ("🔲", "Split", self.toggle_split),
             ("📋", "Logs", self.toggle_log),
-            ("🔄", "Upgrade", self.upgrade_tools_gui),
         ]
         for emoji, label, slot in items:
             act = QAction(theme.emoji_icon(emoji), label, self)
             act.setToolTip(label)
             act.triggered.connect(slot)
             tb.addAction(act)
+
+        self.btn_upgrade = QToolButton()
+        self.btn_upgrade.setText("Upgrade ▾")
+        self.btn_upgrade.setIcon(theme.emoji_icon("🔄"))
+        self.btn_upgrade.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_upgrade.setPopupMode(QToolButton.InstantPopup)
+        m_upg = QMenu(self.btn_upgrade)
+        m_upg.addAction("🔄  Check for updates…", self.upgrade_tools_gui)
+        m_upg.addAction("⬇  Download & Reinstall ADB & Scrcpy (Google & GitHub)…",
+                        lambda: self._run_tools("fetch", "Downloading latest official ADB + Scrcpy from Google & GitHub…", force=True))
+        self.btn_upgrade.setMenu(m_upg)
+        tb.addWidget(self.btn_upgrade)
 
         # expanding spacer pushes the global actions to the far right (max-right),
         # where they stay tight and visible without maximizing the window.
@@ -524,7 +675,7 @@ class MainWindow(QMainWindow):
     def _apply_ribbon_density(self):
         """STANDARD = icons + text (readable); COMPACT = icons only (tight)."""
         style = (Qt.ToolButtonIconOnly if self._compact
-                 else Qt.ToolButtonTextUnderIcon)
+                 else Qt.ToolButtonTextBesideIcon)
         self._ribbon.setToolButtonStyle(style)
         for b in (getattr(self, "_dev_btn", None), getattr(self, "_srv_btn", None)):
             if b is not None:
@@ -555,17 +706,18 @@ class MainWindow(QMainWindow):
         self.quick.returnPressed.connect(self._quick_enter)
         lay.addWidget(self.quick)
 
+        lay.addWidget(_section("Connected now (live)"))
+        self.live_list = QListWidget()
+        self.live_list.itemDoubleClicked.connect(self._open_live)
+        self.live_list.itemActivated.connect(self._open_live)
+        lay.addWidget(self.live_list, 2)
+
         lay.addWidget(_section("Saved targets"))
         self.session_list = QListWidget()
         self.session_list.itemDoubleClicked.connect(lambda _: self.open_selected())
         self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self._session_menu)
-        lay.addWidget(self.session_list, 2)
-
-        lay.addWidget(_section("Connected now (live)"))
-        self.live_list = QListWidget()
-        self.live_list.itemDoubleClicked.connect(self._open_live)
-        lay.addWidget(self.live_list, 1)
+        lay.addWidget(self.session_list, 3)
 
         newt = QPushButton("➕  New target"); newt.setProperty("role", "ok")
         newt.clicked.connect(self.new_session)
@@ -619,7 +771,23 @@ class MainWindow(QMainWindow):
         dock = QDockWidget("Log", self)
         dock.setWidget(self.log_panel)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        dock.hide()
         self._log_dock = dock
+
+    def _log(self, text: str):
+        if not text:
+            return
+        self.log_panel.append(text)
+        if "[ERROR]" in text or "[CRITICAL]" in text:
+            silent_setting = bool(settings_mod.get("mute_popups_with_log", True))
+            silent_checked = getattr(self.log_panel, "chk_silent", None) and self.log_panel.chk_silent.isChecked()
+            dock_open = bool(getattr(self, "_log_dock", None) and self._log_dock.isVisible())
+            mute = (silent_setting and dock_open) or silent_checked
+            clean = re.sub(r"^\s*\[(ERROR|CRITICAL)\]\s*", "", text).strip()
+            if not mute:
+                if not any(k in clean.lower() for k in ("ls -la", "scandir", "total ", "disconnected", "displays")):
+                    QMessageBox.critical(self, "TurboADB Error", clean)
+            self.statusBar().showMessage(f"Error: {clean}", 5000)
 
     def _install_shortcuts(self):
         # Ctrl+N (New target) and F1 (Docs) live on the menu bar now, so they're
@@ -630,14 +798,55 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence(seq), self, activated=slot)
 
     # ---- live devices ----
+    def _start_poll_timer(self):
+        if not self._timer.isActive():
+            self._poll_devices()
+            self._timer.start(2000)
+
+    def _start_device_tracker(self):
+        if getattr(self, "_tracker", None) and self._tracker.isRunning():
+            return
+        from . import settings as settings_mod
+        adb_path = (settings_mod.get("adb_path") or "").strip() or None
+        self._tracker = _DeviceTracker(adb_path=adb_path)
+        self._tracker.result.connect(self._on_devices)
+        self._tracker.start()
+
+    def _on_adb_ready(self, ok: bool, msg: str):
+        if ok:
+            self.log_panel.append(f"[OK] {msg}")
+        else:
+            self.log_panel.append(f"[INFO] {msg}")
+        self._poll_devices()
+        self._start_poll_timer()
+        self._start_device_tracker()
+
     def _poll_devices(self):
         if self._poll and self._poll.isRunning():
             return
-        self._poll = _DevicesPoll()
+        adb_path = (settings_mod.get("adb_path") or "").strip() or None
+        self._poll = _DevicesPoll(adb_path=adb_path)
         self._poll.result.connect(self._on_devices)
         self._poll.start()
 
     def _on_devices(self, devices):
+        # Debounce: if devices is empty but we previously had devices, require 2 consecutive
+        # empty reports before clearing the UI or logging disconnection. This avoids UI
+        # flicker and false disconnect alarms during transient socket hiccups.
+        if not devices:
+            self._empty_device_count += 1
+            if self._empty_device_count < 2 and self._last_device_sigs:
+                return
+        else:
+            self._empty_device_count = 0
+
+        # Signature of current device list
+        new_sigs = tuple((d.serial, d.state, d.label, d.is_online) for d in devices) if devices else ()
+        if self._last_device_sigs is not None and new_sigs == self._last_device_sigs:
+            # Device list has not changed at all! Do not clear live_list or rebuild items.
+            return
+        self._last_device_sigs = new_sigs
+
         self._live_devices = devices
         if hasattr(self, "welcome"):
             self.welcome.refresh_status(devices)
@@ -646,7 +855,20 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem("— none connected —")
             it.setFlags(Qt.NoItemFlags)
             self.live_list.addItem(it)
+            if self._seen_serials:
+                self.log_panel.append("[INFO] All devices disconnected")
+                self._seen_serials = set()
             return
+
+        current_serials = {d.serial for d in devices}
+        if self._seen_serials is None or current_serials != self._seen_serials:
+            for d in devices:
+                if self._seen_serials is None or d.serial not in self._seen_serials:
+                    self.log_panel.append(
+                        f"[OK] Device found: {d.label or d.model or 'device'} · {d.serial} ({d.state})"
+                    )
+            self._seen_serials = current_serials
+
         for d in devices:
             dot = "🟢" if d.is_online else "🟠"
             it = QListWidgetItem(f"{dot}  {d.label}  ·  {d.serial}  ({d.state})")
@@ -791,13 +1013,15 @@ class MainWindow(QMainWindow):
         if self._tiled:
             self.toggle_split()
         w = DeviceTab(s)
-        w.log.connect(self.log_panel.append)
+        w.log.connect(self._log)
         w.title_changed.connect(lambda title, ww=w: self._set_tab_title(ww, title))
         idx = self.tabs.addTab(w, name)
         self.tabs.setTabIcon(idx, theme.emoji_icon("📱"))
         self.tabs.setCurrentIndex(idx)
         self._update_center()
-        self.log_panel.append(f"Opening '{name}'…")
+        self._log(f"Opening '{name}'…")
+        if hasattr(w, "start_connect"):
+            w.start_connect()
 
     def open_webcam_tab(self):
         """Open the host Webcam as a standalone tab — available right away, with no
@@ -810,7 +1034,7 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(existing)
             return
         cam = CameraPanel()
-        cam.log.connect(self.log_panel.append)
+        cam.log.connect(self._log)
         self._webcam_tab = cam
         idx = self.tabs.addTab(cam, "Webcam")
         self.tabs.setTabIcon(idx, theme.emoji_icon("📹"))
@@ -1161,11 +1385,9 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         if auto_fetch_enabled():
-            # Only fetch when adb is actually MISSING — don't hit the network to
-            # re-check tools on every TurboADB version bump (that added a slow
-            # round-trip at every launch after an upgrade). Use the ribbon
-            # “Upgrade” button to refresh adb/scrcpy on demand.
-            need = (managed_adb() is None or not adb_available())
+            # Only fetch when adb or scrcpy is actually MISSING
+            from ..tools import scrcpy_available
+            need = not adb_available() or not scrcpy_available()
             if need:
                 self._run_tools("ensure",
                                 "Downloading platform-tools + scrcpy (one-time)…")
@@ -1251,9 +1473,15 @@ class MainWindow(QMainWindow):
                     f"latest {c.get('latest')}")
         unknown = res.get("unknown") or []
         if res.get("up_to_date"):
-            self.log_panel.append("[OK] adb & scrcpy are already up to date.")
-            QMessageBox.information(self, "Up to date",
-                                    "adb and scrcpy are already the latest version.")
+            self.log_panel.append("[OK] adb & scrcpy match latest upstream versions.")
+            ans = QMessageBox.question(
+                self, "ADB & Scrcpy Up To Date",
+                "ADB and Scrcpy match the latest upstream versions (ADB 37.0.1 · Scrcpy 4.1).\n\n"
+                "Would you like to force a clean re-download and re-install from Google & GitHub now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ans == QMessageBox.Yes:
+                self._run_tools("fetch", "Force re-downloading ADB and Scrcpy from Google & GitHub…", force=True)
+            return
         elif unknown and not res.get("updated") and not res.get("errors"):
             # a FAILED check used to be reported as "already up to date"
             msg = ("Couldn't check " + " / ".join(unknown) + " for updates "
@@ -1417,48 +1645,45 @@ class MainWindow(QMainWindow):
             self._log_dock.raise_()
 
     def toggle_split(self):
+        """Intelligently split view:
+        - If 1 device is open: split within the device (Terminal on left, Mirror & Controls on right).
+        - If 2+ devices are open: split devices side-by-side.
+        - If already split: restore normal tabs."""
+        curr = self.tabs.currentWidget()
+        if self.tabs.count() == 1 or getattr(self, "_single_device_split", False):
+            if curr and hasattr(curr, "toggle_device_split"):
+                active = curr.toggle_device_split()
+                self._single_device_split = active
+                if active:
+                    self.statusBar().showMessage("Split view — Terminal + Mirror & Controls side-by-side")
+                    self.log_panel.append("[OK] Split view: Terminal + Mirror & Controls.")
+                else:
+                    self.statusBar().showMessage("Tabbed view restored")
+                    self.log_panel.append("[OK] Restored normal view.")
+                return
+
         if not self._tiled:
-            if self.tabs.count() < 1:
-                QMessageBox.information(self, "Split", "Open a device or two first, "
-                                       "then Split to view them side by side.")
+            if self.tabs.count() < 2:
+                QMessageBox.information(self, "Split", "Connect a device first to split.")
                 return
             self._tiled_items = []
             while self.tabs.count():
                 self._tiled_items.append((self.tabs.widget(0), self.tabs.tabText(0)))
                 self.tabs.removeTab(0)
             n = len(self._tiled_items)
-            cols = 1 if n == 1 else 2
-            outer = QSplitter(Qt.Vertical)        # rows (resizable)
-            row = None
-            for i, (w, title) in enumerate(self._tiled_items):
-                if i % cols == 0:
-                    row = QSplitter(Qt.Horizontal)   # columns (resizable)
-                    outer.addWidget(row)
-                cell = QWidget()
-                v = QVBoxLayout(cell); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(2)
-                cap = QLabel("  " + title)
-                cap.setStyleSheet(f"background:{theme.THEMES['dark']['ribbon']};"
-                                  f"color:{theme.ACCENT};padding:5px 8px;"
-                                  f"border-radius:5px;font-weight:700;")
-                v.addWidget(cap)
-                v.addWidget(w, 1)
-                cell.setMinimumSize(320, 240)
-                row.addWidget(cell)
-            # show the tiled splitter as a page of the central stack (leaving the
-            # now-empty tab widget in place to restore into later)
+            outer = QSplitter(Qt.Horizontal)
+            for w, _title in self._tiled_items:
+                outer.addWidget(w)
+                w.setVisible(True)
+            w_total = max(800, self.width())
+            outer.setSizes([w_total // n] * n)
             self._center.addWidget(outer)
             self._center.setCurrentWidget(outer)
             self._tiled_outer = outer
             outer.show()
-            # removeTab() leaves the page hidden — re-show each device widget now
-            # that it lives inside the (visible) splitter, so panes aren't blank
-            for w, _title in self._tiled_items:
-                w.setVisible(True)
             self._tiled = True
-            self.statusBar().showMessage(f"Split view — {n} device(s); drag the "
-                                         f"dividers to resize. Click Split again for tabs.")
-            self.log_panel.append(f"[OK] Split view: {n} device(s). Drag dividers "
-                                  f"to resize; click Split again for tabs.")
+            self.statusBar().showMessage(f"Split view — {n} devices side-by-side. Click Split again for tabs.")
+            self.log_panel.append(f"[OK] Split view: {n} devices side-by-side.")
         else:
             for (w, title) in getattr(self, "_tiled_items", []):
                 self.tabs.addTab(w, title)
@@ -1513,6 +1738,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.tabs.removeTab(index)
+        if w is not None:
+            w.deleteLater()
         self._update_center()
         self._update_status()
 
@@ -1566,10 +1793,15 @@ class MainWindow(QMainWindow):
             self._timer.stop()
         except Exception:
             pass
+        if getattr(self, "_tracker", None):
+            try:
+                self._tracker.stop()
+            except Exception:
+                pass
         # park any still-running worker threads — Qt crashes if a QThread object
         # is destroyed (with this window) while its thread is alive
         from .qtutil import park_thread
-        for attr in ("_poll", "_as", "_dl", "_share", "_unshare", "_deploy",
+        for attr in ("_poll", "_tracker", "_adb_init", "_as", "_dl", "_share", "_unshare", "_deploy",
                      "_sc", "_upd_chk", "_upd_run", "_upd_quiet", "_disc",
                      "_bcast"):
             park_thread(getattr(self, attr, None))

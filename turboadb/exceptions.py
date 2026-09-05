@@ -32,8 +32,7 @@ class ADBCommandError(ADBError):
         stderr = getattr(result, "stderr", "") or ""
         exit_code = getattr(result, "exit_code", "?")
         super().__init__(
-            f"Command failed (exit={exit_code}): {command!r}\n"
-            f"stderr: {stderr.strip()[:500]}"
+            f"Command failed (exit={exit_code}): {command!r}\nstderr: {stderr.strip()[:500]}"
         )
 
 
