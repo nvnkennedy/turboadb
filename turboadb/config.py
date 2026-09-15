@@ -6,6 +6,59 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def validate_port(value, name: str = "port") -> int:
+    """Return a valid TCP port or raise a clear :class:`ValueError`.
+
+    Type annotations do not protect public library entry points.  Converting and
+    validating ports at the boundary also prevents values from being interpolated
+    into command lines by callers of the deployment/startup helpers.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer between 1 and 65535")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer between 1 and 65535") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
+def format_host_port(host: str, port: int) -> str:
+    """Format an ADB endpoint, preserving brackets required for IPv6 literals."""
+    host = (host or "").strip()
+    if not host:
+        raise ValueError("host must not be empty")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{validate_port(port)}"
+
+
+def parse_host_port(value, default_port: Optional[int] = None):
+    """Split an endpoint into ``(host, port)`` — the one shared parser.
+
+    Accepts ``host:port``, ``[ipv6]:port``, ``[ipv6]``, a bare host and a bare
+    IPv6 literal. Brackets are removed from the host. The port is returned as an
+    ``int`` only when it is present and numeric; otherwise *default_port* is
+    returned in its place (range validation is left to :func:`validate_port`).
+    A bare IPv6 literal such as ``fe80::1`` is never split into host and port.
+    """
+    text = str(value or "").strip()
+    if text.startswith("[") and "]" in text:
+        end = text.index("]")
+        host, rest = text[1:end], text[end + 1 :]
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, default_port
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        if host and port.isdigit():
+            return host, int(port)
+    return text, default_port
+
+
 @dataclass
 class ADBConfig:
     """
@@ -41,51 +94,45 @@ class ADBConfig:
     scrcpy_path: Optional[str] = None
 
     # --- behaviour ---
-    command_timeout: Optional[float] = None  # default per-command timeout (s)
+    command_timeout: Optional[float] = 60.0  # default per-command timeout (s)
+    transfer_timeout: Optional[float] = 600.0  # default push/pull timeout (s)
     connect_timeout: float = 20.0  # wait-for-device window on connect
     auto_connect: bool = True  # run `adb connect` for network targets
     auto_wait: bool = True  # wait-for-device after connect
     encoding: str = "utf-8"
 
     def __post_init__(self):
+        self.port = validate_port(self.port)
+        self.adb_server_port = validate_port(self.adb_server_port, "adb_server_port")
+        if self.command_timeout is not None and self.command_timeout <= 0:
+            raise ValueError("command_timeout must be positive or None")
+        if self.transfer_timeout is not None and self.transfer_timeout <= 0:
+            raise ValueError("transfer_timeout must be positive or None")
         # A bare "host:port" passed as serial is also a valid network target.
         if self.serial and self.host is None and ":" in self.serial:
-            if self.serial.startswith("[") and "]" in self.serial:
-                b_end = self.serial.index("]")
-                h = self.serial[1:b_end]
-                rest = self.serial[b_end + 1 :]
-                if rest.startswith(":") and rest[1:].isdigit():
-                    self.host, self.port = h, int(rest[1:])
-            else:
-                h, _, p = self.serial.rpartition(":")
-                if p.isdigit() and ":" not in h:
-                    self.host, self.port = h, int(p)
+            h, p = parse_host_port(self.serial)
+            if h and p is not None:
+                self.host, self.port = h, p
         # Normalise a remote adb-server host given WITH a port (e.g. the user
         # typed "10.232.10.199:5037" or "[::1]:5037"): split the port out so we never build a
         # doubled "host:port:port" address that scrcpy/adb rejects with
-        # "no host in '…:5037:5037'".
-        if self.adb_server_host:
-            h = self.adb_server_host.strip()
-            if h.startswith("[") and "]" in h:
-                b_end = h.index("]")
-                host = h[1:b_end]
-                rest = h[b_end + 1 :]
-                if rest.startswith(":") and rest[1:].isdigit():
-                    self.adb_server_port = int(rest[1:])
-                self.adb_server_host = host
-            elif ":" in h:
-                host, _, p = h.rpartition(":")
-                if host and p.isdigit() and ":" not in host:
-                    self.adb_server_host = host
-                    self.adb_server_port = int(p)
-                else:
-                    self.adb_server_host = h
+        # "no host in '…:5037:5037'". Surrounding whitespace is always removed.
+        if self.adb_server_host is not None:
+            h, p = parse_host_port(self.adb_server_host)
+            self.adb_server_host = h or None
+            if h and p is not None:
+                self.adb_server_port = p
+        # Serial/server endpoint parsing above can replace the initial values.
+        # Validate once more so a value embedded in "host:port" gets the same
+        # boundary checks as an explicit argument.
+        self.port = validate_port(self.port)
+        self.adb_server_port = validate_port(self.adb_server_port, "adb_server_port")
 
     @property
     def target(self) -> Optional[str]:
         """The adb serial to pass with ``-s`` (``host:port`` for network)."""
         if self.host:
-            return f"{self.host}:{self.port}"
+            return format_host_port(self.host, self.port)
         return self.serial
 
     @property
@@ -94,7 +141,7 @@ class ADBConfig:
 
     def __repr__(self) -> str:
         srv = (
-            f", adb_server={self.adb_server_host}:{self.adb_server_port}"
+            f", adb_server={format_host_port(self.adb_server_host, self.adb_server_port)}"
             if self.adb_server_host
             else ""
         )
@@ -107,7 +154,8 @@ class ADBConfig:
 @dataclass
 class ScrcpyOptions:
     """Options for a scrcpy mirroring/control session. All optional; sensible
-    defaults mirror at the device's native size with audio off for low latency."""
+    defaults mirror at the device's native size with scrcpy's audio forwarding
+    enabled when the device supports it."""
 
     max_size: Optional[int] = None  # --max-size (longest edge in px)
     bit_rate: Optional[str] = None  # --video-bit-rate e.g. "8M"
@@ -132,9 +180,16 @@ class ScrcpyOptions:
     window_borderless: bool = False  # --window-borderless (for GUI embedding)
     window_x: Optional[int] = None  # --window-x
     window_y: Optional[int] = None  # --window-y
-    no_audio: bool = False  # audio ON by default (scrcpy 2.0+,
-    # Android 11+); falls back to video-only
-    # automatically on devices without it
+    # Audio is enabled by default.  These values map to scrcpy 4.x audio
+    # controls and are deliberately optional so older scrcpy installations
+    # retain their own compatible defaults.
+    no_audio: bool = False
+    audio_source: Optional[str] = None  # output|playback|mic|voice-call-downlink|voice-performance
+    audio_codec: Optional[str] = None  # opus|aac|flac|raw
+    audio_bit_rate: Optional[str] = None  # e.g. 128K
+    audio_buffer: Optional[int] = None  # capture buffer latency in milliseconds
+    audio_output_buffer: Optional[int] = None  # local playback buffer in milliseconds
+    audio_dup: bool = False  # keep audio playing on device (playback source only)
     no_control: bool = False  # --no-control (view only)
     keyboard_mode: Optional[str] = None  # --keyboard sdk|uhid|aoa — "uhid" is a
     # virtual HARDWARE keyboard, which types
@@ -178,11 +233,14 @@ class ScrcpyOptions:
             args += ["--record", str(self.record)]
         if self.record_format:
             args += ["--record-format", str(self.record_format)]
-        if self.stay_awake:
+        # scrcpy refuses to start when these are combined with --no-control
+        # ("Cannot request to stay awake if control is disabled"), and
+        # stay_awake defaults to True — so a view-only session must drop them.
+        if self.stay_awake and not self.no_control:
             args += ["--stay-awake"]
-        if self.turn_screen_off:
+        if self.turn_screen_off and not self.no_control:
             args += ["--turn-screen-off"]
-        if self.show_touches:
+        if self.show_touches and not self.no_control:
             args += ["--show-touches"]
         if self.fullscreen:
             args += ["--fullscreen"]
@@ -196,6 +254,19 @@ class ScrcpyOptions:
             args += ["--window-y", str(self.window_y)]
         if self.no_audio:
             args += ["--no-audio"]
+        else:
+            if self.audio_source:
+                args += [f"--audio-source={self.audio_source}"]
+            if self.audio_codec:
+                args += ["--audio-codec", str(self.audio_codec)]
+            if self.audio_bit_rate:
+                args += ["--audio-bit-rate", str(self.audio_bit_rate)]
+            if self.audio_buffer is not None:
+                args += ["--audio-buffer", str(self.audio_buffer)]
+            if self.audio_output_buffer is not None:
+                args += ["--audio-output-buffer", str(self.audio_output_buffer)]
+            if self.audio_dup:
+                args += ["--audio-dup"]
         if self.no_control:
             args += ["--no-control"]
         if self.keyboard_mode:
@@ -208,4 +279,3 @@ class ScrcpyOptions:
             args += ["--no-playback"]
         args += list(self.extra_args or [])
         return args
-

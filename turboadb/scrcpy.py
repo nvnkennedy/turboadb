@@ -10,13 +10,19 @@ import socket
 import subprocess
 from typing import Optional
 
-from .config import ScrcpyOptions
-from .tools import find_scrcpy, NO_WINDOW
+from .config import ScrcpyOptions, parse_host_port
+from .tools import find_scrcpy, NO_WINDOW, DEFAULT_ADB_SERVER_PORT
 from .exceptions import ScrcpyError
 
-# Fixed port for the scrcpy video tunnel to a REMOTE adb server, so it can be
-# opened in that machine's firewall (otherwise scrcpy picks a random high port).
+# A bounded port range for video tunnels to a REMOTE adb server. A single forced
+# port made concurrent device tabs race for 27184; scrcpy can safely choose the
+# first available port from this firewall-friendly range.
 TUNNEL_PORT = 27184
+TUNNEL_PORT_LAST = 27199
+# scrcpy's own ``--port=FIRST:LAST`` syntax
+TUNNEL_PORT_RANGE = f"{TUNNEL_PORT}:{TUNNEL_PORT_LAST}"
+# the same range as written for firewall rules / user messages ("FIRST-LAST")
+TUNNEL_PORT_FIREWALL_RANGE = f"{TUNNEL_PORT}-{TUNNEL_PORT_LAST}"
 
 
 def resolve_host(host: Optional[str]) -> Optional[str]:
@@ -29,14 +35,9 @@ def resolve_host(host: Optional[str]) -> Optional[str]:
     separately) so we never produce a doubled ``host:port:port``."""
     if not host:
         return host
-    host = host.strip()
-    if host.startswith("[") and "]" in host:
-        b_end = host.index("]")
-        host = host[1:b_end]
-    elif ":" in host:
-        h, _, p = host.rpartition(":")
-        if h and p.isdigit() and ":" not in h:
-            host = h
+    host = parse_host_port(host)[0]
+    if not host:
+        return host
     try:
         socket.inet_aton(host)  # already a dotted IPv4 — keep as-is
         return host
@@ -78,6 +79,16 @@ def is_local_host(host: Optional[str]) -> bool:
         return False
 
 
+def _remote_server_host(host: Optional[str]) -> Optional[str]:
+    """*host* when it names ANOTHER machine's adb server, else None — resolved
+    once per call so the tunnel flag and the ``ANDROID_ADB_SERVER_*`` environment
+    always agree (a "remote" host that is really this PC must use the local
+    server, not its LAN address)."""
+    if host and not is_local_host(host):
+        return host
+    return None
+
+
 def is_remote_session() -> bool:
     """True when running inside a Windows Remote Desktop session, where scrcpy's
     default GPU renderer (Direct3D/OpenGL) usually fails — software rendering is
@@ -100,12 +111,16 @@ def _server_env(host: Optional[str], port: int, adb_path: Optional[str] = None):
       two servers then fight ("version doesn't match, killing…") and scrcpy dies
       with *"adb start-server exited unexpectedly / server connection failed"* —
       the exact error seen over Remote Desktop.
-    * ``ANDROID_ADB_SERVER_HOST/PORT`` — point scrcpy at a remote adb server.
+    * ``ANDROID_ADB_SERVER_HOST/PORT`` — point scrcpy at a remote adb server
+      (or, without a host, at a local server on a non-default port).
     """
     env = None
     if adb_path:
         env = os.environ.copy()
         env["ADB"] = adb_path
+    if not host and port and int(port) != DEFAULT_ADB_SERVER_PORT:
+        env = env or os.environ.copy()
+        env["ANDROID_ADB_SERVER_PORT"] = str(port)
     if host:
         ip = resolve_host(host)  # clean IP, no :port suffix
         env = env or os.environ.copy()
@@ -137,11 +152,12 @@ def list_displays(
     Raises :class:`ScrcpyError` if scrcpy can't reach the device.
     """
     exe = find_scrcpy(scrcpy_path)
+    remote = _remote_server_host(adb_server_host)
     cmd = [exe]
     if serial:
         cmd += ["--serial", serial]
-    if adb_server_host:
-        cmd += ["--tunnel-host", resolve_host(adb_server_host)]
+    if remote:
+        cmd += ["--tunnel-host", resolve_host(remote)]
     cmd += ["--list-displays"]
     try:
         out = subprocess.run(
@@ -150,7 +166,7 @@ def list_displays(
             text=True,
             timeout=timeout,
             creationflags=NO_WINDOW,
-            env=_server_env(adb_server_host, adb_server_port, adb_path),
+            env=_server_env(remote, adb_server_port, adb_path),
         )
     except subprocess.TimeoutExpired as exc:
         raise ScrcpyError("scrcpy --list-displays timed out") from exc
@@ -167,6 +183,103 @@ def list_displays(
             f"scrcpy could not list displays: {text.strip()[:400] or 'no device reachable'}"
         )
     return displays
+
+
+def _post_close_to_pid(pid: int) -> bool:
+    """Find windows owned by *pid* and post WM_CLOSE so SDL/scrcpy exits cleanly."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.PostMessageW.restype = wintypes.BOOL
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        found = []
+
+        def visit(hwnd, _lparam):
+            p = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid:
+                found.append(hwnd)
+                u.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            return True
+
+        u.EnumWindows(WNDENUMPROC(visit), 0)
+        return bool(found)
+    except Exception:
+        return False
+
+
+# Raises Ctrl+Break on another process's console from a short-lived helper, for
+# a caller that already owns a console (AttachConsole refuses a second one).
+_CTRL_BREAK_HELPER = (
+    "import ctypes,sys\n"
+    "k=ctypes.windll.kernel32\n"
+    "p=int(sys.argv[1])\n"
+    "k.FreeConsole()\n"
+    "sys.exit(0 if k.AttachConsole(p) and k.GenerateConsoleCtrlEvent(1,p) else 1)\n"
+)
+_ERROR_ACCESS_DENIED = 5
+
+
+def _send_ctrl_break(pid: int) -> bool:
+    """Deliver CTRL_BREAK_EVENT to *pid*'s process group on its own console.
+
+    scrcpy handles Ctrl+Break like a closed window: it quits cleanly and writes
+    a recording's MP4 index.  ``Popen.send_signal`` cannot deliver it, because
+    GenerateConsoleCtrlEvent only reaches processes on the caller's console and
+    scrcpy runs on its own hidden console (CREATE_NO_WINDOW).  A windowless
+    (``--no-window``) recorder was therefore always terminated, leaving an MP4
+    without its index.  Attach to scrcpy's console just long enough to raise the
+    event; the caller is not in scrcpy's process group, so it never receives it.
+    """
+    if os.name != "nt" or not pid:
+        return False
+    try:
+        import ctypes
+        import sys
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.AttachConsole.restype = wintypes.BOOL
+        k.AttachConsole.argtypes = [wintypes.DWORD]
+        k.FreeConsole.restype = wintypes.BOOL
+        k.GenerateConsoleCtrlEvent.restype = wintypes.BOOL
+        k.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.GetStdHandle.restype = wintypes.HANDLE
+        k.GetStdHandle.argtypes = [wintypes.DWORD]
+        k.SetStdHandle.restype = wintypes.BOOL
+        k.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        std_ids = (0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4)  # STD_INPUT/OUTPUT/ERROR_HANDLE
+        saved = [k.GetStdHandle(n) for n in std_ids]
+        if k.AttachConsole(pid):
+            try:
+                return bool(k.GenerateConsoleCtrlEvent(1, pid))  # CTRL_BREAK_EVENT
+            finally:
+                k.FreeConsole()
+                # AttachConsole may have replaced empty standard handles with
+                # console handles that FreeConsole just invalidated.
+                for n, handle in zip(std_ids, saved):
+                    k.SetStdHandle(n, handle)
+        if ctypes.get_last_error() != _ERROR_ACCESS_DENIED:
+            return False  # the process is gone, or has no console
+        if getattr(sys, "frozen", False) or not sys.executable:
+            return False
+        done = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _CTRL_BREAK_HELPER, str(int(pid))],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+            timeout=10,
+        )
+        return done.returncode == 0
+    except Exception:
+        return False
 
 
 class ScrcpySession:
@@ -205,15 +318,24 @@ class ScrcpySession:
     def wait(self, timeout: Optional[float] = None) -> int:
         return self._proc.wait(timeout=timeout)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
+        """Ask scrcpy to quit cleanly, as closing its window does, and wait up to
+        *timeout* seconds (a recording's MP4 index is written then) before
+        ending the process."""
         try:
             if self.running:
                 if os.name == "nt":
-                    import signal
-
+                    _post_close_to_pid(self._proc.pid)
+                    # a windowless session (--no-window) has nothing to close
+                    _send_ctrl_break(self._proc.pid)
                     try:
-                        self._proc.send_signal(signal.CTRL_BREAK_EVENT)
-                        self._proc.wait(timeout=2.0)
+                        self._proc.wait(timeout=timeout)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._proc.terminate()
+                        self._proc.wait(timeout=timeout)
                     except Exception:
                         pass
                 if self.running:
@@ -268,19 +390,21 @@ def launch_scrcpy(
     """
     exe = find_scrcpy(scrcpy_path)
     opts = options or ScrcpyOptions()
+    remote = _remote_server_host(adb_server_host)
     cmd = [exe]
     if serial:
         cmd += ["--serial", serial]
-    if adb_server_host:
+    if remote:
         # Remote adb server: scrcpy must tunnel the VIDEO socket across the
-        # network. We force a FORWARD tunnel to a FIXED, known port on the remote
-        # machine (--tunnel-host + --tunnel-port) instead of a random one, so it
-        # can be opened in that machine's firewall. (Resolve a hostname → IP;
-        # scrcpy's tunnel won't resolve names itself.)
-        cmd += [f"--tunnel-host={resolve_host(adb_server_host)}", f"--tunnel-port={TUNNEL_PORT}"]
+        # network. Keep selection inside a known firewall range, while allowing
+        # simultaneous tabs to choose different ports instead of colliding.
+        cmd += [
+            f"--tunnel-host={resolve_host(remote)}",
+            f"--port={TUNNEL_PORT_RANGE}",
+        ]
     cmd += opts.to_args()
 
-    env = _server_env(adb_server_host, adb_server_port, adb_path)
+    env = _server_env(remote, adb_server_port, adb_path)
     if (opts.render_driver or "").lower() == "software":
         # belt-and-braces: also force SDL software rendering via env, so it holds
         # even if this scrcpy build ignores --render-driver

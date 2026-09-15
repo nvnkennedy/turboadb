@@ -45,7 +45,6 @@ turboadb/
 ├── remote_deploy.py   deploy 'serve' to remote Windows hosts over WinRM (pywinrm/NTLM)
 ├── cli.py             argparse front-end; console-script entry points
 ├── assets/            icon.ico / icon.png
-├── bin/               bundled turboadb-gui.exe (shipped in the wheel)
 └── gui/               the PyQt5 application (see below)
 ```
 
@@ -144,13 +143,15 @@ Two patterns recur and are worth preserving:
 ## Packaging
 
 - `pyproject.toml` — package metadata, the console-script/gui-script entry
-  points, optional extras (`gui`, `winrm`, `all`), and `package-data` that ships
-  the bundled exe + assets inside the wheel.
+  points, optional extras (`gui`, `winrm`, `all`), and package assets.
 - `turboadb-gui.spec` + `scripts/build_exe.py` — PyInstaller build of the
-  one-file GUI exe. `collect_all` pulls the entire pywinrm/NTLM stack so WinRM
-  works in the frozen exe. `scripts/gui_entry.py` is the frozen entry point (with
-  a startup self-test hook).
-- `scripts/release.py` — build wheel+sdist and upload to PyPI.
+  versioned GUI executable (`dist/TurboADB-<version>-win64.exe`). `collect_all`
+  pulls the entire pywinrm/NTLM stack so WinRM works in the frozen exe.
+  `scripts/gui_entry.py` is the frozen entry point (with a startup self-test hook).
+- `scripts/release.py` — copy that exe into `turboadb/bin/turboadb-gui.exe`
+  (package data, git-ignored), build wheel+sdist, check the wheel contains the
+  exe, and upload to PyPI. `turboadb-gui` starts the bundled exe when PyQt5 is
+  not installed.
 
 ## Where things live at runtime
 

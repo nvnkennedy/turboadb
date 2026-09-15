@@ -9,7 +9,12 @@ from typing import Optional, Union
 
 
 # ANSI/VT escape sequences (CSI like ESC[1;32m, OSC like ESC]0;title BEL, etc.)
-_ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+# OSC and CSI must be tried BEFORE the two-byte Fe form: the old class
+# ``[@-Z\\-_]`` also matched ``]`` (0x5D), so "ESC ]" was consumed alone and the
+# OSC payload (e.g. a window title) leaked into the cleaned text.
+_ANSI_RE = re.compile(
+    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\^_])"
+)
 # control chars except tab(09), newline(0a); carriage-return(0d) handled separately
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 

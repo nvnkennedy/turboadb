@@ -8,7 +8,7 @@ bundled automotive/Android icon, using PyInstaller.
     python scripts/build_exe.py          # one-file build via the spec
 
 Output:
-    dist/turboadb-gui.exe
+    dist/TurboADB-<version>-win64.exe
 
 Run from the repo root so the spec finds turboadb/.
 """
@@ -17,10 +17,20 @@ from __future__ import annotations
 
 import sys
 import subprocess
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "turboadb-gui.spec"
+
+
+def executable_path() -> Path:
+    """Return the versioned executable path declared by the PyInstaller spec."""
+    text = (ROOT / "turboadb" / "__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    if match is None:
+        raise RuntimeError("Could not read TurboADB's version.")
+    return ROOT / "dist" / f"TurboADB-{match.group(1)}-win64.exe"
 
 
 def main(argv=None) -> int:
@@ -32,7 +42,7 @@ def main(argv=None) -> int:
     print("Running:", " ".join(str(c) for c in cmd))
     rc = subprocess.call(cmd, cwd=str(ROOT))
     if rc == 0:
-        print("\nDone. Executable at: dist/turboadb-gui.exe")
+        print(f"\nDone. Executable at: {executable_path().relative_to(ROOT)}")
     return rc
 
 

@@ -1,9 +1,8 @@
 name: Release
 
 # Build the Windows GUI exe and attach it (plus the wheel/sdist) to the GitHub
-# Release when a v* tag is pushed. PyPI upload stays manual via
-# scripts/release.py — this only automates the exe artifact that used to be
-# built and attached by hand, so PyPI and GitHub Releases can't drift apart.
+# Release when a v* tag is pushed. The wheel bundles the same exe, exactly like
+# the one scripts/release.py uploads to PyPI (the PyPI upload stays manual).
 
 on:
   push:
@@ -27,13 +26,19 @@ jobs:
           python -m pip install -e ".[all]" pyinstaller pillow build
       - name: Build the one-file GUI exe
         run: python -m PyInstaller --clean --noconfirm turboadb-gui.spec
+      - name: Bundle the exe into the package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force turboadb/bin | Out-Null
+          $exe = Get-ChildItem dist/TurboADB-*-win64.exe | Select-Object -First 1
+          Copy-Item $exe.FullName turboadb/bin/turboadb-gui.exe
       - name: Build wheel + sdist
         run: python -m build
       - name: Attach to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/turboadb-gui.exe
+            dist/TurboADB-*-win64.exe
             dist/*.whl
             dist/*.tar.gz
           fail_on_unmatched_files: false

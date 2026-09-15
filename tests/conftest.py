@@ -3,10 +3,23 @@ output, so the real ADBHandler code paths (arg building, parsing, safe-mode) run
 without a device or a real adb binary — portable across Linux/Windows CI."""
 import os
 import sys
+import tempfile
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if sys.path[0] != repo_root:
     sys.path.insert(0, repo_root)
+
+# Never let GUI tests read or write the developer's real ~/.turboadb profile.
+# Besides leaking state between runs, a redirected/profile-scanned home directory
+# can make a tiny settings or terminal-log write hang the suite.
+_TEST_HOME = tempfile.mkdtemp(prefix="turboadb-tests-")
+os.environ["HOME"] = _TEST_HOME
+os.environ["USERPROFILE"] = _TEST_HOME
+# A MainWindow built by a test runs its startup tool check.  With auto-fetch on
+# it downloaded platform-tools on a worker thread that outlived the test, and
+# Qt later crashed the whole run (access violation).  Tests that exercise
+# auto-fetch opt back in with monkeypatch.setenv.
+os.environ["TURBOADB_AUTO_FETCH"] = "0"
 
 import pytest
 
@@ -86,6 +99,23 @@ def fake_adb(monkeypatch, tmp_path):
     monkeypatch.setattr(core.subprocess, "run", fake.run)
     monkeypatch.setattr(tools.subprocess, "run", fake.run)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _no_real_device_connect(monkeypatch):
+    """GUI tests build DeviceTabs for made-up serials such as "123". Their
+    automatic connect ran the real ``adb -s 123 wait-for-device``, which waits
+    for a device that never appears; when pytest exited, that adb child was
+    orphaned, and dozens piled up across runs. The connect thread still starts
+    (tab lifecycle stays as in the app) but runs no adb; tests that need a
+    connection call ``_on_connected`` with a fake handler."""
+    try:
+        from turboadb.gui import device_tab
+    except Exception:  # PyQt5 is not installed (CI installs only [test])
+        yield
+        return
+    monkeypatch.setattr(device_tab._ConnectThread, "run", lambda self: None)
+    yield
 
 
 @pytest.fixture(scope="session")

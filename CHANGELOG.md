@@ -3,6 +3,293 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 2.0.0
+
+A redesigned app, the Windows executable back inside the pip package, and a
+full code-review pass.
+
+**Highlights**
+
+- **One install, exe included:** the wheel bundles the Windows GUI executable,
+  so `pip install turboadb` gives you `turboadb-gui` even without PyQt5. The same
+  `TurboADB-2.0.0-win64.exe` is attached to the GitHub Release.
+- **Phone tab:** dialler with keypad, live call state, recent calls and messages.
+- **Redesigned window:** colourful theme-following icons, a Device Control
+  control centre, no device header (actions sit beside the section tabs) and a
+  boxed two-line welcome banner in every terminal.
+- **Device type detection:** Android Automotive, infotainment head unit, TV,
+  watch, tablet or phone, which picks the IVI-compatible screen profile.
+- **Calmer themes:** Graphite / Porcelain by default plus Mocha / Latte,
+  Forest / Sage, Plum / Rose and Deep teal / Mint; light themes are dimmer.
+- **Better screen mirroring:** starts on the first click, sharper video, typing
+  straight on the embedded screen, and recording without restarting the view.
+- **Real Windows shells:** PowerShell and Command Prompt tabs run Python, Git,
+  `where`, current-folder programs and non-English text like a normal console.
+- **Notifications:** every action shows a small toast; errors show a red popup
+  with a sound and a Copy button.
+
+### Details
+
+- New **Phone** tab for each device: a dialler with a keypad and Call / End /
+  Answer / Open in dialler, a live call-state pill (Idle, Ringing, In call or
+  No telephony), colour-coded recent calls with Call back, and messages with a
+  Compose in Messages box. Enter only opens the dialler and Call back only
+  fills the number in, so nothing rings by accident. If the device refuses the
+  call log or messages, the list shows the reason instead of an error.
+- The screen mirror embedded in a tab works again. The scrcpy window is now
+  made a child window before it is re-parented and the attachment is checked
+  with the correct Windows call; previously every embed was wrongly treated as
+  rejected and fell back to a separate window. The status line no longer sticks
+  on "embedding…" when a real fallback happens.
+- The first Start click in Device Control now works right after TurboADB
+  launches. The window used to be adopted while scrcpy was still preparing its
+  first frame on a cold ADB server, which made scrcpy exit and showed a
+  "didn't start — retrying" toast before the automatic retry worked. It is now
+  embedded only once scrcpy has shown its window.
+- Webcam: starting no longer flashes "Camera stopped" while the feed comes up.
+  A camera that rejects the requested frame rate switches to its native mode
+  within about 0.3 s and is remembered for later starts; the status says
+  "Starting…" until the first frame arrives, and a camera that stays silent
+  reports "No video" after 12 s instead of waiting forever.
+- File browser: deleting, renaming or pulling a file whose name starts or ends
+  with spaces no longer acts on a different file; pasting a folder into its own
+  subfolder is refused instead of copying without end; Delete, F2, F4, Ctrl+C
+  and Ctrl+V work again; push, pull and paste onto an existing folder merge
+  (asking before overwriting) instead of nesting a copy; rename asks before
+  replacing; saving an edited device file keeps its permissions; symlinked
+  files and folders can be pulled and edited; unreadable entries are listed as
+  "Unknown"; a mistyped path no longer becomes the current folder; local
+  delete handles read-only files and junctions; the editor keeps non-breaking
+  spaces and refuses device nodes and oversize targets; transfers can be
+  cancelled; and pulled names Windows can't store are renamed and logged.
+- CLI: global options such as `--adb-host`, `--json` and `-s` work before or
+  after the subcommand, and `connect` / `pair` / `disconnect` honour
+  `--adb-host`. Commands exit 1 when the device refuses an action, unexpected
+  errors print one line instead of a traceback, `--timeout` no longer disables
+  the 60 s default, `scrcpy --no-control` starts, `scrcpy -s ip:port` connects
+  first, split-APK `install` passes `--downgrade`, and Ctrl+C during `record`
+  stops and still saves the MP4.
+- Tools: automatic fetching only installs a missing `adb` / `scrcpy` and never
+  upgrades (so a routine command can't restart the shared ADB server); Linux and
+  macOS commands no longer re-check for updates on every run; `find_adb` no
+  longer changes `PATH` / `ADB`, and an explicit path beats `TURBOADB_ADB`,
+  which beats the GUI setting.
+- Engine: text passed to device commands (URLs, package names, SMS bodies,
+  paths, typed text) is quoted for the device shell, and `%` is typed
+  literally. Port-forward removal is scoped to the device and reports failure.
+  Root, unroot, remount, verity and remount-rw raise on refusal instead of
+  reporting "ok"; install errors show adb's real reason; `get_state` reports
+  `unauthorized` / `offline`. `tel:`, `geo:`, `mailto:` and `market:` links keep
+  their scheme and `#` is encoded in dial codes. Screenshots never silently
+  return a different display. Call-log and SMS queries return complete
+  multi-line rows and surface permission errors. Safe mode never raises for
+  invalid arguments, and `with ADBHandler(...)` only disconnects connections it
+  opened. Raw `$ adb …` traces log at DEBUG and the library no longer installs
+  its own log handler.
+- New API: `ADBHandler.restart_server()`, `config.parse_host_port()`,
+  `scrcpy.TUNNEL_PORT_FIREWALL_RANGE`, `install_multiple(downgrade=)`,
+  `shell_many(safe=, timeout=, su=, check=)` and `ShellSession.at_eof`;
+  `ForwardHandle.close()` returns whether removal succeeded.
+- Sharing: the shared ADB server no longer reports success when it failed to
+  bind, remote deploy no longer fails on harmless stderr output, and enabling
+  auto-start from the standalone executable gives a clear error instead of
+  opening the GUI at every login.
+
+- Redesigned window. The top bar now holds only global actions (Connect, ADB
+  server, Tools, plus theme, log, settings and help icons) instead of repeating
+  the device sections. The Devices sidebar is a fixed panel with a device
+  count, a + button, a list sized to its devices and an empty state. The log
+  panel no longer repeats its title, and the Settings,
+  Connect, Session, Deploy and Report dialogs share aligned forms with a footer
+  holding the primary button.
+- Colourful icons: a new set of theme-following vector icons replaces the emoji
+  across the top bar, menus, sidebar, section tabs and every page and dialog.
+  Each section keeps one colour (Terminal teal, Logcat amber, Files blue,
+  Device Control purple, Apps orange, Phone green, Webcam red), and actions
+  are colour-coded (start green, delete red, save teal). File lists show
+  folder and file-type icons instead of emoji prefixes, with folders still
+  sorted first. Logcat, Apps and Webcam show a hint while empty.
+- Terminals: the Android / PowerShell / CMD switcher shares one row with the
+  terminal actions, so terminals get more height. The font stays 10 pt unless you choose another size in
+  Settings or with zoom. Zooming one terminal (A+ / A− or Ctrl + wheel)
+  resizes all of them together.
+- The window opens maximized, and page toolbars wrap onto a second row instead
+  of widening the window: opening a device used to demand 2,002 px, which
+  pushed the right side (including the device controls) off the screen.
+- Sharper embedded screen: scrcpy now draws with OpenGL and trilinear
+  filtering, so small text stays crisp when the phone is scaled down (it falls
+  back to scrcpy's default renderer if OpenGL fails), and the default video
+  bitrate is 16 Mbit/s (settings still carrying the old 8M default move once).
+  The "Click here, then type" bar under the screen is gone; type on the screen
+  itself or use Device Control's Keyboard section.
+- Device list: the ‹ button in its header (or Ctrl+B) hides it, and a slim bar
+  with a › arrow on the window's left edge brings it back. The list hides
+  itself while a device screen is showing and returns when the screen stops.
+  Connected and Saved targets are separate boxes with underlined headers and
+  clearer icons, and Device Control has its own screen-and-pointer icon.
+- Themes switch in about 0.12 s with a device open (was about 0.8 s): pages
+  no longer carry their own stylesheets, and the Themes menu and Settings list
+  the dark and light palettes as separate groups. The logcat right-click menu
+  is readable in light themes again.
+- Notifications: every action updates the status bar and shows a small toast
+  (one toast, updated in place); errors show a large red toast at the bottom
+  with an alert sound. The log panel's "Silent" option now only mutes popups
+  while the log is open; it used to hide every warning toast.
+- Typing on the embedded screen works without the old typing bar and is fast:
+  click anywhere on the screen, including the video, and the PC keyboard goes
+  straight to scrcpy, so keys arrive immediately and a held key stops repeating
+  when released. If Windows refuses that focus hand-off, keys go over ADB
+  instead, where held-key repeats are dropped while a key is still being sent
+  and identical keys are sent together, so Backspace no longer keeps deleting
+  after you let go. (With the direct route, symbols from non-US keyboard
+  layouts and IME input are not typed; UHID keyboard mode is unaffected.)
+- Recording while the screen is live no longer restarts or blanks it. A second,
+  windowless scrcpy records alongside the live view (falling back to on-device
+  recording if it can't start), and stopping it finalises the MP4 properly
+  instead of killing scrcpy and leaving an unplayable file.
+- The "Screen is off" placeholder follows the display's real shape: head units,
+  clusters and other wide displays show a display frame (with a car icon for
+  automotive devices) and phones a phone frame.
+- Device type detection: `ADBHandler.device_kind()` (also merged into
+  `device_info()` and `turboadb info`) classifies a device as Android
+  Automotive (the automotive feature or build characteristic), an infotainment
+  head unit running ordinary Android (no telephony and a landscape display),
+  TV, watch, tablet or phone, with the evidence it used. Both car kinds get the
+  IVI-compatible screen profile, the display-shaped placeholder and the IVI
+  displays tab.
+- The device page no longer has a header row: Screen, Screenshot, Reboot and
+  More sit at the right end of the section tabs, and the terminals open with a
+  two-line welcome banner (the Android one shows the connection, device type,
+  Android version, CPU and serial). The "TurboADB" title next to Connect is
+  gone.
+- Light themes are dimmer (page brightness about a third lower) so they are
+  no longer glaring; every text colour still meets the contrast checks.
+- Toasts no longer print "QWindowsWindow::setGeometry: Unable to set
+  geometry" warnings.
+- Connecting no longer shows a red "shell failed: adb command timed out after
+  0.45s" error when the phone is a little slow to answer the first identity
+  check: the check (`ADBHandler.quick_identity()`) now allows 1.5 s, also reads
+  the CPU type, and a slow reply is logged quietly. The background device
+  details request no longer raises error popups either, so the terminal banner
+  keeps the device's details. The red error popup has a Copy button, because
+  Ctrl+C there went to the terminal and stopped its command.
+- PowerShell and Command Prompt tabs behave like normal Windows shells:
+  - **Frozen exe leaks:** the exe no longer passes its internal variables
+    (`_PYI_*`, `QT_PLUGIN_PATH`, `_MEI…` PATH entries) or its private DLL search
+    folder to the shells, which broke Python, Git and other tools there. The
+    source run no longer adds PyQt5's Qt folder to PATH.
+  - **Current-folder programs:** in CMD, `tool.exe` runs the copy in the current
+    folder even when TurboADB was started from a shell that disabled that.
+  - **Registry variables:** new ones are expanded the way Windows expands them.
+  - **Non-English text:** it types, prints and works in paths (UTF-8 in both shells).
+  - **Tab completion:** it offers `.\tool.exe` for programs in the current
+    folder and follows `cd` / `pushd`.
+  - **Interactive programs:** a bare `python`, `py` or `node` shows its prompt
+    instead of seeming to hang (its input is a pipe, so it is started with
+    `-i`), and in PowerShell `where python` runs `where.exe` (`where` is
+    PowerShell's alias for `Where-Object`).
+- Device Control is a control centre: while the screen is off, a device-shaped
+  frame offers Start screen and Open in separate window; controls are large
+  Back / Home / Recents buttons, media and volume icon buttons, one Wi-Fi /
+  Bluetooth / Mobile data / Airplane / Hotspot tile each with On and Off, and
+  colourful app launcher tiles and keyboard keys.
+- The status bar no longer says "no device connected" while devices are
+  attached but not yet opened.
+- New themes: the default pair is Graphite (dark) and Porcelain (light),
+  layered neutral surfaces with soft text instead of pure black or glaring
+  white. Mocha/Latte, Forest/Sage, Plum/Rose and Deep teal/Mint are extra pairs
+  in Settings and the Themes menu, and the top-bar toggle switches to the other
+  half of the current pair. Terminal,
+  logcat and log panels use toned-down ANSI and level colours, every colour
+  comes from one palette, live theme switches also update placeholder text,
+  text colours are tested for readable contrast, and tab labels are no longer
+  clipped.
+- Closing a device tab or its screen panel no longer stops half-way (leaving
+  adb, logcat or scrcpy running) when a background task had already finished.
+- Pairing, the shell-lost check and "refresh shortcuts" no longer freeze the
+  window; a shell that keeps dropping stops reconnecting after three attempts
+  in 30 s and waits for the device instead.
+- A closed tab's reconnect loop stops immediately; quitting during an ADB
+  server restart no longer crashes; the Webcam tab can be reopened after
+  closing it; a second screenshot can no longer destroy one in progress; a
+  cancelled screen start no longer leaves Record stuck on "Starting recording…".
+- Screen mirror: closing a tab during a recording finishes the MP4 instead of
+  truncating it; a failed embed falls back to a separate window; the window no
+  longer flashes at the desktop corner while a recording closes; long sessions
+  stop re-reading the whole scrcpy log twice a second; closing the IVI display
+  wall no longer freezes; typed text and taps keep their order; scrcpy's
+  temporary logs are cleaned up.
+- Device tabs: Stop / Ctrl+C in the Android shell no longer kills every logcat
+  on the device (including the Logcat tab); a Reconnect button appears after a
+  failed connection, a reconnect timeout or a reboot to recovery/bootloader;
+  Device → Mirror honours the selected display and the IVI compatibility
+  default; a USB "only device" target no longer opens a second tab.
+- Main window: changing the ADB path in Settings offers to restart the ADB
+  server; warning toasts are rate-limited; Help opens the documentation site;
+  the "up to date" dialog shows the real tool versions; device polling pauses
+  while the ADB server restarts.
+- File browser: the built-in editor keeps line endings and refuses files it
+  can't decode instead of corrupting them; folder symlinks such as `/sdcard`
+  open as folders; transfers run one at a time; local copy, delete and folder
+  listing run off the UI thread; device paths are quoted.
+- Logcat keeps working after a one-off dump or stop, an early Stop no longer
+  leaks `adb logcat`, and changing the filter redraws a bounded slice.
+- Webcam: the remote stream's firewall rule is limited to this PC and removed
+  when the stream stops; closing during a remote start stops the remote
+  ffmpeg; long recordings are no longer cut off while finalising; the ffmpeg
+  download is written atomically.
+- "Save full output" reports failures instead of silently truncating, and
+  writes off the UI thread. Closing a local terminal also ends programs it
+  started.
+- Terminal: 256-colour and true-colour output, `ESC ( B`, erase-to-line-start,
+  PageUp/PageDown and `cd -` / quoted directories now behave correctly; split
+  escape sequences no longer leak into saved logs; font zoom is debounced.
+- Settings are type-checked on load, cached, and written atomically under a
+  lock; the Settings dialog saves only what you changed. The unused "open docs
+  on first run" option was removed.
+- Dialogs clean up after themselves; editing a saved target renames it instead
+  of creating a copy, and incomplete targets are rejected before saving.
+  Repeated error popups are rate-limited.
+
+### Release baseline
+
+- Removed the unused split/tile workspace mode and its obsolete menu and
+  documentation entries.
+- Standardized the package and UI on the 2.0.0 release version.
+- The wheel bundles the Windows GUI executable (`turboadb/bin/turboadb-gui.exe`),
+  and GitHub Releases carry the same versioned `TurboADB-<version>-win64.exe`.
+  `turboadb-gui` starts the bundled executable when PyQt5 isn't installed.
+  `scripts/release.py` builds or reuses the executable, bundles it and checks
+  the wheel contains it (`--no-exe` builds a lean package).
+- Refined device-session startup, terminal focus recovery, shell naming, and
+  live-device handling introduced during the 1.1.x stabilization work.
+- Reworked the layered tab UI with native Qt fade transitions and clear primary,
+  device, and terminal tab hierarchy; removed the harsh nested-tab divider.
+- Added persistent ADB/device/version status indicators and a reordered
+  **Device Control** toolbar.
+- Added an automotive-only IVI display wall with simultaneous lightweight
+  previews and per-display control, maximise, screenshot, and recording actions.
+- Serialized scrcpy start/stop/record transitions so cancelled launches and
+  retries cannot create duplicate recording sessions or overlapping windows.
+- Made device input FIFO and bounded, hardened embedded keyboard focus and tab
+  shutdown, and isolated each device-side recording by remote file and PID.
+- Allowed concurrent remote mirrors to select from TCP 27184-27199 instead of
+  forcing every session onto the same tunnel port.
+
+## 1.1.17
+
+Release packaging and stability follow-up.
+
+- Fixed duplicate device-tab creation and reduced the fallback device poll rate;
+  event-driven ADB tracking remains the primary update path.
+- Hardened ADB socket reads, reconnect handling, transfer cancellation, IPv6
+  target formatting, persistence writes, and remote-deploy input validation.
+- Fixed local-terminal completion so a nested `adb shell` never receives Windows
+  folder suggestions or alters the local shell path.
+- Restored the framed terminal welcome banner while removing the redundant
+  date/time prompt strip; PowerShell/CMD and ADB prompts retain the active path.
+- Added Windows single-instance protection and targeted regression coverage.
+
 ## 1.1.16
 
 Comprehensive architectural hardening, concurrency safety, and code quality pass.

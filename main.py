@@ -14,9 +14,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from turboadb.cli import launch_gui, main as cli_main
 
+
+def main() -> int:
+    """Run the local checkout without needing an editable install.
+
+    ``python main.py`` launches the GUI; any CLI arguments keep their normal
+    TurboADB meaning.  ``python main.py gui`` and ``--gui`` are explicit GUI
+    aliases, which is handy for local smoke tests and IDE run configurations.
+    """
+    args = sys.argv[1:]
+    if not args or args in (["gui"], ["--gui"]):
+        return launch_gui()
+    return cli_main()
+
+
 if __name__ == "__main__":
-    # If subcommands/flags are provided, run as CLI; otherwise launch desktop GUI
-    if len(sys.argv) > 1:
-        sys.exit(cli_main())
-    else:
-        sys.exit(launch_gui())
+    raise SystemExit(main())

@@ -12,7 +12,9 @@ yet the tools are one command (or one click) away.
 
 Nothing here runs at install time (wheels don't run code on install); it runs
 when you ask: ``turboadb fetch-tools``, the GUI's download prompt, or
-``turboadb.fetch_tools()``.
+``turboadb.fetch_tools()``. The automatic :func:`ensure_tools` only downloads a
+tool that is MISSING; upgrades happen only through :func:`upgrade_tools`
+(``turboadb upgrade-tools`` / self-update / the GUI Upgrade button).
 """
 
 from __future__ import annotations
@@ -25,12 +27,21 @@ import shutil
 import zipfile
 import tempfile
 import platform
+import threading
 import subprocess
 import urllib.error
 import urllib.request
 
 from .exceptions import ADBError, ADBNotFoundError
-from .tools import find_adb, find_scrcpy, NO_WINDOW, parse_version
+from .tools import (  # noqa: F401  (_exe re-exported for existing importers)
+    NO_WINDOW,
+    _adb_version_output,
+    _exe,
+    find_adb,
+    find_scrcpy,
+    managed_tools_dir,
+    parse_version,
+)
 
 PLATFORM_TOOLS_REPO_XML = "https://dl.google.com/android/repository/repository2-3.xml"
 
@@ -52,9 +63,18 @@ def _os_key() -> str:
     return "linux"
 
 
+def scrcpy_download_supported() -> bool:
+    """True where a prebuilt scrcpy can be downloaded (Windows only)."""
+    return _os_key() == "windows"
+
+
 def tools_dir() -> str:
-    """The managed cache directory for downloaded tools."""
-    d = os.path.join(os.path.expanduser("~"), ".turboadb", "tools")
+    """The managed cache directory for downloaded tools (not created on read)."""
+    return managed_tools_dir()
+
+
+def _ensure_tools_dir() -> str:
+    d = tools_dir()
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -65,10 +85,6 @@ def adb_dir() -> str:
 
 def scrcpy_dir() -> str:
     return os.path.join(tools_dir(), "scrcpy")
-
-
-def _exe(name: str) -> str:
-    return f"{name}.exe" if os.name == "nt" else name
 
 
 def managed_adb() -> str | None:
@@ -114,41 +130,28 @@ def _extract_zip(zip_path: str, dest_parent: str, *, strip_top_to: str | None = 
     sanitized ('..' / absolute / backslash tricks dropped) so a crafted archive
     can never write outside the target directory (zip-slip)."""
     with zipfile.ZipFile(zip_path) as z:
+        members = z.namelist()
+        names = [n.replace("\\", "/") for n in members]
+        top = None
         if strip_top_to:
-            names = [n.replace("\\", "/") for n in z.namelist()]
             tops = {n.split("/")[0] for n in names if n.strip("/")}
             top = next(iter(tops)) if len(tops) == 1 else None
-            os.makedirs(strip_top_to, exist_ok=True)
-            root = os.path.realpath(strip_top_to)
-            for member, name in zip(z.namelist(), names):
-                if name.endswith("/"):
-                    continue
-                rel = name[len(top) + 1 :] if top and name.startswith(top + "/") else name
-                parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
-                if not parts:
-                    continue
-                target = os.path.join(root, *parts)
-                if not os.path.realpath(target).startswith(root + os.sep):
-                    continue  # zip-slip attempt — skip it
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with z.open(member) as src, open(target, "wb") as out:
-                    shutil.copyfileobj(src, out)
-        else:
-            os.makedirs(dest_parent, exist_ok=True)
-            root = os.path.realpath(dest_parent)
-            for member in z.namelist():
-                norm = member.replace("\\", "/")
-                if norm.endswith("/"):
-                    continue
-                parts = [p for p in norm.split("/") if p not in ("", ".", "..")]
-                if not parts:
-                    continue
-                target = os.path.join(root, *parts)
-                if not os.path.realpath(target).startswith(os.path.join(root, "")):
-                    continue  # zip-slip attempt — skip it
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with z.open(member) as src, open(target, "wb") as out:
-                    shutil.copyfileobj(src, out)
+        target_dir = strip_top_to or dest_parent
+        os.makedirs(target_dir, exist_ok=True)
+        root = os.path.realpath(target_dir)
+        for member, name in zip(members, names):
+            if name.endswith("/"):
+                continue
+            rel = name[len(top) + 1 :] if top and name.startswith(top + "/") else name
+            parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
+            if not parts:
+                continue
+            target = os.path.join(root, *parts)
+            if not os.path.realpath(target).startswith(os.path.join(root, "")):
+                continue  # zip-slip attempt — skip it
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(member) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
 
 
 def _kill_adb_server(adb_path: str | None = None) -> None:
@@ -175,6 +178,9 @@ def _swap_dir(new_dir: str, dest: str) -> None:
     session), the rename fails LOUDLY instead of silently leaving a
     half-updated mix of old and new files."""
     old = None
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     if os.path.isdir(dest):
         old = dest + ".old"
         shutil.rmtree(old, ignore_errors=True)
@@ -223,6 +229,7 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     if existing and not force:
         return existing
     url = PLATFORM_TOOLS_URLS[_os_key()]
+    _ensure_tools_dir()
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "platform-tools.zip")
         _download(url, zip_path, on_progress)
@@ -245,6 +252,7 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
             "platform-tools downloaded but adb was not found after install (unexpected layout)."
         )
     _chmod_x(adb)
+    _sync_scrcpy_adb()
     return adb
 
 
@@ -273,6 +281,7 @@ def _github_release_json(timeout: float = 30) -> dict:
             data = json.load(resp)
             etag = resp.headers.get("ETag") or ""
         try:
+            _ensure_tools_dir()
             with open(cache_path, "w", encoding="utf-8") as fh:
                 json.dump({"etag": etag, "data": data}, fh)
         except Exception:
@@ -293,8 +302,7 @@ def _github_release_json(timeout: float = 30) -> dict:
 def _scrcpy_assets() -> tuple:
     """(zip_url, zip_name, sums_url|None) for the right Windows scrcpy asset.
     *sums_url* points at the release's SHA256SUMS.txt when it publishes one."""
-    key = _os_key()
-    if key != "windows":
+    if not scrcpy_download_supported():
         raise ADBNotFoundError(
             "Prebuilt scrcpy is downloaded only on Windows. On macOS use "
             "'brew install scrcpy'; on Linux use 'apt install scrcpy' (or your "
@@ -369,6 +377,7 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
     if existing and not force:
         return existing
     url, asset_name, sums_url = _scrcpy_assets()
+    _ensure_tools_dir()
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "scrcpy.zip")
         _download(url, zip_path, on_progress)
@@ -391,6 +400,7 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
         raise ADBNotFoundError(
             "scrcpy downloaded but scrcpy.exe was not found after install (unexpected layout)."
         )
+    _sync_scrcpy_adb()
     return scr
 
 
@@ -408,6 +418,7 @@ def _read_stamp() -> str:
 
 def _write_stamp(version: str) -> None:
     try:
+        _ensure_tools_dir()
         with open(_stamp_path(), "w", encoding="utf-8") as fh:
             fh.write(version)
     except Exception:
@@ -415,12 +426,9 @@ def _write_stamp(version: str) -> None:
 
 
 def _pkg_version() -> str:
-    try:
-        from . import __version__
+    from .update import current_version
 
-        return __version__
-    except Exception:
-        return "?"
+    return current_version()
 
 
 def auto_fetch_enabled() -> bool:
@@ -433,14 +441,19 @@ def auto_fetch_enabled() -> bool:
 
 
 _ensured = False
+_ENSURE_LOCK = threading.Lock()
 
 
 def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
-    """Make sure the managed cache has adb (and scrcpy) for the **current**
-    TurboADB version. Runs at most once per process. On a fresh install it
-    downloads; after an upgrade it re-downloads the LATEST platform-tools +
-    scrcpy so you're always current. Best-effort and never raises — if the
-    network is down, detection simply falls back to whatever's already on PATH.
+    """Make sure the managed cache has adb (and, where a prebuilt exists,
+    scrcpy). Runs at most once per process and downloads ONLY tools that are
+    missing from the cache — it never upgrades an existing copy, because
+    replacing platform-tools means stopping the running adb server (which drops
+    every device session). Upgrades go through :func:`upgrade_tools`.
+
+    Best-effort and never raises — if the network is down, detection simply
+    falls back to whatever's already on PATH. Thread-safe: concurrent callers
+    wait for the first one instead of racing the same download.
 
     Disable entirely with the ``TURBOADB_AUTO_FETCH=0`` environment variable.
     """
@@ -454,53 +467,45 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
             "errors": errors or {},
         }
 
-    if _ensured:
-        return norm("already-ensured")
-    _ensured = True
-    if not auto_fetch_enabled():
-        return norm("disabled")
-    version = _pkg_version()
-    upgraded = _read_stamp() != version
-    have_adb = managed_adb() is not None
-    if have_adb and not upgraded:
-        return norm("up-to-date")
-    errors = {}
-    note = ""
-    try:
-        if not have_adb:
-            # fresh install: download the latest tools
-            note = "installed"
-            if notify:
-                notify(
-                    "Downloading latest platform-tools + scrcpy "
-                    "(one-time; set TURBOADB_AUTO_FETCH=0 to skip)…"
+    with _ENSURE_LOCK:
+        if _ensured:
+            return norm("already-ensured")
+        _ensured = True
+        if not auto_fetch_enabled():
+            return norm("disabled")
+        errors = {}
+        note = "up-to-date"
+        try:
+            want_adb = managed_adb() is None
+            # Requesting scrcpy where no prebuilt exists always "failed", so the
+            # stamp was never written and every command retried the network.
+            want_scrcpy = bool(scrcpy) and scrcpy_download_supported() and managed_scrcpy() is None
+            if want_adb or want_scrcpy:
+                note = "installed"
+                if notify:
+                    what = " + ".join(
+                        n for n, w in (("platform-tools", want_adb), ("scrcpy", want_scrcpy)) if w
+                    )
+                    notify(
+                        f"Downloading latest {what} (one-time; set TURBOADB_AUTO_FETCH=0 to skip)…"
+                    )
+                res = fetch_tools(
+                    adb=want_adb, scrcpy=want_scrcpy, force=False, on_progress=on_progress
                 )
-            res = fetch_tools(adb=True, scrcpy=scrcpy, force=False, on_progress=on_progress)
-            errors = res.get("errors", {})
-        elif upgraded:
-            # TurboADB itself was upgraded: check for newer adb/scrcpy and
-            # download ONLY what's outdated (not a blind re-download)
-            up = upgrade_tools(on_progress=on_progress, notify=notify)
-            errors = up.get("errors", {})
-            if up.get("up_to_date"):
-                note = "up-to-date"
-            elif up.get("updated"):
-                note = "updated"
-            else:
-                note = "unknown" if up.get("unknown") else "up-to-date"
-        # only mark this TurboADB version as "tools refreshed" when nothing
-        # FAILED — a failed download used to be stamped anyway (the old, locked
-        # adb.exe still existed), so the update was never retried
-        if managed_adb() and not errors:
-            _write_stamp(version)
-        _sync_scrcpy_adb()
-    except Exception as exc:  # never let auto-fetch break a real command
-        errors["ensure"] = str(exc)
-    return norm(note, errors)
+                errors = dict(res.get("errors", {}))
+            # only mark this TurboADB version when nothing FAILED
+            if managed_adb() and not errors:
+                _write_stamp(_pkg_version())
+            _sync_scrcpy_adb()
+        except Exception as exc:  # never let auto-fetch break a real command
+            errors["ensure"] = str(exc)
+        return norm(note, errors)
 
 
 def _sync_scrcpy_adb() -> None:
-    """Ensure scrcpy's bundled adb on Windows matches platform-tools adb to eliminate daemon killing conflicts."""
+    """Ensure scrcpy's bundled adb on Windows matches platform-tools adb to eliminate
+    daemon killing conflicts. Called after every managed download, not only from
+    :func:`ensure_tools`."""
     if os.name != "nt":
         return
     m_adb = managed_adb()
@@ -518,17 +523,13 @@ def _sync_scrcpy_adb() -> None:
                 pass
 
 
-
 # --------------------------------------------------------------------------- #
 # version checks ("only download if there's a newer version")
 # --------------------------------------------------------------------------- #
 def installed_adb_version(adb_path: str | None = None) -> str | None:
     try:
         exe = adb_path or find_adb()
-        out = subprocess.run(
-            [exe, "version"], capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW
-        )
-        m = re.search(r"Version\s+(\d+\.\d+\.\d+)", out.stdout or out.stderr or "")
+        m = re.search(r"Version\s+(\d+\.\d+\.\d+)", _adb_version_output(exe))
         return m.group(1) if m else None
     except Exception:
         return None
@@ -589,8 +590,9 @@ def _decide(installed: str | None, latest: str | None) -> bool | None:
 
 def check_updates() -> dict:
     """Compare installed adb/scrcpy against the latest available. Returns
-    ``{"adb": {"installed","latest","upgrade","path"}, "scrcpy": {...}}`` where
-    ``upgrade`` is True / False / None (unknown). Makes no changes.
+    ``{"adb": {"installed","latest","upgrade","path","supported"}, "scrcpy": {...}}``
+    where ``upgrade`` is True / False / None (unknown) and ``supported`` says
+    whether TurboADB can download that tool on this OS. Makes no changes.
 
     The MANAGED copy (the one downloads replace, and the one TurboADB prefers)
     is what gets version-checked when it exists — comparing a PATH/system adb
@@ -599,21 +601,39 @@ def check_updates() -> dict:
     ai, al = installed_adb_version(a_path), latest_adb_version()
     si, sl = installed_scrcpy_version(s_path), latest_scrcpy_version()
     return {
-        "adb": {"installed": ai, "latest": al, "upgrade": _decide(ai, al), "path": a_path},
-        "scrcpy": {"installed": si, "latest": sl, "upgrade": _decide(si, sl), "path": s_path},
+        "adb": {
+            "installed": ai,
+            "latest": al,
+            "upgrade": _decide(ai, al),
+            "path": a_path,
+            "supported": True,
+        },
+        "scrcpy": {
+            "installed": si,
+            "latest": sl,
+            "upgrade": _decide(si, sl),
+            "path": s_path,
+            "supported": scrcpy_download_supported(),
+        },
     }
 
 
-def upgrade_tools(*, on_progress=None, notify=None) -> dict:
+def upgrade_tools(*, on_progress=None, notify=None, checks: dict | None = None) -> dict:
     """Check for newer adb/scrcpy and download **only** the ones that are
     outdated (or missing). If everything's current, downloads nothing. Returns a
-    summary dict including the version check and what was updated."""
-    checks = check_updates()
+    summary dict including the version check and what was updated.
+
+    Pass *checks* (a :func:`check_updates` result) to reuse a check that was
+    already made instead of querying the version sources twice. scrcpy is only
+    considered where a prebuilt download exists (Windows)."""
+    if checks is None:
+        checks = check_updates()
     updated = {}
     errors = {}
-    want_adb = checks["adb"]["upgrade"] is True
-    want_scrcpy = checks["scrcpy"]["upgrade"] is True
-    unknown = [t for t in ("adb", "scrcpy") if checks[t]["upgrade"] is None]
+    tools = ["adb", "scrcpy"] if scrcpy_download_supported() else ["adb"]
+    want_adb = "adb" in tools and checks["adb"]["upgrade"] is True
+    want_scrcpy = "scrcpy" in tools and checks["scrcpy"]["upgrade"] is True
+    unknown = [t for t in tools if checks[t]["upgrade"] is None]
     if not want_adb and not want_scrcpy:
         # 'unknown' (couldn't reach the version source / GitHub rate limit) is
         # NOT the same as up to date — reporting it as such hid failed checks

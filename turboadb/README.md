@@ -47,9 +47,10 @@ can run on background threads, so it never blocks or crashes the caller.
 pip install turboadb
 ```
 
-That gives you the Python API, the `turboadb` CLI, and `turboadb-gui` (which
-launches the bundled Windows exe; on other platforms install the GUI extra:
-`pip install "turboadb[gui]"`).
+That gives you the Python API, the `turboadb` CLI and `turboadb-gui`. On Windows
+the wheel bundles the GUI executable, so `turboadb-gui` works without PyQt5. To
+run the GUI from the Python package instead, install the optional GUI dependency:
+`pip install "turboadb[gui]"`. The standalone executable is also on GitHub Releases.
 
 TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 **`scrcpy`**. It auto-detects them on your `PATH`, in the Android SDK, or in
@@ -67,8 +68,8 @@ cache (`~/.turboadb/tools/`), which is first in the detection order — so a fre
 new version re-fetches the latest. Disable with **`TURBOADB_AUTO_FETCH=0`** (for
 offline/CI/locked-down machines), then fetch manually with `turboadb fetch-tools`.
 
-- **GUI:** downloads automatically on launch (progress bar), or use the ribbon's
-  **Get tools** button to refresh.
+- **GUI:** downloads automatically on launch (progress bar), or use
+  **Tools ▾ → Download and reinstall ADB and scrcpy** in the top bar to refresh.
 - **Python:** `turboadb.fetch_tools()` (explicit) or it happens on first device use.
 
 > Why not at `pip install` time? Wheels don't run code on install, and
@@ -96,47 +97,67 @@ turboadb-shortcut       # make a Desktop shortcut (Windows)
 
 A tabbed, multi-device workspace:
 
-- **Tabbed multi-device sessions** — each device opens its own tab; tabs are
-  closable, movable, and there's a **`+`** new-tab button. A **Split/tile** view
-  shows several devices at once.
+- **Tabbed multi-device sessions** — each device opens in its own tab; tabs are
+  closable, movable, and there's a **`+`** new-tab button.
 - **Sidebar device manager** — saved targets **plus a LIVE `adb devices`** list
   that auto-refreshes; a **Quick connect** filter box; right-click context menu
   (New / Open / Edit / Duplicate / Delete). Double-click a live device to open it.
-- **Ribbon toolbar** with colorful buttons: Device, Shell, Logcat, Files, Apps,
-  Scrcpy (mirror), Screenshot, Split, Settings, Help, Exit.
+- **Top bar** with the global actions — **Connect**, **ADB server** and **Tools**
+  — plus theme, log panel, settings and help icons. The device list hides with
+  the ‹ button in its header (or Ctrl+B) and comes back from the › bar on the
+  window's left edge; it also hides itself while a device screen is showing. A
+  device page has no header row: **Screen ▾**, **Screenshot**, **Reboot ▾** and
+  **More ▾** (split view, device health, build details, root and mount, go
+  wireless, bugreport) sit at the right end of its section tabs. Icons are colour-coded per
+  section and follow the theme.
 - **Per-device panels (tabs):**
-  - **Shell** — type straight into the terminal; **one Enter runs the command**
+  - **Terminal** — the Android shell, or **PowerShell** / **CMD** on this PC
+    (TurboADB's adb first on PATH, `ANDROID_SERIAL` set), each under a boxed
+    two-line welcome banner (the Android one shows the device type). Type
+    straight into the terminal; **one Enter runs the command**
     (reliable cooked line-editing, with Up/Down history and Ctrl+C). Full
     **native text selection + copy/paste**, **save output to file**, a right-click
     menu (Copy / Paste / Save / Send-key: Tab/Esc/Ctrl-C/D/Z…), scrollback, and
     **auto-reconnect** — after a reboot or unplug it detects the dropped shell and
     reconnects when the device comes back.
-  - **Logcat** — live viewer with regex + level filter, pause, clear, save, and
-    **instant stop**.
-  - **Files** — adb push/pull browser with file *and* folder pickers for both
-    directions and a progress bar.
+  - **Logcat** — live viewer with level, history, tag, regex filter and
+    highlight, a Crashes preset, pause, clear, save, and **instant stop**.
+  - **Files** — **This PC** and **Device** panes with **Push** / **Pull**, drag
+    and drop, new folder / file, a built-in editor, copy / paste, rename, delete
+    and a progress bar with Cancel.
   - **Apps** — install (incl. split APKs), list, uninstall, clear, start, stop.
-  - **Controls** — navigation (Home/Back/Recents/DPAD), volume, **media** (via the
-    active media session), **brightness** (via settings), Wi-Fi / Bluetooth /
-    Airplane / Hotspot, screen on/off; **app & web shortcuts** (open any URL,
-    web-search, launch Browser / YouTube / Spotify / Maps / Play Store / Settings);
-    and a **text-send box that types into the device's focused field** — a keyboard
-    for head units / devices with no on-screen keyboard.
-  - **Phone** — a phone simulation: a **dialler** (dial / call / answer / end),
-    the **call log**, and **SMS messages** (read + compose), all over adb.
-  - **Root / Mount** header menu — `adb root`, `remount`, `mount -o remount,rw /`,
+  - **Device Control** — the device screen (Start screen, or open it in a
+    separate window) beside a control centre: Back / Home / Recents, power,
+    notifications and settings; volume and **media** (via the active media
+    session); one tile each for Wi-Fi / Bluetooth / Mobile data / Airplane /
+    Hotspot with On and Off; screen on/off, battery and reboot; **app & web
+    shortcuts** (open any URL, web-search, launch Browser / YouTube / Spotify /
+    Maps / Play Store / Gallery / Calculator / Camera); and a **text-send box
+    that types into the device's focused field** — a keyboard for head units /
+    devices with no on-screen keyboard.
+  - **Phone** — a **dialler** with a keypad (call / end / answer / open in dialler)
+    and a live call-state pill, colour-coded **recent calls** with call back, and
+    **SMS messages** with a compose box that opens a draft in the device's
+    Messages app, all over adb.
+  - **Webcam** — a host USB / laptop camera, local or on a remote Windows PC.
+  - **IVI Displays** (cars only) — the IVI display wall with every display live.
+  - **More ▾ → Root and mount** — `adb root`, `remount`, `mount -o remount,rw /`,
     `disable-verity` (auto sync + reboot prompt).
-  - **Mirror** — scrcpy with a display picker and compatibility mode. By default
-    it opens a reliable separate window; tick **embed (experimental)** to host the
-    scrcpy screen *inside* the tab (Windows). Embedding is opt-in because
-    reparenting a foreign window can be flaky on some setups / over Remote Desktop.
-- A ribbon **Upgrade** button checks for newer adb/scrcpy and downloads **only if
-  a newer version exists**.
-- A dark, color-coded **log dock** at the bottom.
+  - **Screen** — scrcpy with a display picker and compatibility mode, shown
+    inside Device Control (Windows) or in a separate window from the **Screen ▾**
+    menu.
+- **Tools ▾ → Check for updates…** updates TurboADB from PyPI when a newer
+  version exists (then refreshes adb/scrcpy and restarts); otherwise it checks
+  adb/scrcpy and downloads **only if a newer version exists**.
+- A dark, color-coded **log dock** at the bottom. With it closed, every action
+  still shows in the status bar and a small toast, and errors show a large red
+  toast with an alert sound.
 - **Settings** (persisted to `~/.turboadb/settings.json`, applied live):
-  dark/light theme, terminal font + size, default scrcpy options, adb/scrcpy
-  paths, logcat format. Defaults to a clean **black** dark theme; the light
-  theme isn't glaring.
+  theme, terminal font + size, default scrcpy video and audio options,
+  adb/scrcpy/ffmpeg paths, logcat format and startup behaviour. The default pair is Graphite (dark) and Porcelain
+  (light): layered neutral surfaces with soft text, never pure black or glaring
+  white. Mocha/Latte, Forest/Sage, Plum/Rose and Deep teal/Mint are extra pairs;
+  terminal and log views stay dark in every theme.
 - **Crash-proof:** a startup-failure native popup + crash log, a global
   exception hook that logs and shows a non-fatal popup, and clean thread
   shutdown when a tab closes.
@@ -153,7 +174,7 @@ from turboadb import ADBHandler, ADBConfig
 
 # USB: the only attached device (or pass serial="..." to pick one)
 with ADBHandler() as dev:
-    print(dev.device_info().value if False else dev.shell("getprop ro.build.version.release").text)
+    print(dev.shell("getprop ro.build.version.release").text)
     dev.push("app.apk", "/data/local/tmp/app.apk")
     dev.install("app.apk", grant_perms=True)
 
@@ -221,11 +242,11 @@ with ADBHandler(ADBConfig(adb_server_host="192.168.1.20", serial="SERIAL")) as d
     dev.mirror()                               # scrcpy via the remote server
 ```
 
-In the **GUI**: **Device ▾ → Connect to a remote PC's ADB (devices there)…** —
-enter the machine's IP, pick from the devices attached over there, and it opens
-a full tab (Shell / Logcat / Files / Apps / Mirror) driven through that server.
-Save it as a target with **type "Remote ADB server"**. (Keep it on a trusted
-network/VPN — the adb server is unauthenticated; or tunnel 5037 over SSH.)
+In the **GUI**: **Connect ▾ → Connect to a device…** → **Remote** — enter the
+machine's IP, press **Scan devices there**, pick a device, and it opens a full
+tab (Terminal / Logcat / Files / Device Control / Apps …) driven through that
+server. Tick **Save this target** to keep it in the sidebar. (Keep it on a
+trusted network/VPN — the adb server is unauthenticated; or tunnel 5037 over SSH.)
 
 **Android 11+ wireless pairing:**
 
@@ -387,18 +408,25 @@ with ADBHandler(ADBConfig(host="192.168.1.50")) as hu:
     hu.mirror(display_id=2)                  # mirror a specific IVI display
 
     # "scrcpy won't work" on this unit? use the automotive compatibility profile
-    # (forces H.264, caps size/fps, disables audio — fixes most IVI encoders):
+    # (forces H.264 and applies safe size/fps caps for IVI encoders):
     hu.mirror(compat=True)
 ```
 
-`device_info()` includes an `automotive` flag (from the automotive hardware
-feature / build characteristics), so you can branch IVI-specific flows.
+`device_info()` includes an `automotive` flag and a `kind` from `device_kind()`:
+`automotive` (the Android Automotive feature or build characteristic),
+`headunit` (ordinary Android with no telephony and a landscape display), `tv`,
+`watch`, `tablet` or `phone`, with the evidence in `kind_reason`. Both car kinds
+set `automotive`, so you can branch IVI-specific flows; the GUI uses it for the
+IVI-compatible screen profile and shows the type in the terminal banner.
 
-**In the GUI**, automotive devices show a **Mirror (IVI)** split-button with:
-*Mirror (default)*, *Mirror a specific display…* (lists the head unit's displays
-to choose from), and *Mirror (compatibility mode)*. If a mirror fails, the error
-suggests trying compatibility mode or a different display. The default scrcpy
-video codec is configurable in **Settings** (auto / h264 / h265 / av1).
+**In the GUI**, automotive devices get an **IVI Displays** tab that opens the
+**IVI display wall** (also under **Device Control → Options**). It presents
+lightweight live previews of every discovered display, each with Control,
+Maximize, Screenshot, and Record actions. The normal
+Device Control toolbar still supports selecting one display at a time. If a
+mirror fails, the error suggests trying compatibility mode or a different
+display. Video quality, codec and full audio forwarding controls are configurable
+in **Settings → scrcpy** (audio source, codec, bitrate and latency included).
 
 **Why scrcpy sometimes fails on IVI — and what TurboADB does about it**
 
@@ -406,7 +434,7 @@ video codec is configurable in **Settings** (auto / h264 / h265 / av1).
 |-------------------------------------------|--------------------------------------------------|
 | Black screen / wrong screen mirrored      | `list_displays()` + `display_id=` to pick the right one |
 | "Could not open video stream" / encoder error | `compat=True` → forces `--video-codec h264`, caps size/fps |
-| Audio init fails / no video on Android <11 | audio is **off by default**; compat mode keeps it off |
+| Audio capture is unavailable on Android <11 | TurboADB continues with video; disable Audio or use an Android 11+ device |
 | Bandwidth/lag over Wi-Fi                   | `max_size=`, `bit_rate=`, `max_fps=`             |
 
 ---
@@ -477,23 +505,32 @@ turboadb restart-server               # kill+start adb server (device-not-visibl
 turboadb disconnect  [HOST:PORT]
 turboadb tcpip       [-s S] [PORT]
 turboadb pair        HOST:PAIRPORT CODE
+turboadb wireless    [-s S] [PORT]           # USB device -> Wi-Fi adb in one step
+turboadb discover                            # find wireless-debugging devices (mDNS)
 turboadb reboot      [-s S] [recovery|bootloader|sideload]
-turboadb root        [-s S]
-# device controls (same as the GUI Controls tab):
+turboadb root | unroot | mount-rw   [-s S]
+# device controls (same as the GUI's Device controls panel):
 turboadb key         [-s S] home|back|recents|vol_up|play_pause|…
 turboadb text        [-s S] hello world          # type into the focused field
 turboadb scroll      [-s S] up|down|left|right    # swipe-scroll (works on touch)
 turboadb tap         [-s S]
 turboadb media       [-s S] play-pause|next|previous|stop
 turboadb brightness  [-s S] 0.6                   # live, 0.0-1.0
-turboadb wifi|bluetooth|airplane  [-s S] on|off
+turboadb wifi|bluetooth|airplane|hotspot|screen  [-s S] on|off
 turboadb open        [-s S] youtube.com           # VIEW intent (app or browser)
 turboadb search      [-s S] weather today
-turboadb camera | close-apps | battery | build-info   [-s S]
+turboadb settings | camera | gallery | calculator | close-apps   [-s S]
+turboadb battery | health | build-info   [-s S]
+turboadb bugreport   [-s S] [PATH]
 turboadb remount | disable-verity | enable-verity     [-s S]
 # phone:
 turboadb dial NUMBER | call NUMBER | answer | end-call   [-s S]
 turboadb call-log [--limit N] | sms [--limit N] | send-sms NUMBER message…  [-s S]
+# sharing and maintenance:
+turboadb serve [--startup-task | --uninstall-startup]   # share this PC's devices
+turboadb deploy-serve HOST [HOST…] -u USER [--test]     # needs turboadb[winrm]
+turboadb self-update                  # upgrade TurboADB, then adb/scrcpy
+turboadb shortcut                     # desktop / Start-menu shortcut (Windows)
 turboadb gui                          # launch the desktop GUI
 ```
 
@@ -520,7 +557,7 @@ turboadb
 │   ├── connect() / disconnect() / is_connected / get_state() / wait_for_device()
 │   ├── tcpip(port) / connect_tcp(host, port) / pair(host, port, code)
 │   ├── reboot(mode) / root() / unroot() / remount()
-│   ├── getprop(name?) / device_info() / is_automotive()
+│   ├── getprop(name?) / device_info() / device_kind() / is_automotive()
 │   ├── shell(cmd, su=, check=) / shell_many() / open_shell() -> ShellSession
 │   ├── iter_lines(args) / stream(args, …) / logcat(…) / logcat_clear()
 │   ├── push(local, remote, on_progress=) / pull(remote, local, on_progress=)
@@ -552,15 +589,19 @@ turboadb
 
 ```bash
 python scripts/make_icon.py        # (re)generate the icon
-python scripts/build_exe.py        # -> dist/turboadb-gui.exe (PyQt5 baked in)
-# copy the exe into turboadb/bin/ so the wheel ships it, then:
-python scripts/release.py patch    # bump -> test -> build -> twine check -> upload
+python scripts/build_exe.py        # -> dist/TurboADB-<version>-win64.exe
+# release.py bundles that exe into the wheel (building it when dist/ has none):
+python scripts/release.py patch    # bump -> test -> exe -> build -> twine check -> upload
 ```
 
-`turboadb-gui` runs the bundled exe when present and falls back to running from
-source (`turboadb[gui]`) otherwise. The release helper reads the PyPI token from
-`TWINE_PASSWORD` (never hard-coded) and supports `--wheel-only` if a flaky
-network makes the sdist+wheel upload hang.
+`turboadb-gui` runs from the installed package when PyQt5 is available
+(`turboadb[gui]`) and otherwise starts the executable bundled in the wheel
+(`turboadb/bin/turboadb-gui.exe`). The same executable is attached to the GitHub
+Release. The release helper reads the PyPI token from `TWINE_PASSWORD` (never
+hard-coded) and uploads the wheel and the source archive (about 59 MB each,
+because both carry the exe). It also supports `--wheel-only` if a flaky network
+makes the upload hang, `--rebuild-exe` to rebuild the executable first, and
+`--no-exe` for a lean package.
 
 ---
 
@@ -570,24 +611,25 @@ network makes the sdist+wheel upload hang.
 
 - **adb works over RDP** — it's just a local process on the RDP host. But a device
   plugged into *your* laptop is **not** visible on the remote host unless USB is
-  redirected. Easiest path — in the GUI use **Device ▾ → Connect wirelessly
-  (IP / host:port)** (or `turboadb connect HOST:5555`):
+  redirected. Easiest path — in the GUI use **Connect ▾ → Connect to a device…**
+  → **Network** (or `turboadb connect HOST:5555`):
   - **Network adb** (recommended for IVI/head units): on the device do
     `adb tcpip 5555` once over USB, then connect by IP from the RDP host — no USB
-    redirection needed. Android 11+: **Device ▾ → Pair device**.
+    redirection needed. Android 11+: **Connect ▾ → Pair device (Android 11+)…**.
   - If a device is plugged into the remote host but shows offline/missing, use
-    **Device ▾ → Restart ADB server** (or `turboadb restart-server`) — that clears
+    **Connect ▾ → Restart ADB server** (or `turboadb restart-server`) — that clears
     the common adb-version-mismatch that hides devices.
   - Or enable **USB redirection** in your RDP client (mstsc → Local Resources →
     More → your device).
 - **scrcpy over RDP** often can't open its video stream (no local GPU/decoder in
-  the RDP session). The embedded **Mirror** tab detects scrcpy exiting early and
+  the RDP session). The **Device Control** screen detects scrcpy exiting early and
   tells you so; try **compatibility mode** (forces H.264), and if it still fails,
   mirroring isn't available in that RDP session — use it from a local session.
 
-**"scrcpy won't work" on a head unit** → use **Mirror → compatibility mode**, or
-pick the right display from **Mirror → display picker** (see the automotive table
-above).
+**"scrcpy won't work" on a head unit** → turn on **Device Control → Options →
+Compatibility mode (IVI / automotive)** (or **Screen ▾ → Open screen in
+compatibility mode**), or pick the right display from the display picker in
+Device Control (see the automotive table above).
 
 **adb not found / outdated** → `turboadb doctor` shows what's resolved;
 `turboadb upgrade-tools` updates to the latest only if newer; set

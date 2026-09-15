@@ -1,2 +1,3 @@
-The PyInstaller-built turboadb-gui.exe is placed here so the wheel ships it.
-turboadb-gui launches this exe (PyQt5 baked in); falls back to source if absent.
+scripts/release.py copies dist/TurboADB-<version>-win64.exe here as turboadb-gui.exe
+so the wheel ships it. turboadb-gui starts it when PyQt5 isn't installed.
+The .exe itself is git-ignored.

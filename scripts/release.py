@@ -11,6 +11,12 @@ Usage
     python scripts/release.py 0.1.1 --dry-run    # build + check, do NOT upload
     python scripts/release.py 0.1.1 --test-pypi  # upload to TestPyPI
     python scripts/release.py 0.1.1 --wheel-only # upload only the wheel (skip sdist)
+    python scripts/release.py 0.1.1 --rebuild-exe  # rebuild the exe even if dist/ has it
+    python scripts/release.py 0.1.1 --no-exe     # lean package without the Windows exe
+
+The wheel bundles the Windows GUI executable (turboadb/bin/turboadb-gui.exe). It
+is copied from dist/TurboADB-<version>-win64.exe, which scripts/build_exe.py
+builds first when dist/ has none for the release version.
 
 The PyPI token is read from the environment, never hard-coded:
     TWINE_USERNAME=__token__   (default if unset)
@@ -23,9 +29,9 @@ must use a new version number.
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -35,11 +41,39 @@ PYPROJECT = ROOT / "pyproject.toml"
 INIT = ROOT / "turboadb" / "__init__.py"
 
 VERSION_RE = re.compile(r"^\s*\d+\.\d+\.\d+\s*$")
+BUNDLED_EXE = "turboadb/bin/turboadb-gui.exe"
 
 
 def run(cmd, **kw) -> None:
     print(f"\n$ {' '.join(str(c) for c in cmd)}")
     subprocess.run(cmd, check=True, cwd=ROOT, **kw)
+
+
+def release_exe(version: str) -> Path:
+    """The versioned executable scripts/build_exe.py writes for *version*."""
+    return ROOT / "dist" / f"TurboADB-{version}-win64.exe"
+
+
+def bundle_exe(version: str, rebuild: bool = False) -> Path:
+    """Copy this version's Windows executable into the package so the wheel
+    ships it, building the executable first when dist/ has none (or *rebuild*)."""
+    exe = release_exe(version)
+    if rebuild or not exe.is_file():
+        run([sys.executable, "scripts/build_exe.py"])
+        if not exe.is_file():
+            sys.exit(f"scripts/build_exe.py did not produce {exe.relative_to(ROOT)}")
+    target = ROOT / BUNDLED_EXE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(exe, target)
+    print(f"  bundled {exe.relative_to(ROOT)} -> {BUNDLED_EXE}")
+    return target
+
+
+def wheel_has_exe(wheel: Path) -> bool:
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as zf:
+        return BUNDLED_EXE in zf.namelist()
 
 
 def current_version() -> str:
@@ -91,6 +125,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="upload only the wheel (handy if sdist upload hangs)",
     )
+    ap.add_argument(
+        "--rebuild-exe",
+        action="store_true",
+        help="rebuild dist/TurboADB-<version>-win64.exe even if it already exists",
+    )
+    ap.add_argument(
+        "--no-exe", action="store_true", help="build without the bundled Windows executable"
+    )
     args = ap.parse_args(argv)
 
     cur = current_version()
@@ -111,22 +153,43 @@ def main(argv=None) -> int:
             )
 
     print("\nUpdating version strings:")
+    # The version must be bumped before building (the wheel embeds it), but a
+    # failed build/check must not leave the files bumped for a release that
+    # never happened — the next `patch` run would then skip a version number.
+    originals = {path: path.read_text(encoding="utf-8") for path in (PYPROJECT, INIT)}
     set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")
     set_version(INIT, r'__version__\s*=\s*"([^"]+)"', new, "turboadb/__init__.py")
 
-    for d in ("dist", "build"):
-        p = ROOT / d
-        if p.exists():
-            for f in sorted(p.rglob("*"), reverse=True):
-                f.unlink() if f.is_file() else f.rmdir()
-            p.rmdir()
-    for egg in ROOT.glob("*.egg-info"):
-        for f in sorted(egg.rglob("*"), reverse=True):
-            f.unlink() if f.is_file() else f.rmdir()
-        egg.rmdir()
+    try:
+        if (ROOT / "build").exists():
+            shutil.rmtree(ROOT / "build")
+        for egg in ROOT.glob("*.egg-info"):
+            shutil.rmtree(egg)
+        # old packages only: dist/TurboADB-<version>-win64.exe is the release exe
+        for old in [*(ROOT / "dist").glob("*.whl"), *(ROOT / "dist").glob("*.tar.gz")]:
+            old.unlink()
 
-    run([sys.executable, "-m", "build"])
-    run([sys.executable, "-m", "twine", "check", "dist/*"])
+        if args.no_exe:
+            (ROOT / BUNDLED_EXE).unlink(missing_ok=True)
+        else:
+            bundle_exe(new, rebuild=args.rebuild_exe)
+
+        run([sys.executable, "-m", "build"])
+        artifacts = sorted((ROOT / "dist").glob("*.whl")) + sorted(
+            (ROOT / "dist").glob("*.tar.gz")
+        )
+        if not artifacts:
+            sys.exit("Build completed without producing a wheel or source archive.")
+        if not args.no_exe:
+            for wheel in (p for p in artifacts if p.suffix == ".whl"):
+                if not wheel_has_exe(wheel):
+                    sys.exit(f"{wheel.name} is missing {BUNDLED_EXE}")
+        run([sys.executable, "-m", "twine", "check", *(str(p) for p in artifacts)])
+    except BaseException:
+        for path, text in originals.items():
+            path.write_text(text, encoding="utf-8")
+        print(f"\nBuild/check failed — version strings restored to {cur}.", file=sys.stderr)
+        raise
 
     if args.dry_run:
         print("\n--dry-run: built and validated, skipping upload.")
@@ -139,9 +202,9 @@ def main(argv=None) -> int:
     if args.test_pypi:
         cmd += ["--repository", "testpypi"]
     if args.wheel_only:
-        cmd += sorted(glob.glob(str(ROOT / "dist" / "*.whl")))
+        cmd += [str(p) for p in sorted((ROOT / "dist").glob("*.whl"))]
     else:
-        cmd += ["dist/*"]
+        cmd += [str(p) for p in artifacts]
     run(cmd)
 
     target = "TestPyPI" if args.test_pypi else "PyPI"

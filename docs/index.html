@@ -44,8 +44,8 @@
         <a class="btn btn-ghost" href="#install">pip install turboadb</a>
       </div>
       <p class="cta-sub">
-        Bundled GUI executable — no Python needed. Or <code>pip install turboadb</code>
-        for the CLI, API, and GUI together.
+        Windows app — no Python needed. Or <code>pip install turboadb</code> for the
+        CLI, the Python API and the app (the Windows executable is included).
       </p>
     </div>
   </section>
@@ -70,36 +70,37 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
-          <h3><span class="ver">v1.0.8</span> Remote webcam &amp; polish</h3>
+          <h3><span class="ver">v2.0.0</span> One install, new look</h3>
           <ul>
-            <li><b>Webcam → Remote source</b> — view a camera on another Windows /
-            RDP machine over WinRM (no SSH), streamed back over TCP.</li>
-            <li><b>Tabbed Settings</b> — a proper preferences window (Appearance ·
-            Tools · scrcpy · Logcat · Startup).</li>
-            <li><b>Dropdown arrows fixed</b> — real chevrons instead of a "dot",
-            app-wide.</li>
+            <li><b>Exe inside pip</b> — <code>pip install turboadb</code> now carries
+            the Windows app, so <code>turboadb-gui</code> works without PyQt5.</li>
+            <li><b>Redesigned window</b> — colourful icons that follow the theme,
+            actions beside the section tabs, and a boxed welcome banner in every
+            terminal.</li>
+            <li><b>📞 Phone tab</b> — dialler with keypad, live call state, recent
+            calls and messages.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v1.0.7</span> Host webcam</h3>
+          <h3><span class="ver">v2.0.0</span> Screen &amp; shells</h3>
           <ul>
-            <li><b>📹 Webcam tab</b> — view a USB / laptop camera on the machine
-            running TurboADB, beside the scrcpy mirror. Point it at the physical
-            head unit or bench.</li>
-            <li><b>Works locally <em>and</em> over RDP</b> — local DirectShow capture
-            sees whatever camera the RDP session exposes.</li>
-            <li>Snapshot, record (H.264 MP4), pause, rotate / mirror, Fill·Fit·Stretch.</li>
+            <li><b>Screen mirroring</b> starts on the first click, looks sharper, and
+            you type straight on the embedded screen.</li>
+            <li><b>Record without restarting</b> — a second, windowless recorder
+            runs beside the live view and saves a playable MP4.</li>
+            <li><b>Real PowerShell &amp; CMD tabs</b> — Python, Git, <code>where</code>
+            and non-English text work like in a normal console.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v1.0.6</span> Quick wins</h3>
+          <h3><span class="ver">v2.0.0</span> Smarter &amp; calmer</h3>
           <ul>
-            <li><b>📷 Device-camera mirror</b> — mirror the phone's own camera
-            (<code>scrcpy --video-source camera</code>), front or back.</li>
-            <li><b>Logcat keyword highlighting</b> — mark <code>error|anr|crash</code>
-            in-line without hiding the rest.</li>
-            <li><b>One-click dark / light toggle</b>, and a <b>Stop sharing &amp;
-            remove auto-start</b> control. Nothing auto-starts on connect.</li>
+            <li><b>Device type detection</b> — car, head unit, TV, watch, tablet or
+            phone; cars get the IVI-compatible screen profile.</li>
+            <li><b>Calmer themes</b> — Graphite / Porcelain plus Mocha, Forest, Plum
+            and Deep teal pairs; light themes are easy on the eyes.</li>
+            <li><b>Clear notifications</b> — a small toast for every action and a red
+            popup (with Copy) for errors.</li>
           </ul>
         </div>
       </div>
@@ -152,8 +153,9 @@
           <div class="ic">📱</div>
           <h3>Mirroring &amp; capture</h3>
           <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
-          IVI units. <strong>Mirror all</strong> displays at once, a side-by-side
-          <strong>Control + Mirror</strong> view, or the device <strong>camera</strong>.
+          IVI units. The automotive <strong>IVI display wall</strong> previews all
+          displays together with per-display controls, or use the device
+          <strong>camera</strong>.
           Screenshots and recording that work over RDP.</p>
         </div>
 
@@ -168,9 +170,35 @@
 
         <div class="card">
           <div class="ic">📞</div>
-          <h3>Telephony</h3>
-          <p>Dial, place / answer / end calls, read the call log, list SMS, and
-          compose a message — handy on IVI units with telephony.</p>
+          <h3>Phone</h3>
+          <p>A dialler with a keypad, Call / End / Answer, a live call-state pill,
+          colour-coded recent calls with call back, and messages with a compose
+          box that opens a draft on the device — nothing rings by accident.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">⌨</div>
+          <h3>PowerShell &amp; CMD too</h3>
+          <p>Switch the terminal between the Android shell, PowerShell and Command
+          Prompt. The Windows shells have TurboADB's <code>adb</code> first on PATH
+          and the device serial set, and run Python, Git and your own tools like a
+          normal console.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">🚗</div>
+          <h3>Knows the device type</h3>
+          <p>Detects Android Automotive, an infotainment head unit, TV, watch,
+          tablet or phone from the device itself, shows it in the terminal banner,
+          and gives cars the IVI-compatible screen profile.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic">🎨</div>
+          <h3>Calm themes</h3>
+          <p>Graphite and Porcelain by default, plus Mocha / Latte, Forest / Sage,
+          Plum / Rose and Deep teal / Mint. Soft text, dimmed light themes, and
+          colour-coded icons for every section.</p>
         </div>
 
         <div class="card">
@@ -202,8 +230,8 @@
           <div class="ic">⬆</div>
           <h3>Bundled &amp; self-updating</h3>
           <p><code>adb</code> and <code>scrcpy</code> download themselves on first
-          run. The Upgrade button updates TurboADB from PyPI, refreshes the tools,
-          and restarts.</p>
+          run. <b>Tools ▾ → Check for updates…</b> updates TurboADB from PyPI,
+          refreshes the tools, and restarts.</p>
         </div>
 
       </div>
@@ -217,9 +245,10 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download the standalone GUI and double-click it. It downloads
-          <code>adb</code> and <code>scrcpy</code> on first run.</p>
-          <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download turboadb-gui.exe</a>
+          <p>Download <code>TurboADB-2.0.0-win64.exe</code> from the latest release
+          and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
+          on first run and adds a desktop shortcut.</p>
+          <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>
         </div>
         <div>
           <h3>With pip (CLI + API + GUI)</h3>
@@ -229,7 +258,10 @@
           </div>
           <p class="muted">Then run <code>turboadb-gui</code>, or use
           <code>turboadb</code> on the command line, or
-          <code>import turboadb</code> in Python.</p>
+          <code>import turboadb</code> in Python. On Windows the package includes
+          the app's executable, so no PyQt5 is needed; on Linux or macOS use
+          <code>pip install "turboadb[gui]"</code> for the GUI. Upgrade with
+          <code>pip install --upgrade turboadb</code>.</p>
         </div>
       </div>
     </div>
@@ -330,7 +362,7 @@ turboadb deploy-serve lab-pc-01 lab-pc-02 \
     repo: base,
     releases: base + "/releases",
     changelog: base + "/blob/main/CHANGELOG.md",
-    exe: base + "/releases/latest/download/turboadb-gui.exe",
+    exe: base + "/releases/latest",
   };
   document.querySelectorAll("[data-gh]").forEach(function (a) {
     a.href = urls[a.getAttribute("data-gh")] || base;

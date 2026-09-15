@@ -1,10 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import re
+
 from PyInstaller.utils.hooks import collect_submodules, collect_all
+
+# PyInstaller executes a spec with ``SPECPATH`` rather than ``__file__``.
+ROOT = Path(SPECPATH)
+_version_text = (ROOT / 'turboadb' / '__init__.py').read_text(encoding='utf-8')
+_version_match = re.search(r'__version__\s*=\s*"([^"]+)"', _version_text)
+if _version_match is None:
+    raise RuntimeError('Could not read the TurboADB version for the executable name.')
+APP_VERSION = _version_match.group(1)
+EXE_NAME = f'TurboADB-{APP_VERSION}-win64'
 
 hiddenimports = ['winrm', 'requests_ntlm', 'spnego']   # WinRM remote-deploy (NTLM)
 hiddenimports += ['keyring.backends', 'keyring.backends.Windows']  # OS vault (password)
 hiddenimports += collect_submodules('keyring')
 hiddenimports += collect_submodules('turboadb')
+hiddenimports += ['PyQt5.QtSvg']   # gui/icons.py renders its vector icons lazily
 datas = [('turboadb/assets/icon.ico', 'turboadb/assets'),
          ('turboadb/assets/icon.png', 'turboadb/assets')]
 binaries = []
@@ -40,7 +53,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='turboadb-gui',
+    name=EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

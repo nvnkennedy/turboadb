@@ -1,78 +1,269 @@
-"""Device controls laid out as a UNIFORM, gap-free responsive grid that tiles the
-whole panel: system keys, media, connectivity, device & power, app/web shortcuts
-and a text keyboard. The groups are equal-width cards that reflow into 1/2/3
-balanced columns by window width — every cell is filled (no empty regions, no
-short-column void) and nothing truncates because columns are always wide enough."""
+"""Device controls laid out as a control centre.
+
+Six titled sections: navigation (an Android-style Back / Home / Recents bar plus
+Power, Notifications and Settings tiles), media & volume, quick-setting tiles
+(one tile per radio with an On | Off pair), screen & power, app/web launchers and
+a text keyboard. Every control carries a colour-coded vector icon from
+:mod:`icons`; tiles paint their surfaces from :mod:`theme` tokens at paint time,
+so a live theme switch restyles the whole panel.
+
+The host (DeviceTab's side panel) supplies the card surface, so sections draw no
+boxes of their own. They flow into 1/2/3 columns by width (masonry, so a short
+section never leaves a gap), and every tile row reflows its own column count, so
+the panel never scrolls horizontally in the ~340 px side pane.
+"""
 
 from __future__ import annotations
 
-import math
+from PyQt5.QtCore import QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PyQt5.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                             QScrollArea, QSizePolicy, QToolButton, QVBoxLayout,
+                             QWidget)
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QPushButton, QGroupBox, QLineEdit, QDialog,
-                             QPlainTextEdit, QDialogButtonBox, QSizePolicy,
-                             QScrollArea)
+from ..results import CommandResult, OperationResult
+from . import theme
+from .device_commands import DeviceCommandDispatcher
+from .icons import icon
 
-_BTN_MIN_H = 32        # compact enough that a 3x2 grid fits a restored window…
-_BTN_MAX_H = 96        # …yet grows to fill a card when the window is large
-_INPUT_H = 34
-_GROUP_W = 320         # px budget per column — generous enough to avoid truncation
-_MAX_COLS = 3          # 6 cards tile cleanly as 1x6 / 2x3 / 3x2 — never leave gaps
+_NAV_H = 44            # Back / Home / Recents bar
+_TILE_H = 60           # quick-setting tiles and icon-over-label tiles
+_BTN_H = 38            # normal buttons, key chips, media keys
+_INPUT_H = 36          # text fields and the buttons beside them
+_SEG_H = 30            # the On | Off pair inside a quick-setting tile
+_SEG_W = 46
+_GROUP_W = 320         # px budget per section column
+_MAX_COLS = 3
+_SECTION_GAP = 18
+
+# Explanations some connectivity toggles return when every method was refused
+# by the device (rather than raising); surface them as warnings, not success.
+_REFUSED_MARKERS = ("can't be", "permission-denied")
 
 
-class _Runner(QThread):
-    done = pyqtSignal(str)
-    fail = pyqtSignal(str)
+class _Surface(QWidget):
+    """A layout-only container. Unlike a plain QWidget, a subclass never paints
+    the stylesheet's window fill, so it can't leave a slab on the side panel."""
 
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
 
-    def run(self):
-        try:
-            self.done.emit(str(self.fn()))
-        except Exception as exc:
-            self.fail.emit(f"{type(exc).__name__}: {exc}")
+class _Section(_Surface):
+    """One titled group of controls."""
+
+
+class _Glyph(QWidget):
+    """A small icon painted in the live theme colour (a QLabel pixmap would keep
+    the colour of the theme it was created in)."""
+
+    def __init__(self, name, tone=None, size=16, parent=None):
+        super().__init__(parent)
+        self._icon = icon(name, tone)
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        self._icon.paint(painter, self.rect())
+        painter.end()
+
+
+class _TileGrid(_Surface):
+    """Equal-width buttons in a grid whose column count follows its width.
+
+    *choices* are the allowed column counts, widest first (e.g. ``(4, 2)`` keeps
+    eight launchers in full rows). The widest count whose columns still fit every
+    label is used, so labels never clip and the grid never forces horizontal
+    scrolling: its minimum width is one narrow column.
+    """
+
+    def __init__(self, buttons, choices, spacing=6, parent=None):
+        super().__init__(parent)
+        self.buttons = list(buttons)
+        self._choices = tuple(sorted(set(choices), reverse=True)) or (1,)
+        self._ncols = -1
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(spacing)
+        for button in self.buttons:
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumWidth(1)
+        self._place(self._choices[0])
+
+    @property
+    def columns(self):
+        return self._ncols
+
+    def _needed_width(self):
+        need = 1
+        for b in self.buttons:
+            width = b.sizeHint().width()
+            if (isinstance(b, QToolButton) and b.text()
+                    and b.toolButtonStyle() != Qt.ToolButtonIconOnly):
+                # QToolButton pads its label with two spaces of slack; the style
+                # padding is already in the hint, so the label shows unclipped
+                # without that slack
+                width -= b.fontMetrics().horizontalAdvance(" ") * 2
+            need = max(need, width)
+        return need
+
+    def columns_for(self, width):
+        spacing = self._grid.horizontalSpacing()
+        need = self._needed_width()
+        for n in self._choices:
+            if n * need + (n - 1) * spacing <= width:
+                return n
+        return self._choices[-1]
+
+    def _place(self, ncols):
+        if ncols == self._ncols:
+            return
+        self._ncols = ncols
+        grid = self._grid
+        for button in self.buttons:
+            grid.removeWidget(button)
+        for c in range(max(self._choices) + 1):
+            grid.setColumnStretch(c, 0)
+        for index, button in enumerate(self.buttons):
+            row, col = divmod(index, ncols)
+            grid.addWidget(button, row, col)
+        for c in range(ncols):
+            grid.setColumnStretch(c, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place(self.columns_for(self.width()))
+
+
+class _QuickTile(QWidget):
+    """One quick setting: a tinted icon badge, the name and a short caption,
+    then an On | Off pair. The surface, badge and text are painted from theme
+    tokens at paint time; the two buttons are ordinary tinted tool buttons."""
+
+    _PAD = 10
+    _BADGE = 36
+
+    def __init__(self, name, caption, icon_name, tone, on_label="On", off_label="Off",
+                 parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.caption = caption
+        self._tone = tone
+        self._icon = icon(icon_name, tone)
+        self.setFixedHeight(_TILE_H)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setAccessibleName(name)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(self._PAD, 0, self._PAD, 0)
+        lay.setSpacing(4)
+        lay.addStretch(1)
+        self.btn_on = self._segment(on_label, tone, f"Turn {name} on")
+        self.btn_off = self._segment(off_label, None, f"Turn {name} off")
+        lay.addWidget(self.btn_on)
+        lay.addWidget(self.btn_off)
+
+    @staticmethod
+    def _segment(text, tone, tip):
+        b = QToolButton()
+        b.setObjectName("ctlSeg")
+        b.setText(text)
+        b.setToolTip(tip)
+        b.setAccessibleName(tip)
+        if tone:
+            b.setProperty("tone", tone)
+        b.setFixedSize(_SEG_W, _SEG_H)
+        b.setCursor(Qt.PointingHandCursor)
+        return b
+
+    def minimumSizeHint(self):
+        # badge + a short name + the pair; longer names elide instead of
+        # forcing the side panel to scroll sideways
+        return QSize(self._PAD * 2 + self._BADGE + 10 + 64 + 4 + 2 * _SEG_W, _TILE_H)
+
+    def sizeHint(self):
+        return QSize(max(self.minimumSizeHint().width(), 280), _TILE_H)
+
+    def paintEvent(self, _event):
+        c = theme.palette()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        outer = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setPen(QPen(QColor(c["border"]), 1))
+        p.setBrush(QColor(c["raised"]))
+        p.drawRoundedRect(outer, 10, 10)
+
+        top = (self.height() - self._BADGE) / 2.0
+        badge = QRectF(self._PAD, top, self._BADGE, self._BADGE)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.tint(self._tone)))
+        p.drawRoundedRect(badge, 10, 10)
+        self._icon.paint(p, badge.adjusted(8, 8, -8, -8).toRect())
+
+        text_x = int(badge.right()) + 10
+        text_w = max(0, self.btn_on.x() - 8 - text_x)
+        name_font = QFont(self.font())
+        name_font.setWeight(QFont.DemiBold)
+        cap_font = QFont(self.font())
+        if cap_font.pointSizeF() > 0:
+            cap_font.setPointSizeF(cap_font.pointSizeF() - 0.5)
+        name_fm, cap_fm = QFontMetrics(name_font), QFontMetrics(cap_font)
+        block = name_fm.height() + cap_fm.height()
+        y = (self.height() - block) // 2
+        p.setFont(name_font)
+        p.setPen(QColor(c["text"]))
+        p.drawText(text_x, y + name_fm.ascent(),
+                   name_fm.elidedText(self.name, Qt.ElideRight, text_w))
+        p.setFont(cap_font)
+        p.setPen(QColor(c["dim"]))
+        p.drawText(text_x, y + name_fm.height() + cap_fm.ascent(),
+                   cap_fm.elidedText(self.caption, Qt.ElideRight, text_w))
+        p.end()
 
 
 class ControlsPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, compact=False, parent=None):
+    def __init__(self, handler, compact=False, on_reboot=None, parent=None, dispatcher=None):
         """*compact=True* (the Control + Mirror side pane) allows a narrower
-        minimum width so the mirror keeps most of the space — the cards simply
-        reflow into a single column there."""
+        minimum width so the mirror keeps most of the space — the sections
+        simply reflow into a single column there."""
         super().__init__(parent)
         self.handler = handler
         self._compact = compact
-        self._threads = []
+        self._on_reboot = on_reboot
+        self._owns_dispatcher = dispatcher is None
+        self._dispatcher = dispatcher or DeviceCommandDispatcher()
         self._ncols = -1
         self._ready = False          # guard: resizeEvent fires during construction
+        self.quick_tiles = {}
+        # Button geometry (#ctlNav, #ctlTile, …) and the section-title padding
+        # are rules in theme.stylesheet(); a panel-wide stylesheet here made
+        # every live theme switch re-resolve the whole panel separately.
+        self.setObjectName("controlsPanel")
 
-        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._scroll = scroll
 
-        # Six balanced cards. Each fills its grid cell (Expanding both ways), so the
-        # outer grid tiles the entire panel with no gaps. Order pairs tall and short
-        # groups so columns stay even.
-        self._groups = [self._keys_group(), self._media_group(),
-                        self._devpower_group(), self._conn_group(),
-                        self._web_group(), self._text_group()]
+        self._groups = [self._nav_group(), self._media_group(), self._quick_group(),
+                        self._power_group(), self._web_group(), self._text_group()]
         for g in self._groups:
-            g.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            g.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        host = QWidget()
+        host = _Surface()
         host_lay = QVBoxLayout(host)
-        host_lay.setContentsMargins(8, 8, 8, 8); host_lay.setSpacing(0)
-        self._grid_host = QWidget()            # ONE persistent host; rebuilt in place
+        host_lay.setContentsMargins(12, 6, 12, 16)
+        host_lay.setSpacing(0)
+        self._grid_host = _Surface()           # ONE persistent host; rebuilt in place
         self._card_grid = QGridLayout(self._grid_host)
         self._card_grid.setContentsMargins(0, 0, 0, 0)
-        self._card_grid.setHorizontalSpacing(8); self._card_grid.setVerticalSpacing(8)
-        host_lay.addWidget(self._grid_host, 1)
+        self._card_grid.setHorizontalSpacing(20)
+        self._card_grid.setVerticalSpacing(0)
+        self._columns = []
+        host_lay.addWidget(self._grid_host)
+        host_lay.addStretch(1)                 # sections keep their natural height
         scroll.setWidget(host)
         outer.addWidget(scroll)
 
@@ -80,269 +271,377 @@ class ControlsPanel(QWidget):
         self._ready = True
         self._relayout(1)
 
-    _MAX_RC = 16        # generous bound when clearing old row/column stretches
-
-    def _grid(self, ncols=1):
-        return self._relayout(ncols)
-
     def _relayout(self, ncols):
+        """Flow the sections into *ncols* columns. Each column stacks its own
+        sections, and each section goes to the currently shortest column, so a
+        short section never leaves a hole beside a tall one."""
         ncols = max(1, ncols)
         if ncols == self._ncols:
             return
         self._ncols = ncols
         grid = self._card_grid
         for g in self._groups:                # detach (kept alive by self._groups)
-            grid.removeWidget(g)
             g.setParent(None)
-        for i in range(self._MAX_RC):          # clear any stretches from a prior layout
-            grid.setColumnStretch(i, 0)
-            grid.setRowStretch(i, 0)
-        nrows = math.ceil(len(self._groups) / ncols)
-        for idx, g in enumerate(self._groups):
-            r, c = divmod(idx, ncols)
-            grid.addWidget(g, r, c)
-            g.setVisible(True)
+        for column in self._columns:
+            grid.removeWidget(column)
+            column.setParent(None)
+            column.deleteLater()
+        for c in range(_MAX_COLS + 1):
+            grid.setColumnStretch(c, 0)
+        self._columns, layouts, heights = [], [], []
         for c in range(ncols):
+            column = _Surface()
+            lay = QVBoxLayout(column)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(_SECTION_GAP)
+            self._columns.append(column)
+            layouts.append(lay)
+            heights.append(0)
+            grid.addWidget(column, 0, c, Qt.AlignTop)
             grid.setColumnStretch(c, 1)        # equal columns fill the full width
-        for r in range(nrows):
-            grid.setRowStretch(r, 1)           # equal rows fill the full height
+        for g in self._groups:
+            c = heights.index(min(heights))
+            layouts[c].addWidget(g)
+            g.setVisible(True)
+            heights[c] += g.sizeHint().height() + _SECTION_GAP
+        for lay in layouts:
+            lay.addStretch(1)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if not self._ready:
             return
         # use the panel width (not the scrollbar-reduced viewport) so a vertical
-        # scrollbar can't trap us in a too-narrow single column; cap at _MAX_COLS
-        # so the 6 cards always fill a clean grid (no empty trailing cells)
+        # scrollbar can't trap us in a too-narrow single column
         self._relayout(min(_MAX_COLS, max(1, self.width() // _GROUP_W)))
 
     # ---- result / run plumbing ----
     @staticmethod
     def _result_msg(label, r):
-        """Turn a handler result into an honest log line: a falsy/empty result
-        means the action had no effect (e.g. the app isn't installed)."""
-        r = (str(r) if r is not None else "").strip()
-        if r in ("True", "", "None"):
-            return f"[OK] {label}"
-        if r == "False":
+        """Turn a handler result into an honest log line: a failed operation is
+        an error, and a falsy result means the action had no effect (e.g. the
+        app isn't installed)."""
+        if isinstance(r, OperationResult):
+            if not r.success:
+                return f"[ERROR] {label}: {r.error or 'failed'}"
+            r = r.value
+        if isinstance(r, CommandResult):
+            if not r.ok:
+                detail = (r.stderr or r.text or f"exit {r.exit_code}").strip()
+                return f"[ERROR] {label}: {detail}"
+            r = r.text
+        if r is False or (isinstance(r, str) and r.strip() == "False"):
             return (f"[WARNING] {label}: nothing happened — not available on this "
                     f"device (on an IVI the app may not be installed; try the "
                     f"Apps tab to launch what IS installed)")
-        # the connectivity toggles return an explanation when every method was
-        # refused — surface that as a warning, not a fake success
-        if "can't be" in r or "permission-denied" in r:
-            return f"[WARNING] {label}: {r}"
-        return f"[OK] {label}: {r}"
-
-    def _track_thread(self, t):
-        self._threads.append(t)
-        t.finished.connect(t.deleteLater)
-        t.finished.connect(self._on_thread_finished)
-
-    def _on_thread_finished(self):
-        t = self.sender()
-        if t in self._threads:
-            self._threads.remove(t)
+        text = "" if r is None or r is True else str(r).strip()
+        if text in ("", "True", "None"):
+            return f"[OK] {label}"
+        if any(marker in text for marker in _REFUSED_MARKERS):
+            return f"[WARNING] {label}: {text}"
+        return f"[OK] {label}: {text}"
 
     def _run(self, label, fn):
-        t = _Runner(lambda: fn(self.handler))
-        t.done.connect(lambda r: self.log.emit(self._result_msg(label, r)))
-        t.fail.connect(lambda m: self.log.emit(f"[ERROR] {label}: {m}"))
-        self._track_thread(t); t.start()
+        self._dispatcher.submit(
+            lambda: fn(self.handler),
+            on_done=lambda result: self.log.emit(self._result_msg(label, result)),
+            on_fail=lambda message: self.log.emit(f"[ERROR] {label}: {message}"),
+        )
 
     def _run_info(self, label, fn):
         self.log.emit(f"{label}…")
-        t = _Runner(lambda: fn(self.handler))
-        t.done.connect(lambda r: self._show_info(label, r))
-        t.fail.connect(lambda m: self.log.emit(f"[ERROR] {label}: {m}"))
-        self._track_thread(t); t.start()
+        self._dispatcher.submit(
+            lambda: fn(self.handler),
+            on_done=lambda result: self._show_info_result(label, result),
+            on_fail=lambda message: self.log.emit(f"[ERROR] {label}: {message}"),
+        )
+
+    def _show_info_result(self, label, result):
+        if isinstance(result, OperationResult):
+            if not result.success:
+                self.log.emit(f"[ERROR] {label}: {result.error or 'failed'}")
+                return
+            result = result.value
+        if isinstance(result, CommandResult):
+            result = result.text
+        self._show_info(label, "" if result is None else str(result))
 
     def _show_info(self, title, text):
-        dlg = QDialog(self); dlg.setWindowTitle(title); dlg.resize(640, 460)
-        v = QVBoxLayout(dlg)
-        view = QPlainTextEdit(); view.setReadOnly(True); view.setPlainText(text)
-        from PyQt5.QtGui import QFont
-        view.setFont(QFont("Consolas", 9))
-        v.addWidget(view)
-        bb = QDialogButtonBox(QDialogButtonBox.Close)
-        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
-        v.addWidget(bb)
-        dlg.exec_()
+        from .report_dialog import show_report_dialog
+
+        stem = "build-report" if "build" in title.lower() else "device-info"
+        show_report_dialog(
+            self,
+            title,
+            text,
+            stem,
+            "Copy the result, save a complete text report, or render the entire report as a PNG.",
+        )
 
     # ---- button factories ----
-    def _btn(self, text, fn, role="ghost"):
-        b = QPushButton(text); b.setProperty("role", role)
-        b.setMinimumHeight(_BTN_MIN_H); b.setMaximumHeight(_BTN_MAX_H)
-        b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    @staticmethod
+    def _button(text, icon_name, tone=None, *, kind="ctlAction", height=_BTN_H,
+                style=Qt.ToolButtonTextBesideIcon, icon_size=18, tip=None):
+        """A tool button with a colour-coded icon. *tone* tints its fill too."""
+        b = QToolButton()
+        b.setObjectName(kind)
+        b.setText(text)
+        b.setIcon(icon(icon_name, tone or "accent"))
+        b.setIconSize(QSize(icon_size, icon_size))
+        b.setToolButtonStyle(style)
+        if tone:
+            b.setProperty("tone", tone)
+        b.setFixedHeight(height)
+        b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        b.setToolTip(tip or text)
+        b.setAccessibleName(text)
+        b.setCursor(Qt.PointingHandCursor)
+        return b
+
+    def _btn(self, text, icon_name, fn, tone=None, **kwargs):
+        b = self._button(text, icon_name, tone, **kwargs)
         b.clicked.connect(lambda _=False, t=text, f=fn: self._run(t, f))
         return b
 
-    def _info_btn(self, text, fn):
-        b = QPushButton(text); b.setProperty("role", "ghost")
-        b.setMinimumHeight(_BTN_MIN_H); b.setMaximumHeight(_BTN_MAX_H)
-        b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    def _key_btn(self, text, icon_name, key, tone=None, **kwargs):
+        return self._btn(text, icon_name, lambda h, k=key: h.keyevent(k, safe=True),
+                         tone, **kwargs)
+
+    def _icon_key(self, text, icon_name, key, tone, *, kind, height, icon_size):
+        """An icon-only device key (nav bar, media): the label stays as the
+        tooltip, accessible name and log text."""
+        return self._key_btn(text, icon_name, key, tone, kind=kind, height=height,
+                             style=Qt.ToolButtonIconOnly, icon_size=icon_size)
+
+    def _tile(self, text, icon_name, fn, tone, tip=None):
+        """An icon-over-label tile (launchers, Power/Notifications/Settings)."""
+        return self._btn(text, icon_name, fn, tone, kind="ctlTile", height=_TILE_H,
+                         style=Qt.ToolButtonTextUnderIcon, icon_size=22, tip=tip)
+
+    def _callback_btn(self, text, icon_name, callback, tone=None, **kwargs):
+        """A button whose action is owned by the parent workflow."""
+        b = self._button(text, icon_name, tone, **kwargs)
+        b.clicked.connect(lambda _=False: callback())
+        return b
+
+    def _request_reboot(self):
+        if callable(self._on_reboot):
+            self._on_reboot()
+        else:
+            # Kept for standalone embedding, where there is no DeviceTab to
+            # coordinate recovery. The main TurboADB UI always supplies the
+            # callback above.
+            self._run("Reboot", lambda h: h.reboot(safe=True))
+
+    def _info_btn(self, text, icon_name, fn, tone=None, **kwargs):
+        b = self._button(text, icon_name, tone, **kwargs)
         b.clicked.connect(lambda _=False, t=text, f=fn: self._run_info(t, f))
         return b
 
-    def _local_btn(self, text, slot, role="ghost"):
-        """A button bound to a local slot (input rows). Fixed, input-height — it
-        sits next to a text field, so it must not balloon."""
-        b = QPushButton(text); b.setProperty("role", role)
-        b.setFixedHeight(_INPUT_H)
+    def _local_btn(self, text, icon_name, slot, tone=None):
+        """A button bound to a local slot beside a text field (input height)."""
+        b = self._button(text, icon_name, tone, height=_INPUT_H, icon_size=16)
+        # natural width normally; it may give way (rather than force sideways
+        # scrolling) only when the panel is narrower than the row's labels
+        b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        b.setMinimumWidth(_INPUT_H)
         b.clicked.connect(lambda _=False: slot())
         return b
 
-    def _key_btn(self, text, key):
-        return self._btn(text, lambda h, k=key: h.keyevent(k, safe=False))
+    def _quick_tile(self, key, name, caption, icon_name, tone, setter):
+        tile = _QuickTile(name, caption, icon_name, tone)
+        tile.btn_on.clicked.connect(
+            lambda _=False: self._run(f"{name} on", lambda h: setter(h, True)))
+        tile.btn_off.clicked.connect(
+            lambda _=False: self._run(f"{name} off", lambda h: setter(h, False)))
+        self.quick_tiles[key] = tile
+        return tile
 
     @staticmethod
-    def _grid(ncols):
-        grid = QGridLayout(); grid.setSpacing(6); grid.setContentsMargins(0, 0, 0, 0)
-        for c in range(ncols):
-            grid.setColumnStretch(c, 1)        # buttons share the card width
-        return grid
+    def _field(placeholder):
+        field = QLineEdit()
+        field.setPlaceholderText(placeholder)
+        field.setMinimumWidth(60)
+        field.setFixedHeight(_INPUT_H)
+        return field
 
-    @staticmethod
-    def _fill_rows(grid):
-        for r in range(grid.rowCount()):       # stretch only rows that hold buttons
-            if any(grid.itemAtPosition(r, c) for c in range(grid.columnCount())):
-                grid.setRowStretch(r, 1)
-
-    def _card(self, title):
-        g = QGroupBox(title)
-        v = QVBoxLayout(g); v.setContentsMargins(8, 6, 8, 8); v.setSpacing(6)
+    def _card(self, title, icon_name, tone="accent"):
+        """A section: an icon + small title over the section's controls."""
+        g = _Section()
+        v = QVBoxLayout(g)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(7)
+        head.addWidget(_Glyph(icon_name, tone, 15))
+        heading = QLabel(title)
+        # the side panel pads its own caption; section titles align with the
+        # buttons (#controlsPanel QLabel#cardTitle in theme.py)
+        heading.setObjectName("cardTitle")
+        head.addWidget(heading, 1)
+        v.addLayout(head)
         return g, v
 
-    # ---- groups (cards) ----
-    def _keys_group(self):
-        g, v = self._card("System keys")
-        grid = self._grid(2)
-        items = [("◀ Back", "back", 0, 0), ("⌂ Home", "home", 0, 1),
-                 ("▣ Recents", "recents", 1, 0), ("⏻ Power", "power", 1, 1),
-                 ("🔔 Notifs", "notifications", 2, 0)]
-        for text, key, r, c in items:
-            grid.addWidget(self._key_btn(text, key), r, c)
-        grid.addWidget(self._btn("⚙ Settings", lambda h: h.open_settings(safe=False)), 2, 1)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+    # ---- sections ----
+    def _nav_group(self):
+        g, v = self._card("Navigation", "smartphone")
+        bar = _TileGrid(
+            [self._icon_key(text, name, key, "blue", kind="ctlNav", height=_NAV_H,
+                            icon_size=22)
+             for text, name, key in (("Back", "back", "back"), ("Home", "home", "home"),
+                                     ("Recents", "recents", "recents"))],
+            (3,), spacing=8)
+        v.addWidget(bar)
+        v.addWidget(_TileGrid([
+            self._key_btn("Power", "power", "power", "red", kind="ctlTile",
+                          height=_TILE_H, style=Qt.ToolButtonTextUnderIcon, icon_size=22,
+                          tip="Power key (sleep / wake)"),
+            self._tile(
+                "Notifications",
+                "bell",
+                lambda h: (
+                    h.expand_notifications(safe=True)
+                    if hasattr(h, "expand_notifications")
+                    else h.keyevent("notifications", safe=True)
+                ),
+                "amber",
+                tip="Pull down the notification shade",
+            ),
+            # The one "Settings" shortcut (it used to be repeated on three cards).
+            self._tile("Settings", "settings", lambda h: h.open_settings(safe=True), "teal",
+                       tip="Open the device's Settings app"),
+        ], (3, 1), spacing=6))
         return g
 
     def _media_group(self):
-        g, v = self._card("Media controls")
-        ncols = 2 if self._compact else 3
-        grid = self._grid(ncols)
-        items = [
-            ("🔉 Vol −", "vol_down", True),
-            ("🔊 Vol +", "vol_up", True),
-            ("🔇 Mute", "vol_mute", True),
-            ("⏯ Play", lambda h: h.media("play-pause", safe=False), False),
-            ("⏮ Prev", lambda h: h.media("previous", safe=False), False),
-            ("⏭ Next", lambda h: h.media("next", safe=False), False),
-        ] if self._compact else [
-            ("🔉 Vol −", "vol_down", True),
-            ("🔇 Mute", "vol_mute", True),
-            ("🔊 Vol +", "vol_up", True),
-            ("⏮ Prev", lambda h: h.media("previous", safe=False), False),
-            ("⏯ Play", lambda h: h.media("play-pause", safe=False), False),
-            ("⏭ Next", lambda h: h.media("next", safe=False), False),
-        ]
-        for idx, item in enumerate(items):
-            r, c = divmod(idx, ncols)
-            text = item[0]
-            if item[2]:
-                grid.addWidget(self._key_btn(text, item[1]), r, c)
-            else:
-                grid.addWidget(self._btn(text, item[1]), r, c)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+        g, v = self._card("Media & volume", "music")
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        groups = (
+            ("purple", (("Volume down", "volume-down", "vol_down"),
+                        ("Mute", "mute", "vol_mute"),
+                        ("Volume up", "volume-up", "vol_up"))),
+            ("pink", (("Previous track", "skip-back", "previous"),
+                      ("Play / pause", "play-pause", "play-pause"),
+                      ("Next track", "skip-forward", "next"))),
+        )
+        for tone, items in groups:
+            seg = QHBoxLayout()
+            seg.setSpacing(4)
+            for text, name, action in items:
+                if tone == "purple":
+                    b = self._icon_key(text, name, action, tone, kind="ctlMedia",
+                                       height=_BTN_H + 2, icon_size=20)
+                else:
+                    b = self._btn(text, name, lambda h, a=action: h.media(a, safe=True),
+                                  tone, kind="ctlMedia", height=_BTN_H + 2,
+                                  style=Qt.ToolButtonIconOnly, icon_size=20)
+                b.setMinimumWidth(34)
+                seg.addWidget(b, 1)
+            row.addLayout(seg, 1)
+        v.addLayout(row)
         return g
 
-    def _devpower_group(self):
-        g, v = self._card("Device & Power")
-        grid = self._grid(2)
-        grid.addWidget(self._info_btn("ℹ Build info", lambda h: h.build_info(safe=False)), 0, 0)
-        grid.addWidget(self._info_btn("🔋 Battery", lambda h: h.battery(safe=False)), 0, 1)
-        grid.addWidget(self._btn("☀ Screen on", lambda h: h.screen_on(safe=False)), 1, 0)
-        grid.addWidget(self._btn("🌙 Screen off", lambda h: h.screen_off(safe=False)), 1, 1)
-        grid.addWidget(self._btn("⚙ Settings", lambda h: h.open_settings(safe=False)), 2, 0)
-        grid.addWidget(self._btn("⟳ Reboot", lambda h: h.reboot(safe=False)), 2, 1)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+    def _quick_group(self):
+        g, v = self._card("Quick settings", "sliders")
+        tiles = (
+            ("wifi", "Wi-Fi", "Wireless network", "wifi", "blue",
+             lambda h, on: h.set_wifi(on, safe=True)),
+            ("bluetooth", "Bluetooth", "Nearby devices", "bluetooth", "purple",
+             lambda h, on: h.set_bluetooth(on, safe=True)),
+            ("mobile_data", "Mobile data", "Cellular connection", "signal", "green",
+             lambda h, on: h.set_mobile_data(on, safe=True)),
+            ("airplane", "Airplane mode", "All radios off", "airplane", "orange",
+             lambda h, on: h.set_airplane(on, safe=True)),
+            ("hotspot", "Hotspot", "Share the connection", "hotspot", "teal",
+             lambda h, on: h.set_hotspot(on, safe=True)),
+        )
+        stack = QVBoxLayout()
+        stack.setSpacing(6)
+        for key, name, caption, icon_name, tone, setter in tiles:
+            stack.addWidget(self._quick_tile(key, name, caption, icon_name, tone, setter))
+        v.addLayout(stack)
         return g
 
-    def _conn_group(self):
-        g, v = self._card("Connectivity")
-        grid = self._grid(2)
-        defs = [("Wi-Fi On", lambda h: h.set_wifi(True, safe=False), 0, 0),
-                ("Wi-Fi Off", lambda h: h.set_wifi(False, safe=False), 0, 1),
-                ("BT On", lambda h: h.set_bluetooth(True, safe=False), 1, 0),
-                ("BT Off", lambda h: h.set_bluetooth(False, safe=False), 1, 1),
-                ("Data On", lambda h: h.set_mobile_data(True, safe=False), 2, 0),
-                ("Data Off", lambda h: h.set_mobile_data(False, safe=False), 2, 1),
-                ("Airplane On", lambda h: h.set_airplane(True, safe=False), 3, 0),
-                ("Airplane Off", lambda h: h.set_airplane(False, safe=False), 3, 1),
-                ("Hotspot On", lambda h: h.set_hotspot(True, safe=False), 4, 0),
-                ("Hotspot Off", lambda h: h.set_hotspot(False, safe=False), 4, 1)]
-        for text, fn, r, c in defs:
-            grid.addWidget(self._btn(text, fn), r, c)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+    def _power_group(self):
+        g, v = self._card("Screen & power", "power")
+        v.addWidget(self._quick_tile(
+            "screen", "Screen", "Wake or sleep", "screen-on", "amber",
+            lambda h, on: h.screen_on(safe=True) if on else h.screen_off(safe=True)))
+        v.addWidget(_TileGrid([
+            self._info_btn("Battery", "battery", lambda h: h.battery(safe=True), "green",
+                           tip="Show battery level, health and charging state"),
+            self._callback_btn("Reboot", "reboot", self._request_reboot, "red",
+                               tip="Reboot the device"),
+        ], (2, 1)))
         return g
 
     def _web_group(self):
-        g, v = self._card("Apps & Web")
-        row = QHBoxLayout()
-        self.url = QLineEdit()
-        self.url.setPlaceholderText("URL or search…")
-        self.url.setMinimumWidth(50); self.url.setFixedHeight(_INPUT_H)
+        g, v = self._card("Apps & web", "apps")
+        # the field gets a full row so the placeholder never truncates in the
+        # side pane; its two actions share the row below
+        self.url = self._field("URL or search terms…")
+        self.url.addAction(icon("globe", "dim"), QLineEdit.LeadingPosition)
         self.url.returnPressed.connect(self._open_url)
-        row.addWidget(self.url, 1)
-        row.addWidget(self._local_btn("Open", self._open_url))
-        row.addWidget(self._local_btn("Search", self._search))
-        v.addLayout(row)
-        ncols = 2 if self._compact else 3
-        grid = self._grid(ncols)
+        v.addWidget(self.url)
+        v.addWidget(_TileGrid([
+            self._local_btn("Open URL", "external", self._open_url, "blue"),
+            self._local_btn("Web search", "search", self._search),
+        ], (2, 1)))
         items = [
-            ("🌐 Browser", lambda h: h.open_url("https://www.google.com", safe=False)),
-            ("▶ YouTube", lambda h: h.open_url("https://www.youtube.com", safe=False)),
-            ("🎵 Spotify", lambda h: h.open_url("https://open.spotify.com", safe=False)),
-            ("🗺 Maps", lambda h: h.open_url("https://maps.google.com", safe=False)),
-            ("🛒 Store", lambda h: h.open_url("https://play.google.com/store/apps", safe=False)),
-            ("🖼 Gallery", lambda h: h.open_gallery(safe=False)),
-            ("🧮 Calc", lambda h: h.open_calculator(safe=False)),
-            ("📷 Camera", lambda h: h.open_camera(safe=False)),
-            ("⚙ Settings", lambda h: h.open_settings(safe=False)),
+            ("Browser", "globe", "blue",
+             lambda h: h.open_url("https://www.google.com", safe=True)),
+            ("YouTube", "youtube", "red",
+             lambda h: h.open_url("https://www.youtube.com", safe=True)),
+            ("Spotify", "music", "green",
+             lambda h: h.open_url("https://open.spotify.com", safe=True)),
+            ("Maps", "map", "teal",
+             lambda h: h.open_url("https://maps.google.com", safe=True)),
+            ("Play Store", "store", "orange",
+             lambda h: h.open_url("https://play.google.com/store/apps", safe=True)),
+            ("Gallery", "image", "pink", lambda h: h.open_gallery(safe=True)),
+            ("Calculator", "calculator", "amber", lambda h: h.open_calculator(safe=True)),
+            ("Camera", "camera", "purple", lambda h: h.open_camera(safe=True)),
         ]
-        for i, (text, fn) in enumerate(items):
-            grid.addWidget(self._btn(text, fn), i // ncols, i % ncols)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+        # compact coloured launchers: 2x4 in the side pane, one row of 4 when wide
+        v.addWidget(_TileGrid(
+            [self._btn(text, name, fn, tone, height=_BTN_H + 2, icon_size=20,
+                       tip=f"Open {text}")
+             for text, name, tone, fn in items],
+            (4, 2)))
         return g
 
     def _open_url(self):
         u = self.url.text().strip()
         if u:
-            self._run(f"open {u}", lambda h: h.open_url(u, safe=False))
+            self._run(f"open {u}", lambda h: h.open_url(u, safe=True))
 
     def _search(self):
         q = self.url.text().strip()
         if q:
-            self._run(f"search {q!r}", lambda h: h.web_search(q, safe=False))
+            self._run(f"search {q!r}", lambda h: h.web_search(q, safe=True))
 
     def _text_group(self):
-        g, v = self._card("Keyboard")
+        g, v = self._card("Keyboard", "keyboard")
         g.setToolTip("Type into the device's focused field (works when the device "
                      "has no on-screen keyboard).")
         row = QHBoxLayout()
-        self.text = QLineEdit()
-        self.text.setPlaceholderText("type, then Send…")
-        self.text.setMinimumWidth(50); self.text.setFixedHeight(_INPUT_H)
+        row.setSpacing(6)
+        self.text = self._field("Type text, then Send…")
         self.text.returnPressed.connect(self._send_text)
         row.addWidget(self.text, 1)
-        row.addWidget(self._local_btn("Send", self._send_text, "ok"))
+        row.addWidget(self._local_btn("Send", "send", self._send_text, "green"))
         v.addLayout(row)
-        ncols = 2 if self._compact else 3
-        grid = self._grid(ncols)
-        for i, (text, key) in enumerate((("⏎ Enter", "enter"), ("⌫ Backspace", "del"),
-                                         ("␣ Space", "space"), ("⇥ Tab", "tab"),
-                                         ("Esc", "esc"), ("🔍 Search", "search"))):
-            grid.addWidget(self._key_btn(text, key), i // ncols, i % ncols)
-        self._fill_rows(grid); v.addLayout(grid, 1)
+        keys = (("Enter", "enter", "enter"), ("Backspace", "backspace", "del"),
+                ("Space", "space", "space"), ("Tab", "tab", "tab"),
+                ("Esc", "x", "esc"), ("Search", "search", "search"))
+        v.addWidget(_TileGrid(
+            [self._key_btn(text, name, key, kind="ctlKey", height=_BTN_H - 2, icon_size=16,
+                           tip=f"{text} key")
+             for text, name, key in keys],
+            (6, 3, 2)))
         return g
 
     def _send_text(self):
@@ -350,8 +649,13 @@ class ControlsPanel(QWidget):
         if not t:
             return
         self.text.clear()
-        self._run(f"type {t!r}", lambda h: h.input_text(t, safe=False))
+        self._run(f"type {t!r}", lambda h: h.input_text(t, safe=True))
 
     def close_panel(self):
-        for t in list(self._threads):
-            t.wait(700)
+        # Commands go through the dispatcher; a shared (device-tab) dispatcher
+        # is stopped by its owner.
+        if self._owns_dispatcher:
+            from .qtutil import park_thread
+
+            self._dispatcher.stop()
+            park_thread(self._dispatcher)

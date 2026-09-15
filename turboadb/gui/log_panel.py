@@ -19,7 +19,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QPushButton,
     QPlainTextEdit,
-    QFileDialog,
     QComboBox,
     QLabel,
     QCheckBox,
@@ -32,11 +31,14 @@ DOCS_URL = "https://pypi.org/project/turboadb/"
 
 #   name -> (rank, 4-char badge, badge colour, message colour)
 _LEVELS = {
-    "DEBUG": (0, "dbg ", "#7e8896", "#8b95a3"),
-    "INFO": (1, "info", "#7fb2e8", "#cfe3f7"),
-    "OK": (1, "ok  ", "#5be39a", "#bdebcf"),
-    "WARNING": (2, "warn", "#ffc34d", "#ffe1a3"),
-    "ERROR": (3, "err ", "#ff7a6e", "#ffb3aa"),
+    level: (rank, badge, *theme.LOG_LEVEL_STYLE[level])
+    for level, rank, badge in (
+        ("DEBUG", 0, "dbg "),
+        ("INFO", 1, "info"),
+        ("OK", 1, "ok  "),
+        ("WARNING", 2, "warn"),
+        ("ERROR", 3, "err "),
+    )
 }
 _ALIASES = {
     "SUCCESS": "OK",
@@ -58,23 +60,25 @@ _PREFIX_RE = re.compile(
 
 class LogPanel(QGroupBox):
     def __init__(self, parent=None):
-        super().__init__("Log", parent)
+        # The dock already titles this panel "Log"; a second group-box title
+        # repeated it.
+        super().__init__("", parent)
+        self.setObjectName("logPanel")
         self._entries = deque(maxlen=20000)  # (ts, level, msg) — the full record
         self._min_rank = 1  # "Normal": hide DEBUG by default
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 8)
+        lay.setSpacing(6)
         self.view = QPlainTextEdit()
         self.view.setReadOnly(True)
         self.view.setFont(QFont("Consolas", 9))
         self.view.setMaximumBlockCount(80000)
         # the log dock is DARK in both themes so its colour-coding stays readable
-        self.view.setStyleSheet(
-            "QPlainTextEdit{background:#0b0b0d;color:#cfe3f7;border:1px solid #2a2a2a;}"
-        )
+        self.view.setObjectName("logBox")  # terminal colours (theme.py)
 
         row = QHBoxLayout()
         lbl = QLabel("Show:")
-        lbl.setStyleSheet("color:#9aa4af;")
         row.addWidget(lbl)
         self.level_box = QComboBox()
         self.level_box.addItems([f[0] for f in _FILTERS])
@@ -92,17 +96,19 @@ class LogPanel(QGroupBox):
         self.chk_silent.toggled.connect(self._on_silent_toggled)
         row.addWidget(self.chk_silent)
         row.addStretch(1)
+        from .icons import icon
+
         clear = QPushButton("Clear")
         clear.setProperty("role", "ghost")
-        clear.setIcon(theme.emoji_icon("🧹"))
+        clear.setIcon(icon("eraser", "amber"))
         clear.clicked.connect(self._clear)
         save = QPushButton("Save log…")
         save.setProperty("role", "ghost")
-        save.setIcon(theme.emoji_icon("💾"))
+        save.setIcon(icon("save", "teal"))
         save.clicked.connect(self._save)
-        docs = QPushButton("Help / Docs")
+        docs = QPushButton("Help")
         docs.setProperty("role", "ghost")
-        docs.setIcon(theme.emoji_icon("❓"))
+        docs.setIcon(icon("help", "blue"))
         docs.clicked.connect(lambda: webbrowser.open(DOCS_URL))
         row.addWidget(clear)
         row.addWidget(save)
@@ -121,6 +127,10 @@ class LogPanel(QGroupBox):
     def append(self, text: str):
         if text is None:
             return
+        sb = self.view.verticalScrollBar()
+        # Follow new entries only when already at the bottom; someone reading
+        # older lines must not be yanked away by every new message.
+        at_bottom = sb.value() >= sb.maximum() - 4
         for raw in str(text).split("\n"):
             if not raw.strip():
                 continue
@@ -129,8 +139,8 @@ class LogPanel(QGroupBox):
             self._entries.append(entry)
             if _LEVELS[level][0] >= self._min_rank:
                 self._render(entry)
-        sb = self.view.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        if at_bottom:
+            sb.setValue(sb.maximum())
 
     # ---- classification ----
     @staticmethod
@@ -153,7 +163,7 @@ class LogPanel(QGroupBox):
         cur = self.view.textCursor()
         cur.movePosition(QTextCursor.End)
         tsfmt = QTextCharFormat()
-        tsfmt.setForeground(QColor("#6b7580"))
+        tsfmt.setForeground(QColor(theme.LOG_TIMESTAMP))
         bfmt = QTextCharFormat()
         bfmt.setForeground(QColor(badge_col))
         bfmt.setFontWeight(QFont.Bold)
@@ -181,19 +191,19 @@ class LogPanel(QGroupBox):
         self.view.clear()
 
     def _save(self):
-        from .fileutil import download_path
+        """Save exactly what is shown, off the UI thread, reporting real errors."""
+        from .fileutil import save_output, write_text_file
 
-        default = download_path("turboadb-log-" + time.strftime("%Y%m%d-%H%M%S") + ".log")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save log", default, "Log files (*.log);;Text files (*.txt);;All files (*)"
+        text = "".join(
+            f"{ts} {_LEVELS[level][1].strip().upper():4} {msg}\n"
+            for ts, level, msg in self._entries
+            if _LEVELS[level][0] >= self._min_rank
         )
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as fh:
-            for ts, level, msg in self._entries:
-                if _LEVELS[level][0] >= self._min_rank:
-                    fh.write(f"{ts} {_LEVELS[level][1].strip().upper():4} {msg}\n")
-        self.append(f"[OK] Log saved to {path}")
-        from .fileutil import saved_dialog
-
-        saved_dialog(self, path, "log")
+        save_output(
+            self,
+            "Save log",
+            "turboadb-log-" + time.strftime("%Y%m%d-%H%M%S") + ".log",
+            lambda path: write_text_file(path, text, newline=None),
+            what="log",
+            on_saved=lambda path: self.append(f"[OK] Log saved to {path}"),
+        )

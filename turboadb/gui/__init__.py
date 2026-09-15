@@ -3,7 +3,7 @@
     from turboadb.gui.app import main
     main()
 
-Or simply run ``turboadb-gui`` (prefers the bundled Windows exe), or
+Or run ``turboadb-gui`` after installing the ``gui`` extra, or
 ``python -m turboadb.gui``.
 """
 

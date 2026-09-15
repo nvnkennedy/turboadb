@@ -10,21 +10,19 @@ import json
 import subprocess
 import urllib.request
 
-from .tools import NO_WINDOW, parse_version
+from .tools import NO_WINDOW, parse_version, windowless_python
 
 PYPI_JSON = "https://pypi.org/pypi/turboadb/json"
 
 
 def current_version() -> str:
+    """The running TurboADB version (the single ``__version__`` lookup)."""
     try:
         from . import __version__
 
         return __version__
     except Exception:
         return "0"
-
-
-_vtuple = parse_version
 
 
 def pypi_latest(timeout: float = 6.0) -> str | None:
@@ -41,7 +39,7 @@ def pypi_latest(timeout: float = 6.0) -> str | None:
 def is_newer(latest: str | None, current: str | None = None) -> bool:
     if not latest:
         return False
-    return _vtuple(latest) > _vtuple(current or current_version())
+    return parse_version(latest) > parse_version(current or current_version())
 
 
 def can_self_update() -> bool:
@@ -139,7 +137,7 @@ def run_upgrade(notify=None) -> dict:
         "error": None,
     }
     if not can_self_update():
-        res["error"] = "running the bundled exe — upgrade with: pip install -U turboadb"
+        res["error"] = "running the standalone executable — upgrade with: pip install -U turboadb"
         return res
     try:
         say("Upgrading TurboADB from PyPI (pip install --upgrade)…")
@@ -177,16 +175,12 @@ def run_upgrade(notify=None) -> dict:
 
 def _relaunch_cmd():
     """The best windowless way to start a FRESH GUI process (which will import the
-    upgraded code)."""
-    import shutil
-
-    launcher = shutil.which("turboadb-gui")
-    if launcher:
-        return [launcher]
-    pydir = os.path.dirname(sys.executable)
-    pyw = os.path.join(pydir, "pythonw.exe")
-    exe = pyw if os.path.exists(pyw) else sys.executable
-    return [exe, "-m", "turboadb", "gui"]
+    upgraded code). Always the interpreter that is running now — a
+    ``turboadb-gui`` found on PATH may belong to a different environment that
+    was never upgraded."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [windowless_python(), "-m", "turboadb", "gui"]
 
 
 def relaunch() -> bool:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadb"
-version = "1.1.16"
+version = "2.0.0"
 description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/embedded (Android Automotive OS / IVI) & general Android: Python API, CLI, and a full PyQt5 GUI."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -23,7 +23,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Operating System :: OS Independent",
     "Operating System :: Microsoft :: Windows",
     "Topic :: Software Development :: Testing",
     "Topic :: System :: Hardware",
@@ -33,9 +32,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 # Batteries-included: the engine + CLI wrap adb/scrcpy and need no third-party
-# Python deps. PyQt5 is OPTIONAL ([gui]) — the GUI also ships as a bundled exe so
-# it runs even where PyQt5 has no wheel. (Making PyQt5 mandatory broke `pip
-# install` on Pythons without a PyQt5 wheel, so it stays optional.)
+# Python deps. PyQt5 is OPTIONAL ([gui]); the wheel also bundles the Windows GUI
+# executable (turboadb/bin/turboadb-gui.exe, copied in by scripts/release.py), so
+# `turboadb-gui` runs even where PyQt5 has no wheel. Making PyQt5 mandatory broke
+# `pip install` on Pythons without a PyQt5 wheel, so it stays optional.
 dependencies = []
 
 [project.optional-dependencies]
@@ -63,6 +63,12 @@ Changelog = "https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["turboadb", "turboadb.gui"]
+# Assets and the bundled Windows executable are explicitly declared below as
+# package data; do not treat their directories as implicit Python packages.
+include-package-data = false
 
 [tool.setuptools.package-data]
 turboadb = ["*.md", "py.typed", "assets/*.ico", "assets/*.png", "bin/*.exe"]
+
+[tool.pytest.ini_options]
+addopts = "--ignore=tests/test_offline.py"
