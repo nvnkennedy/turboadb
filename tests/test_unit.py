@@ -799,6 +799,7 @@ def test_windows_drives_and_ls_parser():
     assert owner == "root:sdcard_rw"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="starts a real cmd.exe")
 def test_local_terminal_session():
     from turboadb.gui.local_terminal import LocalShellSession
 
@@ -976,6 +977,7 @@ def test_file_table_drag_flags():
     assert bool(it.flags() & Qt.ItemIsDropEnabled)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="starts a real cmd.exe")
 def test_local_terminal_non_blocking_read():
     from turboadb.gui.local_terminal import LocalShellSession
 
@@ -1424,9 +1426,13 @@ def test_console_columnize_and_prompt_provider(qapp):
     assert strip_ansi(AnsiConsole._style_local_prompts("PS C:\\Users\\n> ")) == "PS C:\\Users\\n> "
 
 
-def test_tools_cache_and_clear():
+def test_tools_cache_and_clear(tmp_path, monkeypatch):
     from turboadb.tools import find_adb, clear_tools_cache, _CACHE
 
+    # a fake adb, so the test never depends on adb being installed on the runner
+    fake = tmp_path / ("adb.exe" if os.name == "nt" else "adb")
+    fake.write_text("")
+    monkeypatch.setenv("TURBOADB_ADB", str(fake))
     clear_tools_cache()
     assert len(_CACHE) == 0
     adb = find_adb()
