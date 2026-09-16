@@ -498,21 +498,23 @@ class AnsiConsole(QPlainTextEdit):
             self._need_prompt = False
             self._shown_prompt = ""
 
-    def set_prompt(self, host, root=False):
-        self._host = host or ""
+    def set_prompt(self, identity, root=False):
+        """Show *identity* — the device's ``user@host``, or just a host — in the prompt."""
+        self._host = identity or ""
         self._root = bool(root)
 
     def _prompt_text(self):
-        """Return a compact, familiar ADB-shell prompt.
+        """Return the device's own compact prompt: ``user@host:cwd $``.
 
         The shell already tells the user where they are.  A clock and a second
         decorated path made every prompt long and obscured command output.
         """
         cwd = self._cwd or "/"
-        host = self._host or "android"
         marker = "#" if self._root else "$"
+        user, _, host = (self._host or "android").rpartition("@")
+        user = user or ("root" if self._root else "shell")
         return (
-            f"\x1b[1;95madb@\x1b[1;96m{host}"
+            f"\x1b[1;95m{user}@\x1b[1;96m{host or 'android'}"
             f"\x1b[90m:\x1b[1;93m{cwd} "
             f"\x1b[1;92m{marker}\x1b[0m "
         )

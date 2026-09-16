@@ -232,6 +232,7 @@ class ControlsPanel(QWidget):
         self._owns_dispatcher = dispatcher is None
         self._dispatcher = dispatcher or DeviceCommandDispatcher()
         self._ncols = -1
+        self._strip = False  # True: laid out as a wide strip under the screen
         self._ready = False          # guard: resizeEvent fires during construction
         self.quick_tiles = {}
         # Button geometry (#ctlNav, #ctlTile, …) and the section-title padding
@@ -286,7 +287,7 @@ class ControlsPanel(QWidget):
             grid.removeWidget(column)
             column.setParent(None)
             column.deleteLater()
-        for c in range(_MAX_COLS + 1):
+        for c in range(max(_MAX_COLS, self.STRIP_COLS) + 1):
             grid.setColumnStretch(c, 0)
         self._columns, layouts, heights = [], [], []
         for c in range(ncols):
@@ -313,7 +314,33 @@ class ControlsPanel(QWidget):
             return
         # use the panel width (not the scrollbar-reduced viewport) so a vertical
         # scrollbar can't trap us in a too-narrow single column
-        self._relayout(min(_MAX_COLS, max(1, self.width() // _GROUP_W)))
+        self._relayout(self._columns_for(self.width()))
+
+    STRIP_COLS = 6  # a strip under the screen is wide: up to six section columns
+
+    def _columns_for(self, width, strip=None):
+        strip = self._strip if strip is None else strip
+        return min(self.STRIP_COLS if strip else _MAX_COLS, max(1, int(width) // _GROUP_W))
+
+    def set_strip(self, strip: bool) -> None:
+        """Lay the sections out as a wide, short strip (under the device screen)
+        instead of a side panel; the side panel keeps its 340 px minimum."""
+        strip = bool(strip)
+        if strip == self._strip:
+            return
+        self._strip = strip
+        self.setMinimumWidth(1 if strip else (340 if self._compact else 500))
+        if self._ready:
+            self._relayout(self._columns_for(self.width()))
+
+    def content_height(self, width, strip=None) -> int:
+        """Height the sections need when flowed into the columns *width* allows
+        (packed like _relayout: each section into the shortest column)."""
+        heights = [0] * self._columns_for(width, strip)
+        for g in self._groups:
+            c = heights.index(min(heights))
+            heights[c] += g.sizeHint().height() + _SECTION_GAP
+        return max(heights) + 22  # the host's top and bottom margins
 
     # ---- result / run plumbing ----
     @staticmethod

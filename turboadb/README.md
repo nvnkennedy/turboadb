@@ -140,10 +140,12 @@ A tabbed, multi-device workspace:
     **SMS messages** with a compose box that opens a draft in the device's
     Messages app, all over adb.
   - **Webcam** — a host USB / laptop camera, local or on a remote Windows PC.
-  - **IVI Displays** (cars only) — the IVI display wall with every display live.
+  - **IVI Displays** (cars and multi-display devices) — every display live and
+    controllable, side by side, started one after another, with Start all /
+    Stop all / Rescan and Focus.
   - **More ▾ → Root and mount** — `adb root`, `remount`, `mount -o remount,rw /`,
     `disable-verity` (auto sync + reboot prompt).
-  - **Screen** — scrcpy with a display picker and compatibility mode, shown
+  - **Screen** — scrcpy with a named display picker and compatibility mode, shown
     inside Device Control (Windows) or in a separate window from the **Screen ▾**
     menu.
 - **Tools ▾ → Check for updates…** updates TurboADB from PyPI when a newer
@@ -419,11 +421,14 @@ with ADBHandler(ADBConfig(host="192.168.1.50")) as hu:
 set `automotive`, so you can branch IVI-specific flows; the GUI uses it for the
 IVI-compatible screen profile and shows the type in the terminal banner.
 
-**In the GUI**, automotive devices get an **IVI Displays** tab that opens the
-**IVI display wall** (also under **Device Control → Options**). It presents
-lightweight live previews of every discovered display, each with Control,
-Maximize, Screenshot, and Record actions. The normal
-Device Control toolbar still supports selecting one display at a time. If a
+**In the GUI**, automotive devices (and any device with several displays) get an
+**IVI Displays** tab that shows every discovered display live, side by side.
+Each tile is a real, controllable screen with Start / Stop, Separate window,
+Screenshot and Record, and the displays start one after another when the tab
+first opens; **Focus** shows one display, and **Start all**, **Stop all** and
+**Rescan** sit at the top (**Device Control → Options → All displays** opens it).
+The Device Control display picker lists every display with its name and size as
+soon as the device connects. If a
 mirror fails, the error suggests trying compatibility mode or a different
 display. Video quality, codec and full audio forwarding controls are configurable
 in **Settings → scrcpy** (audio source, codec, bitrate and latency included).
@@ -479,63 +484,79 @@ Exception hierarchy (catch `ADBError` for everything):
 
 ## CLI reference
 
+The complete reference, with every option and example, is at
+<https://github.com/NVNKENNEDY/turboadb/blob/main/CLI.md> and
+<https://nvnkennedy.github.io/turboadb/cli.html>.
+
 ```
 turboadb doctor                      # is adb / scrcpy installed?
 turboadb fetch-tools [--adb-only|--scrcpy-only --force]   # download into the cache
 turboadb upgrade-tools [--check]     # update adb/scrcpy only if a newer version exists
 turboadb devices                     # list attached/known devices
 turboadb info        [-s S]          # device identity / build / automotive flag
-turboadb shell       [-s S] -- CMD…  # one-shot adb shell (use --su to wrap in su -c)
-turboadb logcat      [-s S] [--tag T --priority I --match RE --save F --stop-on-match --clear --dump]
+turboadb state | serialno | ip | wait [SECONDS]   [-s S]
+turboadb targets list | add NAME usb|network|remote ADDRESS [SERIAL] | remove NAME | export F | import F
+turboadb shell       [-s S] [-- CMD…] [--su --all --batch FILE --keep-going]   # no CMD: interactive
+turboadb adb         [-s S] -- ARGS…     # any adb command for this device
+turboadb logcat      [-s S] [--tag T --priority I --filter TAG:LEVEL --crashes --grep RE --match RE --save F --clear --dump --tail N]
 turboadb logcat-clear[-s S]
 turboadb push        [-s S] LOCAL REMOTE
 turboadb pull        [-s S] REMOTE LOCAL
-turboadb install     [-s S] APK [APK…] [--grant --downgrade --no-replace]
+turboadb ls [PATH] | mkdir PATH… | touch PATH… | rm [-r] PATH… | mv [-f] SRC DST | cp SRC DST | stat PATH   [-s S]
+turboadb edit        [-s S] PATH [--editor "code --wait"]   # edit a device text file locally
+turboadb install     [-s S] APK [APK…] [--grant --downgrade --no-replace --test]
 turboadb uninstall   [-s S] PKG [--keep-data]
-turboadb packages    [-s S] [--third-party --system] [FILTER]
+turboadb packages    [-s S] [--third-party --system --enabled --disabled --path] [FILTER]
 turboadb clear       [-s S] PKG
 turboadb start|stop  [-s S] PKG
-turboadb screenshot  [-s S] PATH
-turboadb record      [-s S] PATH [--time-limit 30 --size 1280x720 --bit-rate 8M]
-turboadb forward     [-s S] LOCAL REMOTE      # stays until Ctrl+C
-turboadb reverse     [-s S] REMOTE LOCAL
-turboadb scrcpy      [-s S] [--max-size 1280 --bit-rate 8M --record F --turn-screen-off --no-control --wait]
+turboadb start-activity [-s S] PKG/.Activity [--action A --data URI --es K V --ei K V --ez K V]
+turboadb activity | grant PKG PERM | revoke PKG PERM   [-s S]
+turboadb displays    [-s S] [--method auto|adb|scrcpy]
+turboadb screenshot  [-s S] PATH [--display N]
+turboadb record      [-s S] PATH [--time-limit 30 --size 1280x720 --bit-rate 8M --display N --continuous]
+turboadb forward     [-s S] LOCAL REMOTE [--no-wait] | --list | --remove SPEC | --remove-all
+turboadb reverse     [-s S] REMOTE LOCAL [--no-wait] | --list | --remove SPEC | --remove-all
+turboadb scrcpy      [-s S] [--display-id N --compat --max-size 1280 --bit-rate 8M --record F --log F --wait …]
 turboadb connect     HOST:PORT
 turboadb restart-server               # kill+start adb server (device-not-visible fixes)
 turboadb disconnect  [HOST:PORT]
 turboadb tcpip       [-s S] [PORT]
 turboadb pair        HOST:PAIRPORT CODE
 turboadb wireless    [-s S] [PORT]           # USB device -> Wi-Fi adb in one step
-turboadb discover                            # find wireless-debugging devices (mDNS)
-turboadb reboot      [-s S] [recovery|bootloader|sideload]
-turboadb root | unroot | mount-rw   [-s S]
+turboadb discover    [--connect]             # find wireless-debugging devices (mDNS)
+turboadb reboot      [-s S] [recovery|bootloader|fastboot|sideload] [--wait --wait-timeout 180]
+turboadb root | unroot | mount-rw [PATH]   [-s S]
 # device controls (same as the GUI's Device controls panel):
-turboadb key         [-s S] home|back|recents|vol_up|play_pause|…
-turboadb text        [-s S] hello world          # type into the focused field
-turboadb scroll      [-s S] up|down|left|right    # swipe-scroll (works on touch)
-turboadb tap         [-s S]
+turboadb key         [-s S] KEY… [--longpress --display N]   # home|back|recents|vol_up|play_pause|…
+turboadb text        [-s S] [--display N] hello world        # type into the focused field
+turboadb tap         [-s S] [X Y] [--display N]
+turboadb swipe       [-s S] X1 Y1 X2 Y2 [--ms 200 --display N]
+turboadb scroll      [-s S] up|down|left|right [--display N]
 turboadb media       [-s S] play-pause|next|previous|stop
-turboadb brightness  [-s S] 0.6                   # live, 0.0-1.0
-turboadb wifi|bluetooth|airplane|hotspot|screen  [-s S] on|off
-turboadb open        [-s S] youtube.com           # VIEW intent (app or browser)
+turboadb brightness  [-s S] 0.6 | --get | --level N | --step N
+turboadb notifications [-s S] expand|collapse
+turboadb wifi|bluetooth|airplane|hotspot|mobile-data|screen  [-s S] on|off
+turboadb open        [-s S] youtube.com | youtube|maps|spotify|browser|play-store
 turboadb search      [-s S] weather today
 turboadb settings | camera | gallery | calculator | close-apps   [-s S]
-turboadb battery | health | build-info   [-s S]
+turboadb battery | health [--full -o F] | build-info [--full -o F] | getprop [NAME]   [-s S]
 turboadb bugreport   [-s S] [PATH]
-turboadb remount | disable-verity | enable-verity     [-s S]
+turboadb remount | disable-verity [--reboot] | enable-verity [--reboot]   [-s S]
 # phone:
-turboadb dial NUMBER | call NUMBER | answer | end-call   [-s S]
+turboadb dial NUMBER | call NUMBER | answer | end-call | call-state   [-s S]
 turboadb call-log [--limit N] | sms [--limit N] | send-sms NUMBER message…  [-s S]
+turboadb phone-support [-s S]          # telephony + the dialler / call / SMS apps it has
 # sharing and maintenance:
-turboadb serve [--startup-task | --uninstall-startup]   # share this PC's devices
-turboadb deploy-serve HOST [HOST…] -u USER [--test]     # needs turboadb[winrm]
-turboadb self-update                  # upgrade TurboADB, then adb/scrcpy
+turboadb serve [--startup-task | --uninstall-startup | --status | --stop]   # share this PC's devices
+turboadb deploy-serve HOST [HOST…] -u USER [--ssl --test]   # needs turboadb[winrm]
+turboadb self-update [--check]        # upgrade TurboADB, then adb/scrcpy
 turboadb shortcut                     # desktop / Start-menu shortcut (Windows)
 turboadb gui                          # launch the desktop GUI
 ```
 
-`-s` accepts a USB serial **or** a `host:port` network target. Add `--json` to
-most commands for machine-readable output. Examples:
+`-s` accepts a USB serial, a `host:port` network target, or `@NAME` for a saved
+target. `--timeout` also limits push and pull, and `--scrcpy-path` picks the
+scrcpy executable. Add `--json` for machine-readable output. Examples:
 
 ```bash
 turboadb -s 192.168.1.50:5555 shell -- dumpsys power | findstr mWakefulness

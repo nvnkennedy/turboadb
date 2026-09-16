@@ -413,6 +413,23 @@ def _window_ready(hwnd) -> bool:
         return False
 
 
+def _window_aspect(hwnd):
+    """Width / height of a window's client area, or None."""
+    if not hwnd:
+        return None
+    try:
+        ctypes, u = _win_api()
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if not u.GetClientRect(hwnd, ctypes.byref(rect)):
+            return None
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        return width / height if width >= 64 and height >= 64 else None
+    except Exception:
+        return None
+
+
 def _post_close(title, hwnd=None) -> bool:
     """Ask a scrcpy window to close politely — WM_CLOSE.
 
@@ -733,175 +750,16 @@ class _ToolbarFlowLayout(FlowLayout):
         return y - rect.y() + m.bottom()
 
 
-class _IviPreviewTile(QFrame):
-    """One low-rate, independently captured display in the IVI wall.
-
-    Capturing previews at 2 FPS avoids starving the actual mirror / control
-    session, while still making it immediately obvious which physical display
-    is the cluster, centre stack, or passenger display.
-    """
-
-    def __init__(self, panel, display: dict, parent=None):
-        super().__init__(parent)
-        self.panel = panel
-        self.display_id = display.get("id", 0)
-        self._live = None
-        self._pm = None
-        self.setObjectName("iviPreviewTile")
-        self.setMinimumWidth(300)
-
-        v = QVBoxLayout(self)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(7)
-        size = display.get("size") or "resolution unavailable"
-        title = QLabel(f"Display {self.display_id}  ·  {size}")
-        title.setObjectName("iviPreviewTitle")
-        v.addWidget(title)
-
-        self.preview = QLabel("Waiting for preview…")
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(280, 160)
-        self.preview.setObjectName("iviPreviewImage")  # black well (theme.py)
-        v.addWidget(self.preview)
-
-        self.status = QLabel("Connecting to display…")
-        self.status.setObjectName("iviPreviewStatus")
-        v.addWidget(self.status)
-
-        actions = QHBoxLayout()
-        actions.setSpacing(6)
-        open_button = QPushButton("▶ Control")
-        open_button.setProperty("role", "ghost")
-        open_button.setToolTip(f"Open Display {self.display_id} in Device Control")
-        open_button.clicked.connect(
-            lambda: self.panel._open_display_from_ivi(self.display_id, maximize=False)
-        )
-        max_button = QPushButton("⛶ Maximize")
-        max_button.setProperty("role", "ghost")
-        max_button.setToolTip("Open this display and maximise Device Control")
-        max_button.clicked.connect(
-            lambda: self.panel._open_display_from_ivi(self.display_id, maximize=True)
-        )
-        shot_button = QPushButton("Screenshot")
-        shot_button.setProperty("role", "ghost")
-        shot_button.setToolTip(f"Screenshot Display {self.display_id}")
-        shot_button.clicked.connect(
-            lambda: self.panel._take_screenshot(display_id=self.display_id)
-        )
-        record_button = QPushButton("Record")
-        record_button.setProperty("role", "ghost")
-        record_button.setToolTip(f"Record Display {self.display_id}")
-        record_button.clicked.connect(
-            lambda: self.panel._begin_record(display_id=self.display_id)
-        )
-        for button in (open_button, max_button, shot_button, record_button):
-            actions.addWidget(button)
-        v.addLayout(actions)
-
-        self._live = _LiveThread(panel.handler, max_fps=2.0, display_id=self.display_id)
-        self._live.target_w = self.preview.width()
-        self._live.target_h = self.preview.height()
-        self._live.frame.connect(self._on_frame)
-        self._live.note.connect(self._on_note)
-        self._live.start()
-
-    def _on_note(self, note: str) -> None:
-        if "[ERROR]" in note or "[WARNING]" in note:
-            self.status.setText("Preview unavailable — use Control to try scrcpy")
-
-    def _on_frame(self, image, width: int, height: int) -> None:
-        from PyQt5.QtGui import QPixmap
-
-        pixmap = QPixmap.fromImage(image)
-        if pixmap.isNull():
-            return
-        self._pm = pixmap
-        self.status.setText(f"Live preview  ·  {width} × {height}")
-        self._draw()
-        if self._live is not None:
-            self._live.target_w = max(1, self.preview.width())
-            self._live.target_h = max(1, self.preview.height())
-
-    def _draw(self) -> None:
-        if self._pm is not None and not self._pm.isNull():
-            self.preview.setPixmap(
-                self._pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._draw()
-        if self._live is not None:
-            self._live.target_w = max(1, self.preview.width())
-            self._live.target_h = max(1, self.preview.height())
-
-    def stop(self) -> None:
-        if self._live is None:
-            return
-        live, self._live = self._live, None
-        live.stop()
-        try:
-            live.frame.disconnect(self._on_frame)
-            live.note.disconnect(self._on_note)
-        except (RuntimeError, TypeError):
-            pass
-        # Never wait here: closing a wall of tiles used to block the UI up to
-        # 0.9 s per display.  The worker exits after its current capture.
-        park_thread(live)
-
-
-class _IviDisplayWall(QDialog):
-    """Non-modal display wall with an independent preview and action set per screen."""
-
-    def __init__(self, panel, displays, parent=None):
-        super().__init__(parent or panel)
-        self.setWindowTitle("TurboADB — IVI display wall")
-        self.setModal(False)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.resize(980, 700)
-        self._tiles = []
-        self._stopped = False
-
-        v = QVBoxLayout(self)
-        v.setContentsMargins(16, 14, 16, 14)
-        title = QLabel("IVI display wall")
-        title.setObjectName("iviPreviewTitle")
-        v.addWidget(title)
-        hint = QLabel(
-            "Live previews are intentionally light on the ADB link. Each display has its own "
-            "control, maximise, screenshot and recording actions."
-        )
-        hint.setWordWrap(True)
-        v.addWidget(hint)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QWidget()
-        grid = QGridLayout(body)
-        grid.setContentsMargins(2, 2, 2, 2)
-        grid.setSpacing(10)
-        current = list(displays or [{"id": 0, "size": "primary"}])
-        for index, display in enumerate(current):
-            tile = _IviPreviewTile(panel, display, body)
-            self._tiles.append(tile)
-            grid.addWidget(tile, index // 2, index % 2)
-        scroll.setWidget(body)
-        v.addWidget(scroll, 1)
-
-        bottom = QHBoxLayout()
-        bottom.addStretch(1)
-        close = QPushButton("Close display wall")
-        close.setProperty("role", "ghost")
-        close.clicked.connect(self.close)
-        bottom.addWidget(close)
-        v.addLayout(bottom)
-
-    def closeEvent(self, event) -> None:
-        if not self._stopped:
-            self._stopped = True
-            for tile in self._tiles:
-                tile.stop()
-        super().closeEvent(event)
+def display_label(display) -> str:
+    """``Display 2  ·  Cluster  ·  1920x720`` for a display from ``list_displays``."""
+    display = display or {}
+    bits = [f"Display {display.get('id', 0)}"]
+    name = str(display.get("name") or "").strip()
+    if name:
+        bits.append(name)
+    if display.get("size"):
+        bits.append(str(display["size"]))
+    return "  ·  ".join(bits)
 
 
 # Edit shortcuts sent to the device as Android keycodes.
@@ -1749,6 +1607,12 @@ class MirrorPanel(QWidget):
     # True while a screen session shows video here, False when it goes idle.
     video_active_changed = pyqtSignal(bool)
     displays_failed = pyqtSignal(str)
+    # The shape of the shown screen changed (another display, or the real video).
+    display_shape_changed = pyqtSignal()
+    # The current screen session shows video (its window is up).
+    screen_ready = pyqtSignal()
+    # "All displays" was chosen: the device tab shows every display at once.
+    all_displays_requested = pyqtSignal()
     # Android must encode once for scrcpy and once for screenrecord. Keep the
     # latter modest whenever a display is already active so control stays
     # responsive and the final pull is reasonably small.
@@ -1797,9 +1661,11 @@ class MirrorPanel(QWidget):
         self._shot = None
         self._shot_path = None
         self._closing = False  # guards deferred callbacks (retry timers)
-        self._displays = []  # cached [{id,size}] from the last list
-        self._ivi_dialog = None
-        self._open_ivi_after_refresh = False
+        self._displays = []  # cached [{id,size,name}] from the last list
+        self._displays_loaded = False
+        self._quiet_scan = False
+        self._fixed_display = False  # a tile locked to one display (all-displays tab)
+        self._video_aspect = None  # real width / height of the embedded video, once seen
         self._dt = None
         self._launch_thread = None
         self._launch_pending = False
@@ -1996,12 +1862,6 @@ class MirrorPanel(QWidget):
         lay.addWidget(self.container, 1)
         self._sync_start_mode(self.act_embed.isChecked())
         self._sync_video_surface(False)
-
-        # Display discovery is deliberately explicit.  ``scrcpy --list-displays``
-        # can create a second ADB transport and delay the first mirror, especially
-        # on Automotive/IVI units.  The default display is always ready, while
-        # "Manage displays" and the IVI wall perform discovery when requested.
-        self._displays_loaded = True
 
     def eventFilter(self, obj, event):
         if obj is self.container and event.type() == QEvent.Resize:
@@ -2407,9 +2267,9 @@ class MirrorPanel(QWidget):
         btn_cam.clicked.connect(lambda: (menu.close(), self._mirror_camera()))
         extra_grid.addWidget(btn_cam, 0, 0)
 
-        self.btn_ivi = QPushButton("IVI display wall")
+        self.btn_ivi = QPushButton("All displays")
         self.btn_ivi.setProperty("role", "ghost")
-        self.btn_ivi.setToolTip("See all IVI displays together with per-display controls")
+        self.btn_ivi.setToolTip("Show every display of this device live, side by side")
         self.btn_ivi.clicked.connect(lambda: (menu.close(), self.open_ivi_view()))
         self.btn_ivi.setVisible(bool(automotive))
         extra_grid.addWidget(self.btn_ivi, 2, 1)  # last: hidden unless IVI
@@ -2574,8 +2434,7 @@ class MirrorPanel(QWidget):
         """Apply delayed automotive detection without overriding user options."""
         self.automotive = bool(automotive)
         self._sync_idle_shape()
-        if hasattr(self, "btn_ivi"):
-            self.btn_ivi.setVisible(self.automotive)
+        self._sync_all_displays_button()
         if self._compat_user_changed or not hasattr(self, "act_compat"):
             return
         if self.act_compat.isChecked() == self.automotive:
@@ -2763,64 +2622,41 @@ class MirrorPanel(QWidget):
 
     # ----- display list -----
     def open_ivi_view(self) -> None:
-        """Open the multi-display wall after obtaining a fresh display list.
+        """Ask the device tab to show every display at once (the displays tab)."""
+        self.all_displays_requested.emit()
 
-        This option is intentionally available only for an identified automotive
-        device, but still works when its display discovery has not completed.
+    def _sync_all_displays_button(self) -> None:
+        if hasattr(self, "btn_ivi"):
+            self.btn_ivi.setVisible(
+                not self._fixed_display and (self.automotive or len(self._displays) > 1)
+            )
+
+    def refresh_displays(self, quiet: bool = False):
+        """List the device's displays in the background.
+
+        A *quiet* scan (the automatic one on connect) asks Android over adb only
+        — it never starts scrcpy, so it can't delay the first screen — and stays
+        silent unless it finds several displays.
         """
-        if self._ivi_dialog is not None:
-            try:
-                self._ivi_dialog.raise_()
-                self._ivi_dialog.activateWindow()
-                return
-            except RuntimeError:
-                self._ivi_dialog = None
-        if not self._displays:
-            self._open_ivi_after_refresh = True
-            self.status.setText("Scanning IVI displays…")
-            self.status.show()
-            self.refresh_displays()
-            return
-        self._show_ivi_wall()
-
-    def _show_ivi_wall(self) -> None:
-        if self._ivi_dialog is not None:
-            try:
-                self._ivi_dialog.raise_()
-                self._ivi_dialog.activateWindow()
-                return
-            except RuntimeError:
-                self._ivi_dialog = None
-        wall = _IviDisplayWall(self, self._displays, self)
-        self._ivi_dialog = wall
-        wall.finished.connect(lambda *_: setattr(self, "_ivi_dialog", None))
-        wall.show()
-        self.log.emit(f"[OK] IVI display wall opened ({len(self._displays) or 1} display(s))")
-
-    def _open_display_from_ivi(self, display_id, *, maximize: bool) -> None:
-        """Open one IVI display in its reliable native scrcpy window."""
-        if self._integrated_recording_blocks():
-            return
-        dialog = self._ivi_dialog
-        if dialog is not None:
-            dialog.close()
-        self._sync_display_selection(display_id)
-        if self._scrcpy is not None:
-            self.stop()
-        # SDL/Direct3D reparenting is particularly unreliable for secondary
-        # automotive displays.  Use the normal native scrcpy window here; it
-        # supports keyboard/mouse directly and avoids the off-screen embed race.
-        self.start(display_id=display_id, embed=False)
-        if maximize and not self.act_max.isChecked():
-            self.act_max.setChecked(True)
-
-    def refresh_displays(self):
         if thread_running(self._dt):
-            self.log.emit("[INFO] Display scan is already running.")
+            if not quiet:
+                self.log.emit("[INFO] Display scan is already running.")
             return
-        self.log.emit("Listing displays…")
+        if self.handler is None:
+            return
+        self._quiet_scan = bool(quiet)
+        if not quiet:
+            self.log.emit("Listing displays…")
         handler = self.handler
-        self._dt = FunctionThread(lambda: handler.list_displays(safe=True))
+        method = "adb" if quiet else "auto"
+
+        def scan():
+            try:
+                return handler.list_displays(method=method, safe=True)
+            except TypeError:  # a handler without the *method* option
+                return handler.list_displays(safe=True)
+
+        self._dt = FunctionThread(scan)
         self._dt.done.connect(self._on_displays_result)
         self._dt.fail.connect(self._on_displays_failed)
         self._dt.start()
@@ -2833,58 +2669,45 @@ class MirrorPanel(QWidget):
                 self._on_displays_failed(str(result.error or "display discovery failed"))
                 return
             result = result.value
-        self._got_displays(result)
+        self._got_displays(result, quiet=self._quiet_scan)
 
     def _on_displays_failed(self, message):
         if self._closing:
             return
-        self.log.emit("[ERROR] displays: " + message)
-        if self._open_ivi_after_refresh:
-            self._open_ivi_after_refresh = False
-            self.status.setText("Could not detect IVI displays.")
+        if not self._quiet_scan:
+            self.log.emit("[ERROR] displays: " + message)
         self.displays_failed.emit(message)
 
-    def _got_displays(self, displays):
-        self._displays = list(displays or [])
+    def _got_displays(self, displays, quiet=False):
+        if self._fixed_display:
+            return
+        self._displays = sorted(
+            (dict(d) for d in (displays or []) if isinstance(d, dict) and "id" in d),
+            key=lambda d: int(d.get("id", 0) or 0),
+        )
+        self._displays_loaded = True
         keep = self.cmb_display.currentData()  # preserve the user's choice
-        self.cmb_display.clear()
-        self.cmb_display.addItem("default display", None)
-        for d in self._displays:
-            label = f"Display {d['id']}" + (f"  ·  {d['size']}" if d.get("size") else "")
-            self.cmb_display.addItem(label, d["id"])
-        idx = self.cmb_display.findData(keep)
-        if idx >= 0:
-            self.cmb_display.setCurrentIndex(idx)
-        # Displays & Recording option is always enabled
-        self.act_mirror_all.setEnabled(True)
-
-        # Multi-display tab bar
-        if len(self._displays) > 1:
-            self.display_tabs.blockSignals(True)
-            while self.display_tabs.count():
-                self.display_tabs.removeTab(0)
+        self.cmb_display.blockSignals(True)
+        try:
+            self.cmb_display.clear()
+            # Display 0 is the default display: listed once, started without an id.
+            if not any(int(d["id"]) == 0 for d in self._displays):
+                self.cmb_display.addItem("default display", None)
             for d in self._displays:
-                label = f"Display {d['id']}" + (f" ({d['size']})" if d.get("size") else "")
-                t_idx = self.display_tabs.addTab(label)
-                self.display_tabs.setTabData(t_idx, d["id"])
-            cur_tab = 0
-            if keep is not None:
-                for i in range(self.display_tabs.count()):
-                    if self.display_tabs.tabData(i) == keep:
-                        cur_tab = i
-                        break
-            self.display_tabs.setCurrentIndex(cur_tab)
-            self.display_tabs.blockSignals(False)
-            self.display_tabs.show()
-        else:
-            self.display_tabs.hide()
-
+                display_id = int(d["id"])
+                self.cmb_display.addItem(display_label(d), None if display_id == 0 else display_id)
+            idx = self.cmb_display.findData(keep)
+            self.cmb_display.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self.cmb_display.blockSignals(False)
+        self.act_mirror_all.setEnabled(True)
+        # The picker and the all-displays tab replace the old per-display tab bar.
+        self.display_tabs.hide()
+        self._sync_all_displays_button()
         self._sync_idle_shape()
-        self.log.emit(f"[OK] {len(self._displays)} display(s) found")
+        if not quiet or len(self._displays) > 1:
+            self.log.emit(f"[OK] {len(self._displays)} display(s) found")
         self.displays_changed.emit(list(self._displays))
-        if self._open_ivi_after_refresh:
-            self._open_ivi_after_refresh = False
-            self._show_ivi_wall()
 
     def _on_display_tab_changed(self, idx: int):
         if idx >= 0:
@@ -3030,6 +2853,11 @@ class MirrorPanel(QWidget):
 
     def _sync_display_selection(self, disp_id):
         c_idx = self.cmb_display.findData(disp_id)
+        if c_idx < 0 and disp_id in (0, None):
+            # Display 0 is listed as the default display (no id), and vice versa.
+            c_idx = self.cmb_display.findData(None if disp_id == 0 else 0)
+        if c_idx >= 0 and c_idx != self.cmb_display.currentIndex():
+            self._video_aspect = None  # another display: its real shape is unknown yet
         if c_idx >= 0:
             self.cmb_display.blockSignals(True)
             self.cmb_display.setCurrentIndex(c_idx)
@@ -3071,6 +2899,54 @@ class MirrorPanel(QWidget):
         if empty is None:
             return
         empty.set_device(automotive=self.automotive, size=self._selected_display_size())
+        self.display_shape_changed.emit()
+
+    def display_aspect(self) -> float:
+        """Width / height of the screen shown here: the real video once it has
+        been embedded, else the selected display's known (or typical) shape."""
+        if self._video_aspect:
+            return float(self._video_aspect)
+        empty = getattr(self, "empty_state", None)
+        return float(empty.aspect) if empty is not None else 16.0 / 9.0
+
+    def chrome_height(self) -> int:
+        """Height taken above the video area (toolbar, status line)."""
+        container = getattr(self, "container", None)
+        if container is None or self.height() <= 0:
+            return 0
+        return max(0, self.height() - container.height())
+
+    def is_active(self) -> bool:
+        """True while a screen session is starting, running, stopping or retrying."""
+        return bool(
+            self._scrcpy is not None
+            or self._launch_pending
+            or self._stopping_mirror
+            or self._retry_pending
+        )
+
+    def set_fixed_display(self, display) -> None:
+        """Lock this panel to one display — a tile in the all-displays tab.
+
+        The display picker, options, audio and max-view controls are hidden:
+        several sessions can't all play sound, and the tab owns the layout.
+        """
+        display = dict(display or {})
+        display_id = int(display.get("id", 0) or 0)
+        self._fixed_display = True
+        self._displays = [display]
+        self._displays_loaded = True
+        self.cmb_display.blockSignals(True)
+        try:
+            self.cmb_display.clear()
+            self.cmb_display.addItem(display_label(display), None if display_id == 0 else display_id)
+            self.cmb_display.setCurrentIndex(0)
+        finally:
+            self.cmb_display.blockSignals(False)
+        for widget in (self.cmb_display, self.btn_audio, self.btn_opts, self.btn_max, self.display_tabs):
+            widget.hide()
+        self._sync_all_displays_button()
+        self._sync_idle_shape()
 
     def _select_and_mirror(self, disp_id):
         if self._integrated_recording_blocks():
@@ -3720,7 +3596,7 @@ class MirrorPanel(QWidget):
         )
         # Camera mirroring is a video-source operation; screen mirroring and
         # recordings use the complete user-selected audio profile.
-        self._apply_audio_options(opts, allow_audio=not bool(camera))
+        self._apply_audio_options(opts, allow_audio=not bool(camera) and not self._fixed_display)
         self._tune(opts)
         self._launch_opts = opts  # a parallel recorder copies its video settings
         if camera:
@@ -3942,6 +3818,7 @@ class MirrorPanel(QWidget):
             or any(m in _read_log_tail(self._scrcpy) for m in self._HEALTHY)
         ):
             self._became_ready = True
+            self.screen_ready.emit()
 
         running = self._scrcpy.running
         ran_s = time.time() - getattr(self, "_start_t", 0)
@@ -4145,6 +4022,11 @@ class MirrorPanel(QWidget):
             if now - self._win_first_seen < self._EMBED_SETTLE:
                 return
             self._stop_embed_timer()
+            aspect = _window_aspect(hwnd)
+            if aspect and abs(aspect - (self._video_aspect or 0.0)) > 0.01:
+                # scrcpy sized its window to the video: the real (rotated) shape
+                self._video_aspect = aspect
+                self.display_shape_changed.emit()
             parent_hwnd = int(self.container.winId())
             try:
                 _reparent(hwnd, parent_hwnd, self.container.width(), self.container.height())
@@ -4456,12 +4338,6 @@ class MirrorPanel(QWidget):
         rec_launch = self._rec_launch_thread
         if thread_running(rec_launch):
             rec_launch.cancel()
-        if self._ivi_dialog is not None:
-            try:
-                self._ivi_dialog.close()
-            except RuntimeError:
-                pass
-            self._ivi_dialog = None
         if self._key_batcher is not None:
             self._key_batcher.stop()
         self._disconnect_focus_tracking()

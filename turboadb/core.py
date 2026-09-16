@@ -810,7 +810,7 @@ class ADBHandler:
     # ------------------------------------------------------------------ #
     def reboot(self, mode: Optional[str] = None, *, safe: Optional[bool] = None):
         """Reboot the device. *mode*: None (normal), ``recovery``, ``bootloader``,
-        or ``sideload``."""
+        ``fastboot`` (userspace fastbootd) or ``sideload``."""
         args = ["reboot"] + ([mode] if mode else [])
         return self._guard("reboot", lambda: self._run(args, timeout=30, check=False).ok, safe=safe)
 
@@ -1450,6 +1450,15 @@ class ADBHandler:
         "market:": ["com.android.vending"],
     }
 
+    # Named shortcuts open_url accepts (the Device controls' app tiles, the CLI).
+    WEB_SHORTCUTS = {
+        "browser": "https://www.google.com",
+        "youtube": "https://www.youtube.com",
+        "spotify": "https://open.spotify.com",
+        "maps": "https://maps.google.com",
+        "play-store": "https://play.google.com/store/apps",
+    }
+
     # URI schemes whose "scheme:rest" form must never get an https:// prefix,
     # even when "rest" is all digits (tel:12345 is not host:port).
     _OPAQUE_URI_SCHEMES = frozenset(
@@ -1475,10 +1484,11 @@ class ADBHandler:
         """Open a URL/URI with a VIEW intent — routes to the matching app
         (e.g. a youtube.com URL opens the YouTube app) or the browser. If that
         fails (common on IVIs with no browser), launch the matching app
-        package directly."""
+        package directly. *url* may also be a :attr:`WEB_SHORTCUTS` name such
+        as ``"youtube"`` or ``"maps"``."""
 
         def _do():
-            target = self._normalise_url(url)
+            target = self._normalise_url(self.WEB_SHORTCUTS.get(str(url).strip().lower(), url))
             r = self._logged_run(
                 f"open {target}",
                 self._shell_args("am", "start", "-a", "android.intent.action.VIEW", "-d", target),
@@ -1754,6 +1764,20 @@ class ADBHandler:
 
         return self._guard("build_info", _do, safe=safe)
 
+    def build_properties(self, *, safe: Optional[bool] = None):
+        """The :meth:`build_info` properties as a ``{name: value}`` dict."""
+
+        def _do():
+            p = self.getprop(safe=False)
+            return {
+                k: p.get(k, "")
+                for _heading, group in self._BUILD_KEY_GROUPS[:2]
+                for k in group
+                if k not in self._BUILD_INFO_OMIT
+            }
+
+        return self._guard("build_properties", _do, safe=safe)
+
     def build_report(self, *, safe: Optional[bool] = None):
         """Detailed build identity followed by the complete ``getprop`` dump.
 
@@ -1787,6 +1811,30 @@ class ADBHandler:
         return self._guard(
             "battery",
             lambda: self._run(["shell", "dumpsys", "battery"], timeout=20).text,
+            safe=safe,
+        )
+
+    @staticmethod
+    def _parse_battery(text: str) -> dict:
+        info = {}
+        for line in (text or "").splitlines():
+            key, sep, value = line.strip().partition(":")
+            key, value = key.strip(), value.strip()
+            if not sep or not key or not value:
+                continue
+            if re.fullmatch(r"-?\d+", value):
+                value = int(value)
+            elif value in ("true", "false"):
+                value = value == "true"
+            info[key.replace(" ", "_")] = value
+        return info
+
+    def battery_status(self, *, safe: Optional[bool] = None):
+        """``dumpsys battery`` as a dict (``level``, ``temperature``, ``status`` …;
+        numbers become ints and true/false become booleans)."""
+        return self._guard(
+            "battery_status",
+            lambda: self._parse_battery(self._run(["shell", "dumpsys", "battery"], timeout=20).text),
             safe=safe,
         )
 
@@ -1954,11 +2002,26 @@ class ADBHandler:
         clean = "".join(c for c in str(number) if c in "+*#0123456789,;")
         return f"{scheme}:{quote(clean, safe='+*,;')}"
 
+    _PHONE_INTENTS = {
+        "android.intent.action.DIAL": "the dialler",
+        "android.intent.action.CALL": "phone calls",
+        "android.intent.action.SENDTO": "text messages",
+    }
+
     def _phone_intent(self, action: str, scheme: str, number: str, *extra) -> bool:
-        return self._run(
-            self._shell_args("am", "start", "-a", action, "-d", self._phone_uri(scheme, number), *extra),
-            timeout=15,
-        ).ok
+        uri = self._phone_uri(scheme, number)
+        res = self._run(self._shell_args("am", "start", "-a", action, "-d", uri, *extra), timeout=15)
+        output = self._combined_output(res)
+        if "unable to resolve intent" in output.lower() or "no activity found" in output.lower():
+            # Customised head units often have no standard dialler / messaging app.
+            what = self._PHONE_INTENTS.get(action, action)
+            raise ADBError(
+                f"No app on this device handles {what} ({action}). Customised head "
+                "units often have their own phone app instead — see phone_support()."
+            )
+        if not res.ok or re.search(r"(?m)^Error:", output):
+            raise self._command_error(f"shell am start -a {action} -d {uri}", res)
+        return True
 
     def dial(self, number: str, *, safe: Optional[bool] = None):
         """Open the dialler pre-filled with *number* (doesn't place the call)."""
@@ -2069,6 +2132,92 @@ class ADBHandler:
             lambda: self._phone_intent(
                 "android.intent.action.SENDTO", "sms", number, "--es", "sms_body", body
             ),
+            safe=safe,
+        )
+
+    _PHONE_APP_WORDS = ("dialer", "dialler", "phone", "telecom", "hfp", "handsfree", "call")
+
+    @classmethod
+    def _looks_like_phone_app(cls, component: str) -> bool:
+        """True for ``com.oem.btphone/.HandsfreeActivity`` or ``…/com.android.dialer.X``,
+        not for apps that merely contain "phone" (``com.phonepe.app``, a phonebook)."""
+        for part in re.split(r"[./$_]", component.lower()):
+            if part.endswith("activity"):
+                part = part[: -len("activity")]
+            if part.startswith("incall") or any(
+                part == word or part.endswith(word) for word in cls._PHONE_APP_WORDS
+            ):
+                return True
+        return False
+
+    @classmethod
+    def parse_phone_support(cls, text: str) -> dict:
+        """The :meth:`phone_support` result from its shell output."""
+        sections = {}
+        current = None
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if line.startswith("@@"):
+                current = line[2:]
+                sections[current] = []
+            elif current is not None and line:
+                sections[current].append(line)
+
+        def handler(key):
+            lines = sections.get(key)
+            if not lines:
+                return None
+            if any("no activity found" in line.lower() for line in lines):
+                return ""
+            components = [line for line in lines if "/" in line and " " not in line]
+            return components[-1] if components else None  # e.g. an old Android's "Unknown command"
+
+        features = sections.get("features") or []
+        telephony = None
+        if any(line.startswith("feature:") for line in features):
+            telephony = any(line.startswith("feature:android.hardware.telephony") for line in features)
+        apps = []
+        for line in sections.get("apps") or []:
+            if "/" in line and " " not in line and cls._looks_like_phone_app(line):
+                package = line.split("/", 1)[0]
+                if package not in apps:
+                    apps.append(package)
+        return {
+            "telephony": telephony,
+            "dialer": handler("dial"),
+            "caller": handler("call"),
+            "messages": handler("sms"),
+            "phone_apps": apps,
+        }
+
+    def phone_support(self, *, safe: Optional[bool] = None):
+        """What the device offers for calls and messages — found without calling anyone.
+
+        Returns ``{"telephony", "dialer", "caller", "messages", "phone_apps"}``:
+        whether it has the telephony feature (a SIM radio); the activity that
+        handles the dialler (``DIAL``), placing calls (``CALL``) and composing
+        SMS (``SENDTO``), each ``""`` when no app does and ``None`` when the
+        device can't say; and launchable apps that look like phone apps, such as
+        a customised head unit's own Bluetooth phone app.
+        """
+        script = "; ".join(
+            (
+                "echo @@features",
+                "pm list features 2>/dev/null",
+                "echo @@dial",
+                "cmd package resolve-activity --brief -a android.intent.action.DIAL -d tel:1 2>&1",
+                "echo @@call",
+                "cmd package resolve-activity --brief -a android.intent.action.CALL -d tel:1 2>&1",
+                "echo @@sms",
+                "cmd package resolve-activity --brief -a android.intent.action.SENDTO -d smsto:1 2>&1",
+                "echo @@apps",
+                "cmd package query-activities --brief -a android.intent.action.MAIN "
+                "-c android.intent.category.LAUNCHER 2>&1",
+            )
+        )
+        return self._guard(
+            "phone_support",
+            lambda: self.parse_phone_support(self._run(["shell", script], timeout=30).text),
             safe=safe,
         )
 
@@ -2349,6 +2498,41 @@ class ADBHandler:
 
         return self._guard("open_shell", _do, safe=safe)
 
+    def interactive_shell(self) -> int:
+        """Run ``adb shell`` attached to this console (stdin, stdout and stderr
+        inherited) until the user leaves it, and return its exit code — the
+        interactive ``turboadb shell`` with no command."""
+        return subprocess.call(self._base(target=True) + ["shell"])
+
+    def wait_for_boot(self, timeout: float = 180, *, safe: Optional[bool] = None):
+        """After a reboot: wait until adb sees the device again and Android
+        reports ``sys.boot_completed=1``. Raises ADBTimeoutError after
+        *timeout* seconds."""
+
+        def _do():
+            limit = float(timeout)
+            deadline = time.monotonic() + limit
+            try:  # the device is often still online for a moment after `reboot`
+                self._run(["wait-for-disconnect"], timeout=min(60.0, limit), check=False)
+            except ADBError:
+                pass
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ADBTimeoutError(
+                        f"{self._serial or 'the device'} did not finish booting within {limit:g} s"
+                    )
+                try:
+                    self._run(["wait-for-device"], timeout=max(1.0, left), check=False)
+                    res = self._run(["shell", "getprop", "sys.boot_completed"], timeout=10, check=False)
+                    if res.ok and res.text.strip() == "1":
+                        return True
+                except ADBError:
+                    pass
+                time.sleep(2.0)
+
+        return self._guard("wait_for_boot", _do, safe=safe)
+
     # ------------------------------------------------------------------ #
     # Streaming (logcat -f, live shell loops…)
     # ------------------------------------------------------------------ #
@@ -2551,8 +2735,10 @@ class ADBHandler:
             args = ["logcat"]
             if dump:
                 args.append("-d")
-            if tail and not dump:
-                args += ["-T", str(int(tail))]
+            if tail:
+                # -T N starts the live stream at the last N lines; when dumping
+                # the matching flag is -t N (only the last N lines, then exit)
+                args += ["-t" if dump else "-T", str(int(tail))]
             if fmt:
                 args += ["-v", fmt]
             for b in buffers or []:
@@ -2586,6 +2772,197 @@ class ADBHandler:
         return self._guard(
             "logcat_clear", lambda: self._run(["logcat", "-c"], timeout=15).ok, safe=safe
         )
+
+    # ------------------------------------------------------------------ #
+    # Device files — list, create, move, copy, delete (the Files tab's device
+    # logic, shared with the CLI; the shell helpers live in remotefs)
+    # ------------------------------------------------------------------ #
+    def _file_command(self, label: str, command: str, timeout: float = 60) -> CommandResult:
+        res = self.shell(command, timeout=timeout, safe=False)
+        if not res.ok:
+            raise self._command_error(label, res)
+        return res
+
+    def _probe_paths(self, paths) -> dict:
+        """``{path: (kind, is_link, resolved)}``; kind is d, f, b (broken link) or n."""
+        from . import remotefs
+
+        try:
+            return remotefs._probe_remote(self, list(paths))
+        except RuntimeError as exc:
+            raise ADBError(str(exc)) from None
+
+    def list_dir(self, path: str = "/sdcard", *, safe: Optional[bool] = None):
+        """The entries of a device folder, folders first, as dicts with ``name``,
+        ``is_dir``, ``size``, ``size_text``, ``type``, ``modified``,
+        ``permissions``, ``owner`` and ``exact`` (False when ``ls`` couldn't return
+        the name unambiguously). Folder symlinks such as ``/sdcard`` count as
+        folders. Raises ADBError when the folder can't be listed."""
+        from . import remotefs
+
+        def _do():
+            target = remotefs._normalize_remote_path(path)
+            rows, error = remotefs._list_remote_dir(self, target)
+            if error and not rows:
+                raise ADBError(f"could not list {target}: {error}")
+            entries = [
+                {
+                    "name": name,
+                    "is_dir": bool(is_dir),
+                    "size": raw_size,
+                    "size_text": size_text,
+                    "type": ftype,
+                    "modified": mtime,
+                    "permissions": perms,
+                    "owner": owner,
+                    "exact": name not in rows.uncertain,
+                }
+                for name, raw_size, size_text, ftype, mtime, perms, owner, is_dir in rows
+            ]
+            entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+            return entries
+
+        return self._guard("list_dir", _do, safe=safe)
+
+    def make_dir(self, path: str, *, safe: Optional[bool] = None):
+        """Create a device folder, with any missing parents (``mkdir -p``).
+        Returns the normalised path."""
+        from . import remotefs
+
+        def _do():
+            target = remotefs._normalize_remote_path(path)
+            self._file_command(f"mkdir {target}", remotefs._mkdir_cmd(target))
+            return target
+
+        return self._guard("make_dir", _do, safe=safe)
+
+    def touch(self, path: str, *, safe: Optional[bool] = None):
+        """Create an empty device file (or update an existing file's time)."""
+        from . import remotefs
+
+        def _do():
+            target = remotefs._normalize_remote_path(path)
+            self._file_command(f"touch {target}", remotefs._touch_cmd(target))
+            return target
+
+        return self._guard("touch", _do, safe=safe)
+
+    def remove(self, paths, *, recursive: bool = False, safe: Optional[bool] = None):
+        """Delete device files, and folders too when *recursive* is True. Every
+        path is checked first: a missing path or a folder without *recursive*
+        raises ADBError and nothing is deleted. Returns the deleted paths."""
+        from . import remotefs
+
+        def _do():
+            items = [paths] if isinstance(paths, str) else list(paths)
+            targets = list(dict.fromkeys(remotefs._normalize_remote_path(p) for p in items))
+            if not targets:
+                return []
+            info = self._probe_paths(targets)
+            for target in targets:
+                kind, is_link, _resolved = info[target]
+                if target == "/":
+                    raise ADBError("refusing to delete /")
+                if kind == "n":
+                    raise ADBError(f"{target}: no such file or folder")
+                if kind == "d" and not is_link and not recursive:
+                    raise ADBError(f"{target} is a folder — pass recursive=True (CLI: rm -r)")
+            for chunk in remotefs._chunks(targets):
+                self._file_command("rm " + " ".join(chunk), remotefs._rm_cmd(chunk), timeout=300)
+            return targets
+
+        return self._guard("remove", _do, safe=safe)
+
+    def move(self, src: str, dst: str, *, overwrite: bool = False, safe: Optional[bool] = None):
+        """Move or rename *src* to *dst* — into *dst* when it is an existing
+        folder. Without *overwrite* an existing target is never replaced.
+        Returns the new path."""
+        import posixpath
+
+        from . import remotefs
+
+        def _do():
+            source = remotefs._normalize_remote_path(src)
+            target = remotefs._normalize_remote_path(dst)
+            info = self._probe_paths([source, target])
+            if info[source][0] == "n":
+                raise ADBError(f"{source}: no such file or folder")
+            if info[target][0] == "d" and target != source:
+                target = posixpath.join(target, posixpath.basename(source))
+            if target == source:
+                return target
+            self._file_command(
+                f"mv {source} {target}", remotefs._rename_cmd(source, target, overwrite=overwrite)
+            )
+            return target
+
+        return self._guard("move", _do, safe=safe)
+
+    def copy(self, src: str, dst: str, *, safe: Optional[bool] = None):
+        """Copy a device file or folder to *dst* — into *dst* when it is an
+        existing folder, merging into a folder of the same name that is already
+        there. A folder is never copied into itself (also not through a
+        symlinked path). Returns the new path."""
+        import posixpath
+
+        from . import remotefs
+
+        def _do():
+            source = remotefs._normalize_remote_path(src)
+            target = remotefs._normalize_remote_path(dst)
+            info = self._probe_paths([source, target])
+            kind, _is_link, resolved = info[source]
+            if kind == "n":
+                raise ADBError(f"{source}: no such file or folder")
+            if info[target][0] == "d":
+                target = posixpath.join(target, posixpath.basename(source))
+                info.update(self._probe_paths([target]))
+            if target == source:
+                raise ADBError(f"{source}: the source and destination are the same")
+            if kind == "d":
+                real_src = posixpath.normpath(resolved or source)
+                parent = posixpath.dirname(target)
+                real_parent = posixpath.normpath(self._probe_paths([parent])[parent][2] or parent)
+                real_target = posixpath.join(real_parent, posixpath.basename(target))
+                if real_target == real_src or real_target.startswith(real_src.rstrip("/") + "/"):
+                    raise ADBError(f"can't copy the folder {source} into itself")
+            merge = kind == "d" and info[target][0] == "d"
+            self._file_command(
+                f"cp {source} {target}", remotefs._copy_into_cmd(source, target, merge), timeout=600
+            )
+            return target
+
+        return self._guard("copy", _do, safe=safe)
+
+    def stat_path(self, path: str, *, safe: Optional[bool] = None):
+        """``{"path", "real_path", "size", "mode", "type"}`` for what *path* points
+        to (symlinks followed; *mode* is octal such as ``644``, *type* for
+        example ``regular file`` or ``directory``)."""
+        from . import remotefs
+
+        def _do():
+            target = remotefs._normalize_remote_path(path)
+            res = self.shell(remotefs._edit_stat_cmd(target), timeout=30, safe=False)
+            parsed = remotefs._parse_edit_stat(res.stdout, target) if res.ok else None
+            if parsed is None:
+                raise ADBError(f"{target}: {self._combined_output(res) or 'no such file or folder'}")
+            size, mode, ftype, real = parsed
+            return {"path": target, "real_path": real, "size": size, "mode": mode, "type": ftype}
+
+        return self._guard("stat_path", _do, safe=safe)
+
+    def chmod(self, path: str, mode: str, *, safe: Optional[bool] = None):
+        """Set a device file's permission bits (octal, for example ``644``)."""
+        from . import remotefs
+
+        def _do():
+            if not re.fullmatch(r"[0-7]{3,4}", str(mode)):
+                raise ValueError(f"mode must be octal such as 644, got {mode!r}")
+            target = remotefs._normalize_remote_path(path)
+            self._file_command(f"chmod {mode} {target}", remotefs._chmod_cmd(str(mode), target))
+            return True
+
+        return self._guard("chmod", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # File transfer (push / pull) with progress
@@ -2799,6 +3176,7 @@ class ADBHandler:
         replace: bool = True,
         grant_perms: bool = False,
         downgrade: bool = False,
+        allow_test: bool = False,
         safe: Optional[bool] = None,
     ):
         """Install split APKs together (``adb install-multiple``)."""
@@ -2811,6 +3189,8 @@ class ADBHandler:
                 args.append("-d")
             if grant_perms:
                 args.append("-g")
+            if allow_test:
+                args.append("-t")
             args += [os.path.expanduser(a) for a in apks]
             self._emit(logging.INFO, f"Installing {len(apks)} split APK(s)…")
             res = self._run(args, timeout=600)
@@ -3339,25 +3719,114 @@ class ADBHandler:
 
         return self._guard("remove_all_forwards", _do, safe=safe)
 
+    def remove_forward(self, local: str, *, safe: Optional[bool] = None):
+        """Remove one of this device's forward rules by its local spec (``tcp:8080``)."""
+        return self._guard(
+            "remove_forward",
+            lambda: self._run(["forward", "--remove", local], timeout=15, check=True).ok,
+            safe=safe,
+        )
+
+    def list_reverses(self, *, safe: Optional[bool] = None):
+        """This device's reverse rules (``adb reverse --list``)."""
+        return self._guard(
+            "list_reverses",
+            lambda: self._run(["reverse", "--list"], timeout=15, check=True).lines,
+            safe=safe,
+        )
+
+    def remove_reverse(self, remote: str, *, safe: Optional[bool] = None):
+        """Remove one reverse rule by its device-side spec (``tcp:3000``)."""
+        return self._guard(
+            "remove_reverse",
+            lambda: self._run(["reverse", "--remove", remote], timeout=15, check=True).ok,
+            safe=safe,
+        )
+
+    def remove_all_reverses(self, *, safe: Optional[bool] = None):
+        """Remove this device's reverse rules (reverse rules are per device)."""
+        return self._guard(
+            "remove_all_reverses",
+            lambda: self._run(["reverse", "--remove-all"], timeout=15, check=True).ok,
+            safe=safe,
+        )
+
     # ------------------------------------------------------------------ #
     # scrcpy — visual mirroring/control session
     # ------------------------------------------------------------------ #
-    def list_displays(self, *, safe: Optional[bool] = None):
-        """Enumerate the device's displays (id + size) via scrcpy — use the id
-        with ``mirror(display_id=...)`` to mirror a specific IVI display."""
+    _DISPLAY_INFO_RE = re.compile(
+        r'DisplayInfo\{"(?P<name>[^"]*?)(?:, displayId (?P<quoted_id>\d+))?"'
+        r"(?:, displayId (?P<id>\d+))?(?P<body>[^}]*)"
+    )
+
+    @classmethod
+    def parse_display_info(cls, text: str) -> list:
+        """Displays in ``cmd display get-displays`` / ``dumpsys display`` output.
+
+        Returns ``[{"id": int, "size": "WxH", "name": str}, …]`` sorted by id. A
+        display listed more than once keeps its last entry (the current,
+        override size). Android 9 entries carry no id; they take it from the
+        ``mDisplayId=`` line above them.
+        """
+        text = text or ""
+        headers = [(m.start(), int(m.group(1))) for m in re.finditer(r"mDisplayId=\s*(\d+)", text)]
+        found = {}
+        for match in cls._DISPLAY_INFO_RE.finditer(text):
+            raw_id = match.group("quoted_id") or match.group("id")
+            if raw_id is None:
+                before = [did for pos, did in headers if pos < match.start()]
+                if not before:
+                    continue
+                display_id = before[-1]
+            else:
+                display_id = int(raw_id)
+            real = re.search(r"\breal (\d+) x (\d+)", match.group("body") or "")
+            size = f"{real.group(1)}x{real.group(2)}" if real else ""
+            if not size and display_id in found:
+                size = found[display_id]["size"]
+            found[display_id] = {"id": display_id, "size": size, "name": match.group("name").strip()}
+        return [found[key] for key in sorted(found)]
+
+    def _list_displays_adb(self) -> list:
+        """Ask Android itself for its displays; ``[]`` when it can't say."""
+        for args in (["shell", "cmd", "display", "get-displays"], ["shell", "dumpsys", "display"]):
+            try:
+                res = self._run(args, timeout=15)
+            except ADBError:
+                continue
+            displays = self.parse_display_info(res.text)
+            if displays:
+                return displays
+        return []
+
+    def list_displays(self, *, method: str = "auto", safe: Optional[bool] = None):
+        """Enumerate the device's displays — use an id with ``mirror(display_id=...)``
+        to mirror a specific IVI display (cluster, centre stack, passenger).
+
+        Returns ``[{"id": int, "size": "WxH", "name": str}, …]``. *method*
+        ``"adb"`` asks Android itself (``cmd display get-displays``, else
+        ``dumpsys display``): fast, and it never starts scrcpy. ``"scrcpy"`` runs
+        ``scrcpy --list-displays`` (no names). ``"auto"`` (the default) tries adb
+        first and falls back to scrcpy.
+        """
         from .scrcpy import list_displays as _ld
 
-        return self._guard(
-            "list_displays",
-            lambda: _ld(
+        def _do():
+            if method not in ("auto", "adb", "scrcpy"):
+                raise ValueError(f"unknown display listing method: {method!r}")
+            if method != "scrcpy":
+                displays = self._list_displays_adb()
+                if displays or method == "adb":
+                    return displays
+            return _ld(
                 self._serial,
                 scrcpy_path=self.config.scrcpy_path,
                 adb_server_host=self.config.adb_server_host,
                 adb_server_port=self.config.adb_server_port,
                 adb_path=self.adb_path,
-            ),
-            safe=safe,
-        )
+            )
+
+        return self._guard("list_displays", _do, safe=safe)
 
     def mirror(
         self,

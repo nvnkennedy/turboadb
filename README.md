@@ -16,10 +16,12 @@
 
 ---
 
-> **New in 2.0.0:** a redesigned window with colourful icons, a **Phone** tab,
-> device type detection (car, head unit, TV, watch, tablet, phone), calmer
-> themes, real PowerShell / Command Prompt tabs, and the Windows executable
-> inside the pip package. Full notes in the
+> **New in 2.1.0:** every display of a head unit live side by side in the
+> **Displays** tab, a Device Control layout that uses big monitors, a Phone tab
+> that works on customised head units, the device's real `user@host` prompt, and
+> a complete command line — 94 commands, including device files (`ls`, `rm`,
+> `mv`, `edit`), `--display N`, saved targets (`-s @name`) and `--json` on every
+> command. Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -44,7 +46,7 @@ steps, the **CLI** command, and the **Python** call.
   - [Telephony](#telephony) · [Root & mount](#root--mount) · [Reboot](#reboot) · [Device info](#device-info)
   - [Remote devices](#remote-devices) · [Share devices (serve)](#share-devices-serve) · [Deploy serve over WinRM](#deploy-serve-over-winrm)
   - [Keep things up to date](#keep-things-up-to-date)
-- [CLI cheatsheet](#cli-cheatsheet)
+- [CLI cheatsheet](#cli-cheatsheet) — full [CLI reference](https://github.com/NVNKENNEDY/turboadb/blob/main/CLI.md)
 - [Python API notes](#python-api-notes)
 - [Android Automotive / IVI tips](#android-automotive--ivi-tips)
 - [Build from source](#build-from-source)
@@ -56,7 +58,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-2.0.0-win64.exe`** from the
+1. Download **`TurboADB-2.1.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
@@ -148,7 +150,7 @@ abort a run.
   Ctrl+B.
 - **Device tabs** — every device gets **Terminal**, **Logcat**, **Files**,
   **Device Control**, **Apps**, **Phone** and **Webcam** (plus **IVI Displays**
-  on cars). **Screen ▾**, **Screenshot**, **Reboot ▾** and **More ▾** sit at the
+  on cars and multi-display devices). **Screen ▾**, **Screenshot**, **Reboot ▾** and **More ▾** sit at the
   right end of that row. **More ▾** holds **Split view** (Terminal, Device
   Control, Files and Logcat side by side, stacked or in a grid), **Device
   health…**, **Build details…**, **Root and mount**, **Go wireless (USB → Wi-Fi)**
@@ -392,18 +394,26 @@ choke on the defaults, and it works through a remote adb server.
 to show it in the tab or **Separate window** (**Screen ▾** beside the section
 tabs does the same from any tab). Click the screen and type on your PC keyboard.
 The toolbar also has **Stop**, a screenshot icon, **Record…**, **Audio on / off**,
-**Options**, **Maximize view** and **Hide controls** (hides the side panel
-without stopping the screen).
+**Options**, **Maximize view** and **Hide controls** (hides the controls without
+stopping the screen). The controls sit beside the screen or in a strip below it,
+whichever shows the screen larger for your window and the screen's shape.
 
+The display picker lists every display by number, name and size (for example
+`Display 2 · Instrument cluster · 1920x720`) as soon as the device connects.
+TurboADB asks Android over adb for them, so connecting never starts scrcpy.
 **Options** holds audio forwarding and its source, **Compatibility mode (IVI /
 automotive)**, software rendering, the keyboard mode (Standard SDK or UHID
 hardware keyboard), **Device camera** with Back / Front — the device's own camera
-instead of its screen, needing scrcpy 2.2+ and Android 12+ — and **Manage
-displays…** to start, record or screenshot each display. On cars the **IVI
-Displays** tab opens the **IVI display wall**: live previews of every display,
-each with Control, Maximize, Screenshot and Record. Audio needs Android 11+; tune
-codec, bitrate and latency in **Settings → scrcpy**. The display list loads the
-first time you open the tab, so connecting never starts scrcpy on its own.
+instead of its screen, needing scrcpy 2.2+ and Android 12+ — **Manage
+displays…** and **All displays**. Audio needs Android 11+; tune codec, bitrate
+and latency in **Settings → scrcpy**.
+
+**All displays at once** — cars, and any device with several displays, get an
+**IVI Displays** tab (**Displays** on other devices) that shows every display
+live and controllable, side by side, each with its own Start / Stop, Separate
+window, screenshot and Record. The displays start one after another the first
+time you open the tab. **Start all**, **Stop all** and **Rescan** are at the top,
+and **Focus** on a display shows only that one until you click it again.
 
 **CLI**:
 
@@ -507,6 +517,13 @@ first time you open the tab, never while connecting.
 If the device refuses access to its call log or messages, the list says so in
 place of the rows and the log gets one warning.
 
+**Head units and other devices without a phone** — the tab first checks what the
+device has, so nothing shows as an error. Without telephony the pill shows a grey
+**No telephony**; without a call log or SMS store the lists say so; and when no
+standard phone app exists, Call, Open in dialler and Compose are disabled. If the
+device has its own phone app (a customised head unit's Bluetooth phone, for
+example), an **Open …** button starts it.
+
 **CLI**:
 
 ```bash
@@ -517,6 +534,7 @@ turboadb -s SERIAL end-call
 turboadb -s SERIAL call-log --limit 20
 turboadb -s SERIAL sms --limit 20
 turboadb -s SERIAL send-sms 1800123456 "on my way"
+turboadb -s SERIAL phone-support          # telephony + dialler / call / SMS apps
 ```
 
 **Python**:
@@ -527,6 +545,7 @@ dev.answer_call(); dev.end_call()
 for c in dev.call_log(20): print(c)
 for m in dev.sms_list(20): print(m)
 dev.send_sms("1800123456", "on my way")
+print(dev.phone_support())  # which dialler / SMS / phone apps exist (calls no one)
 ```
 
 ## Root & mount
@@ -685,20 +704,29 @@ turboadb doctor           # report what's installed / missing
 
 ## CLI cheatsheet
 
-`turboadb -h` lists everything; `turboadb <command> -h` details one. Most read
-commands take `--json`. Target with `-s SERIAL`; add `--adb-host HOST` for a
-remote server.
+Every command with all its options and examples is in the
+**[CLI reference](https://github.com/NVNKENNEDY/turboadb/blob/main/CLI.md)** (also
+[on the website](https://nvnkennedy.github.io/turboadb/cli.html), with search).
+`turboadb -h` lists everything; `turboadb <command> -h` details one. Every
+command takes `--json`. Target with `-s SERIAL` (or `-s @NAME` for a saved
+target); add `--adb-host HOST` for a remote server.
 
 ```
-devices  info  shell  logcat  logcat-clear  push  pull  install  uninstall
-packages  clear  start  stop  screenshot  record  forward  reverse  scrcpy
-connect  disconnect  pair  tcpip  wireless  discover  restart-server
-reboot  root  unroot  remount  mount-rw  disable-verity  enable-verity
-key  text  scroll  tap  media  brightness  wifi  bluetooth  airplane
-hotspot  screen  settings  open  search  camera  gallery  calculator
-close-apps  battery  health  bugreport  build-info  dial  call  end-call
-answer  call-log  sms  send-sms  serve  deploy-serve  doctor  fetch-tools
-upgrade-tools  self-update  shortcut  gui
+devices  info  state  serialno  ip  wait  targets  connect  disconnect  pair
+tcpip  wireless  discover  restart-server
+shell  adb  logcat  logcat-clear  bugreport
+push  pull  ls  mkdir  touch  rm  mv  cp  stat  edit
+packages  install  uninstall  clear  start  start-activity  activity  stop
+grant  revoke  close-apps
+displays  screenshot  record  scrcpy  screen
+key  text  tap  swipe  scroll  media  brightness  notifications
+wifi  bluetooth  airplane  hotspot  mobile-data
+settings  open  search  camera  gallery  calculator
+battery  health  build-info  getprop
+dial  call  answer  end-call  call-state  call-log  sms  send-sms  phone-support
+root  unroot  remount  mount-rw  disable-verity  enable-verity  reboot
+forward  reverse  serve  deploy-serve
+doctor  fetch-tools  upgrade-tools  self-update  shortcut  gui
 ```
 
 ## Python API notes
@@ -724,8 +752,10 @@ dev.screenshot("after_install.png")
 
 - `device_info()` flags `automotive` for Android Automotive OS and for head units
   running ordinary Android (see `device_kind()` in Device info); the GUI then
-  uses the IVI-compatible screen profile and exposes the IVI display wall in
-  Device Control → Options, with a preview and action set for every display.
+  uses the IVI-compatible screen profile and adds the **IVI Displays** tab, which
+  shows every display (centre stack, cluster, passenger) live at once.
+- `list_displays()` names each display (`Instrument cluster`, `Passenger`) and
+  asks Android over adb; pass `method="scrcpy"` for scrcpy's own list.
 - If the default mirror fails, use **compatibility mode** (software decode).
 - `bootloader` / `sideload` reboots warn hard — many head units have no on-screen
   recovery UI and can get stuck.

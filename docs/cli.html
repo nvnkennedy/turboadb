@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TurboADB — Command line reference</title>
+<meta name="description" content="Every turboadb command with its options and examples: devices, shell, logcat, device files, apps, screen mirroring, multi-display input, phone, root, port forwarding and sharing devices.">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="index.html">
+      <img src="icon.png" alt="" width="30" height="30"><span>TurboADB</span>
+    </a>
+    <nav class="nav-links">
+      <a href="index.html#features">Features</a>
+      <a href="index.html#install">Install</a>
+      <a href="guide.html">Guide</a>
+      <a href="cli.html">CLI</a>
+      <a data-gh="repo" href="#">GitHub</a>
+      <a href="https://pypi.org/project/turboadb/">PyPI</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="guide-hero">
+    <div class="wrap">
+      <h1>Command line</h1>
+      <p>Everything TurboADB does, as one-line commands you can script. Every device
+      command takes <code>-s SERIAL</code> (or <code>-s @saved-name</code>); add
+      <code>--adb-host HOST</code> to drive a device plugged into another PC.</p>
+      <input id="cli-search" class="cli-search" type="search"
+        placeholder="Find a command — try “logcat”, “display” or “rm”…" aria-label="Find a command">
+      <p class="cli-count" id="cli-count"></p>
+      <div class="guide-toc">
+        <a href="#start">Getting started</a><a href="#global">Global options</a>
+        <a href="#setup">Setup</a><a href="#devices">Devices</a>
+        <a href="#shell">Shell &amp; logs</a><a href="#files">Files</a>
+        <a href="#apps">Apps</a><a href="#screen">Screen</a>
+        <a href="#input">Keys &amp; input</a><a href="#connectivity">Connectivity</a>
+        <a href="#open">Open apps</a><a href="#status">Status</a>
+        <a href="#phone">Phone</a><a href="#root">Root</a>
+        <a href="#forward">Forwarding</a><a href="#sharing">Sharing</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:30px">
+    <div class="wrap">
+
+      <article class="feature" id="start">
+        <h3>Getting started</h3>
+        <p class="desc"><code>adb</code> and <code>scrcpy</code> download themselves on
+        first use. <code>turboadb -h</code> lists the commands and
+        <code>turboadb &lt;command&gt; -h</code> shows one command's options.</p>
+        <div class="code"><pre><code>pip install turboadb
+turboadb doctor                                   # are adb and scrcpy available?
+turboadb devices                                  # what's attached
+turboadb -s 10BE330KG9000AF info                  # one device by serial
+turboadb -s 192.168.1.50:5555 screenshot shot.png # a network device
+turboadb --adb-host lab-pc-01 -s DEVICE info      # a device on another PC
+turboadb targets add bench network 192.168.1.50   # save a target once…
+turboadb -s @bench info                           # …and use it by name</code></pre></div>
+      </article>
+
+      <article class="feature" id="global">
+        <h3>Global options, output and exit codes</h3>
+        <p class="desc">Device options work before or after the command name, so
+        <code>turboadb -s SERIAL info</code> and <code>turboadb info -s SERIAL</code> are
+        the same.</p>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>-s, --serial SERIAL</code></td><td>The device: a USB serial or <code>host:port</code>, or <code>@NAME</code> for a saved target. Omit it when only one device is attached.</td></tr>
+            <tr><td><code>--adb-host HOST</code></td><td>Use another PC's adb server (that PC runs <code>turboadb serve</code>).</td></tr>
+            <tr><td><code>--adb-port PORT</code></td><td>adb server port (default <code>5037</code>).</td></tr>
+            <tr><td><code>--adb-path PATH</code></td><td>Use this adb executable.</td></tr>
+            <tr><td><code>--scrcpy-path PATH</code></td><td>Use this scrcpy executable.</td></tr>
+            <tr><td><code>--timeout SECONDS</code></td><td>Timeout for each command, and for push, pull and bugreport too (defaults: 60 s, transfers 600 s).</td></tr>
+            <tr><td><code>--json</code></td><td>JSON output: data as JSON, actions as <code>{"ok": …, "message": …}</code>, saved files as <code>{"ok": …, "path": …}</code>. <code>logcat</code> and the setup commands print text.</td></tr>
+            <tr><td><code>-V, --version</code></td><td>Print the TurboADB version.</td></tr>
+          </tbody>
+        </table></div>
+        <div class="cols">
+          <div>
+            <div class="table-wrap"><table class="cmds">
+              <thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+              <tbody>
+                <tr><td><code>0</code></td><td>Success.</td></tr>
+                <tr><td><code>1</code></td><td>The action failed or the device refused it (one <code>ERROR:</code> line explains why).</td></tr>
+                <tr><td><code>2</code></td><td>Wrong command-line usage.</td></tr>
+                <tr><td><code>3</code></td><td>adb not found — run <code>turboadb fetch-tools</code>.</td></tr>
+                <tr><td><code>130</code></td><td>Stopped with Ctrl+C.</td></tr>
+              </tbody>
+            </table></div>
+            <p class="muted"><code>shell</code> and <code>adb</code> exit with the device command's own code.</p>
+          </div>
+          <div>
+            <div class="table-wrap"><table class="cmds">
+              <thead><tr><th>Environment</th><th>Effect</th></tr></thead>
+              <tbody>
+                <tr><td><code>TURBOADB_ADB</code></td><td>Path to the adb executable.</td></tr>
+                <tr><td><code>TURBOADB_SCRCPY</code></td><td>Path to the scrcpy executable.</td></tr>
+                <tr><td><code>TURBOADB_AUTO_FETCH=0</code></td><td>Never download adb / scrcpy automatically.</td></tr>
+                <tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>The editor <code>turboadb edit</code> opens.</td></tr>
+              </tbody>
+            </table></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="feature cli-group" id="setup">
+        <h3>Setup and tools</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="doctor"><td><code>doctor</code></td><td>Report whether adb and scrcpy were found, and where.</td><td></td></tr>
+            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>.</td><td><code>--adb-only</code> <code>--scrcpy-only</code> <code>--force</code></td></tr>
+            <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code></td></tr>
+            <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from PyPI, then adb and scrcpy.</td><td><code>--check</code></td></tr>
+            <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows).</td><td></td></tr>
+            <tr data-cmd="gui"><td><code>gui</code></td><td>Launch the desktop app.</td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb fetch-tools --scrcpy-only --force
+turboadb self-update --check</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="devices">
+        <h3>Devices and connection</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="devices"><td><code>devices</code></td><td>List devices on the local adb server, or another PC's with <code>--adb-host</code>.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="info"><td><code>info</code></td><td>Identity and build: model, Android, CPU, device type (phone, tablet, tv, watch, automotive, head unit), telephony, display size.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="connect"><td><code>connect</code></td><td><code>adb connect</code> to a network device.</td><td><code>HOST:PORT</code></td></tr>
+            <tr data-cmd="disconnect"><td><code>disconnect</code></td><td>Disconnect one network device, or all.</td><td><code>[HOST:PORT]</code></td></tr>
+            <tr data-cmd="pair"><td><code>pair</code></td><td>Pair with an Android 11+ device (Wireless debugging).</td><td><code>HOST:PORT CODE</code></td></tr>
+            <tr data-cmd="tcpip"><td><code>tcpip</code></td><td>Restart adbd on a USB device in TCP mode.</td><td><code>[PORT=5555]</code></td></tr>
+            <tr data-cmd="wireless"><td><code>wireless</code></td><td>USB → Wi-Fi in one step: read the IP, <code>tcpip</code>, connect.</td><td><code>[PORT=5555]</code></td></tr>
+            <tr data-cmd="discover"><td><code>discover</code></td><td>Find Wireless-debugging devices on the network (mDNS).</td><td><code>--connect</code> <code>--json</code></td></tr>
+            <tr data-cmd="restart-server"><td><code>restart-server</code></td><td>Kill and start the adb server (devices not showing up).</td><td></td></tr>
+            <tr data-cmd="wait"><td><code>wait</code></td><td>Wait until the device is online.</td><td><code>[SECONDS]</code></td></tr>
+            <tr data-cmd="state"><td><code>state</code></td><td>The adb state: device, offline, unauthorized, recovery, bootloader… (works while rebooting).</td><td></td></tr>
+            <tr data-cmd="serialno"><td><code>serialno</code></td><td>The device's serial number.</td><td></td></tr>
+            <tr data-cmd="ip"><td><code>ip</code></td><td>The device's Wi-Fi / Ethernet IP address.</td><td></td></tr>
+            <tr data-cmd="targets"><td><code>targets</code></td><td>Saved targets (the GUI sidebar's list); use one with <code>-s @NAME</code>.</td><td><code>list</code> <code>add NAME usb [SERIAL]</code> <code>add NAME network HOST[:PORT]</code> <code>add NAME remote ADBHOST[:PORT] [SERIAL]</code> <code>remove NAME</code> <code>export FILE</code> <code>import FILE</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb connect 192.168.1.50:5555
+turboadb pair 192.168.1.50:37123 482913
+turboadb -s SERIAL wireless
+turboadb discover --connect
+turboadb targets add lab remote lab-pc-01 10BE330KG9000AF
+turboadb -s @lab screenshot lab.png</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="shell">
+        <h3>Shell, logs and reports</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="shell"><td><code>shell</code></td><td>Run a command on the device (put <code>--</code> before it), on every device, or a batch file; no command opens an interactive shell.</td><td><code>COMMAND…</code> <code>--su</code> <code>--all</code> <code>--batch FILE</code> <code>--keep-going</code> <code>--json</code></td></tr>
+            <tr data-cmd="adb"><td><code>adb</code></td><td>Any adb command for the selected device (<code>-s</code>, <code>--adb-host</code> added for you).</td><td><code>-- ARGS…</code></td></tr>
+            <tr data-cmd="logcat"><td><code>logcat</code></td><td>Stream logcat live, filtered, and save it.</td><td><code>--tag TAG</code> <code>--priority V|D|I|W|E|F</code> <code>--filter TAG:LEVEL</code> (repeat) <code>--buffer NAME</code> (repeat) <code>--crashes</code> <code>--grep REGEX</code> <code>--match REGEX</code> <code>--stop-on-match</code> <code>--format threadtime</code> <code>--save FILE</code> <code>--clear</code> <code>--dump</code> <code>--tail N</code></td></tr>
+            <tr data-cmd="logcat-clear"><td><code>logcat-clear</code></td><td>Clear the logcat buffers.</td><td></td></tr>
+            <tr data-cmd="bugreport"><td><code>bugreport</code></td><td>Capture a full bug report zip (a few minutes; <code>--timeout</code> sets the limit).</td><td><code>[PATH]</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL shell
+turboadb -s SERIAL shell -- getprop ro.build.version.release
+turboadb shell --all -- getprop ro.product.model
+turboadb -s SERIAL shell --batch setup.txt --keep-going
+turboadb -s SERIAL logcat --crashes --dump
+turboadb -s SERIAL logcat --filter ActivityManager:I --grep "ANR|FATAL" --save crash.log</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="files">
+        <h3>Files</h3>
+        <p class="desc">Paths are checked first: a missing path, or a folder without
+        <code>-r</code>, is an error and nothing changes.</p>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="push"><td><code>push</code></td><td>Upload a file or folder to the device, with progress.</td><td><code>LOCAL REMOTE</code> <code>--json</code></td></tr>
+            <tr data-cmd="pull"><td><code>pull</code></td><td>Download a file or folder from the device, with progress.</td><td><code>REMOTE LOCAL</code> <code>--json</code></td></tr>
+            <tr data-cmd="ls"><td><code>ls</code></td><td>List a device folder: permissions, owner, size, date, name.</td><td><code>[PATH=/sdcard]</code> <code>--json</code></td></tr>
+            <tr data-cmd="mkdir"><td><code>mkdir</code></td><td>Create folders, with any missing parents.</td><td><code>PATH…</code></td></tr>
+            <tr data-cmd="touch"><td><code>touch</code></td><td>Create empty files.</td><td><code>PATH…</code></td></tr>
+            <tr data-cmd="rm"><td><code>rm</code></td><td>Delete files, and folders with <code>-r</code> (<code>/</code> is always refused).</td><td><code>PATH…</code> <code>-r</code></td></tr>
+            <tr data-cmd="mv"><td><code>mv</code></td><td>Move or rename; into a folder when the destination is one.</td><td><code>SRC DST</code> <code>-f</code></td></tr>
+            <tr data-cmd="cp"><td><code>cp</code></td><td>Copy a file or folder (never a folder into itself).</td><td><code>SRC DST</code></td></tr>
+            <tr data-cmd="stat"><td><code>stat</code></td><td>Path, real path, type, size and octal mode.</td><td><code>PATH</code> <code>--json</code></td></tr>
+            <tr data-cmd="edit"><td><code>edit</code></td><td>Edit a device text file in a local editor; saved back only when changed, keeping its permissions.</td><td><code>PATH</code> <code>--editor "code --wait"</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL push app.apk /data/local/tmp/
+turboadb -s SERIAL ls /sdcard/Download
+turboadb -s SERIAL mv /sdcard/clip.mp4 /sdcard/Movies
+turboadb -s SERIAL rm -r /sdcard/logs
+turboadb -s SERIAL edit /data/local/tmp/config.ini</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="apps">
+        <h3>Apps</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="packages"><td><code>packages</code></td><td>List installed packages.</td><td><code>[FILTER]</code> <code>--third-party</code> <code>--system</code> <code>--enabled</code> <code>--disabled</code> <code>--path</code> <code>--json</code></td></tr>
+            <tr data-cmd="install"><td><code>install</code></td><td>Install one APK, or several as a split install.</td><td><code>APK…</code> <code>--grant</code> <code>--downgrade</code> <code>--no-replace</code> <code>--test</code></td></tr>
+            <tr data-cmd="uninstall"><td><code>uninstall</code></td><td>Uninstall a package.</td><td><code>PACKAGE</code> <code>--keep-data</code></td></tr>
+            <tr data-cmd="clear"><td><code>clear</code></td><td>Clear an app's data.</td><td><code>PACKAGE</code></td></tr>
+            <tr data-cmd="start"><td><code>start</code></td><td>Launch an app by package (works on head units too).</td><td><code>PACKAGE</code></td></tr>
+            <tr data-cmd="start-activity"><td><code>start-activity</code></td><td>Start an activity with an optional action, data and extras.</td><td><code>PKG/.Activity</code> <code>--action</code> <code>--data</code> <code>--es K V</code> <code>--ei K V</code> <code>--ez K V</code></td></tr>
+            <tr data-cmd="activity"><td><code>activity</code></td><td>The activity in the foreground.</td><td></td></tr>
+            <tr data-cmd="stop"><td><code>stop</code></td><td>Force-stop an app.</td><td><code>PACKAGE</code></td></tr>
+            <tr data-cmd="grant"><td><code>grant</code></td><td>Grant a runtime permission.</td><td><code>PACKAGE PERMISSION</code></td></tr>
+            <tr data-cmd="revoke"><td><code>revoke</code></td><td>Revoke a runtime permission.</td><td><code>PACKAGE PERMISSION</code></td></tr>
+            <tr data-cmd="close-apps"><td><code>close-apps</code></td><td>Close background apps.</td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL packages --disabled
+turboadb -s SERIAL install app-debug.apk --grant --test
+turboadb -s SERIAL start-activity com.example/.MainActivity --es mode demo
+turboadb -s SERIAL grant com.example.app android.permission.ACCESS_FINE_LOCATION</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="screen">
+        <h3>Screen, capture and mirroring</h3>
+        <p class="desc"><code>--display N</code> picks one display of a multi-display head
+        unit (cluster, centre stack, passenger); <code>displays</code> lists the ids.</p>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="displays"><td><code>displays</code></td><td>List the device's displays: id, size, name.</td><td><code>--method auto|adb|scrcpy</code> <code>--json</code></td></tr>
+            <tr data-cmd="screenshot"><td><code>screenshot</code></td><td>Save a PNG screenshot.</td><td><code>PATH</code> <code>--display N</code></td></tr>
+            <tr data-cmd="record"><td><code>record</code></td><td>Record on the device and pull the MP4 (works over RDP; Ctrl+C stops and saves). <code>--continuous</code> records past the 3-minute cap in parts.</td><td><code>PATH</code> <code>--time-limit 30</code> <code>--size WxH</code> <code>--bit-rate 8M</code> <code>--display N</code> <code>--continuous</code></td></tr>
+            <tr data-cmd="scrcpy"><td><code>scrcpy</code></td><td>Mirror and control the screen, or the device camera. <code>--compat</code> is the profile for head units that won't mirror with the defaults.</td><td><code>--display-id N</code> <code>--compat</code> <code>--max-size PX</code> <code>--bit-rate</code> <code>--max-fps</code> <code>--video-codec h264|h265|av1</code> <code>--crop W:H:X:Y</code> <code>--render-driver</code> <code>--keyboard sdk|uhid|aoa</code> <code>--force-adb-forward</code> <code>--no-audio</code> <code>--audio-source</code> <code>--audio-codec</code> <code>--audio-bit-rate</code> <code>--audio-buffer</code> <code>--audio-output-buffer</code> <code>--audio-dup</code> <code>--record FILE</code> <code>--record-format mp4|mkv</code> <code>--no-playback</code> <code>--turn-screen-off</code> <code>--no-stay-awake</code> <code>--show-touches</code> <code>--no-control</code> <code>--fullscreen</code> <code>--always-on-top</code> <code>--window-borderless</code> <code>--window-title</code> <code>--video-source display|camera</code> <code>--camera-facing</code> <code>--camera-size</code> <code>--log FILE</code> <code>--wait</code></td></tr>
+            <tr data-cmd="screen"><td><code>screen</code></td><td>Turn the device screen on or off.</td><td><code>on|off</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL displays
+turboadb -s SERIAL screenshot cluster.png --display 2
+turboadb -s SERIAL record drive.mp4 --continuous
+turboadb -s SERIAL scrcpy --compat --display-id 2 --log scrcpy.log
+turboadb -s SERIAL scrcpy --no-playback --record drive.mkv --record-format mkv</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="input">
+        <h3>Keys and input</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="key"><td><code>key</code></td><td>Send keys in order, by name or keycode: <code>home</code>, <code>back</code>, <code>recents</code>, <code>menu</code>, <code>search</code>, <code>power</code>, <code>sleep</code>, <code>wake</code>, <code>notifications</code>, <code>call</code>, <code>enter</code>, <code>del</code>, <code>tab</code>, <code>space</code>, <code>esc</code>, <code>up</code>, <code>down</code>, <code>left</code>, <code>right</code>, <code>center</code>, <code>vol_up</code>, <code>vol_down</code>, <code>vol_mute</code>, <code>play_pause</code>, <code>media_play</code>, <code>media_pause</code>, <code>stop</code>, <code>next</code>, <code>prev</code>, <code>rewind</code>, <code>fast_forward</code>, <code>brightness_up</code>, <code>brightness_down</code>.</td><td><code>KEY…</code> <code>--longpress</code> <code>--display N</code></td></tr>
+            <tr data-cmd="text"><td><code>text</code></td><td>Type text into the focused field.</td><td><code>TEXT…</code> <code>--display N</code></td></tr>
+            <tr data-cmd="tap"><td><code>tap</code></td><td>Tap a point, or the centre of the screen.</td><td><code>[X Y]</code> <code>--display N</code></td></tr>
+            <tr data-cmd="swipe"><td><code>swipe</code></td><td>Swipe from one point to another.</td><td><code>X1 Y1 X2 Y2</code> <code>--ms 200</code> <code>--display N</code></td></tr>
+            <tr data-cmd="scroll"><td><code>scroll</code></td><td>Scroll with a swipe.</td><td><code>up|down|left|right</code> <code>--display N</code></td></tr>
+            <tr data-cmd="media"><td><code>media</code></td><td>Media control through the active session.</td><td><code>play-pause|play|pause|next|previous|stop|fast-forward|rewind|mute</code></td></tr>
+            <tr data-cmd="brightness"><td><code>brightness</code></td><td>Set brightness live, or read / set / step the 0–255 setting.</td><td><code>[0.0–1.0]</code> <code>--get</code> <code>--level N</code> <code>--step N</code></td></tr>
+            <tr data-cmd="notifications"><td><code>notifications</code></td><td>Open or close the notification shade.</td><td><code>expand|collapse</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL key down down enter
+turboadb -s SERIAL key power --longpress
+turboadb -s SERIAL tap 540 1200 --display 2
+turboadb -s SERIAL swipe 500 1500 500 400 --ms 300
+turboadb -s SERIAL brightness --step -20</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="connectivity">
+        <h3>Connectivity</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments</th></tr></thead>
+          <tbody>
+            <tr data-cmd="wifi"><td><code>wifi</code></td><td>Turn Wi-Fi on or off.</td><td><code>on|off</code></td></tr>
+            <tr data-cmd="bluetooth"><td><code>bluetooth</code></td><td>Turn Bluetooth on or off.</td><td><code>on|off</code></td></tr>
+            <tr data-cmd="airplane"><td><code>airplane</code></td><td>Turn airplane mode on or off.</td><td><code>on|off</code></td></tr>
+            <tr data-cmd="hotspot"><td><code>hotspot</code></td><td>Turn the hotspot on or off (best effort; opens tethering settings otherwise).</td><td><code>on|off</code></td></tr>
+            <tr data-cmd="mobile-data"><td><code>mobile-data</code></td><td>Turn mobile data on or off.</td><td><code>on|off</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL wifi on
+turboadb -s SERIAL mobile-data off</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="open">
+        <h3>Open apps and the web</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments</th></tr></thead>
+          <tbody>
+            <tr data-cmd="settings"><td><code>settings</code></td><td>Open the Settings app.</td><td></td></tr>
+            <tr data-cmd="open"><td><code>open</code></td><td>Open a URL with the app that handles it, or a shortcut.</td><td><code>URL</code> or <code>browser|youtube|maps|spotify|play-store</code></td></tr>
+            <tr data-cmd="search"><td><code>search</code></td><td>Search the web in the browser.</td><td><code>QUERY…</code></td></tr>
+            <tr data-cmd="camera"><td><code>camera</code></td><td>Open the camera app.</td><td></td></tr>
+            <tr data-cmd="gallery"><td><code>gallery</code></td><td>Open the gallery / photos app.</td><td></td></tr>
+            <tr data-cmd="calculator"><td><code>calculator</code></td><td>Open the calculator app.</td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL open https://maps.google.com
+turboadb -s SERIAL open youtube
+turboadb -s SERIAL search "nearest charger"</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="status">
+        <h3>Device status</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="battery"><td><code>battery</code></td><td>Battery details (<code>dumpsys battery</code>).</td><td><code>--json</code></td></tr>
+            <tr data-cmd="health"><td><code>health</code></td><td>Battery, temperature, memory, CPU and uptime in one snapshot, or the full report.</td><td><code>--full</code> <code>-o FILE</code> <code>--json</code></td></tr>
+            <tr data-cmd="build-info"><td><code>build-info</code></td><td>Build and version properties, or the full report.</td><td><code>--full</code> <code>-o FILE</code> <code>--json</code></td></tr>
+            <tr data-cmd="getprop"><td><code>getprop</code></td><td>One Android property, or all of them.</td><td><code>[NAME]</code> <code>--json</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL health --full -o health.txt
+turboadb -s SERIAL getprop ro.build.fingerprint</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="phone">
+        <h3>Phone and messages</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="dial"><td><code>dial</code></td><td>Open the dialler with a number filled in (doesn't call).</td><td><code>NUMBER</code></td></tr>
+            <tr data-cmd="call"><td><code>call</code></td><td>Place a call.</td><td><code>NUMBER</code></td></tr>
+            <tr data-cmd="answer"><td><code>answer</code></td><td>Answer a ringing call.</td><td></td></tr>
+            <tr data-cmd="end-call"><td><code>end-call</code></td><td>Hang up or reject the current call.</td><td></td></tr>
+            <tr data-cmd="call-state"><td><code>call-state</code></td><td>Idle, ringing or in call.</td><td></td></tr>
+            <tr data-cmd="call-log"><td><code>call-log</code></td><td>Recent calls.</td><td><code>--limit 20</code> <code>--json</code></td></tr>
+            <tr data-cmd="sms"><td><code>sms</code></td><td>Recent SMS messages.</td><td><code>--limit 20</code> <code>--json</code></td></tr>
+            <tr data-cmd="send-sms"><td><code>send-sms</code></td><td>Open Messages with a draft; you press Send on the device.</td><td><code>NUMBER TEXT…</code></td></tr>
+            <tr data-cmd="phone-support"><td><code>phone-support</code></td><td>What the device has: telephony, the dialler / call / SMS apps, and phone-like apps (a head unit's own Bluetooth phone).</td><td><code>--json</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL phone-support
+turboadb -s SERIAL call-state
+turboadb -s SERIAL send-sms 1800123456 "on my way"</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="root">
+        <h3>Root and system</h3>
+        <p class="desc">For rooted and engineering builds.</p>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="root"><td><code>root</code></td><td>Restart adbd as root.</td><td></td></tr>
+            <tr data-cmd="unroot"><td><code>unroot</code></td><td>Restart adbd without root.</td><td></td></tr>
+            <tr data-cmd="remount"><td><code>remount</code></td><td><code>adb remount</code> read-write.</td><td></td></tr>
+            <tr data-cmd="mount-rw"><td><code>mount-rw</code></td><td>Remount a partition read-write.</td><td><code>[PATH=/]</code></td></tr>
+            <tr data-cmd="disable-verity"><td><code>disable-verity</code></td><td><code>adb disable-verity</code> (reboot to apply).</td><td><code>--reboot</code></td></tr>
+            <tr data-cmd="enable-verity"><td><code>enable-verity</code></td><td><code>adb enable-verity</code> (reboot to apply).</td><td><code>--reboot</code></td></tr>
+            <tr data-cmd="reboot"><td><code>reboot</code></td><td>Reboot, optionally into another mode, and wait for the boot (head units often have no recovery UI).</td><td><code>[recovery|bootloader|fastboot|sideload]</code> <code>--wait</code> <code>--wait-timeout 180</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL root
+turboadb -s SERIAL disable-verity --reboot
+turboadb -s SERIAL reboot --wait</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="forward">
+        <h3>Port forwarding</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="forward"><td><code>forward</code></td><td><code>adb forward</code>; active until Ctrl+C (or left in place with <code>--no-wait</code>). Also lists and removes rules.</td><td><code>LOCAL REMOTE</code> <code>--no-wait</code> <code>--list</code> <code>--remove SPEC</code> <code>--remove-all</code></td></tr>
+            <tr data-cmd="reverse"><td><code>reverse</code></td><td><code>adb reverse</code>; active until Ctrl+C (or left in place with <code>--no-wait</code>). Also lists and removes rules.</td><td><code>REMOTE LOCAL</code> <code>--no-wait</code> <code>--list</code> <code>--remove SPEC</code> <code>--remove-all</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code>turboadb -s SERIAL forward tcp:9222 localabstract:chrome_devtools_remote --no-wait
+turboadb -s SERIAL forward --list
+turboadb -s SERIAL reverse --remove tcp:3000</code></pre></div>
+      </article>
+
+      <article class="feature cli-group" id="sharing">
+        <h3>Sharing devices with other PCs</h3>
+        <div class="table-wrap"><table class="cmds">
+          <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
+          <tbody>
+            <tr data-cmd="serve"><td><code>serve</code></td><td>Share this PC's adb server so others can use <code>--adb-host</code> (opens the firewall; needs Administrator), check it, or stop sharing.</td><td><code>--port 5037</code> <code>--startup-task</code> <code>--install-startup</code> <code>--uninstall-startup</code> <code>--status</code> <code>--stop</code></td></tr>
+            <tr data-cmd="deploy-serve"><td><code>deploy-serve</code></td><td>Set up <code>serve</code> on remote Windows PCs over WinRM (needs <code>turboadb[winrm]</code>).</td><td><code>HOST…</code> <code>-u USER</code> <code>-p PASSWORD</code> <code>--port 5037</code> <code>--ssl</code> <code>--winrm-port</code> <code>--no-update</code> <code>--test</code></td></tr>
+          </tbody>
+        </table></div>
+        <div class="code"><pre><code># on the PC with the device:
+turboadb serve --startup-task
+turboadb serve --status
+
+# or from your machine:
+turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user" --ssl</code></pre></div>
+      </article>
+
+      <p class="no-match" id="no-match">No command matches that search.</p>
+
+      <article class="feature" id="more">
+        <h3>More</h3>
+        <p class="desc"><code>turboadb-gui</code> starts the desktop app, <code>turboadb-docs</code>
+        opens this site, and <code>turboadb-shortcut</code> creates shortcuts. For shell tab
+        completion install <code>turboadb[completion]</code> and run
+        <code>eval "$(register-python-argcomplete turboadb)"</code>. The same reference, with
+        every option explained, is in <a data-gh="climd" href="#">CLI.md</a> on GitHub.</p>
+      </article>
+
+    </div>
+  </section>
+
+  <section class="band closing">
+    <div class="wrap center">
+      <h2>Prefer clicking?</h2>
+      <div class="cta">
+        <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download for Windows</a>
+        <a class="btn btn-ghost" href="guide.html">Usage guide</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <span>TurboADB · MIT licensed</span>
+    <span><a data-gh="repo" href="#">GitHub</a> ·
+      <a href="https://pypi.org/project/turboadb/">PyPI</a></span>
+  </div>
+</footer>
+
+<script>
+  const REPO = "nvnkennedy/turboadb";
+  const base = "https://github.com/" + REPO;
+  const urls = { repo: base, releases: base + "/releases",
+    exe: base + "/releases/latest", climd: base + "/blob/main/CLI.md" };
+  document.querySelectorAll("[data-gh]").forEach(function (a) {
+    a.href = urls[a.getAttribute("data-gh")] || base;
+  });
+
+  // live command search: hide rows (and whole groups) that don't match
+  const input = document.getElementById("cli-search");
+  const rows = Array.from(document.querySelectorAll("tr[data-cmd]"));
+  const groups = Array.from(document.querySelectorAll(".cli-group"));
+  const count = document.getElementById("cli-count");
+  const noMatch = document.getElementById("no-match");
+  function filter() {
+    const q = input.value.trim().toLowerCase();
+    let shown = 0;
+    rows.forEach(function (row) {
+      const hit = !q || row.textContent.toLowerCase().indexOf(q) >= 0;
+      row.hidden = !hit;
+      if (hit) shown++;
+    });
+    groups.forEach(function (group) {
+      group.hidden = !!q && !group.querySelector("tr[data-cmd]:not([hidden])");
+    });
+    count.textContent = q ? shown + " of " + rows.length + " commands" : rows.length + " commands";
+    noMatch.style.display = q && !shown ? "block" : "none";
+  }
+  input.addEventListener("input", filter);
+  filter();
+</script>
+</body>
+</html>

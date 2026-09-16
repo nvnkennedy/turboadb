@@ -43,6 +43,7 @@ turboadb/
 ├── toolsdl.py         download/upgrade adb + scrcpy into ~/.turboadb/tools
 ├── update.py          self-update: check PyPI, pip-upgrade, relaunch
 ├── remote_deploy.py   deploy 'serve' to remote Windows hosts over WinRM (pywinrm/NTLM)
+├── remotefs.py        device-file shell helpers (ls parsing, mv/cp/rm/probe) shared by the engine and the Files tab
 ├── cli.py             argparse front-end; console-script entry points
 ├── assets/            icon.ico / icon.png
 └── gui/               the PyQt5 application (see below)

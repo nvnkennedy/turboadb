@@ -176,43 +176,58 @@ def test_window_lookup_never_matches_an_empty_title():
     assert _post_close(None) is False
 
 
-def test_ivi_tile_stop_never_waits_on_the_ui_thread(app, monkeypatch):
-    """B15: closing the display wall must not block 0.9 s per tile."""
-    import turboadb.gui.mirror_panel as mp_mod
+def _wall_with_fake_starts(displays):
+    from turboadb.gui.display_wall import DisplayWall
 
-    class Signal:
-        def connect(self, _slot):
-            pass
+    wall = DisplayWall(types.SimpleNamespace(serial="ivi", config=None), {"name": "ivi"}, automotive=True)
+    wall.set_displays(displays)
+    started, stopped = [], []
+    for tile in wall._tiles:
+        tile.panel.start = lambda t=tile: started.append(t.display_id)
+        tile.panel.stop = lambda t=tile: stopped.append(t.display_id)
+        tile.panel.is_active = lambda t=tile: t.display_id in started and t.display_id not in stopped
+    return wall, started, stopped
 
-        def disconnect(self, _slot):
-            pass
 
-    class FakeLive:
-        def __init__(self, *_args, **_kwargs):
-            self.frame, self.note = Signal(), Signal()
-            self.stopped = False
-            self.target_w = self.target_h = 0
-
-        def start(self):
-            pass
-
-        def stop(self):
-            self.stopped = True
-
-        def wait(self, *_args):
-            raise AssertionError("tile.stop() must not block on QThread.wait")
-
-        def isFinished(self):
-            return True
-
-    monkeypatch.setattr(mp_mod, "_LiveThread", FakeLive)
-    tile = mp_mod._IviPreviewTile(
-        types.SimpleNamespace(handler=None), {"id": 2, "size": "1920x720"}
+def test_display_wall_starts_every_display_one_after_another(app):
+    """Issue: each IVI display had to be started by hand, one by one."""
+    wall, started, stopped = _wall_with_fake_starts(
+        [{"id": 2, "size": "1920x720"}, {"id": 0, "size": "1920x720"}, {"id": 3, "size": "800x480"}]
     )
-    live = tile._live
-    tile.stop()
-    assert live.stopped and tile._live is None
-    tile.close()
+    try:
+        assert [tile.display_id for tile in wall._tiles] == [0, 2, 3]
+        wall.start_all()
+        assert started == [0]  # never several scrcpy servers starting at once
+        wall._on_tile_ready(wall._tiles[1])  # not the one being waited on: ignored
+        assert started == [0] and wall._next_timer.remainingTime() > 5000
+        wall._on_tile_ready(wall._tiles[0])  # display 0 is up: the next follows shortly
+        assert wall._next_timer.remainingTime() <= wall.START_GAP_MS
+        wall._start_next()
+        assert started == [0, 2]
+        wall._start_next()  # display 2 never came up (timeout): move on
+        assert started == [0, 2, 3]
+        wall.stop_all()
+        assert stopped == [0, 2, 3]
+        wall.set_displays([{"id": 0}, {"id": 2}, {"id": 3}, {"id": 4}])
+        assert started == [0, 2, 3]  # stopped by the user: a rescan doesn't restart them
+    finally:
+        wall.close_panel()
+        wall.close()
+
+
+def test_display_wall_focus_shows_one_display_then_all(app):
+    wall, _started, _stopped = _wall_with_fake_starts([{"id": 0}, {"id": 1}])
+    try:
+        first, second = wall._tiles
+        second.btn_focus.setChecked(True)
+        assert wall._focused is second and first.isHidden() and not second.isHidden()
+        first.btn_focus.setChecked(True)  # focusing another display switches to it
+        assert wall._focused is first and second.isHidden() and not second.btn_focus.isChecked()
+        first.btn_focus.setChecked(False)
+        assert wall._focused is None and not first.isHidden() and not second.isHidden()
+    finally:
+        wall.close_panel()
+        wall.close()
 
 
 def test_options_popover_restyles_on_theme_refresh(app):
@@ -351,13 +366,13 @@ def test_display_switch_is_blocked_while_scrcpy_records(app):
         panel._launch_spec = {"display_id": 0}
         panel._on_display_combo_changed(panel.cmb_display.findData(1))
         assert starts == []
-        assert panel.cmb_display.currentData() == 0
+        assert panel.cmb_display.currentData() is None  # display 0 = the default display
 
         panel._recording = False
         panel._rec_mode = None
         panel._on_display_combo_changed(panel.cmb_display.findData(1))
         assert starts == [{"display_id": 1}]
-        assert panel.display_tabs.tabData(panel.display_tabs.currentIndex()) == 1
+        assert panel.cmb_display.currentData() == 1
     finally:
         _close_panel(panel)
 
@@ -503,24 +518,48 @@ def test_android_shell_stop_never_kills_device_wide_processes(app):
         widget.close()
 
 
-def test_prompt_probe_reads_root_state_in_safe_mode(app):
-    """B7: the probe only asks for root state, in safe mode."""
+def test_prompt_probe_reads_the_device_user_and_host_in_safe_mode(app):
+    """B7: the probe copies the device's own user@host and root state, in safe mode."""
     from turboadb.gui.device_tab import _PromptThread
     from turboadb.results import CommandResult, OperationResult
 
     class Handler:
         def shell(self, command, **kwargs):
-            assert command == "id -u"
+            assert command == _PromptThread.COMMAND
             assert kwargs.get("safe") is True
             return OperationResult(
-                True, "shell", value=CommandResult(command, 0, "0\n", "", 0.0)
+                True, "shell", value=CommandResult(command, 0, "0|root|adelegg\n", "", 0.0)
             )
 
     probe = _PromptThread(Handler())
     results = []
-    probe.ready.connect(results.append)
+    probe.ready.connect(lambda root, identity: results.append((root, identity)))
     probe.run()
-    assert results == [True]
+    assert results == [(True, "root@adelegg")]
+
+
+def test_prompt_probe_parse_falls_back_safely():
+    from turboadb.gui.device_tab import _PromptThread
+
+    assert _PromptThread.parse("2000|shell|V2318\n") == (False, "shell@V2318")
+    assert _PromptThread.parse("0||adelegg") == (True, "root@adelegg")
+    assert _PromptThread.parse("0|root|") == (True, "")
+    assert _PromptThread.parse("sh: id: not found") == (False, "")
+    assert _PromptThread.parse("") == (False, "")
+
+
+def test_console_prompt_shows_the_device_user_and_host(app):
+    """The prompt reads like the device's shell (root@adelegg), never adb@<model>."""
+    from turboadb.gui.console import AnsiConsole
+    from turboadb.results import strip_ansi
+
+    con = AnsiConsole()
+    con.set_prompt("root@adelegg", root=True)
+    assert strip_ansi(con._prompt_text()).startswith("root@adelegg:/ #")
+    con.set_prompt("V2318", root=False)
+    assert strip_ansi(con._prompt_text()).startswith("shell@V2318:/ $")
+    con.set_prompt("", root=False)
+    assert "adb@" not in strip_ansi(con._prompt_text())
 
 
 def test_device_actions_treat_safe_mode_failures_as_errors():

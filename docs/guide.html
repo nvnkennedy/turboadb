@@ -19,6 +19,7 @@
       <a href="index.html#features">Features</a>
       <a href="index.html#install">Install</a>
       <a href="guide.html">Guide</a>
+      <a href="cli.html">CLI</a>
       <a data-gh="repo" href="#">GitHub</a>
       <a href="https://pypi.org/project/turboadb/">PyPI</a>
     </nav>
@@ -203,13 +204,19 @@ dev.open_url("https://maps.google.com"); dev.input_text("hello world")</code></p
             window</b>. Click the screen to type on it with your PC keyboard.</li>
             <li><b>Options</b> holds audio, <b>Compatibility mode (IVI /
             automotive)</b> for stubborn head units, the keyboard mode, <b>Device
-            camera</b> (Back / Front) and <b>Manage displays…</b> to start, record or
-            screenshot each display.</li>
+            camera</b> (Back / Front), <b>Manage displays…</b> and <b>All
+            displays</b>.</li>
             <li><b>Record…</b> records without restarting the live view;
             <b>Maximize view</b> and <b>Hide controls</b> give the screen more room.
-            On cars, the <b>IVI Displays</b> tab opens the IVI display wall.</li>
+            The controls sit beside the screen or below it, whichever shows the
+            screen larger.</li>
+            <li>On cars (and any device with several displays) the <b>IVI Displays</b>
+            tab shows every display live at once and starts them one after another.
+            <b>Focus</b> shows a single display; <b>Start all</b>, <b>Stop all</b> and
+            <b>Rescan</b> are at the top.</li>
           </ol>
-          <p class="muted">The display list loads only when you open the tab — so
+          <p class="muted">The display picker lists every display with its name and
+          size as soon as the device connects — TurboADB asks Android over adb, so
           connecting never starts scrcpy on its own.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M
@@ -297,7 +304,11 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
             <li>Switch between <b>Recent calls</b> and <b>Messages</b>. <b>Call back</b>
             fills the dialler; <b>Compose in Messages</b> opens a draft on the device,
             where you press Send.</li>
-          </ol></div>
+          </ol>
+          <p class="muted">On a head unit without a phone the tab checks what the device
+          has and says so calmly: no telephony, no call history, and — when there's no
+          standard phone app — an <b>Open …</b> button for the device's own phone app
+          instead of a dialler that can't work.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL call 1800123456
 turboadb -s SERIAL call-log --limit 20

@@ -543,12 +543,13 @@ def test_mirror_panel_display_actions(qapp, monkeypatch):
     assert mp.btn_audio.isChecked() is True
     assert mp.btn_ivi.isHidden()
     assert not hasattr(mp, "btn_live")
-    assert mp._displays_loaded is True
+    assert mp._displays_loaded is False  # the device tab lists them on connect
     mp.set_automotive_default(True)
     assert not mp.btn_ivi.isHidden()
     # Test that _got_displays preserves act_mirror_all enabled even with 1 display
     mp._got_displays([{"id": 0, "size": "1080x2400"}])
     assert mp.act_mirror_all.isEnabled() is True
+    assert mp._displays_loaded is True
 
     # Test _select_and_mirror calls start() without attribute errors
     started_display = []
@@ -710,10 +711,10 @@ def test_ivi_display_and_record_toolbar_keep_native_mirror_focus(qapp):
 
     panel = MirrorPanel(Handler(), {"name": "mock"}, automotive=True)
     try:
-        starts = []
-        panel.start = lambda **kwargs: starts.append(kwargs)
-        panel._open_display_from_ivi(2, maximize=False)
-        assert starts == [{"display_id": 2, "embed": False}]
+        requested = []
+        panel.all_displays_requested.connect(lambda: requested.append(True))
+        panel.open_ivi_view()  # "All displays" hands over to the displays tab
+        assert requested == [True]
 
         class Session:
             running = True
@@ -936,20 +937,33 @@ def test_terminal_only_device_tab_has_no_full_workspace_actions(qapp):
 
 def test_automotive_device_gets_a_dedicated_ivi_tab(qapp):
     from turboadb.gui.device_tab import DeviceTab
+    from turboadb.gui.display_wall import DisplayWall
 
     class MirrorStub:
-        def open_ivi_view(self):
+        _displays = [
+            {"id": 2, "size": "1920x720", "name": "Cluster"},
+            {"id": 0, "size": "1920x720", "name": "Centre"},
+        ]
+
+        def refresh_displays(self, quiet=False):
             pass
 
-        def refresh_displays(self):
-            pass
+    class Handler:
+        serial = "123"
+        config = None
 
     tab = DeviceTab({"name": "ivi", "serial": "123"})
     tab.mirror_tab = MirrorStub()
+    tab.handler = Handler()
+    tab._automotive = True
     tab._subtabs = {}
     tab._add_ivi_tab()
-    assert "ivi" in tab._subtabs
-    assert tab.inner.tabText(tab.inner.indexOf(tab._subtabs["ivi"])) == "IVI Displays"
+    wall = tab._subtabs["ivi"]
+    assert isinstance(wall, DisplayWall)
+    assert tab.inner.tabText(tab.inner.indexOf(wall)) == "IVI Displays"
+    # every display gets its own live screen tile, in display order
+    assert [tile.display_id for tile in wall._tiles] == [0, 2]
+    tab.handler = None
     tab.close_session()
     tab.close()
 

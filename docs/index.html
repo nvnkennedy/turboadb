@@ -20,6 +20,7 @@
       <a href="#features">Features</a>
       <a href="#install">Install</a>
       <a href="guide.html">Guide</a>
+      <a href="cli.html">CLI</a>
       <a href="#remote">Remote</a>
       <a data-gh="repo" href="#">GitHub</a>
       <a href="https://pypi.org/project/turboadb/">PyPI</a>
@@ -70,37 +71,35 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
-          <h3><span class="ver">v2.0.0</span> One install, new look</h3>
+          <h3><span class="ver">v2.1.0</span> Head units, done right</h3>
           <ul>
-            <li><b>Exe inside pip</b> — <code>pip install turboadb</code> now carries
-            the Windows app, so <code>turboadb-gui</code> works without PyQt5.</li>
-            <li><b>Redesigned window</b> — colourful icons that follow the theme,
-            actions beside the section tabs, and a boxed welcome banner in every
-            terminal.</li>
-            <li><b>📞 Phone tab</b> — dialler with keypad, live call state, recent
-            calls and messages.</li>
+            <li><b>Every display at once</b> — the Displays tab shows the centre stack,
+            cluster and passenger screens live side by side, each controllable.</li>
+            <li><b>All displays in the picker</b> as soon as a device connects, with
+            their names and sizes.</li>
+            <li><b>Big monitors</b> — Device Control puts its buttons beside or below
+            the screen, whichever shows it larger.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.0.0</span> Screen &amp; shells</h3>
+          <h3><span class="ver">v2.1.0</span> Complete command line</h3>
           <ul>
-            <li><b>Screen mirroring</b> starts on the first click, looks sharper, and
-            you type straight on the embedded screen.</li>
-            <li><b>Record without restarting</b> — a second, windowless recorder
-            runs beside the live view and saves a playable MP4.</li>
-            <li><b>Real PowerShell &amp; CMD tabs</b> — Python, Git, <code>where</code>
-            and non-English text work like in a normal console.</li>
+            <li><b>94 commands</b> — everything the app does, now also as a
+            <a href="cli.html">scriptable command</a>.</li>
+            <li><b>Device files</b> — <code>ls</code>, <code>rm</code>, <code>mv</code>,
+            <code>cp</code> and <code>edit</code> a device file in your own editor.</li>
+            <li><b>Built for IVI</b> — <code>--display N</code>, saved targets with
+            <code>-s @name</code>, and <code>--json</code> on every command.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.0.0</span> Smarter &amp; calmer</h3>
+          <h3><span class="ver">v2.1.0</span> Phone &amp; terminal</h3>
           <ul>
-            <li><b>Device type detection</b> — car, head unit, TV, watch, tablet or
-            phone; cars get the IVI-compatible screen profile.</li>
-            <li><b>Calmer themes</b> — Graphite / Porcelain plus Mocha, Forest, Plum
-            and Deep teal pairs; light themes are easy on the eyes.</li>
-            <li><b>Clear notifications</b> — a small toast for every action and a red
-            popup (with Copy) for errors.</li>
+            <li><b>Phone tab on head units</b> — no more errors on customised units;
+            it opens the unit's own phone app when there's no standard dialler.</li>
+            <li><b>The real prompt</b> — the terminal shows the device's own
+            <code>user@host</code>, just like <code>adb shell</code>.</li>
+            <li><b>Faster to find</b> — the new CLI page has live command search.</li>
           </ul>
         </div>
       </div>
@@ -153,9 +152,9 @@
           <div class="ic">📱</div>
           <h3>Mirroring &amp; capture</h3>
           <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
-          IVI units. The automotive <strong>IVI display wall</strong> previews all
-          displays together with per-display controls, or use the device
-          <strong>camera</strong>.
+          IVI units. The <strong>IVI Displays</strong> tab shows every display of a
+          head unit live at once — centre stack, cluster, passenger — or use the
+          device <strong>camera</strong>.
           Screenshots and recording that work over RDP.</p>
         </div>
 
@@ -245,7 +244,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-2.0.0-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-2.1.0-win64.exe</code> from the latest release
           and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
           on first run and adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>
@@ -283,6 +282,7 @@
 turboadb -s SERIAL \
   shell -- getprop ro.product.model
 turboadb -s SERIAL screenshot shot.png</code></pre></div>
+          <p class="muted"><a href="cli.html">All 70 commands →</a></p>
         </div>
         <div>
           <h3>Python</h3>

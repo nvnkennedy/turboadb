@@ -3,6 +3,86 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 2.1.0
+
+- The Android terminal's prompt copies the device's own `user@host`, as
+  `adb shell` shows it (for example `root@adelegg` on a head unit or
+  `shell@V2318` on a phone), instead of `adb@` followed by the model name.
+- The display picker lists every display (number, name and size, for example
+  `Display 2 · Instrument cluster · 1920x720`) as soon as a device connects,
+  instead of only "default display" until Manage displays was opened. Displays
+  are listed over adb (`cmd display get-displays`, else `dumpsys display`), so
+  connecting never starts scrcpy. `ADBHandler.list_displays()` gained
+  `method="auto" | "adb" | "scrcpy"` and returns each display's `name`.
+- The IVI Displays tab (also added for any device with several displays) shows
+  every display live and controllable side by side, replacing the separate
+  window of 2-fps previews whose Control button opened yet another window. The
+  displays start one after another the first time the tab opens; each has its
+  own Start / Stop, Separate window, screenshot and Record, **Focus** shows only
+  one display, and Start all / Stop all / Rescan sit at the top. Options → All
+  displays opens the tab.
+- Phone tab on customised head units: it first checks what the device has
+  (`ADBHandler.phone_support()`, `turboadb phone-support`) instead of showing
+  errors. No telephony is a grey "No telephony" with no warnings; a missing call
+  log or SMS store says "No call history / No messages on this device"; with no
+  standard phone app, Call, Open in dialler and Compose are disabled and an
+  "Open …" button starts the head unit's own phone app. `dial()`, `call()` and
+  `send_sms()` now say "No app on this device handles …" instead of failing
+  silently or with "device rejected the command".
+- A complete command-line reference: `CLI.md` and a new website page
+  (`docs/cli.html`, with live command search) document every command with
+  its options, examples, global options, JSON output, exit codes and
+  environment variables. A test keeps both in step with the parser.
+- The CLI now covers everything the app does (94 commands):
+  - **Device files:** `ls`, `mkdir`, `touch`, `rm [-r]`, `mv [-f]`, `cp`, `stat`,
+    and `edit` (open a device text file in a local editor; it is saved back only
+    when changed, keeping its permissions).
+  - **Devices:** `state`, `serialno`, `ip`, `wait [SECONDS]`, `adb -- ARGS`
+    (any adb command for the selected device), `discover --connect`, and saved
+    targets (`targets list|add|remove|export|import`, then `-s @NAME`).
+  - **Shell:** `shell` with no command opens an interactive shell; `shell --all`
+    runs a command on every device; `shell --batch FILE [--keep-going]`.
+  - **Logs:** `logcat --filter TAG:LEVEL`, `--grep REGEX`, `--crashes`.
+  - **Apps:** `start-activity` with `--action` / `--data` / `--es` / `--ei` /
+    `--ez`, `activity`, `grant`, `revoke`, `install --test`, and
+    `packages --enabled --disabled --path`.
+  - **Screens and input:** `displays`, `--display N` on `screenshot`, `record`,
+    `key`, `text`, `tap`, `swipe` and `scroll`; `record --continuous` (past the
+    3-minute cap, in parts); `tap X Y`, `swipe`, several keys in one `key`, and
+    `key --longpress`; `brightness --get / --level / --step`;
+    `notifications expand|collapse`; `mobile-data on|off`.
+  - **scrcpy:** `--display-id`, `--compat` (the head-unit profile),
+    `--video-codec`, `--crop`, `--render-driver`, `--keyboard`,
+    `--force-adb-forward`, `--record-format`, `--no-playback`, `--no-stay-awake`,
+    `--show-touches`, `--fullscreen`, `--always-on-top`, `--window-borderless`,
+    `--window-title` and `--log FILE`.
+  - **Status:** `getprop [NAME]`, `call-state`, `health --full -o FILE`,
+    `build-info --full -o FILE`.
+  - **System:** `reboot fastboot`, `reboot --wait`, `disable-verity --reboot` /
+    `enable-verity --reboot`, and `mount-rw [PATH]`.
+  - **Forwarding:** `forward` / `reverse --list`, `--remove SPEC`,
+    `--remove-all` and `--no-wait`.
+  - **Sharing and updates:** `serve --status` / `--stop`, `deploy-serve --ssl`,
+    `self-update --check`.
+  - **Open:** `open youtube` (also `maps`, `spotify`, `browser`, `play-store`).
+- The engine gained the matching methods: `list_dir`, `make_dir`, `touch`,
+  `remove`, `move`, `copy`, `stat_path`, `chmod`, `list_reverses`,
+  `remove_reverse`, `remove_forward`, `remove_all_reverses`, `battery_status`,
+  `build_properties`, `interactive_shell` and `wait_for_boot`. The Files tab's
+  device-shell helpers moved to `turboadb.remotefs` so the CLI and the GUI share
+  them.
+- CLI fixes:
+  - `logcat --dump --tail N` printed the whole buffer; it now prints the last N
+    lines.
+  - `--timeout` now also limits push, pull and bugreport.
+  - `--scrcpy-path` is accepted.
+  - `--json` is honoured by every command that prints a result, instead of being
+    silently ignored by most of them.
+- Device Control on a big monitor: the controls sit beside the screen or in a
+  strip below it, whichever shows the device screen larger, and beside a wide
+  head-unit screen they stay one narrow column instead of taking a third of
+  the window.
+
 ## 2.0.0
 
 A redesigned app, the Windows executable back inside the pip package, and a

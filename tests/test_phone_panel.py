@@ -312,7 +312,17 @@ def test_selected_message_prefills_compose_and_composes(qapp, make_panel):
 
 
 def test_call_state_failure_shows_no_telephony(qapp, make_panel):
+    # No telephony service at all (a head unit): shown calmly, without a warning.
     handler = FakePhone(state_error="Can't find service: telephony.registry")
+    panel = make_panel(handler)
+    panel.refresh()
+    assert _pump(qapp, lambda: panel.call_state_text() == "No telephony")
+    assert (panel.state_pill.property("state") or "") == ""
+    assert not any(m.startswith(("[WARNING]", "[ERROR]")) for m in panel.logs)
+
+
+def test_unexpected_call_state_failure_warns_once(qapp, make_panel):
+    handler = FakePhone(state_error="adb: device offline")
     panel = make_panel(handler)
     panel.refresh()
     assert _pump(qapp, lambda: panel.call_state_text() == "No telephony")
@@ -320,6 +330,79 @@ def test_call_state_failure_shows_no_telephony(qapp, make_panel):
     warnings = [m for m in panel.logs if m.startswith("[WARNING]")]
     assert len(warnings) == 1 and "Call state unavailable" in warnings[0]
     assert not any(m.startswith("[ERROR]") for m in panel.logs)
+
+
+class FakeHeadUnit(FakePhone):
+    """A customised head unit: no telephony, no dialler, no call log, its own phone app."""
+
+    NO_CALL_LOG = (
+        "Error while accessing provider:call_log\n"
+        "java.lang.IllegalArgumentException: Unknown authority call_log"
+    )
+
+    def __init__(self, support=None, **kwargs):
+        kwargs.setdefault("calls_error", self.NO_CALL_LOG)
+        kwargs.setdefault("sms_error", "Error while accessing provider:sms")
+        kwargs.setdefault("state_error", "Can't find service: telephony.registry")
+        super().__init__(**kwargs)
+        self.support = support if support is not None else {
+            "telephony": False, "dialer": "", "caller": "", "messages": "",
+            "phone_apps": ["com.oem.btphone"],
+        }
+
+    def phone_support(self, *, safe=None):
+        self.invoked.append(("phone_support",))
+        return _ok("phone_support", dict(self.support))
+
+    def start_app(self, package, *, safe=None):
+        self.invoked.append(("start_app", package))
+        return _ok("start_app", True)
+
+
+def test_head_unit_without_a_phone_app_shows_no_errors(qapp, make_panel):
+    """Issue: on a customised head unit the Phone tab showed errors (no phone app)."""
+    handler = FakeHeadUnit()
+    panel = make_panel(handler)
+    panel.refresh()
+    assert _pump(qapp, lambda: panel.calls_empty.title.text() == "No call history on this device"
+                 and panel.sms_empty.title.text() == "No messages on this device")
+    assert panel.call_state_text() == "No telephony"
+    assert (panel.state_pill.property("state") or "") == ""  # expected, not a fault
+    assert "call_state" not in handler.names()  # no telephony: nothing to poll
+    assert not any(m.startswith(("[ERROR]", "[WARNING]")) for m in panel.logs)
+
+    panel.number.setText("+15550100")
+    assert not panel.btn_call.isEnabled() and not panel.btn_dial.isEnabled()
+    panel.number.returnPressed.emit()  # Enter doesn't try the missing dialler
+    assert not panel.app_notice.isHidden()
+    assert panel.btn_phone_app.text() == "Open com.oem.btphone"
+    panel.btn_phone_app.click()
+    assert _pump(qapp, lambda: ("start_app", "com.oem.btphone") in handler.invoked)
+    assert "dial" not in handler.names() and "call" not in handler.names()
+
+    panel.show_page(panel.PAGE_MESSAGES)
+    panel.sms_to.setText("+15550100")
+    assert not panel.btn_compose.isEnabled()
+
+
+def test_device_with_standard_phone_apps_keeps_the_dialler(qapp, make_panel):
+    handler = FakeHeadUnit(
+        support={
+            "telephony": True,
+            "dialer": "com.android.dialer/.Main",
+            "caller": "com.android.server.telecom/.UserCallActivity",
+            "messages": "com.android.messaging/.Main",
+            "phone_apps": ["com.android.dialer"],
+        },
+        calls_error=None, sms_error=None, state_error=None,
+    )
+    panel = make_panel(handler)
+    panel.refresh()
+    assert _pump(qapp, lambda: _loaded(panel))
+    assert panel.app_notice.isHidden()
+    assert _pump(qapp, lambda: "call_state" in handler.names())
+    panel.number.setText("+15550100")
+    assert panel.btn_call.isEnabled() and panel.btn_dial.isEnabled()
 
 
 def test_unknown_call_state_also_shows_no_telephony(qapp, make_panel):

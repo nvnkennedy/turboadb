@@ -62,6 +62,7 @@ _SECTION_ICONS = {
     "Webcam": ("video", "red"),
     "Phone": ("phone", "green"),
     "IVI Displays": ("car", "pink"),
+    "Displays": ("screen-control", "pink"),
 }
 
 
@@ -380,27 +381,45 @@ class _ReconnectThread(QThread):
 
 
 class _PromptThread(QThread):
-    """Fetch the shell's root state without blocking the UI.
+    """Ask the device shell who and where it is, without blocking the UI.
 
-    The prompt always shows the session's stable device name, so no device
-    name query is made here.
+    The prompt copies the device's own ``user@host`` (``root@adelegg``,
+    ``shell@V2318``): the user from ``id -un`` and the host the way Android's
+    shell sets ``HOSTNAME``, falling back to ``ro.product.device``. The
+    friendly model name is for the banner, not the prompt.
     """
-    ready = pyqtSignal(bool)
+    ready = pyqtSignal(bool, str)
+
+    COMMAND = 'echo "$(id -u)|$(id -un 2>/dev/null)|${HOSTNAME:-$(getprop ro.product.device)}"'
 
     def __init__(self, handler):
         super().__init__()
         self.handler = handler
 
+    @staticmethod
+    def parse(text):
+        """``"0|root|adelegg"`` -> ``(True, "root@adelegg")``; ``(root, "")`` if unknown."""
+        lines = (text or "").strip().splitlines()
+        parts = [part.strip() for part in lines[-1].split("|")] if lines else []
+        if len(parts) != 3 or not parts[0].isdigit():
+            return False, ""
+        uid, user, host = parts
+        root = uid == "0"
+        if not host:
+            return root, ""
+        return root, f"{user or ('root' if root else 'shell')}@{host}"
+
     def run(self):
-        root = False
+        root, identity = False, ""
         try:
-            res = self.handler.shell("id -u", timeout=3.0, safe=True)
+            res = self.handler.shell(self.COMMAND, timeout=3.0, safe=True)
             value = res.value if isinstance(res, OperationResult) else res
-            if not isinstance(res, OperationResult) or res.success:
-                root = bool(value is not None and value.ok and value.text.strip() == "0")
+            ok = not isinstance(res, OperationResult) or res.success
+            if ok and value is not None and value.ok:
+                root, identity = self.parse(value.text)
         except Exception:
             pass
-        self.ready.emit(root)
+        self.ready.emit(root, identity)
 
 
 class _TerminalWidgetBase(QWidget):
@@ -1363,7 +1382,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if focus:
             self.term.setFocus(Qt.OtherFocusReason)
 
-        self.term.set_prompt(self.device_name, root=False)
+        self.term.set_prompt(self._prompt_identity(False), root=False)
         if not self._banner_shown and self.term._alive and not (
             self._info.get("kind") or self._banner_waited
         ):
@@ -1515,11 +1534,20 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             theme.ECHO_WARN,
         )
 
-    def _on_prompt(self, is_root):
-        # The prompt's label is the same stable identity used in the banner;
-        # only the root marker comes from the device.
+    def _on_prompt(self, is_root, identity=""):
+        # The prompt copies the device's own user@host (root@adelegg), not the
+        # friendly model name shown in the banner.
+        if identity:
+            self._prompt_id = identity
         if not self._closing:
-            self.term.set_prompt(self.device_name, is_root)
+            self.term.set_prompt(self._prompt_identity(is_root), is_root)
+
+    def _prompt_identity(self, root=False):
+        """The device's ``user@host`` once known, else ``shell@<codename>``."""
+        if getattr(self, "_prompt_id", ""):
+            return self._prompt_id
+        host = (self._info or {}).get("device") or "android"
+        return f"{'root' if root else 'shell'}@{host}"
 
     def _send(self, data: bytes):
         if self.session and self.session.running:
@@ -1721,6 +1749,109 @@ class ShellPanel(QWidget):
         self.android_widget.close_panel()
         self.ps_widget.close_panel()
         self.cmd_widget.close_panel()
+
+
+def choose_control_layout(width, height, aspect, side_width, strip_height, current="side", margin=1.08):
+    """``"side"`` or ``"below"``: where the device controls go so the device
+    screen (*aspect* = width / height) is shown largest in a *width* x *height*
+    area. The current choice is kept unless the other is clearly (*margin*)
+    larger, so resizing near the boundary doesn't flip back and forth."""
+    aspect = aspect if aspect and aspect > 0 else 16.0 / 9.0
+    side = min(max(0.0, width - side_width), max(0.0, height) * aspect)
+    below = min(max(0.0, width), max(0.0, height - strip_height) * aspect)
+    if current == "below":
+        return "side" if side > below * margin else "below"
+    return "below" if below > side * margin else "side"
+
+
+class _ControlView(QWidget):
+    """Device Control: the device screen with its controls beside or below it.
+
+    The controls go wherever the screen ends up larger for this window and the
+    screen's shape: a portrait phone keeps them at the side, a wide head-unit
+    screen in a wide window gets them as a strip below. Beside the screen, the
+    screen gets all the width it can use and the controls the rest, so a
+    landscape screen is never squeezed by a two-column controls panel.
+    """
+
+    SIDE_WIDTH = 360  # the controls' single-column width
+    SCREEN_MIN = 480  # beside the controls: keeps the screen toolbar to two rows
+    STRIP_MAX = 0.45  # a strip never takes more than this share of the height
+
+    def __init__(self, mirror, screen_card, controls, controls_card, parent=None):
+        super().__init__(parent)
+        self.mirror = mirror
+        self.screen_card = screen_card
+        self.controls = controls
+        self.controls_card = controls_card
+        self.mode = "side"
+        self._user_sized = False
+        self._applying = False
+
+        self.split = QSplitter(Qt.Horizontal)
+        self.split.setHandleWidth(6)
+        self.split.addWidget(screen_card)
+        self.split.addWidget(controls_card)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        self.split.setSizes([700, self.SIDE_WIDTH])
+        self.split.setChildrenCollapsible(False)
+        self.split.splitterMoved.connect(self._on_splitter_moved)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.addWidget(self.split)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._apply)
+        mirror.display_shape_changed.connect(self.schedule_layout)
+
+    def schedule_layout(self, *_args):
+        self._timer.start(40)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.schedule_layout()
+
+    def _on_splitter_moved(self, *_args):
+        if not self._applying:
+            self._user_sized = True  # respect a dragged divider until the mode changes
+
+    def _apply(self):
+        width, height = self.split.width(), self.split.height()
+        if width < 200 or height < 150 or not self.controls_card.isVisibleTo(self):
+            return
+        aspect = self.mirror.display_aspect()
+        chrome = self.mirror.chrome_height() + 4  # + the screen card's frame
+        handle = self.split.handleWidth()
+        strip = min(
+            self.controls.content_height(width, strip=True) + 34,  # + the card title
+            int(height * self.STRIP_MAX),
+        )
+        mode = choose_control_layout(
+            width - handle, height - chrome, aspect, self.SIDE_WIDTH, strip + handle, current=self.mode
+        )
+        self._applying = True
+        try:
+            if mode != self.mode:
+                self.mode = mode
+                self._user_sized = False
+                self.split.setOrientation(Qt.Vertical if mode == "below" else Qt.Horizontal)
+                self.controls.set_strip(mode == "below")
+            if not self._user_sized:
+                if mode == "below":
+                    self.split.setSizes([max(1, height - strip - handle), strip])
+                else:
+                    screen = min(width - handle - self.SIDE_WIDTH, int((height - chrome) * aspect) + 4)
+                    # a narrow (portrait) screen still gets room for its toolbar,
+                    # which would otherwise wrap and shrink the screen itself
+                    floor = min(self.SCREEN_MIN, width - handle - self.SIDE_WIDTH)
+                    screen = max(self.screen_card.minimumWidth(), floor, screen)
+                    self.split.setSizes([screen, max(1, width - handle - screen)])
+        finally:
+            self._applying = False
+        QTimer.singleShot(0, self.mirror._fit)
 
 
 class _StatePill(QLabel):
@@ -2328,6 +2459,11 @@ class DeviceTab(QWidget):
             "phone": self.phone,
             "webcam": self.webcam,
         }
+        # List the displays straight away (plain adb, never scrcpy), so the
+        # Device Control picker and the displays tab have all of them from the start.
+        self.mirror_tab.displays_changed.connect(self._on_displays_found)
+        self.mirror_tab.all_displays_requested.connect(self._show_all_displays)
+        self.mirror_tab.refresh_displays(quiet=True)
 
         if info is not None and not quick:
             # Retain the direct-call path used by tests and integrations, but
@@ -2386,6 +2522,9 @@ class DeviceTab(QWidget):
         mirror = getattr(self, "mirror_tab", None)
         if mirror is not None:
             mirror.set_automotive_default(self._automotive)
+        wall = getattr(self, "display_wall", None)
+        if wall is not None:
+            wall.set_automotive(self._automotive)
         if self._automotive:
             self._add_ivi_tab()
 
@@ -2406,44 +2545,53 @@ class DeviceTab(QWidget):
                     android._info = details
 
     def _add_ivi_tab(self) -> None:
-        """Expose automotive multi-display tools as a first-class tab once the
-        device identity confirms it is an IVI/head unit."""
-        if getattr(self, "_ivi_hub", None) is not None:
-            return
+        """Show every display of a multi-display device (an IVI head unit's centre
+        stack, cluster, passenger screen…) live, side by side, in its own tab."""
         mirror = getattr(self, "mirror_tab", None)
-        if mirror is None:
+        if mirror is None or self.handler is None:
             return
-        hub = QWidget()
-        layout = QVBoxLayout(hub)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(10)
-        title = QLabel("IVI displays")
-        title.setObjectName("iviPreviewTitle")
-        layout.addWidget(title)
-        description = QLabel(
-            "This automotive device can expose a cluster, centre stack, passenger "
-            "screen and other independent displays. Open the wall to see all detected "
-            "displays together and control, maximise, capture or record each one."
+        label = "IVI Displays" if self._automotive else "Displays"
+        wall = getattr(self, "display_wall", None)
+        if wall is not None:
+            self._add_subtab(wall, "▦", label)  # e.g. automotive was detected later
+            return
+        from .display_wall import DisplayWall
+
+        wall = DisplayWall(
+            self.handler,
+            self.session,
+            automotive=self._automotive,
+            dispatcher=self._device_dispatcher,
         )
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        open_wall = QPushButton("▦ Open IVI display wall")
-        open_wall.setProperty("role", "ok")
-        open_wall.setToolTip("Show all detected IVI displays with per-display actions")
-        open_wall.clicked.connect(mirror.open_ivi_view)
-        layout.addWidget(open_wall)
-        scan = QPushButton("↻ Refresh detected displays")
-        scan.setProperty("role", "ghost")
-        scan.clicked.connect(mirror.refresh_displays)
-        layout.addWidget(scan)
-        note = QLabel("Display discovery runs in the background and never starts mirroring by itself.")
-        note.setObjectName("settingsHint")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        layout.addStretch(1)
-        self._ivi_hub = hub
-        self._add_subtab(hub, "▦", "IVI Displays")
-        self._subtabs["ivi"] = hub
+        wall.log.connect(self.log)
+        wall.rescan_requested.connect(lambda: mirror.refresh_displays())
+        self.display_wall = wall
+        self._add_subtab(wall, "▦", label)
+        self._subtabs["ivi"] = wall
+        displays = list(getattr(mirror, "_displays", None) or [])
+        if displays:
+            wall.set_displays(displays)
+        else:
+            mirror.refresh_displays(quiet=True)
+
+    def _on_displays_found(self, displays) -> None:
+        """A display scan finished: several displays (or a car) get the displays tab."""
+        displays = list(displays or [])
+        if len(displays) > 1 or self._automotive:
+            self._add_ivi_tab()
+        wall = getattr(self, "display_wall", None)
+        if wall is not None:
+            wall.set_displays(displays)
+
+    def _show_all_displays(self) -> None:
+        """Options → All displays: open the displays tab (it starts every display)."""
+        self._add_ivi_tab()
+        wall = getattr(self, "display_wall", None)
+        if wall is None:
+            return
+        self.show_subtab("ivi")
+        if not wall._tiles:
+            self.mirror_tab.refresh_displays()
 
     def _add_subtab(self, widget, emoji, label):
         # The glyph is kept for split-view pane titles; the tab itself shows the
@@ -2753,6 +2901,9 @@ class DeviceTab(QWidget):
             visible = c_card.isVisible()
             c_card.setVisible(not visible)
             btn_tog.setText("Show controls" if visible else "Hide controls")
+            view = getattr(self, "_control_view", None)
+            if view is not None:
+                view.schedule_layout()
             self.mirror_tab._fit()
 
         btn_tog.clicked.connect(toggle_device_controls)
@@ -2760,20 +2911,9 @@ class DeviceTab(QWidget):
         self._device_controls_toggle = btn_tog
         self.mirror_tab.add_toolbar_widget(btn_tog)
 
-        split = QSplitter(Qt.Horizontal)
-        split.setHandleWidth(6)
-        split.addWidget(m_card)
-        split.addWidget(c_card)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 1)
-        split.setSizes([700, 320])
-        split.setChildrenCollapsible(False)
-
-        outer = QWidget()
-        ov = QVBoxLayout(outer)
-        ov.setContentsMargins(8, 8, 8, 8)
-        ov.addWidget(split)
-        return outer
+        view = _ControlView(self.mirror_tab, m_card, self.controls, c_card)
+        self._control_view = view
+        return view
 
     def _on_fail(self, msg):
         if self._session_closed:
@@ -3153,7 +3293,7 @@ class DeviceTab(QWidget):
 
         for attr in (
             "shell", "logcat", "files", "apps", "controls",
-            "mirror_tab", "webcam", "phone",
+            "mirror_tab", "display_wall", "webcam", "phone",
         ):
             p = getattr(self, attr, None)
             if p is not None:
@@ -3165,6 +3305,12 @@ class DeviceTab(QWidget):
         if mirror is not None and hasattr(mirror, "shutdown_threads"):
             try:
                 pending_workers.extend(mirror.shutdown_threads())
+            except RuntimeError:
+                pass
+        wall = getattr(self, "display_wall", None)
+        if wall is not None:
+            try:
+                pending_workers.extend(wall.shutdown_threads())
             except RuntimeError:
                 pass
         if self._device_dispatcher is not None:

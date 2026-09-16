@@ -150,11 +150,15 @@ def test_logcat_default_no_tail(fake_adb):
     assert "-T" not in cap["args"]
 
 
-def test_logcat_dump_ignores_tail(fake_adb):
+def test_logcat_dump_tail_prints_the_last_lines(fake_adb):
+    # with --dump, -T would be ignored by logcat and print the whole buffer;
+    # -t N dumps only the last N lines
     h = ADBHandler(ADBConfig(serial="x"))
     cap = _capture_logcat_args(h)
     h.logcat(dump=True, tail=100)
-    assert "-d" in cap["args"] and "-T" not in cap["args"]
+    args = cap["args"]
+    assert "-d" in args and "-T" not in args
+    assert "-t" in args and args[args.index("-t") + 1] == "100"
 
 
 def test_logcat_buffers(fake_adb):
@@ -1422,7 +1426,7 @@ def test_console_columnize_and_prompt_provider(qapp):
     console.set_prompt_provider_fn(lambda: "TEST_PROMPT> ")
     assert console._prompt_provider_fn() == "TEST_PROMPT> "
     assert "📅" not in console._prompt_text()
-    assert "adb@" in console._prompt_text()
+    assert "shell@android" in strip_ansi(console._prompt_text())
     assert strip_ansi(AnsiConsole._style_local_prompts("PS C:\\Users\\n> ")) == "PS C:\\Users\\n> "
 
 

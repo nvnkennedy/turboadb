@@ -118,6 +118,21 @@ def _no_real_device_connect(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_ffmpeg_download(monkeypatch):
+    """A webcam panel scans for cameras when it opens, and without ffmpeg that
+    started the real ~160 MB download. The worker outlived its test and crashed
+    a later one when its signals reached deleted widgets (and slowed the suite
+    threefold). The download test re-enables it with a fake network."""
+    try:
+        from turboadb.gui import ffmpeg_tools
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(ffmpeg_tools, "_auto_download_supported", lambda: False)
+    yield
+
+
 @pytest.fixture(scope="session")
 def qapp():
     pytest.importorskip("PyQt5")
