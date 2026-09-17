@@ -20,6 +20,11 @@ os.environ["USERPROFILE"] = _TEST_HOME
 # Qt later crashed the whole run (access violation).  Tests that exercise
 # auto-fetch opt back in with monkeypatch.setenv.
 os.environ["TURBOADB_AUTO_FETCH"] = "0"
+# Qt's platform plugin is chosen once per process, by whichever test happens to
+# create the QApplication first.  Several test modules set this themselves, so a
+# GUI test could pass when run alone and crash natively in the full run.  conftest
+# is imported before any test module, so setting it here decides it for everyone.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
@@ -135,6 +140,12 @@ def _no_ffmpeg_download(monkeypatch):
 
 @pytest.fixture(scope="session")
 def qapp():
+    """The ONE QApplication for the whole pytest process.
+
+    Qt allows a single QApplication per process and fixes the platform plugin
+    when it is created, so every GUI test module must share this fixture rather
+    than build its own — competing fixtures made the outcome depend on test
+    order.  Also exposed as ``app`` for modules that used that name."""
     pytest.importorskip("PyQt5")
     from PyQt5.QtWidgets import QApplication
 
@@ -142,3 +153,9 @@ def qapp():
     if app is None:
         app = QApplication(["turboadb-test"])
     return app
+
+
+@pytest.fixture(scope="session")
+def app(qapp):
+    """Alias of :func:`qapp` (some modules ask for ``app``)."""
+    return qapp

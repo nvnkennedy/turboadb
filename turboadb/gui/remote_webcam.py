@@ -35,13 +35,16 @@ from contextlib import contextmanager
 
 from ..remote_deploy import _ensure_winrm, _session
 from ..tools import NO_WINDOW as _NO_WINDOW
-from .ffmpeg_tools import _FFMPEG_URL
+from .ffmpeg_tools import ffmpeg_url
 
 _log = logging.getLogger(__name__)
 
 DEFAULT_STREAM_PORT = 28100
 _NET_TIMEOUT_S = 20  # `net use` listing
 _SMB_CONNECT_TIMEOUT_S = 45  # an unreachable host takes ~40 s to fail
+# Pushing ~160 MB over SMB is quick on a LAN; a hung share used to block the
+# scan forever, which left "Scan cameras" greyed out for the whole session.
+_SMB_COPY_TIMEOUT_S = 300
 
 # where the pushed copy lives on the remote (admin-accessible, no profile guessing)
 _PUSH_DIR = r"C:\Windows\Temp\turboadb-ffmpeg"
@@ -232,15 +235,21 @@ def _smb_push(host, login, password, local_ffmpeg, log=None):
     remote_dir = rf"{share}\Windows\Temp\turboadb-ffmpeg"
     remote_exe = rf"{remote_dir}\ffmpeg.exe"
     with _share_connection(share, login, password):
-        os.makedirs(remote_dir, exist_ok=True)
         if log:
             log("Copying ffmpeg to the remote over the admin share (fast)…")
         # copy under a temp name + rename, so an interrupted copy never leaves
         # a truncated ffmpeg.exe that _LOCATE would then "find" forever
         part = remote_exe + f".{os.getpid()}.part"
-        try:
+
+        def copy():
+            os.makedirs(remote_dir, exist_ok=True)
             shutil.copyfile(local_ffmpeg, part)
             os.replace(part, remote_exe)
+
+        try:
+            # Only the connect was bounded before; a share that stops answering
+            # mid-copy made this call (and the scan behind it) hang for good.
+            _call_with_timeout(copy, _SMB_COPY_TIMEOUT_S)
         finally:
             try:
                 os.remove(part)
@@ -255,7 +264,7 @@ def _remote_download(host, login, password, winrm_port, log=None):
     if log:
         log("Downloading ffmpeg on the remote (one-time, ~160 MB — needs internet there)…")
     code, out, err = _run_ps(
-        host, login, password, _REMOTE_DOWNLOAD.replace("__URL__", _FFMPEG_URL), winrm_port
+        host, login, password, _REMOTE_DOWNLOAD.replace("__URL__", ffmpeg_url()), winrm_port
     )
     ff = _parse_ffmpeg(out)
     if ff:
@@ -282,11 +291,11 @@ def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
     # not there — push our LOCAL copy (like TurboSSH), fetching it locally first
     from .ffmpeg_tools import cached_ffmpeg, ensure_local_ffmpeg
 
-    local = cached_ffmpeg()
-    if not local:
-        if log:
-            log("Fetching ffmpeg locally first (one-time)…")
-        local = ensure_local_ffmpeg(log or (lambda m: None))
+    if not cached_ffmpeg() and log:
+        log("Fetching ffmpeg locally first (one-time)…")
+    # ensure_local_ffmpeg returns the cached copy, but only after re-checking the
+    # SHA-256 recorded beside it — never push an unverified binary to a host.
+    local = ensure_local_ffmpeg(log or (lambda m: None))
 
     smb_err = ""
     try:

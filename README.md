@@ -16,12 +16,11 @@
 
 ---
 
-> **New in 2.1.0:** every display of a head unit live side by side in the
-> **Displays** tab, a Device Control layout that uses big monitors, a Phone tab
-> that works on customised head units, the device's real `user@host` prompt, and
-> a complete command line — 94 commands, including device files (`ls`, `rm`,
-> `mv`, `edit`), `--display N`, saved targets (`-s @name`) and `--json` on every
-> command. Full notes in the
+> **New in 2.2.2:** an ADB screencap renderer for builds where scrcpy can't
+> run, controls on every IVI display, Black and White themes, multi-line paste
+> that works in every terminal, call history on Android Automotive, a theme
+> toggle that remembers your dark and light choice, far fewer adb processes, and
+> less memory — plus a full code-review pass. Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -58,7 +57,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-2.1.0-win64.exe`** from the
+1. Download **`TurboADB-2.2.2-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
@@ -145,9 +144,10 @@ abort a run.
   PC's devices, stop sharing), **Tools ▾** (check for updates, reinstall ADB and
   scrcpy, open the host webcam, create shortcuts), then icons for the theme, the
   log panel, settings and help.
-- **Devices sidebar** — **Connected** devices and **Saved targets**. Type in the
-  search box to filter or quick-connect to a host; hide the sidebar with **‹** or
-  Ctrl+B.
+- **Devices sidebar** — **Connected** devices and **Saved targets**. Every device
+  you connect is saved as a target automatically (named after the device, never
+  twice; turn this off in **Settings → Startup**). Type in the search box to
+  filter or quick-connect to a host; hide the sidebar with **‹** or Ctrl+B.
 - **Device tabs** — every device gets **Terminal**, **Logcat**, **Files**,
   **Device Control**, **Apps**, **Phone** and **Webcam** (plus **IVI Displays**
   on cars and multi-display devices). **Screen ▾**, **Screenshot**, **Reboot ▾** and **More ▾** sit at the
@@ -158,10 +158,12 @@ abort a run.
 - **Device type** — TurboADB detects Android Automotive, an infotainment head
   unit, TV, watch, tablet or phone and shows it in the terminal's welcome banner.
   Cars get the IVI-compatible screen profile and the **IVI Displays** tab.
-- **Themes** — Graphite (dark) and Porcelain (light) by default, plus Mocha /
-  Latte, Forest / Sage, Plum / Rose and Deep teal / Mint. The top-bar icon
-  switches to the other half of the pair; pick any theme from the **Themes** menu
-  or **Settings → Themes**.
+- **Themes** — Graphite (dark) and Porcelain (light) by default, plus Black /
+  White, Slate / Mist (cool blue-grey), Night / Paper (a warm reading pair) and
+  Mocha / Latte — all with softened text and muted accents, never pure black or
+  glaring white. The top-bar sun or moon switches between your last dark and
+  your last light theme (pick Slate, and it toggles Slate ↔ Porcelain); its
+  arrow, the **Themes** menu and **Settings → Themes** pick any theme directly.
 - **Notifications** — every action shows in the status bar and a small toast;
   errors show a red popup with a sound and a **Copy** button. The log panel (its
   top-bar icon) filters Normal, Verbose, Warnings + Errors or Errors only.
@@ -187,12 +189,16 @@ columns.
 two-line banner at the top shows the connection, device type, Android version,
 CPU and serial. Right-click for Copy / Paste / **Send key** / **Save full output
 to file…**; **Stop** (or Ctrl+C) halts whatever is running. **A−** / **A+** (or
-Ctrl + mouse wheel) resize every terminal together.
+Ctrl + mouse wheel) resize every terminal together (12 pt by default).
 
 The **Android / PowerShell / CMD** switcher at the left of the toolbar opens
 PowerShell or Command Prompt on this PC, with TurboADB's `adb` first on PATH and
 `ANDROID_SERIAL` set to the device. They behave like a normal console: Python,
-Node, Git, `where` and programs in the current folder all work.
+Node, Git, `where` and programs in the current folder all work. **Stop** ends the
+running command and opens a fresh shell in the same folder. Inside an `adb shell`
+typed there, Stop sends Ctrl+C to the device instead: only the device command
+stops and you stay in adb shell. If that command ignores it, Stop again reopens
+adb shell in the same device folder.
 
 **CLI** — one-shot commands (everything after `--` goes to the device):
 
@@ -395,7 +401,7 @@ to show it in the tab or **Separate window** (**Screen ▾** beside the section
 tabs does the same from any tab). Click the screen and type on your PC keyboard.
 The toolbar also has **Stop**, a screenshot icon, **Record…**, **Audio on / off**,
 **Options**, **Maximize view** and **Hide controls** (hides the controls without
-stopping the screen). The controls sit beside the screen or in a strip below it,
+stopping the screen; it works while maximized too). The controls sit beside the screen or in a strip below it,
 whichever shows the screen larger for your window and the screen's shape.
 
 The display picker lists every display by number, name and size (for example
@@ -413,7 +419,17 @@ and latency in **Settings → scrcpy**.
 live and controllable, side by side, each with its own Start / Stop, Separate
 window, screenshot and Record. The displays start one after another the first
 time you open the tab. **Start all**, **Stop all** and **Rescan** are at the top,
-and **Focus** on a display shows only that one until you click it again.
+and **Maximize** on a display shows only that one (**Restore** or Esc brings the
+grid back). Each
+display has its own Back, Home, Recents, volume, mute, power and screenshot
+buttons, sent to that display.
+
+**When scrcpy won't run** — some builds can't run scrcpy at all. **Settings →
+scrcpy → Screen renderer → ADB screencap** (or **Options → Renderer** on one
+screen) shows the device through `adb screencap` instead: it finds the display
+through `dumpsys display`, streams frames over one adb connection (a few frames a
+second), and still supports tap, drag, long-press, scrolling and typing.
+**Record** records on the device with `screenrecord` instead, so it works without scrcpy too.
 
 **CLI**:
 
@@ -674,6 +690,7 @@ the host(s) + admin credentials, **Test connection**, then **Deploy**.
 ```bash
 turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user"
 turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --test   # just check WinRM first
+turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --password-stdin < pw.txt  # never in argv
 ```
 
 **Python**:

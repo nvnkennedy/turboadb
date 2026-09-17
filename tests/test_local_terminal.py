@@ -11,7 +11,6 @@ import time
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="spawns cmd.exe / powershell.exe")
 

@@ -25,8 +25,12 @@ TurboADB command-line interface (fully argument-driven).
 
 Network targets: pass ``-s host:port`` (or use ``connect`` first). USB: omit
 ``-s`` for the only device, or pass its serial. The shared flags (``-s``,
-``--adb-path``, ``--adb-host``, ``--adb-port``, ``--timeout``, ``--json``) work
-before or after the subcommand.
+``--adb-path``, ``--scrcpy-path``, ``--adb-host``, ``--adb-port``,
+``--timeout``, ``--json``) work before or after the subcommand.
+
+The setup commands (``doctor``, ``fetch-tools``, ``upgrade-tools``,
+``self-update``, ``shortcut``, ``gui`` and ``deploy-serve``) drive no device, so
+of the shared flags they take only ``--json`` (also before or after the name).
 """
 
 from __future__ import annotations
@@ -254,17 +258,14 @@ def create_shortcut(argv=None) -> int:
     present = [loc for loc, path, _maker in _shortcut_paths() if os.path.exists(path)]
     failed = [loc for loc, ok in res.items() if not ok]
     if present and not failed:
-        print(f"Created/refreshed the 'TurboADB' shortcut ({' and '.join(present)}).")
-        return 0
+        return _report(True, f"Created/refreshed the 'TurboADB' shortcut ({' and '.join(present)}).", "")
     if present:
-        print(
+        return _report(
+            False, "",
             f"Shortcut ready in {' and '.join(present)}, but could not create it in "
             f"{' and '.join(failed)}.",
-            file=sys.stderr,
         )
-        return 1
-    print("Could not create the shortcut.", file=sys.stderr)
-    return 1
+    return _report(False, "", "Could not create the shortcut.")
 
 
 def _staged_exe(src: str) -> str:
@@ -408,6 +409,14 @@ def _handler(args, **overrides) -> ADBHandler:
     return ADBHandler(_config(args, **overrides))
 
 
+def _server_devices(cfg: ADBConfig) -> list:
+    """The devices on the adb server *cfg* points at — the local one, or the
+    remote server of an ``--adb-host`` / ``-s @saved-remote`` target."""
+    return list_devices(
+        cfg.adb_path, server_host=cfg.adb_server_host, server_port=cfg.adb_server_port
+    )
+
+
 def _output(args, obj) -> None:
     if getattr(args, "json", False):
         if isinstance(obj, (CommandResult, TransferResult)):
@@ -445,6 +454,17 @@ def build_parser() -> argparse.ArgumentParser:
         _add_target(p)
         return p
 
+    def setup_cmd(name, help_text):
+        """A command that drives no device but still honours --json. It gets
+        only that one shared flag, with a SUPPRESS default so it works both
+        before and after the command name (see _add_target)."""
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument(
+            "--json", action="store_true", default=argparse.SUPPRESS,
+            help="emit machine-readable JSON",
+        )
+        return p
+
     def display_opt(p):
         p.add_argument(
             "--display", type=int, default=None, metavar="N",
@@ -457,26 +477,26 @@ def build_parser() -> argparse.ArgumentParser:
         return p
 
     # --- setup and tools ---
-    sub.add_parser("doctor", help="report whether adb/scrcpy were found")
+    setup_cmd("doctor", "report whether adb/scrcpy were found")
 
-    p_fetch = sub.add_parser("fetch-tools", help="download adb (+scrcpy) into ~/.turboadb/tools")
-    p_fetch.add_argument("--adb-only", action="store_true")
-    p_fetch.add_argument("--scrcpy-only", action="store_true")
+    p_fetch = setup_cmd("fetch-tools", "download adb (+scrcpy) into ~/.turboadb/tools")
+    # asking for both left nothing to download (and exited 1 without saying why)
+    p_only = p_fetch.add_mutually_exclusive_group()
+    p_only.add_argument("--adb-only", action="store_true")
+    p_only.add_argument("--scrcpy-only", action="store_true")
     p_fetch.add_argument("--force", action="store_true", help="re-download even if already cached")
 
-    p_upg = sub.add_parser(
-        "upgrade-tools", help="check for newer adb/scrcpy and update only if newer"
-    )
+    p_upg = setup_cmd("upgrade-tools", "check for newer adb/scrcpy and update only if newer")
     p_upg.add_argument("--check", action="store_true", help="only report versions; don't download")
 
-    p_self = sub.add_parser(
-        "self-update", help="upgrade TurboADB itself (pip) + adb/scrcpy to the latest"
+    p_self = setup_cmd(
+        "self-update", "upgrade TurboADB itself (pip) + adb/scrcpy to the latest"
     )
     p_self.add_argument(
         "--check", action="store_true", help="only report whether a newer TurboADB exists"
     )
-    sub.add_parser("shortcut", help="create Desktop + Start-menu shortcuts to the GUI")
-    sub.add_parser("gui", help="launch the desktop GUI")
+    setup_cmd("shortcut", "create Desktop + Start-menu shortcuts to the GUI")
+    setup_cmd("gui", "launch the desktop GUI")
 
     # --- devices and connection ---
     device_cmd("devices", "list devices on the local (or a remote) adb server")
@@ -911,9 +931,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--status", action="store_true", help="report whether the adb server is shared"
     )
 
-    p_deploy = sub.add_parser(
+    p_deploy = setup_cmd(
         "deploy-serve",
-        help="install/start 'turboadb serve' on remote Windows host(s) over WinRM "
+        "install/start 'turboadb serve' on remote Windows host(s) over WinRM "
         "(NTLM) — the same as the GUI 'ADB Server' button",
     )
     p_deploy.add_argument("hosts", nargs="+", help="remote hostname(s) or IP(s)")
@@ -921,7 +941,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-u", "--user", required=True, help="admin login, DOMAIN\\user (local admin on targets)"
     )
     p_deploy.add_argument(
-        "-p", "--password", default=None, help="password (omit to be prompted securely)"
+        "-p", "--password", default=None,
+        help="password — visible in the process list and shell history; "
+        "prefer --password-stdin, $TURBOADB_DEPLOY_PASSWORD, or the secure prompt",
+    )
+    p_deploy.add_argument(
+        "--password-stdin", action="store_true", help="read the password from standard input"
     )
     p_deploy.add_argument(
         "--port", type=int, default=5037, help="adb server port on the targets (default 5037)"
@@ -1046,13 +1071,30 @@ def _saved(path) -> None:
 
 
 def _write_report(text: str, output) -> int:
-    """Print a long report, or save it to *output*."""
-    if not output:
-        print(text)
+    """Print a long report, or save it to *output*. With --json it is one
+    object either way: ``{"ok": true, "report": …}`` or ``{"ok": true, "path": …}``."""
+    if output:
+        with open(output, "w", encoding="utf-8") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+        _saved(output)
         return 0
-    with open(output, "w", encoding="utf-8") as fh:
-        fh.write(text if text.endswith("\n") else text + "\n")
-    _saved(output)
+    if _JSON["on"]:
+        print(json.dumps({"ok": True, "report": text}, default=str, indent=2))
+    else:
+        print(text)
+    return 0
+
+
+def _snapshot(args, report, data, summary) -> int:
+    """`health` / `build-info`: --full writes the long report (to -o, or stdout),
+    --json prints the machine-readable dict, otherwise the human summary. The
+    three are callables so only the one that's wanted queries the device."""
+    if args.full:
+        return _write_report(report(), args.output)
+    if _JSON["on"]:
+        print(json.dumps(data(), indent=2))
+    else:
+        print(summary())
     return 0
 
 
@@ -1070,17 +1112,18 @@ def _shell_all(args) -> int:
         print("shell --all needs a command, e.g.: turboadb shell --all -- getprop ro.product.model",
               file=sys.stderr)
         return 2
-    devs = [
-        d
-        for d in list_devices(args.adb_path, server_host=args.adb_host, server_port=args.adb_port)
-        if d.state == "device"
-    ]
+    # Enumerate on the SAME server the commands will run on: -s @saved-name may
+    # point at a remote adb server, and local serials mean nothing there.
+    cfg = _config(args, serial=None)
+    devs = [d for d in _server_devices(cfg) if d.state == "device"]
     if not devs:
         print("No online devices.", file=sys.stderr)
         return 1
     results, rc = [], 0
     for d in devs:
-        res = _handler(args, serial=d.serial).shell(command, su=args.su)
+        # host=None so the enumerated serial is the target even when the saved
+        # target is a network device
+        res = _handler(args, serial=d.serial, host=None).shell(command, su=args.su)
         if not res.ok:
             rc = 1
         if _JSON["on"]:
@@ -1144,43 +1187,21 @@ def _forwarding(dev, args) -> int:
 
 
 def _edit(dev, args) -> int:
-    """`edit PATH`: pull a device text file, open it in a local editor, and push
-    it back (keeping its permissions) only when it was changed."""
-    import shlex
-    import tempfile
+    """`edit PATH`: open a device text file in a local editor and save it back.
 
-    info = dev.stat_path(args.path)
-    if not str(info["type"]).startswith("regular"):
-        print(f"ERROR: {info['path']} is not a regular file ({info['type']})", file=sys.stderr)
-        return 1
-    real = info["real_path"]
+    Choosing and running the editor is the CLI's job; the pull / push / restore
+    the file mode / clean up dance is :meth:`ADBHandler.edit_file`'s."""
+    import shlex
+
     editor = (args.editor or os.environ.get("VISUAL") or os.environ.get("EDITOR")
               or ("notepad" if os.name == "nt" else "vi"))
     command = [editor] if os.path.exists(editor) else shlex.split(editor, posix=os.name != "nt")
-    suffix = os.path.splitext(real)[1]
-    fd, tmp = tempfile.mkstemp(prefix="turboadb-edit-", suffix=suffix)
-    os.close(fd)
-    try:
-        dev.pull(real, tmp)
-        with open(tmp, "rb") as fh:
-            before = fh.read()
-        code = subprocess.call(command + [tmp])
-        if code != 0:
-            print(f"The editor exited with {code}; {real} was not changed.", file=sys.stderr)
-            return 1
-        with open(tmp, "rb") as fh:
-            after = fh.read()
-        if after == before:
-            return _report(True, f"No changes — {real} was not changed.", "")
-        dev.push(tmp, real)
-        if info.get("mode"):
-            dev.chmod(real, info["mode"])  # adb push resets the file mode
-        return _report(True, f"Saved {real}", "")
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    res = dev.edit_file(args.path, lambda tmp: subprocess.call(command + [tmp]), editor=editor)
+    if res["editor_exit"]:
+        return _report(False, "", f"the editor exited with {res['editor_exit']}")
+    if res["changed"]:
+        return _report(True, f"Saved {res['path']}", "")
+    return _report(True, f"No changes — {res['path']} was not changed.", "")
 
 
 def _targets(args) -> int:
@@ -1235,33 +1256,37 @@ def _targets(args) -> int:
 def _record(dev, args) -> int:
     """`record`: Ctrl+C stops the recording EARLY and still pulls a playable
     MP4. --continuous records back-to-back parts past Android's 3-minute cap
-    until Ctrl+C."""
+    until Ctrl+C. A part that fails after the first one was saved is still an
+    error (exit 1) — the parts that made it are listed either way."""
     import threading
 
     stop = threading.Event()
-    result = {"paths": []}
+    done, result = [], {}
 
     def work():
-        base, ext = os.path.splitext(args.path)
-        ext = ext or ".mp4"
-        part = 0
         try:
-            while True:
-                path = args.path if part == 0 else f"{base}-part{part + 1:02d}{ext}"
-                result["paths"].append(
+            if args.continuous:
+                result["paths"] = dev.screen_record_continuous(
+                    args.path,
+                    part_seconds=180,
+                    size=args.size,
+                    bit_rate=args.bit_rate,
+                    display_id=args.display,
+                    stop_event=stop,
+                    on_part=done.append,  # what survives a failing later part
+                )
+            else:
+                result["paths"] = [
                     dev.screen_record(
-                        path,
-                        time_limit=180 if args.continuous else args.time_limit,
+                        args.path,
+                        time_limit=args.time_limit,
                         size=args.size,
                         bit_rate=args.bit_rate,
                         display_id=args.display,
                         stop_event=stop,
                     )
-                )
-                part += 1
-                if not args.continuous or stop.is_set():
-                    break
-        except BaseException as exc:  # re-raised on the main thread
+                ]
+        except BaseException as exc:  # re-raised / reported on the main thread
             result["error"] = exc
 
     worker = threading.Thread(target=work, name="turboadb-record", daemon=True)
@@ -1277,11 +1302,22 @@ def _record(dev, args) -> int:
         print("\nStopping the recording and saving it…", file=sys.stderr)
         stop.set()
         worker.join()  # a second Ctrl+C aborts outright
-    if "error" in result and not result["paths"]:
-        raise result["error"]
-    for path in result["paths"]:
-        _saved(path)
-    return 0
+    paths = [str(p) for p in (result.get("paths") or done)]
+    error = result.get("error")
+    if error is not None and not paths:
+        raise error
+    if _JSON["on"]:
+        # ONE document, however many parts were recorded
+        out = {"ok": error is None, "paths": paths}
+        if error is not None:
+            out["error"] = str(error)
+        print(json.dumps(out, default=str, indent=2))
+    else:
+        for path in paths:
+            print(f"Saved {path}")
+        if error is not None:
+            print(f"ERROR: {error}", file=sys.stderr)
+    return 0 if error is None else 1
 
 
 def main(argv=None) -> int:
@@ -1302,6 +1338,10 @@ def main(argv=None) -> int:
     # existing adb stops the running server (dropping every device session), so
     # upgrades happen only via upgrade-tools / self-update — never as a side
     # effect of an ordinary command.
+    # 'serve' is excluded too: the SYSTEM scheduled task runs it under another
+    # profile, where a fetch drops a SECOND adb into that profile and binds port
+    # 5037 with it — the classic cause of Windows device disconnects. Better to
+    # fail loudly there than to serve devices with a stranger's adb.
     if cmd not in (
         "doctor",
         "fetch-tools",
@@ -1309,15 +1349,20 @@ def main(argv=None) -> int:
         "self-update",
         "shortcut",
         "deploy-serve",
+        "serve",
         "targets",
     ):
         try:
-            need_scrcpy = cmd == "scrcpy" and not scrcpy_available()
+            need_scrcpy = cmd == "scrcpy" and not scrcpy_available(
+                getattr(args, "scrcpy_path", None)
+            )
             if need_scrcpy or not adb_available(getattr(args, "adb_path", None)):
                 from . import toolsdl
 
                 toolsdl.ensure_tools(
-                    notify=lambda m: print(m, file=sys.stderr), on_progress=_progress_printer()
+                    notify=lambda m: print(m, file=sys.stderr),
+                    on_progress=_progress_printer(),
+                    scrcpy=need_scrcpy,
                 )
         except Exception:
             pass
@@ -1327,6 +1372,9 @@ def main(argv=None) -> int:
             from . import tools
 
             d = tools.diagnose()
+            if _JSON["on"]:
+                print(json.dumps(d, default=str, indent=2))
+                return 0 if d["adb"] else 1
             print(f"adb    : {d['adb'] or 'NOT FOUND'}")
             print(f"         {d['adb_path'] or tools.ADB_DOWNLOAD}")
             print(f"scrcpy : {'found at ' + d['scrcpy_path'] if d['scrcpy'] else 'NOT FOUND'}")
@@ -1346,8 +1394,14 @@ def main(argv=None) -> int:
             want_scrcpy = not args.adb_only
             print(f"Downloading into {toolsdl.tools_dir()} …", file=sys.stderr)
             res = toolsdl.fetch_tools(
-                adb=want_adb, scrcpy=want_scrcpy, force=args.force, on_progress=_progress_printer()
+                adb=want_adb,
+                scrcpy=want_scrcpy,
+                force=args.force,
+                on_progress=_progress(args),
             )
+            if _JSON["on"]:
+                print(json.dumps(res, default=str, indent=2))
+                return 0 if (res.get("adb") or res.get("scrcpy")) else 1
             if res.get("adb"):
                 print(f"adb    -> {res['adb']}")
             if res.get("scrcpy"):
@@ -1361,36 +1415,44 @@ def main(argv=None) -> int:
 
             checks = toolsdl.check_updates()
             supported = [t for t in ("adb", "scrcpy") if checks[t].get("supported", True)]
-            for tool in ("adb", "scrcpy"):
-                c = checks[tool]
-                if tool not in supported:
-                    state = "not downloadable on this OS (use your package manager)"
-                elif c["upgrade"] is False:
-                    state = "up to date"
-                elif c["upgrade"]:
-                    state = "UPDATE AVAILABLE"
-                else:
-                    state = "unknown (couldn't check)"
-                print(f"{tool:7}: installed={c['installed']}  latest={c['latest']}  -> {state}")
+            if not _JSON["on"]:
+                for tool in ("adb", "scrcpy"):
+                    c = checks[tool]
+                    if tool not in supported:
+                        state = "not downloadable on this OS (use your package manager)"
+                    elif c["upgrade"] is False:
+                        state = "up to date"
+                    elif c["upgrade"]:
+                        state = "UPDATE AVAILABLE"
+                    else:
+                        state = "unknown (couldn't check)"
+                    print(f"{tool:7}: installed={c['installed']}  latest={c['latest']}  -> {state}")
             if args.check:
+                if _JSON["on"]:
+                    print(json.dumps(checks, default=str, indent=2))
                 return 0
             if not any(checks[t]["upgrade"] is True for t in supported):
+                # a failed check is NOT "everything is current"
                 unknown = [t for t in supported if checks[t]["upgrade"] is None]
-                if unknown:
-                    # a failed check is NOT "everything is current"
+                if _JSON["on"]:
+                    print(json.dumps({"updated": {}, "checks": checks}, default=str, indent=2))
+                elif unknown:
                     print(
                         f"\nCouldn't check {', '.join(unknown)} for updates "
                         f"(network / rate limit) — try again in a while.",
                         file=sys.stderr,
                     )
-                    return 1
-                print("\nEverything is current — nothing to download.")
-                return 0
+                else:
+                    print("\nEverything is current — nothing to download.")
+                return 1 if unknown else 0
             res = toolsdl.upgrade_tools(
                 notify=lambda m: print(m, file=sys.stderr),
-                on_progress=_progress_printer(),
+                on_progress=_progress(args),
                 checks=checks,  # don't query the version sources a second time
             )
+            if _JSON["on"]:
+                print(json.dumps(res, default=str, indent=2))
+                return 1 if res.get("errors") else 0
             for tool, path in res.get("updated", {}).items():
                 print(f"updated {tool} -> {path}")
             for tool, err in res.get("errors", {}).items():
@@ -1409,12 +1471,10 @@ def main(argv=None) -> int:
         if cmd == "deploy-serve":
             from . import remote_deploy
 
-            pw = args.password
-            if pw is None:
-                import getpass
-
-                pw = getpass.getpass(f"Password for {args.user}: ")
-            return remote_deploy.deploy_serve(
+            pw = remote_deploy.resolve_password(
+                args.password, from_stdin=args.password_stdin, user=args.user
+            )
+            rc = remote_deploy.deploy_serve(
                 args.hosts,
                 args.user,
                 pw,
@@ -1423,8 +1483,13 @@ def main(argv=None) -> int:
                 winrm_port=args.winrm_port or (5986 if args.ssl else 5985),
                 use_ssl=args.ssl,
                 test_only=args.test,
-                on_status=lambda m: print(m),
+                # with --json the running commentary belongs on stderr, so
+                # stdout stays one parsable document
+                on_status=lambda m: print(m, file=sys.stderr if _JSON["on"] else sys.stdout),
             )
+            if _JSON["on"]:
+                print(json.dumps({"ok": rc == 0, "hosts": args.hosts}, indent=2))
+            return rc
 
         if cmd == "self-update":
             from . import update as _upd
@@ -1472,18 +1537,20 @@ def main(argv=None) -> int:
             return 0
 
         if cmd == "devices":
+            # through _config, so -s @saved-name lists ITS server, not the local one
+            cfg = _config(args, serial=None)
             try:
-                devs = list_devices(
-                    args.adb_path, server_host=args.adb_host, server_port=args.adb_port
-                )
+                devs = _server_devices(cfg)
             except ConnectionError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
-            if args.json:
+            if _JSON["on"]:
                 print(json.dumps([d.__dict__ for d in devs], default=str, indent=2))
             elif not devs:
                 where = (
-                    f"the adb server at {args.adb_host}:{args.adb_port}" if args.adb_host else "USB"
+                    f"the adb server at {cfg.adb_server_host}:{cfg.adb_server_port}"
+                    if cfg.adb_server_host
+                    else "USB"
                 )
                 print(
                     f"No devices found on {where}. Plug in (enable USB "
@@ -1497,8 +1564,9 @@ def main(argv=None) -> int:
         if cmd == "discover":
             from .devices import mdns_devices
 
-            found = mdns_devices(args.adb_path)
-            if args.json:
+            # _config so -s @saved-name's adb (and server) is the one asked
+            found = mdns_devices(_config(args, serial=None).adb_path)
+            if _JSON["on"]:
                 print(json.dumps(found, indent=2))
             elif not found:
                 print(
@@ -1533,7 +1601,7 @@ def main(argv=None) -> int:
 
         if cmd == "restart-server":
             r = _handler(args, serial=None).restart_server()
-            print(r.text or r.stderr.strip() or "ADB server restarted.")
+            _result(r.text or r.stderr.strip() or "ADB server restarted.")
             return 0
 
         if cmd == "serve":
@@ -1549,10 +1617,10 @@ def main(argv=None) -> int:
             )
             from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 
-            def _say(msg):
+            def _say(msg, err=False):
                 # at Windows login we run under pythonw (no console / stdout=None)
                 try:
-                    print(msg)
+                    print(msg, file=sys.stderr if err else sys.stdout)
                 except Exception:
                     pass
 
@@ -1585,14 +1653,14 @@ def main(argv=None) -> int:
                         f"system startup, headless — survives logoff)."
                     )
                 except Exception as exc:
-                    _say(f"Could not install startup task (need admin): {exc}")
+                    _say(f"Could not install startup task (need admin): {exc}", err=True)
                     rc = 1
             if args.install_startup:
                 try:
                     path = install_startup(port=args.port)
                     _say(f"Installed login auto-start: {path}")
                 except Exception as exc:
-                    _say(f"Could not install login auto-start: {exc}")
+                    _say(f"Could not install login auto-start: {exc}", err=True)
                     rc = 1
             if not (args.startup_task or args.install_startup):
                 _say(
@@ -1617,21 +1685,20 @@ def main(argv=None) -> int:
             )
             detail = "\n".join(p for p in (res.text, res.stderr.strip()) if p)
             if not res.ok or "error" in detail.lower():
-                print(detail or f"adb disconnect failed (exit {res.exit_code})", file=sys.stderr)
-                return 1
-            print(res.text or "disconnected")
+                return _report(False, "", detail or f"adb disconnect failed (exit {res.exit_code})")
+            _result(res.text or "disconnected")
             return 0
 
         if cmd == "pair":
             hp = args.hostport
             host, port = parse_host_port(hp)
             if not host or port is None:
-                print(
-                    f"Error: invalid host:port for pair: '{hp}' (format: host:port, e.g. 192.168.1.50:41235)",
-                    file=sys.stderr,
+                return _report(
+                    False, "",
+                    f"invalid host:port for pair: '{hp}' "
+                    f"(format: host:port, e.g. 192.168.1.50:41235)",
                 )
-                return 1
-            print(_handler(args, serial=None).pair(host, port, args.code))
+            _result(_handler(args, serial=None).pair(host, port, args.code))
             return 0
 
         if cmd == "shell" and args.all:
@@ -1685,7 +1752,10 @@ def main(argv=None) -> int:
             if args.log:
                 extra["log_path"] = args.log
             sess = dev.mirror(opts, **extra)
-            print(f"scrcpy launched (pid {sess.pid}). Close its window to end.")
+            if _JSON["on"]:
+                _result({"pid": sess.pid})
+            else:
+                print(f"scrcpy launched (pid {sess.pid}). Close its window to end.")
             if args.wait:
                 return sess.wait() or 0
             return 0
@@ -1735,35 +1805,31 @@ def main(argv=None) -> int:
         elif cmd == "logcat":
             import re as _re
 
-            try:
-                pattern = _re.compile(args.grep, _re.I) if args.grep else None
-            except _re.error as exc:
-                print(f"ERROR: invalid --grep pattern: {exc}", file=sys.stderr)
-                return 2
-            buffers, priority = args.buffer, args.priority
-            if args.crashes:
-                buffers = buffers or ["crash", "main", "system"]
-                priority = priority or "E"
-
-            def show(line):
-                if pattern is None or pattern.search(line):
-                    print(line)
-
+            if args.grep:
+                # the engine does the filtering; catch a bad pattern up front so
+                # it's a usage error and not a traceback mid-stream
+                try:
+                    _re.compile(args.grep, _re.I)
+                except _re.error as exc:
+                    print(f"ERROR: invalid --grep pattern: {exc}", file=sys.stderr)
+                    return 2
             print("Dumping logcat…" if args.dump else "Streaming logcat (Ctrl+C to stop)…", file=sys.stderr)
             try:
                 res = dev.logcat(
                     tag=args.tag,
-                    priority=priority,
+                    priority=args.priority,
                     filterspecs=args.filter,
-                    buffers=buffers,
+                    buffers=args.buffer,
                     fmt=args.format,
                     match=args.match,
+                    grep=args.grep,
+                    crashes=args.crashes,
                     save_to=args.save,
                     stop_on_match=args.stop_on_match,
                     clear_first=args.clear,
                     dump=args.dump,
                     tail=args.tail,
-                    on_line=show,
+                    on_line=print,
                 )
                 if args.match:
                     print(f"\n[{len(res.matches)} matched lines]", file=sys.stderr)
@@ -1898,12 +1964,7 @@ def main(argv=None) -> int:
             else:
                 rc = _report(False, "", "the device has no Wi-Fi / Ethernet IP address")
         elif cmd == "health":
-            if args.full:
-                rc = _write_report(dev.health_report(), args.output)
-            elif _JSON["on"]:
-                print(json.dumps(dev.health(), indent=2))
-            else:
-                print(dev.health_text())
+            rc = _snapshot(args, dev.health_report, dev.health, dev.health_text)
         elif cmd == "bugreport":
             import time as _t
 
@@ -2021,12 +2082,7 @@ def main(argv=None) -> int:
             else:
                 print(dev.battery())
         elif cmd == "build-info":
-            if args.full:
-                rc = _write_report(dev.build_report(), args.output)
-            elif _JSON["on"]:
-                print(json.dumps(dev.build_properties(), indent=2))
-            else:
-                print(dev.build_info())
+            rc = _snapshot(args, dev.build_report, dev.build_properties, dev.build_info)
         elif cmd == "getprop":
             value = dev.getprop(args.name)
             if _JSON["on"]:
@@ -2039,10 +2095,21 @@ def main(argv=None) -> int:
         elif cmd == "remount":
             _result(dev.remount())
         elif cmd in ("disable-verity", "enable-verity"):
-            _result(dev.disable_verity() if cmd == "disable-verity" else dev.enable_verity())
-            if args.reboot:
+            out = dev.disable_verity() if cmd == "disable-verity" else dev.enable_verity()
+            if not args.reboot:
+                _result(out)
+            else:
                 dev.shell("sync")
-                rc = _report(dev.reboot(), "rebooting to apply it", "could not reboot")
+                ok = dev.reboot()
+                message = "rebooting to apply it" if ok else "could not reboot"
+                if _JSON["on"]:
+                    # ONE document — _result plus _report printed two, and jq choked
+                    print(json.dumps({"ok": bool(ok), "result": out, "message": message},
+                                     default=str, indent=2))
+                else:
+                    print(out)
+                    print(message, file=sys.stdout if ok else sys.stderr)
+                rc = 0 if ok else 1
         elif cmd == "dial":
             rc = _report(dev.dial(args.number), f"dialler opened: {args.number}", "could not open the dialler")
         elif cmd == "call":

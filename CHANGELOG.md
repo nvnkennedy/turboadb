@@ -3,6 +3,201 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 2.2.2
+
+### New
+
+- **ADB screencap renderer** for builds where scrcpy can't run: **Settings →
+  scrcpy → Screen renderer**, or **Options → Renderer** on one screen. It finds
+  the display through `dumpsys display`, streams frames through one long-lived
+  adb connection (compressed on the device, a few frames a second), and supports
+  tap, drag, long-press, scrolling and typing. Record uses the device's own
+  `screenrecord`, so recording works without scrcpy too. scrcpy stays the
+  default renderer.
+- **Controls on every IVI display:** each tile in the Displays tab has Back,
+  Home, Recents, volume, mute, power and screenshot, sent to that display.
+- **Calmer themes:** Black and White (a soft near-black and a paper white with
+  softened text), plus two new pairs, Slate / Mist (cool blue-grey) and Night /
+  Paper (a warm reading pair). Plum / Rose, Forest / Sage and Deep teal / Mint
+  were removed; a saved one switches to Graphite or Porcelain. Tab headers have a
+  subtle divider, and links, tab scroll arrows and progress text are readable in
+  every theme.
+- **Saved targets fill themselves:** every device you connect is saved as a
+  target, named after the device and never twice (Settings → Startup to turn it
+  off).
+- Device Control's keys and typing go to the display its screen shows.
+
+### Changed
+
+- Terminals and Logcat use a 12 pt font by default (was 10 pt). A saved 10 pt,
+  the old default, moves to 12 pt once; any other size you chose is kept.
+
+### Fixed
+
+- **Device Control on laptop screens:** the screen's toolbar is one row, the
+  device picture is larger, the frame-rate label no longer covers it, and the
+  controls sit in capped, balanced columns instead of stretching across the
+  window. A "Saving the MP4…" line no longer stays after the recording is saved.
+- **Maximize works:** in Device Control it hides the controls so the screen
+  fills the tab; on an IVI display it shows that display alone. Esc restores.
+  The show/hide controls button stays usable while maximized: it brings the
+  controls back without leaving Maximize view, and Restore keeps your latest
+  choice.
+- **Stop inside `adb shell` in PowerShell or Command Prompt** stops only the
+  command running on the device and keeps you in adb shell, in the same folder.
+  It used to close adb shell and drop you back to the PC prompt. If the device
+  command ignores Ctrl+C (or adb stops answering), Stop again reopens adb shell
+  in that folder. Command Prompt's copyright banner no longer repeats after Stop.
+- **Toasts:** every action shows its toast again (a rate limit hid a second one
+  within 4 seconds), short messages no longer wrap onto two lines, long ones
+  wrap without clipping, and toasts never overlap or leave the screen. Text
+  typed into a device through "Type into the device" is no longer echoed into
+  the log or a toast.
+- The light line above the Screen / Screenshot / Reboot / More buttons is gone,
+  and the Screen button no longer glares in dark themes.
+- **Pasting several lines into a terminal** (Android shell, PowerShell,
+  Command Prompt) runs each line once, in order, after the previous one
+  finishes. Pasted commands were echoed twice in CMD and PowerShell, `cd` and
+  history were lost in the Android shell, text typed before the cursor was
+  dropped, and a multi-line PowerShell block waited for an extra blank line.
+- **Call history on Android Automotive:** the Phone tab queries as the driver's
+  user (a car's user 0 is a headless system user) and, when no phone is
+  connected over Bluetooth, shows "No phone connected" instead of an error.
+- **Theme toggle:** the sun/moon button switches between your last dark and
+  your last light theme — from Slate it goes to Porcelain and back, instead of
+  to Slate's paired theme. Its arrow lists every theme, and the menus mark the
+  current one.
+- **IVI displays:** keys typed on a display whose screen could not take keyboard
+  focus went to whichever display Android considered focused; they now go to
+  that display. Several live displays share a video bit-rate budget, so they no
+  longer saturate the USB link together.
+- **Fewer adb processes:** a device tab connects with one probe instead of five
+  commands, opens its Android shell only when the Terminal is shown, builds
+  Logcat, Files, Apps, Phone and Webcam when first opened, and runs at most two
+  background adb commands at once. An idle tab starts 4 adb processes in its
+  first minute instead of 8, and connecting finishes about three times faster.
+- **Less memory:** the first device tab costs about 15 MB instead of 24 MB, and
+  each further tab about 3 MB instead of 5 MB; three live screencap screens peak
+  20 MB lower.
+- Screenshots of a secondary display use its physical display id, which
+  `screencap` needs on Android 10 and later.
+
+### Code review
+
+A code-review pass over the whole codebase: correctness fixes, safer downloads,
+and CI that actually runs the desktop tests.
+
+### Fixed — device files and commands
+
+- Paths keep their spaces: `turboadb rm "/sdcard/dup "` deleted `/sdcard/dup`,
+  because the path normaliser stripped whitespace while the listing preserved
+  it. This affected `rm`, `mv`, `cp`, `stat`, `chmod` and the Files tab.
+- `touch` can no longer empty an existing file (its fallback truncated it).
+- The Files tab deletes through the engine, so it inherits the batching and the
+  refusals (`/`, and a folder without "delete folders") the CLI already had; a
+  large selection no longer builds one over-long command.
+- "New folder" / "New file" reject a name that would escape the folder shown
+  (`/etc/x`, `../..`) — the rename dialog already did.
+- `ls` keeps names intact on devices whose date column is localised.
+- Device commands work on a shell that colourises its output.
+- A failed `getprop`, `battery` or `dumpsys` is reported instead of returning a
+  blank device identity or an empty build report.
+- Taps and scrolls no longer fall back to guessed phone coordinates when the
+  screen size can't be read — they say so instead, which matters on head units.
+- `am` results are judged by what the device printed: launching an app that was
+  already in the foreground counts as success, while a refusal that exits 0
+  (`start-activity`, `stop`, `settings`) is now an error.
+- `logcat --save ~/boot.log` and `record ~/clips/drive.mp4` expand `~` and
+  create the folder, as screenshots already did.
+- The device identity no longer shifts a field on builds with no manufacturer
+  property.
+
+### Fixed — command line
+
+- `-s @saved-name` now works for `devices`, `discover` and `shell --all`;
+  `shell --all` no longer sends locally listed serials to a remote adb server.
+- `--json` produces exactly one JSON document everywhere: `pair`, `disconnect`,
+  `restart-server` and `scrcpy` honour it, `health --full` / `build-info --full`
+  emit `{"ok": true, "report": …}`, `disable-verity --reboot` no longer prints
+  two documents, and `record --continuous` reports every part in one object and
+  exits non-zero when a part fails.
+- The setup commands (`doctor`, `fetch-tools`, `upgrade-tools`, `self-update`,
+  `shortcut`, `gui`, `deploy-serve`) accept `--json` before or after the name.
+- `fetch-tools --adb-only --scrcpy-only` is refused instead of downloading
+  nothing; `serve` reports its failures on stderr.
+- `--scrcpy-path` is honoured before deciding to download scrcpy, and `serve`
+  never auto-downloads tools — under a system task that installed a second adb
+  on port 5037, the classic cause of devices dropping out on Windows.
+- `deploy-serve` takes `--password-stdin` or `$TURBOADB_DEPLOY_PASSWORD`, so an
+  admin password need not appear in the process list or shell history, and it
+  deploys to several hosts in parallel with an overall time budget.
+- `edit`, `record --continuous` and logcat filtering moved into the engine
+  (`edit_file`, `screen_record_continuous`, `logcat(grep=…, crashes=…)`), so the
+  app and the CLI share one implementation.
+
+### Fixed — desktop app
+
+- Closing the window no longer lets finishing background work restart the device
+  poll or open dialogs on a closed window.
+- Failures reach you: ADB, device-scan, pairing, sharing and deploy errors now
+  raise a toast and a status-bar line instead of only a hidden log entry, and a
+  burst of errors shows one popup rather than ten.
+- Cancelling the Settings dialog fully reverts a previewed theme (icons and
+  status dots kept the cancelled palette).
+- Rescanning displays no longer stops the screens that are running when the scan
+  comes back empty; a display that fails twice retries inside its tile instead of
+  opening a stray window, and reports "Show log" in the tile rather than stacking
+  dialogs.
+- The Displays tab starts screens with the same patience the panel itself uses,
+  keeps a tile alive until its screen has really stopped, and slows its polling
+  while the tab is hidden.
+- Ctrl+C in the PowerShell / Command Prompt tabs no longer freezes the window
+  while the process tree is killed.
+- The terminal keeps split characters whole, the logcat worker's buffer is
+  bounded, the on-screen skip marker survives editing the filter, and the
+  scrollback fallback can no longer grow without limit if the log file fails.
+- A screen recording and an embedded screen can no longer adopt each other's
+  window after a quick Stop/Start.
+- The remote webcam is stopped properly when the app quits (it used to leave
+  ffmpeg running and a firewall rule open on the remote host), the one-time
+  ffmpeg download can be cancelled and has a deadline, and the copy to a remote
+  host can no longer hang the Scan button forever.
+- `fe80::1`-style IPv6 targets parse correctly.
+
+### Fixed — tools, updates and packaging
+
+- adb downloads are verified against Google's published checksum and size, as
+  scrcpy downloads already were; ffmpeg records its checksum and re-checks it on
+  every reuse, with `TURBOADB_FFMPEG_URL` / `TURBOADB_FFMPEG_SHA256` to pin a
+  build.
+- "Stop sharing" succeeds when sharing is already stopped.
+- An update check that cannot reach the network says so instead of reporting
+  "up to date", and a missing managed copy of adb is installed rather than
+  mistaken for current.
+- Self-update no longer runs freshly written code inside the old process, and
+  the restart starts the new instance only once the old one has exited.
+- The Windows startup task pins the adb it was installed with, verifies the
+  server really came up, and writes its launcher so a non-ASCII user folder
+  works.
+- Saved targets and settings survive a second window or a CLI run writing at the
+  same time.
+- `~/.turboadb` is resolved in one place (`turboadb.user_dir()`).
+- Packaging: Linux and macOS are declared, `[all]` includes `argcomplete`, and
+  the source archive ships `CLI.md`, `CHANGELOG.md` and `ARCHITECTURE.md`.
+
+### Testing
+
+- CI runs the desktop tests: they needed PyQt5, which CI never installed, so
+  about half the suite silently skipped. A GUI job now installs it on Ubuntu and
+  Windows and fails if the tests skip anyway.
+- The release workflow verifies before it publishes: tag against version, the
+  full suite, `twine check`, the packaged executable, and a missing file now
+  fails the release instead of publishing a release without it.
+- `release.py` restores the version if the upload fails, and rebuilds the
+  executable when it is older than the sources it was built from.
+- One shared Qt fixture for the whole suite, so a test can no longer pass alone
+  and crash in a full run.
+
 ## 2.1.0
 
 - The Android terminal's prompt copies the device's own `user@host`, as

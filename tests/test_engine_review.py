@@ -1137,3 +1137,657 @@ def test_shell_many_honours_kwargs_and_safe_mode(fake_adb):
     wrapped = h.shell_many(["echo a"], bogus=1, safe=True)
     assert isinstance(wrapped, OperationResult) and not wrapped.success
     assert h.get_serialno(safe=True).success is True
+
+
+# --------------------------------------------------------------------------- #
+# B-1 / B-2  the SYSTEM serve task pins ITS adb and proves the server came up
+# --------------------------------------------------------------------------- #
+def _fake_schtasks(monkeypatch, devices, *, query_out=b""):
+    """Record every schtasks/adb argv the installer runs; everything succeeds."""
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(list(cmd))
+        out = query_out if "/query" in cmd else b""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr=b"")
+
+    monkeypatch.setattr(devices.subprocess, "run", run)
+    return calls
+
+
+def test_serve_task_pins_the_adb_the_installing_user_resolved(monkeypatch):
+    import turboadb.devices as devices
+    import turboadb.tools as tools
+
+    monkeypatch.setattr(devices.os, "name", "nt")
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: r"C:\Users\me\.turboadb\tools\adb.exe")
+    monkeypatch.setattr(devices, "windowless_python", lambda: r"C:\Py\pythonw.exe")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: True)
+    calls = _fake_schtasks(monkeypatch, devices)
+
+    assert devices.install_serve_task(port=5037) == devices._SERVE_TASK
+    create = next(c for c in calls if "/create" in c)
+    command = create[create.index("/tr") + 1]
+    # SYSTEM has no ~/.turboadb/tools and no GUI settings: without this the task
+    # resolves a DIFFERENT adb and binds 5037 with it.
+    assert r'--adb-path "C:\Users\me\.turboadb\tools\adb.exe"' in command
+    assert "serve --port 5037" in command
+
+
+def test_serve_task_fails_when_the_shared_server_never_binds(monkeypatch):
+    import turboadb.devices as devices
+    import turboadb.tools as tools
+
+    monkeypatch.setattr(devices.os, "name", "nt")
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
+    monkeypatch.setattr(devices, "windowless_python", lambda: "pythonw")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    _fake_schtasks(monkeypatch, devices, query_out=b"Last Result: 0x1\r\n")
+
+    # `schtasks /run` returning 0 only means the task LAUNCHED.
+    with pytest.raises(RuntimeError, match="no adb server is listening"):
+        devices.install_serve_task(port=5037, ready_timeout=0.05)
+
+
+def test_serve_task_reports_the_schedulers_last_result(monkeypatch):
+    import turboadb.devices as devices
+    import turboadb.tools as tools
+
+    monkeypatch.setattr(devices.os, "name", "nt")
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
+    monkeypatch.setattr(devices, "windowless_python", lambda: "pythonw")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    _fake_schtasks(monkeypatch, devices, query_out=b"Last Result:  267011\r\n")
+
+    with pytest.raises(RuntimeError, match="267011"):
+        devices.install_serve_task(ready_timeout=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# B-3  "Stop sharing" works when the shared server is already stopped
+# --------------------------------------------------------------------------- #
+def test_stop_shared_server_tolerates_a_kill_server_that_had_nothing_to_kill(monkeypatch):
+    import turboadb.devices as devices
+    import turboadb.tools as tools
+
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: True)
+
+    def run(cmd, **kw):
+        if "kill-server" in cmd:  # several adb builds do this when idle
+            return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"server not running")
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(devices.subprocess, "run", run)
+    assert "not running" in devices.stop_shared_server()
+
+
+def test_stop_shared_server_still_fails_when_the_local_server_does_not_return(monkeypatch):
+    import turboadb.devices as devices
+    import turboadb.tools as tools
+
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(
+        devices.subprocess,
+        "run",
+        lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"cannot bind 5037"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="cannot bind"):
+        devices.stop_shared_server()
+
+
+# --------------------------------------------------------------------------- #
+# B-4  the login .bat is written the way cmd.exe reads it; no Startup, no lie
+# --------------------------------------------------------------------------- #
+def test_startup_dir_fails_loudly_without_appdata(monkeypatch):
+    import turboadb.devices as devices
+
+    monkeypatch.delenv("APPDATA", raising=False)
+    with pytest.raises(RuntimeError, match="APPDATA"):
+        devices._startup_dir()
+    monkeypatch.setattr(devices.os, "name", "nt")
+    assert devices.uninstall_startup() is False  # never reports a phantom removal
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the login launcher is Windows-only")
+def test_login_launcher_is_encoded_for_cmd_not_utf8(monkeypatch, tmp_path):
+    import turboadb.devices as devices
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: None)
+    monkeypatch.setattr(devices, "windowless_python", lambda: "C:\\Pyth\u00f6n\\pythonw.exe")
+    bat = devices.install_startup(port=5037)
+    with open(bat, "rb") as fh:
+        raw = fh.read()
+    # cmd.exe never reads a .bat as UTF-8, so the bytes must decode in the
+    # console codepage — a profile with an accent used to break the launcher.
+    text = raw.decode(devices._batch_encoding())
+    assert "serve --port 5037" in text
+    assert b"\xc3\xb6" not in raw  # the UTF-8 encoding of the accent
+    assert devices.uninstall_startup() is True
+
+
+# --------------------------------------------------------------------------- #
+# B-5  platform-tools is verified against Google's published checksum
+# --------------------------------------------------------------------------- #
+_PT_XML = """<sdk:sdk-repository xmlns:sdk="http://schemas.android.com/repository">
+ <remotePackage path="platform-tools">
+  <revision><major>35</major><minor>0</minor><micro>2</micro></revision>
+  <archives>
+   <archive><complete><size>11</size><checksum type="sha1">aabb</checksum>
+    <url>platform-tools_r35.0.2-windows.zip</url></complete>
+    <host-os>windows</host-os></archive>
+   <archive><complete><size>22</size><checksum type="sha1">ccdd</checksum>
+    <url>platform-tools_r35.0.2-linux.zip</url></complete>
+    <host-os>linux</host-os></archive>
+  </archives>
+ </remotePackage>
+</sdk:sdk-repository>"""
+
+
+def test_manifest_gives_the_version_and_the_matching_archive():
+    import turboadb.toolsdl as toolsdl
+
+    win = toolsdl._parse_platform_tools_manifest(_PT_XML, "windows")
+    assert win["version"] == "35.0.2" and win["size"] == 11 and win["checksum"] == "aabb"
+    assert win["url"] == toolsdl.PLATFORM_TOOLS_BASE + "platform-tools_r35.0.2-windows.zip"
+    assert toolsdl._parse_platform_tools_manifest(_PT_XML, "linux")["checksum"] == "ccdd"
+    # an unknown schema must still yield the version the update check needs
+    loose = '<x path="platform-tools"><revision><major>34</major><minor>1</minor>'
+    loose += "<micro>0</micro></revision>"
+    assert toolsdl._parse_platform_tools_manifest(loose, "windows") == {"version": "34.1.0"}
+
+
+def test_platform_tools_download_refuses_a_mismatching_checksum(monkeypatch, tmp_path):
+    import hashlib
+    import zipfile
+
+    import turboadb.toolsdl as toolsdl
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    src = tmp_path / "pt.zip"
+    with zipfile.ZipFile(src, "w") as archive_file:
+        archive_file.writestr("platform-tools/" + toolsdl._exe("adb"), "not really adb")
+    payload = src.read_bytes()
+
+    def fake_download(url, dest, on_progress=None):
+        with open(dest, "wb") as fh:
+            fh.write(payload)
+
+    def archive(checksum):
+        return {
+            "version": "35.0.2",
+            "url": "https://dl.example/platform-tools_r35.0.2.zip",
+            "size": len(payload),
+            "checksum": checksum,
+            "checksum_type": "sha1",
+        }
+
+    monkeypatch.setattr(toolsdl, "_download", fake_download)
+    monkeypatch.setattr(toolsdl, "_sync_scrcpy_adb", lambda: None)
+    monkeypatch.setattr(toolsdl, "latest_adb_archive", lambda: archive("0" * 40))
+    with pytest.raises(ADBError, match="SHA1 mismatch"):
+        toolsdl.download_platform_tools(force=True)
+    assert toolsdl.managed_adb() is None  # nothing was swapped in
+
+    monkeypatch.setattr(
+        toolsdl, "latest_adb_archive", lambda: archive(hashlib.sha1(payload).hexdigest())
+    )
+    assert toolsdl.download_platform_tools(force=True) == toolsdl.managed_adb()
+
+
+def test_a_published_size_alone_is_checked_and_the_gap_is_logged(tmp_path, caplog):
+    import logging
+
+    import turboadb.toolsdl as toolsdl
+
+    blob = tmp_path / "pt.zip"
+    blob.write_bytes(b"0123456789")
+    with pytest.raises(ADBError, match="manifest publishes"):
+        toolsdl._verify_platform_tools(str(blob), {"size": 99})
+    with caplog.at_level(logging.WARNING, logger="turboadb.toolsdl"):
+        toolsdl._verify_platform_tools(str(blob), {"size": 10, "version": "35.0.2"})
+    assert "no checksum" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# B-6  a stale cached release body is not an answer to "what is the latest?"
+# --------------------------------------------------------------------------- #
+def test_only_a_200_or_304_settles_the_latest_scrcpy_version(monkeypatch, tmp_path):
+    import json as json_mod
+    import urllib.error
+
+    import turboadb.toolsdl as toolsdl
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    toolsdl._ensure_tools_dir()
+    with open(toolsdl._release_cache_path(), "w", encoding="utf-8") as fh:
+        json_mod.dump({"etag": 'W/"x"', "data": {"tag_name": "v3.0"}}, fh)
+
+    def offline(req, timeout=0):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(toolsdl.urllib.request, "urlopen", offline)
+    data, authoritative = toolsdl._github_release()
+    assert data["tag_name"] == "v3.0" and authoritative is False
+    assert toolsdl.latest_scrcpy_version() is None  # "unknown", not "up to date"
+
+    def not_modified(req, timeout=0):
+        raise urllib.error.HTTPError("u", 304, "Not Modified", {}, None)
+
+    monkeypatch.setattr(toolsdl.urllib.request, "urlopen", not_modified)
+    assert toolsdl._github_release()[1] is True
+    assert toolsdl.latest_scrcpy_version() == "3.0"
+
+
+# --------------------------------------------------------------------------- #
+# B-7  a missing MANAGED copy is "install", not "up to date"
+# --------------------------------------------------------------------------- #
+def test_check_updates_reports_a_missing_managed_copy_and_the_path_one_apart(monkeypatch):
+    import turboadb.toolsdl as toolsdl
+
+    monkeypatch.setattr(toolsdl, "managed_adb", lambda: None)
+    monkeypatch.setattr(toolsdl, "managed_scrcpy", lambda: None)
+    monkeypatch.setattr(toolsdl, "scrcpy_download_supported", lambda: True)
+    monkeypatch.setattr(toolsdl, "latest_adb_version", lambda: "35.0.2")
+    monkeypatch.setattr(toolsdl, "latest_scrcpy_version", lambda: "3.1")
+    monkeypatch.setattr(toolsdl, "installed_adb_version", lambda p=None: "34.0.0")
+    monkeypatch.setattr(toolsdl, "installed_scrcpy_version", lambda p=None: "2.7")
+
+    checks = toolsdl.check_updates()
+    # the PATH adb used to be reported as "installed", so the cache stayed empty
+    # and gui_adb_path() kept returning None
+    assert checks["adb"]["installed"] is None and checks["adb"]["upgrade"] is True
+    assert checks["adb"]["system"] == "34.0.0" and checks["adb"]["path"] is None
+    assert checks["scrcpy"]["installed"] is None and checks["scrcpy"]["system"] == "2.7"
+
+
+# --------------------------------------------------------------------------- #
+# B-8  the stamp actually gates the auto-fetch it was written for
+# --------------------------------------------------------------------------- #
+def test_a_matching_stamp_skips_the_whole_tool_check(fresh_ensure, monkeypatch):
+    toolsdl = fresh_ensure
+    monkeypatch.setattr(toolsdl, "_pkg_version", lambda: "9.9.9")
+    monkeypatch.setattr(toolsdl, "_read_stamp", lambda: "9.9.9")
+    monkeypatch.setattr(toolsdl, "managed_adb", lambda: "/managed/adb")
+    monkeypatch.setattr(toolsdl, "managed_scrcpy", lambda: "/managed/scrcpy")
+    monkeypatch.setattr(toolsdl, "scrcpy_download_supported", lambda: True)
+    monkeypatch.setattr(toolsdl, "fetch_tools", lambda **kw: pytest.fail("the stamp must skip this"))
+    monkeypatch.setattr(toolsdl, "_write_stamp", lambda v: pytest.fail("nothing to re-stamp"))
+    assert toolsdl.ensure_tools()["note"] == "stamped"
+
+
+def test_a_stamp_does_not_cover_a_tool_that_was_deleted(fresh_ensure, monkeypatch):
+    toolsdl = fresh_ensure
+    fetched = []
+    monkeypatch.setattr(toolsdl, "_pkg_version", lambda: "9.9.9")
+    monkeypatch.setattr(toolsdl, "_read_stamp", lambda: "9.9.9")
+    monkeypatch.setattr(toolsdl, "managed_adb", lambda: "/managed/adb")
+    monkeypatch.setattr(toolsdl, "managed_scrcpy", lambda: None)
+    monkeypatch.setattr(toolsdl, "scrcpy_download_supported", lambda: True)
+    monkeypatch.setattr(toolsdl, "_write_stamp", lambda v: None)
+    monkeypatch.setattr(toolsdl, "fetch_tools", lambda **kw: fetched.append(kw) or {"errors": {}})
+    toolsdl.ensure_tools()
+    assert fetched and fetched[0]["scrcpy"] is True
+
+
+# --------------------------------------------------------------------------- #
+# B-9  the upgrade's tool refresh and version report run in the NEW code
+# --------------------------------------------------------------------------- #
+def test_run_upgrade_never_drives_the_new_downloader_from_the_old_package(monkeypatch):
+    import turboadb.toolsdl as toolsdl
+    import turboadb.update as update
+
+    monkeypatch.setattr(update, "can_self_update", lambda: True)
+    monkeypatch.setattr(
+        update.subprocess,
+        "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        toolsdl, "upgrade_tools", lambda **kw: pytest.fail("the OLD package must not upgrade tools")
+    )
+    monkeypatch.setattr(
+        update,
+        "_fresh_report",
+        lambda *a, **k: {
+            "version": "9.9.9",
+            "adb": "35.0.2",
+            "scrcpy": "3.1",
+            "errors": {"scrcpy": "boom"},
+        },
+    )
+    res = update.run_upgrade(notify=lambda m: None)
+    assert res["ok"] and res["new"] == "9.9.9"
+    assert res["adb"] == "35.0.2" and res["scrcpy"] == "3.1"
+    assert res["tools_errors"] == {"scrcpy": "boom"}
+
+
+def test_the_post_upgrade_report_is_valid_code_run_in_another_interpreter(monkeypatch):
+    import turboadb.update as update
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout='chatter\n' + update._REPORT_MARK + '{"version": "2.0.0"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    assert update._fresh_report()["version"] == "2.0.0"
+    assert seen["cmd"][0] == sys.executable and seen["cmd"][1] == "-c"
+    compile(seen["cmd"][2], "<post-upgrade>", "exec")  # the generated source is valid
+
+
+def test_relaunch_flushes_settings_and_only_then_starts_the_replacement(monkeypatch):
+    import turboadb.update as update
+
+    order = []
+    monkeypatch.setattr(update, "_flush_user_state", lambda: order.append("flush"))
+    monkeypatch.setattr(update, "_spawn", lambda: order.append("spawn") or True)
+    assert update.relaunch() is True and order == ["flush", "spawn"]
+
+
+def test_relaunch_on_exit_starts_nothing_while_this_instance_still_runs(monkeypatch):
+    import turboadb.update as update
+
+    spawned = []
+    monkeypatch.setattr(update, "_flush_user_state", lambda: None)
+    monkeypatch.setattr(update, "_spawn", lambda: spawned.append(1) or True)
+    monkeypatch.setattr(update, "_relaunch_scheduled", False)
+    try:
+        # the safe contract: no second process exists while dialogs are up
+        assert update.relaunch_on_exit() is True and spawned == []
+        update._relaunch_at_exit()  # what interpreter shutdown will run
+        assert spawned == [1]
+    finally:
+        update.cancel_relaunch()
+
+
+# --------------------------------------------------------------------------- #
+# B-10  ONE ~/.turboadb resolver, consulted on every call
+# --------------------------------------------------------------------------- #
+def test_every_user_state_path_follows_the_same_resolver(monkeypatch, tmp_path):
+    from turboadb import config, tools, update
+    from turboadb.gui import sessions, settings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    root = config.user_dir()
+    assert root.startswith(str(tmp_path))
+    # frozen-at-import paths made one process read tools and settings from two
+    # different home directories
+    for path in (
+        tools.managed_tools_dir(),
+        settings.settings_file(),
+        sessions.sessions_file(),
+        update.check_cache_path(),
+    ):
+        assert path.startswith(root), path
+
+
+def test_an_explicit_settings_path_override_still_wins(monkeypatch, tmp_path):
+    from turboadb.gui import sessions, settings
+
+    monkeypatch.setattr(settings, "_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(sessions, "_FILE", str(tmp_path / "t.json"))
+    assert settings.settings_file() == str(tmp_path / "s.json")
+    assert sessions.sessions_file() == str(tmp_path / "t.json")
+
+
+# --------------------------------------------------------------------------- #
+# B-11  a long-lived store must not delete targets added behind its back
+# --------------------------------------------------------------------------- #
+def test_saving_merges_targets_another_process_added(monkeypatch, tmp_path):
+    from turboadb.gui import sessions
+
+    monkeypatch.setattr(sessions, "_FILE", str(tmp_path / "sessions.json"))
+    gui = sessions.SessionStore()  # the long-running window
+    gui.save({"name": "bench", "type": "usb", "serial": "a"})
+
+    cli = sessions.SessionStore()  # the CLI / a second window
+    cli.save({"name": "lab", "type": "network", "host": "10.0.0.8"})
+
+    gui.save({"name": "bench", "type": "usb", "serial": "c"})  # from a stale snapshot
+    assert sorted(sessions.SessionStore().names()) == ["bench", "lab"]
+    assert sessions.SessionStore().get("bench")["serial"] == "c"
+
+    gui.delete("bench")  # an explicit delete still sticks
+    assert sessions.SessionStore().names() == ["lab"]
+
+
+def test_renaming_does_not_resurrect_the_old_name(monkeypatch, tmp_path):
+    from turboadb.gui import sessions
+
+    monkeypatch.setattr(sessions, "_FILE", str(tmp_path / "sessions.json"))
+    store = sessions.SessionStore()
+    store.save({"name": "bench", "type": "usb", "serial": "a"})
+    store.save({"name": "lab", "type": "usb", "serial": "a", "previous_name": "bench"})
+    assert sessions.SessionStore().names() == ["lab"]
+
+
+# --------------------------------------------------------------------------- #
+# B-12  settings are serialised across PROCESSES, not just threads
+# --------------------------------------------------------------------------- #
+def test_settings_lock_is_exclusive_across_processes_and_reentrant_within_one(tmp_path):
+    from turboadb.gui import settings
+
+    path = str(tmp_path / "settings.json")
+    lock = os.path.abspath(path) + ".lock"
+    with settings._file_lock(path):
+        with settings._file_lock(path):  # update() -> save() takes it twice
+            # a second handle stands in for the second TurboADB process
+            assert settings._lock_acquire(lock, 0.05) is None
+    handle = settings._lock_acquire(lock, 1.0)
+    assert handle is not None  # released again afterwards
+    settings._lock_release(handle)
+
+
+def test_settings_writes_still_work_when_the_lock_cannot_be_taken(monkeypatch, tmp_path):
+    from turboadb.gui import settings
+
+    monkeypatch.setattr(settings, "_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(settings, "_lock_acquire", lambda path, timeout: None)
+    settings.update({"theme": "light"})
+    assert settings.get("theme") == "light"
+
+
+# --------------------------------------------------------------------------- #
+# B-13 / B-14  a bounded, parallel deploy, and a password that stays out of argv
+# --------------------------------------------------------------------------- #
+def _deploy_env(monkeypatch, worker):
+    import turboadb.remote_deploy as rd
+
+    monkeypatch.setattr(rd, "_ensure_winrm", lambda say=None: True)
+    monkeypatch.setattr(rd, "_deploy_one", worker)
+    return rd
+
+
+def test_unreachable_hosts_cannot_outlast_the_total_budget(monkeypatch):
+    def slow(host, *a, **kw):
+        time.sleep(1.0)
+        return True, [f"[OK] {host}"]
+
+    rd = _deploy_env(monkeypatch, slow)
+    said = []
+    rc = rd.deploy_serve(
+        ["a", "b", "c"], "D\\u", "pw", on_status=said.append, total_timeout=0.2, max_workers=1
+    )
+    assert rc == 1
+    skipped = [line for line in said if "Skipped" in line]
+    assert skipped and "a, b, c" in skipped[0]
+
+
+def test_independent_hosts_are_contacted_in_parallel_and_reported_in_order(monkeypatch):
+    def slow(host, *a, **kw):
+        time.sleep(0.3)
+        return True, [f"[OK] {host}"]
+
+    rd = _deploy_env(monkeypatch, slow)
+    said = []
+    started = time.monotonic()
+    rc = rd.deploy_serve(
+        ["a", "b", "c", "d"], "D\\u", "pw", on_status=said.append, max_workers=4
+    )
+    elapsed = time.monotonic() - started
+    assert rc == 0 and elapsed < 1.0  # serial would need >= 1.2 s
+    assert [line for line in said if line.startswith("[OK]")] == [
+        "[OK] a", "[OK] b", "[OK] c", "[OK] d",
+    ]
+
+
+def test_one_failing_host_does_not_abort_the_others(monkeypatch):
+    def worker(host, *a, **kw):
+        if host == "b":
+            return False, [f"[ERROR] {host}: nope"]
+        return True, [f"[OK] {host}"]
+
+    rd = _deploy_env(monkeypatch, worker)
+    said = []
+    assert rd.deploy_serve(["a", "b", "c"], "D\\u", "pw", on_status=said.append) == 1
+    assert "[OK] c" in said
+
+
+def test_the_winrm_password_can_avoid_argv_entirely(monkeypatch):
+    import turboadb.remote_deploy as rd
+
+    monkeypatch.setenv(rd.PASSWORD_ENV, "from-env")
+    assert rd.resolve_password() == "from-env"
+    assert rd.resolve_password("explicit") == "explicit"
+    monkeypatch.setattr(rd.sys, "stdin", io.StringIO("from-stdin\n"))
+    assert rd.resolve_password(from_stdin=True) == "from-stdin"
+    monkeypatch.delenv(rd.PASSWORD_ENV)
+    with pytest.raises(ValueError, match=rd.PASSWORD_ENV):
+        rd.resolve_password(prompt=False)
+
+
+# --------------------------------------------------------------------------- #
+# B-15  packaging metadata matches what the code actually supports
+# --------------------------------------------------------------------------- #
+def _repo_file(*parts):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, *parts), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_packaging_declares_every_supported_os_and_extra():
+    text = _repo_file("pyproject.toml")
+    for classifier in (
+        "Operating System :: Microsoft :: Windows",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: MacOS :: MacOS X",
+    ):
+        assert classifier in text, classifier
+    extras = text.split("[project.optional-dependencies]", 1)[1].split("\n[", 1)[0]
+    all_line = next(line for line in extras.splitlines() if line.startswith("all"))
+    for dep in ("PyQt5", "pywinrm", "keyring", "argcomplete"):
+        assert dep in all_line, dep
+
+
+def test_the_sdist_ships_the_reference_docs():
+    manifest = _repo_file("MANIFEST.in")
+    for doc in ("CLI.md", "CHANGELOG.md", "ARCHITECTURE.md", "LICENSE"):
+        assert f"include {doc}" in manifest, doc
+
+
+# --------------------------------------------------------------------------- #
+# B-16 / B-17 / B-19  CI really runs the GUI suite; releases are gated
+# --------------------------------------------------------------------------- #
+def test_ci_has_a_job_that_installs_qt_and_runs_the_gui_tests():
+    ci = _repo_file(".github", "workflows", "ci.yml")
+    assert "QT_QPA_PLATFORM: offscreen" in ci
+    assert '".[all,test]"' in ci and "libxkbcommon-x11-0" in ci and "libxcb-cursor0" in ci
+    assert 'python-version: ["3.8", "3.11", "3.13"]' in ci  # the plain job stays
+
+
+def test_the_release_workflow_gates_on_version_tests_and_artifacts():
+    rel = _repo_file(".github", "workflows", "release.yml")
+    assert "turboadb.__version__" in rel  # the tag must match
+    assert "python -m pytest tests/ -q" in rel
+    assert "twine check" in rel and "wheel_has_exe" in rel
+    assert "TURBOADB_SELFTEST: winrm" in rel
+    assert "fail_on_unmatched_files: true" in rel
+
+
+def test_conftest_fixes_the_qt_platform_for_the_whole_process():
+    conftest = _repo_file("tests", "conftest.py")
+    assert 'os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")' in conftest
+    assert os.environ.get("QT_QPA_PLATFORM") == "offscreen"
+
+
+# --------------------------------------------------------------------------- #
+# B-18  the release script rebuilds a stale exe and never leaves a phantom bump
+# --------------------------------------------------------------------------- #
+def _release_under_test():
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "release.py"
+    )
+    spec = importlib.util.spec_from_file_location("turboadb_release_staleness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_an_exe_older_than_its_sources_is_rebuilt(tmp_path, monkeypatch):
+    release = _release_under_test()
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "turboadb").mkdir()
+    exe = tmp_path / "dist" / "TurboADB-9.9.9-win64.exe"
+    exe.write_bytes(b"MZ-old")
+    source = tmp_path / "turboadb" / "core.py"
+    source.write_text("# edited after the build\n", encoding="utf-8")
+    os.utime(exe, (1_000_000, 1_000_000))
+    os.utime(source, (2_000_000, 2_000_000))
+    assert release.exe_is_stale(exe) is True
+
+    built = []
+
+    def fake_run(cmd, **kw):
+        built.append(cmd)
+        exe.write_bytes(b"MZ-new")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    target = release.bundle_exe("9.9.9")
+    assert built and target.read_bytes() == b"MZ-new"
+
+    os.utime(exe, (3_000_000, 3_000_000))  # newer than every source again
+    assert release.exe_is_stale(exe) is False
+
+
+def test_a_failed_upload_rolls_the_version_back(monkeypatch, tmp_path):
+    release = _release_under_test()
+    pyproject = tmp_path / "pyproject.toml"
+    init = tmp_path / "__init__.py"
+    pyproject.write_text('[project]\nversion = "1.2.3"\n', encoding="utf-8")
+    init.write_text('__version__ = "1.2.3"\n', encoding="utf-8")
+    (tmp_path / "dist").mkdir()
+    monkeypatch.setattr(release, "ROOT", tmp_path)
+    monkeypatch.setattr(release, "PYPROJECT", pyproject)
+    monkeypatch.setattr(release, "INIT", init)
+    monkeypatch.setattr(release, "bundle_exe", lambda version, rebuild=False: None)
+    monkeypatch.setattr(release, "wheel_has_exe", lambda wheel: True)
+    monkeypatch.setenv("TWINE_PASSWORD", "pypi-token")
+
+    def fake_run(cmd, **kw):
+        if "upload" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+        if "build" in cmd:
+            (tmp_path / "dist" / "turboadb-1.2.4-py3-none-any.whl").write_bytes(b"")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        release.main(["patch", "--skip-tests"])
+    # a bump with nothing published makes the next `patch` skip a number
+    assert '"1.2.3"' in pyproject.read_text(encoding="utf-8")
+    assert '"1.2.3"' in init.read_text(encoding="utf-8")

@@ -14,17 +14,11 @@ import types
 import pytest
 
 pytest.importorskip("PyQt5")
-os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from turboadb.gui import file_browser as fb  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def app():
-    return QApplication.instance() or QApplication(["turboadb-fb-fixes"])
 
 
 class _Res:
@@ -283,10 +277,18 @@ def test_delete_key_in_remote_table_deletes(app, monkeypatch):
 
     _sync_jobs(monkeypatch)
     _quiet_boxes(monkeypatch, answer=fb.QMessageBox.Yes)
-    browser = fb.FileBrowser(None)
+
+    removed = []
+
+    class Handler:
+        """The delete goes through the engine, which chunks and guards the paths."""
+
+        def remove(self, paths, *, recursive=False, safe=None):
+            removed.append((list(paths), recursive))
+            return list(paths)
+
+    browser = fb.FileBrowser(Handler())
     try:
-        ran = []
-        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30: ran.extend(cmds))
         browser._loaded_remote = True  # no device listing on show
         browser.remote_cwd = "/sdcard"
         rows = [("a.txt", 1, "1 B", "File", "", "-rw-rw-rw-", "", False),
@@ -301,7 +303,7 @@ def test_delete_key_in_remote_table_deletes(app, monkeypatch):
         app.processEvents()
         assert QApplication.focusWidget() is browser.remote_table
         QTest.keyClick(browser.remote_table, Qt.Key_Delete)
-        assert [shlex.split(c) for _l, c in ran] == [["rm", "-rf", "/sdcard/dup "]]
+        assert removed == [(["/sdcard/dup "], True)]  # the trailing space survives
     finally:
         browser.hide()
         browser.close_panel()

@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 

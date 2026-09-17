@@ -17,19 +17,6 @@ import pytest
 pytest.importorskip("PyQt5")
 
 
-_APP = []  # a QApplication whose only Python reference dies is destroyed
-
-
-@pytest.fixture(scope="session")
-def app():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt5.QtWidgets import QApplication
-
-    if not _APP:
-        _APP.append(QApplication.instance() or QApplication(["test-mirror-screen"]))
-    return _APP[0]
-
-
 class _Handler:
     serial = "mock"
     config = None
@@ -631,3 +618,148 @@ def test_idle_frame_uses_a_known_default_size_and_keeps_the_old_api(app):
         assert standalone.landscape and standalone.aspect == pytest.approx(16 / 9)
     finally:
         standalone.close()
+
+
+# --------------------------------------------------------------------------- #
+# the screen toolbar: frame rate beside the picture, a status line that clears
+# --------------------------------------------------------------------------- #
+def _solid(width, height, colour="#3366aa"):
+    from PyQt5.QtGui import QColor, QImage
+
+    image = QImage(width, height, QImage.Format_RGB32)
+    image.fill(QColor(colour))
+    return image
+
+
+@pytest.fixture
+def screencap_panel(app, monkeypatch):
+    """A shown panel whose screencap renderer shows a portrait frame at once
+    (no adb, no worker thread)."""
+    from PyQt5.QtCore import Qt
+    import turboadb.gui.mirror_panel as mp_mod
+    from turboadb.gui import screencap_view as sv
+
+    def fake_start(view):
+        view._image = _solid(108, 240)
+        view._frame_size = (1080, 2400)
+        view._fps = 4.5
+        view._message = ""
+        view.frame_shape_changed.emit()
+        view.first_frame.emit()
+        view.stats_changed.emit()
+
+    monkeypatch.setattr(sv.ScreencapView, "start", fake_start)
+    monkeypatch.setattr(mp_mod, "saved_dialog", lambda *_a, **_k: None)
+    monkeypatch.setattr(mp_mod.QMessageBox, "warning", lambda *_a, **_k: None)
+    panel = _panel()
+    panel.setAttribute(Qt.WA_DontShowOnScreen, True)
+    panel.set_screen_backend("screencap")
+    panel.resize(420, 700)
+    panel.show()
+    panel.start()
+    for _ in range(5):
+        app.processEvents()
+    yield panel
+    panel.hide()
+    _close(panel)
+
+
+def test_the_frame_rate_sits_in_the_toolbar_outside_the_picture(app, screencap_panel):
+    from PyQt5.QtCore import QRect
+    from turboadb.gui import screencap_view as sv
+
+    panel = screencap_panel
+    view = panel.screencap_view()
+    chip = panel.lbl_renderer
+    assert not chip.isHidden() and chip.text() == "screencap · 4.5 fps"
+    left, top, width, height = (int(v) for v in sv.fit_rect(108, 240, view.width(), view.height()))
+    picture = QRect(view.mapTo(panel, QRect(left, top, 1, 1).topLeft()), QRect(0, 0, width, height).size())
+    badge = QRect(chip.mapTo(panel, chip.rect().topLeft()), chip.size())
+    assert not badge.intersects(picture)
+    assert chip.parentWidget() is panel._toolbar_widget  # in the toolbar row itself
+    panel.stop()
+    assert chip.isHidden()  # no renderer running, no frame rate
+
+
+def test_a_saved_screencap_recording_clears_its_status_line(app, screencap_panel, tmp_path):
+    """Issue: "Recording stopped. Saving the MP4 to your PC…" stayed under the
+    live screen after the recording had been saved."""
+    panel = screencap_panel
+    assert panel.screencap_view() is not None and panel.status.isHidden()
+    path = tmp_path / "screen.mp4"
+    path.write_bytes(b"video data")
+    panel._rec_path = str(path)
+    panel._recording, panel._rec_mode = True, "device"
+    panel._stop_record()
+    assert panel.status.text() == "Recording stopped. Saving the MP4 to your PC…"
+    panel._record_finished([str(path)])
+    assert panel.status.isHidden() and panel.status.text() == ""
+    assert not panel._recording and not panel._record_finalizing
+
+    # a failed save clears it too, but never another message that replaced it
+    panel._recording, panel._rec_mode = True, "device"
+    panel._stop_record()
+    panel.status.setText("Screen capture ended. Retry")
+    panel.status.show()
+    panel._record_failed("pull failed")
+    assert panel.status.text() == "Screen capture ended. Retry"
+
+
+def test_a_saved_scrcpy_recording_clears_its_status_line(rec):
+    panel, _live, _calls = _live_panel()
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        assert panel.status.text().startswith("● Recording")
+        panel.status.show()  # e.g. shown while the screen was still starting
+        panel._toggle_record()
+        assert panel.status.text() == "Recording stopped. Saving the MP4 to your PC…"
+        with open(rec.path, "wb") as fh:
+            fh.write(b"\x00\x00\x00\x20ftypisom")
+        rec.stops[0].done.emit(True)
+        assert panel.status.isHidden() and panel.status.text() == ""
+        assert not panel._record_finalizing
+    finally:
+        _close(panel)
+
+
+def test_text_typed_for_the_device_never_reaches_the_log(qapp, monkeypatch):
+    """"Type into the device" may carry a password: the log, status bar and
+    toasts only ever see how many characters were sent."""
+    from turboadb.gui import mirror_panel as mp_mod
+
+    sent = []
+
+    class Handler:
+        serial = "dev"
+        config = None
+
+        def input_text(self, text, **kwargs):
+            sent.append(text)
+            return True
+
+    class Now:
+        def submit(self, fn, *, on_done=None, on_fail=None, priority=10):
+            result = fn()
+            if on_done is not None:
+                on_done(result)
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(mp_mod.QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: ("hunter2 secret", True)))
+    panel = mp_mod.MirrorPanel(Handler(), {"name": "dev"}, dispatcher=Now())
+    lines = []
+    panel.log.connect(lines.append)
+    try:
+        panel._type_text()
+        assert sent == ["hunter2 secret"]
+        assert lines and not any("hunter2" in line or "secret" in line for line in lines)
+        assert lines[0] == "[INFO] Sending 14 characters to the device…"
+    finally:
+        panel.close_panel()
+        panel.deleteLater()
+        qapp.processEvents()

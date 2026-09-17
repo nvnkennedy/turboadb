@@ -12,9 +12,10 @@ from PyQt5.QtCore import QLockFile
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from ..config import user_path
 from .main_window import MainWindow, ICON_PATH
 
-_FLAG_DIR = os.path.join(os.path.expanduser("~"), ".turboadb")
+_FLAG_DIR = user_path()
 _window = None  # set after creation, used by the exception hook
 _instance_lock = None  # kept alive for the lifetime of the GUI process
 _instance_mutex = None  # Windows' atomic duplicate-launch guard

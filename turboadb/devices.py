@@ -491,6 +491,8 @@ def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
     kill the ``-a`` (all-interfaces) server, then start a plain server that binds
     to localhost again, so this PC keeps working but no longer shares its devices.
     Best-effort; returns a short status string."""
+    from .tools import is_adb_server_alive
+
     port = validate_port(port)
     adb = find_adb(adb_path)
     stopped = subprocess.run(
@@ -499,29 +501,95 @@ def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
         timeout=15,
         creationflags=NO_WINDOW,
     )
-    if stopped.returncode != 0:
-        detail = (stopped.stderr or stopped.stdout or b"").decode("utf-8", "replace").strip()
-        raise RuntimeError(f"could not stop shared adb server: {detail or 'unknown error'}")
+    # Several adb builds exit non-zero from kill-server when no daemon is
+    # running, so "Stop sharing" used to fail loudly when it was ALREADY
+    # stopped. Like core.restart_server, a failed kill is only a note and
+    # success is judged by the local server coming back.
     started = subprocess.run(
         [adb, "-P", str(port), "start-server"],
         capture_output=True,
         timeout=15,
         creationflags=NO_WINDOW,
     )
-    if started.returncode != 0:
+    if started.returncode != 0 and not is_adb_server_alive(port=port, timeout=1.0):
         detail = (started.stderr or started.stdout or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(f"could not start local adb server: {detail or 'unknown error'}")
-    return "shared adb server stopped — back to local-only (localhost)"
+    note = " (it was not running)" if stopped.returncode != 0 else ""
+    return f"shared adb server stopped — back to local-only (localhost){note}"
 
 
 def _startup_dir() -> str:
-    """The current user's Windows Startup folder (programs run at login)."""
-    appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    """The current user's Windows Startup folder (programs run at login).
+
+    Without APPDATA there is no Startup folder to write to; the old fallback to
+    the home directory happily reported success for a launcher that Windows
+    would never run."""
+    appdata = (os.environ.get("APPDATA") or "").strip()
+    if not appdata:
+        raise RuntimeError(
+            "APPDATA is not set, so this account's Windows Startup folder cannot "
+            "be located. Use the SYSTEM startup task instead:  "
+            "turboadb serve --startup-task"
+        )
     return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
 
 
-def _serve_launcher(port: int) -> str:
+def _short_path(path: str) -> str:
+    """The DOS 8.3 form of *path* (always plain ASCII), or *path* unchanged.
+
+    The login ``.bat`` is read by cmd.exe in the console codepage, which may have
+    no room for a profile directory with an accent; the short path always has."""
+    if os.name != "nt" or not path:
+        return path
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(4096)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+        if 0 < n < len(buf) and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
+def _batch_encoding() -> str:
+    """The codepage cmd.exe decodes a ``.bat`` file with (the OEM codepage).
+
+    Writing the launcher as UTF-8 silently produced a broken launcher for any
+    non-ASCII interpreter path — cmd.exe never reads batch files as UTF-8."""
+    if os.name != "nt":
+        return "utf-8"
+    try:
+        import ctypes
+
+        cp = int(ctypes.windll.kernel32.GetOEMCP())
+        if cp:
+            return f"cp{cp}"
+    except Exception:
+        pass
+    return "mbcs"
+
+
+def _pinned_adb(adb_path: str | None = None) -> Optional[str]:
+    """The adb THIS user resolves, to be pinned into a launcher/task.
+
+    A SYSTEM scheduled task runs under a profile that has no
+    ``~/.turboadb/tools`` and no GUI settings, so it resolved a *different* adb
+    and bound port 5037 with it — two adb binaries taking turns on 5037 is a
+    known cause of Windows device disconnects. Returns None when adb cannot be
+    resolved here either (the launcher then falls back to its own search)."""
+    try:
+        return find_adb(adb_path)
+    except Exception:
+        return None
+
+
+def _serve_launcher(port: int, adb_path: str | None = None, *, short_paths: bool = False) -> str:
     """The quoted command that runs ``turboadb serve`` headlessly.
+
+    *adb_path* pins the adb executable into the command so the background
+    launcher can never fork a second toolchain (see :func:`_pinned_adb`).
 
     The standalone (PyInstaller) exe cannot do this: ``TurboADB.exe -m turboadb
     serve`` just opens the GUI and never starts a server, so a login launcher or
@@ -534,24 +602,45 @@ def _serve_launcher(port: int) -> str:
             "command at startup. Install the Python package on this PC "
             "(pip install turboadb) and run:  turboadb serve --startup-task"
         )
-    return f'"{windowless_python()}" -m turboadb serve --port {port}'
+    python = windowless_python()
+    if short_paths:
+        python = _short_path(python)
+        adb_path = _short_path(adb_path) if adb_path else adb_path
+    cmd = f'"{python}" -m turboadb serve --port {port}'
+    if adb_path:
+        cmd += f' --adb-path "{adb_path}"'
+    return cmd
 
 
-def install_startup(port: int = 5037) -> str:
+def install_startup(port: int = 5037, adb_path: str | None = None) -> str:
     """Make the shared adb server start automatically at every Windows login by
     dropping a tiny launcher in the Startup folder. Returns the file path.
     So it really never has to be done by hand again."""
     if os.name != "nt":
         raise RuntimeError("Startup install is only supported on Windows.")
     port = validate_port(port)
-    launcher = _serve_launcher(port)
+    adb = _pinned_adb(adb_path)
     d = _startup_dir()
     os.makedirs(d, exist_ok=True)
     bat = os.path.join(d, "turboadb-shared-adb.bat")
-    # pythonw -m turboadb serve, detached, no window
-    line = f'@echo off\r\nstart "" /b {launcher}\r\n'
-    with open(bat, "w", encoding="utf-8") as fh:
-        fh.write(line)
+    # pythonw -m turboadb serve, detached, no window. The bytes must be written
+    # in the codepage cmd.exe reads, not UTF-8.
+    encoding = _batch_encoding()
+    text = f'@echo off\r\nstart "" /b {_serve_launcher(port, adb)}\r\n'
+    try:
+        data = text.encode(encoding)
+    except UnicodeEncodeError:
+        text = f'@echo off\r\nstart "" /b {_serve_launcher(port, adb, short_paths=True)}\r\n'
+        try:
+            data = text.encode(encoding)
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(
+                "the interpreter path cannot be written into a batch file cmd.exe "
+                f"can read ({encoding}). Use the SYSTEM startup task instead:  "
+                "turboadb serve --startup-task"
+            ) from exc
+    with open(bat, "wb") as fh:
+        fh.write(data)
     return bat
 
 
@@ -559,7 +648,10 @@ def uninstall_startup() -> bool:
     """Remove the login auto-start launcher if present."""
     if os.name != "nt":
         return False
-    bat = os.path.join(_startup_dir(), "turboadb-shared-adb.bat")
+    try:
+        bat = os.path.join(_startup_dir(), "turboadb-shared-adb.bat")
+    except RuntimeError:
+        return False  # no Startup folder -> nothing was ever installed
     if os.path.exists(bat):
         os.remove(bat)
         return True
@@ -574,16 +666,52 @@ def _pythonw() -> str:
 _SERVE_TASK = "TurboADBSharedADB"
 
 
-def install_serve_task(port: int = 5037, *, run_now: bool = True) -> str:
+def _task_last_result(task: str) -> str:
+    """The scheduler's own verdict on the last run, for an actionable error.
+
+    Best-effort: schtasks localises its labels, so the 'Last Result' line is
+    matched loosely and an empty string simply means 'not available'."""
+    try:
+        q = subprocess.run(
+            ["schtasks", "/query", "/tn", task, "/fo", "list", "/v"],
+            capture_output=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return ""
+    text = (q.stdout or b"").decode("utf-8", "replace")
+    for line in text.splitlines():
+        head, _, tail = line.partition(":")
+        if "result" in head.strip().lower() and tail.strip():
+            return f"{head.strip()}: {tail.strip()}"
+    return ""
+
+
+def install_serve_task(
+    port: int = 5037, *, run_now: bool = True, adb_path: str | None = None,
+    ready_timeout: float = 20.0,
+) -> str:
     """Register a Scheduled Task that runs the shared adb server at SYSTEM
     **startup** — headless and persistent (survives logoff and needs no login,
     unlike the Startup-folder launcher). Optionally start it immediately via the
     scheduler, which detaches it from whatever session created it (e.g. a WinRM
-    remote-deploy session). Returns the task name. Needs admin rights."""
+    remote-deploy session). Returns the task name. Needs admin rights.
+
+    The adb THIS user resolves is pinned into the task's command line, because
+    SYSTEM's profile has neither ``~/.turboadb/tools`` nor the GUI settings and
+    would otherwise bind port 5037 with a different adb binary.
+
+    With *run_now*, success means the server is actually LISTENING: ``schtasks
+    /run`` only reports that the task was launched, so the port is polled for
+    *ready_timeout* seconds and the task's last result is reported if it never
+    binds."""
+    from .tools import is_adb_server_alive
+
     if os.name != "nt":
         raise RuntimeError("Scheduled-task install is Windows-only.")
     port = validate_port(port)
-    tr = _serve_launcher(port)
+    tr = _serve_launcher(port, _pinned_adb(adb_path))
     created = subprocess.run(
         [
             "schtasks",
@@ -617,6 +745,18 @@ def install_serve_task(port: int = 5037, *, run_now: bool = True) -> str:
         if started.returncode != 0:
             detail = (started.stderr or started.stdout or b"").decode("utf-8", "replace").strip()
             raise RuntimeError(f"Scheduled Task {_SERVE_TASK} was created but could not start: {detail or 'unknown error'}")
+        deadline = time.monotonic() + max(0.0, ready_timeout)
+        while not is_adb_server_alive(port=port, timeout=0.25):
+            if time.monotonic() >= deadline:
+                last = _task_last_result(_SERVE_TASK)
+                raise RuntimeError(
+                    f"Scheduled Task {_SERVE_TASK} was started but no adb server is "
+                    f"listening on port {port} after {ready_timeout:g}s"
+                    + (f" — {last}" if last else "")
+                    + ". Check that Python and turboadb are installed machine-wide "
+                    "(SYSTEM cannot see a per-user install)."
+                )
+            time.sleep(0.25)
     return _SERVE_TASK
 
 

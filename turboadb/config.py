@@ -2,8 +2,29 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+USER_DIR_NAME = ".turboadb"
+
+
+def user_dir() -> str:
+    """TurboADB's per-user state directory (``~/.turboadb``) — the ONE resolver.
+
+    Settings, saved targets, the managed tool cache, logs and update stamps all
+    live here.  It is resolved on every call on purpose: the path used to be
+    frozen at import time in some modules and recomputed per call in others, so
+    a process whose ``HOME``/``USERPROFILE`` changed afterwards (the test suite,
+    a service account, a relaunch under another profile) read its settings from
+    one directory and its tools from another.  Creates nothing.
+    """
+    return os.path.join(os.path.expanduser("~"), USER_DIR_NAME)
+
+
+def user_path(*parts: str) -> str:
+    """A path inside :func:`user_dir` (``user_path("tools")``). Creates nothing."""
+    return os.path.join(user_dir(), *parts)
 
 
 def validate_port(value, name: str = "port") -> int:

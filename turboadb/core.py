@@ -37,6 +37,7 @@ from .exceptions import (
     ADBConnectionError,
     ADBError,
     ADBInstallError,
+    ADBNotConnectedError,
     ADBTimeoutError,
     ADBTransferError,
     ADBNotFoundError,
@@ -347,7 +348,11 @@ class ADBHandler:
         start = time.time()
         try:
             out = subprocess.run(
-                cmd, capture_output=True, timeout=eff_timeout, creationflags=NO_WINDOW
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=eff_timeout,
+                creationflags=NO_WINDOW,
             )
         except subprocess.TimeoutExpired as exc:
             raise ADBTimeoutError(
@@ -413,7 +418,27 @@ class ADBHandler:
 
     @staticmethod
     def _display_flag(display_id) -> list:
-        return ["-d", str(int(display_id))] if display_id is not None else []
+        """``["-d", ID]`` for ``input`` / ``screencap``, or ``[]`` for the
+        default display. The one builder for both: it VALIDATES the id as an
+        integer and quotes it, because these words are re-split by ``sh -c``
+        on the device."""
+        if display_id is None:
+            return []
+        return ["-d", shlex.quote(str(int(display_id)))]
+
+    @staticmethod
+    def _prepare_local_path(local_path):
+        """*local_path* with ``~`` expanded and its folder created (None stays
+        None). Every method that writes a file on this machine goes through it,
+        so ``--save ~/boot.log`` and ``out/clip.mp4`` behave the same
+        everywhere."""
+        if not local_path:
+            return local_path
+        path = os.path.expanduser(local_path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return path
 
     @staticmethod
     def _combined_output(res) -> str:
@@ -578,17 +603,30 @@ class ADBHandler:
                 f"Timed out after {timeout}s waiting for {self._serial or 'a device'}."
             ) from exc
 
+    # adb's own wording when the target isn't attached to the server at all —
+    # a different problem from "it is there but not ready yet".
+    _NOT_CONNECTED_RE = re.compile(
+        r"not found|not connected|no devices?(?:/emulators?)? found", re.I
+    )
+
     def wait_for_device(self, timeout: Optional[float] = None, *, safe: Optional[bool] = None):
-        """Block until the device is online (``adb wait-for-device``). Raises
-        ADBConnectionError when adb gives up (e.g. the serial doesn't exist)."""
+        """Block until the device is online (``adb wait-for-device``).
+
+        Raises ADBNotConnectedError when adb reports the target as not
+        connected (a stale serial, or a network device that was never
+        ``connect``ed), and ADBConnectionError for any other failure."""
 
         def _do():
             res = self._wait_for_device(timeout or self.config.connect_timeout)
             if not res.ok:
-                raise ADBConnectionError(
-                    f"wait-for-device failed for {self._serial or 'a device'}: "
-                    f"{self._combined_output(res) or f'exit {res.exit_code}'}"
-                )
+                detail = self._combined_output(res) or f"exit {res.exit_code}"
+                target = self._serial or "a device"
+                if self._NOT_CONNECTED_RE.search(detail):
+                    raise ADBNotConnectedError(
+                        f"{target} is not connected: {detail}. Call connect() "
+                        f"(or 'adb connect host:port') first."
+                    )
+                raise ADBConnectionError(f"wait-for-device failed for {target}: {detail}")
             return True
 
         return self._guard("wait_for_device", _do, safe=safe)
@@ -1072,7 +1110,11 @@ class ADBHandler:
         """The display's CURRENT logical size (override size + rotation applied)
         — the coordinate space ``input tap/swipe`` uses. ``dumpsys window
         displays`` reports it as ``cur=WxH``; ``wm size`` (Override size before
-        Physical size) is the fallback."""
+        Physical size) is the fallback.
+
+        Returns ``None`` when neither answers. A guessed 1080x1920 default sent
+        every gesture off-screen on a 1920x720 head unit — and still reported
+        success — so the callers refuse instead."""
         want = 0 if display_id is None else int(display_id)
         try:
             text = self._run(["shell", "dumpsys", "window", "displays"], timeout=10).text
@@ -1093,7 +1135,19 @@ class ADBHandler:
                 return int(m.group(1)), int(m.group(2))
         except ADBError:
             pass
-        return 1080, 1920
+        return None
+
+    def _gesture_size(self, display_id: Optional[int] = None):
+        """:meth:`_screen_size`, or ADBError — a gesture must never be aimed at
+        a made-up screen."""
+        size = self._screen_size(display_id=display_id)
+        if size is None:
+            raise ADBError(
+                "could not read the display size (neither 'dumpsys window displays' "
+                f"nor 'wm size' reported one for display {0 if display_id is None else display_id})"
+                " — a gesture aimed at a guessed size would land in the wrong place"
+            )
+        return size
 
     def scroll(
         self,
@@ -1107,7 +1161,7 @@ class ADBHandler:
         up | down | left | right."""
 
         def _do():
-            w, h = self._screen_size(display_id=display_id)
+            w, h = self._gesture_size(display_id)
             cx, cy = w // 2, h // 2
             d = direction.lower()
             if d == "up":
@@ -1127,8 +1181,11 @@ class ADBHandler:
         return self._guard("scroll", _do, safe=safe)
 
     def tap_center(self, *, display_id: Optional[int] = None, safe: Optional[bool] = None):
+        """Tap the middle of the display. Raises ADBError when the device won't
+        report its size, rather than tapping a guessed centre."""
+
         def _do():
-            w, h = self._screen_size(display_id=display_id)
+            w, h = self._gesture_size(display_id)
             return self._logged_run(
                 "tap center",
                 self._shell_args("input", *self._display_flag(display_id), "tap", w // 2, h // 2),
@@ -1142,7 +1199,7 @@ class ADBHandler:
         return its message, else *blocked_msg* — an honest result instead of a
         false 'ok'. (These commands exit 0 with an error TEXT on many builds.)"""
         for args, msg in attempts:
-            r = self._logged_run(label, ["shell"] + args, timeout=timeout)
+            r = self._logged_run(label, self._shell_args(*args), timeout=timeout)
             if not self._output_failed(r):
                 return msg
         return blocked_msg
@@ -1217,22 +1274,23 @@ class ADBHandler:
 
         def _do():
             r = self._logged_run(
-                f"airplane {st}", ["shell", "cmd", "connectivity", "airplane-mode", st], timeout=15
+                f"airplane {st}",
+                self._shell_args("cmd", "connectivity", "airplane-mode", st),
+                timeout=15,
             )
             if not self._output_failed(r):
                 return "ok"
             # legacy fallback: set the global flag, then broadcast the change
             s = self._logged_run(
                 f"airplane {st} (settings)",
-                ["shell", "settings", "put", "global", "airplane_mode_on", val],
+                self._shell_args("settings", "put", "global", "airplane_mode_on", val),
                 timeout=15,
             )
             if self._output_failed(s):
                 return "airplane mode can't be toggled via adb on this device (permission-denied)"
             b = self._logged_run(
                 f"airplane {st} (broadcast)",
-                [
-                    "shell",
+                self._shell_args(
                     "am",
                     "broadcast",
                     "-a",
@@ -1240,7 +1298,7 @@ class ADBHandler:
                     "--ez",
                     "state",
                     "true" if on else "false",
-                ],
+                ),
                 timeout=15,
             )
             if self._output_failed(b):
@@ -1518,15 +1576,18 @@ class ADBHandler:
         return self.open_url("https://www.google.com/search?q=" + quote_plus(query), safe=safe)
 
     def open_settings(self, *, safe: Optional[bool] = None):
-        return self._guard(
-            "open_settings",
-            lambda: (
-                self._run(
-                    ["shell", "am", "start", "-a", "android.settings.SETTINGS"], timeout=15
-                ).ok
-            ),
-            safe=safe,
-        )
+        """Open the system Settings app. ``am`` exits 0 while refusing, so the
+        output decides (see :meth:`_output_failed`), not the exit code."""
+
+        def _do():
+            res = self._logged_run(
+                "open settings",
+                ["shell", "am", "start", "-a", "android.settings.SETTINGS"],
+                timeout=15,
+            )
+            return not self._output_failed(res)
+
+        return self._guard("open_settings", _do, safe=safe)
 
     # Known package names per app, so launching works on ANY OEM (Vivo/Samsung/
     # Xiaomi/Oppo/OnePlus/stock…) when the standard intent isn't honoured.
@@ -1658,7 +1719,10 @@ class ADBHandler:
 
         def _do():
             r = self._run(["shell", "am", "start"] + intent_args, timeout=15, check=False)
-            if not self._output_failed(r, extra=("not started",)):
+            # No "not started" marker here: AOSP prints "Activity not started,
+            # its current task has been brought to the front" on SUCCESS. The
+            # real refusals are already covered by _FAILURE_MARKERS.
+            if not self._output_failed(r):
                 return True
             try:
                 installed = set(self.list_packages(safe=False))
@@ -1750,22 +1814,18 @@ class ADBHandler:
     ))
 
     def build_info(self, *, safe: Optional[bool] = None):
-        """A readable block of the key build/identity properties."""
-        keys = [
-            k
-            for _heading, group in self._BUILD_KEY_GROUPS[:2]
-            for k in group
-            if k not in self._BUILD_INFO_OMIT
-        ]
+        """A readable block of the key build/identity properties — the printed
+        form of :meth:`build_properties` (one query, one key list)."""
 
         def _do():
-            p = self.getprop(safe=False)  # raw dict even when handler is safe
-            return "\n".join(f"{k:32} {p.get(k, '')}" for k in keys)
+            props = self.build_properties(safe=False)  # raw dict even when safe
+            return "\n".join(f"{key:32} {value}" for key, value in props.items())
 
         return self._guard("build_info", _do, safe=safe)
 
     def build_properties(self, *, safe: Optional[bool] = None):
-        """The :meth:`build_info` properties as a ``{name: value}`` dict."""
+        """The :meth:`build_info` properties as a ``{name: value}`` dict, in the
+        order :attr:`_BUILD_KEY_GROUPS` lists them."""
 
         def _do():
             p = self.getprop(safe=False)
@@ -1807,10 +1867,12 @@ class ADBHandler:
         return self._guard("build_report", _do, safe=safe)
 
     def battery(self, *, safe: Optional[bool] = None):
-        """Battery status (``dumpsys battery``)."""
+        """Battery status (``dumpsys battery``) as the device prints it.
+
+        check=True: a failed call used to hand callers a blank report."""
         return self._guard(
             "battery",
-            lambda: self._run(["shell", "dumpsys", "battery"], timeout=20).text,
+            lambda: self._run(["shell", "dumpsys", "battery"], timeout=20, check=True).text,
             safe=safe,
         )
 
@@ -1831,10 +1893,12 @@ class ADBHandler:
 
     def battery_status(self, *, safe: Optional[bool] = None):
         """``dumpsys battery`` as a dict (``level``, ``temperature``, ``status`` …;
-        numbers become ints and true/false become booleans)."""
+        numbers become ints and true/false become booleans).
+
+        The parsed view of :meth:`battery` — one query, one place to change."""
         return self._guard(
             "battery_status",
-            lambda: self._parse_battery(self._run(["shell", "dumpsys", "battery"], timeout=20).text),
+            lambda: self._parse_battery(self.battery(safe=False)),
             safe=safe,
         )
 
@@ -2060,22 +2124,69 @@ class ADBHandler:
         r"Error while accessing provider|SecurityException|Permission Denial|IllegalArgumentException"
     )
 
+    # The foreground user is asked again after this many seconds, so a driver
+    # switch on a car is noticed without an extra round-trip before every query.
+    _FOREGROUND_USER_TTL = 30.0
+    # Only a hint for the query: a slow answer must not hold up the call log.
+    _FOREGROUND_USER_TIMEOUT = 4.0
+    _foreground_user_cache = None  # (serial, monotonic time, user id or None)
+
+    @staticmethod
+    def parse_current_user(text) -> Optional[int]:
+        """The user id that ``am get-current-user`` printed, or None for
+        anything else (an old Android's "Unknown command", usage text, an error)."""
+        m = re.match(r"\s*(\d+)\s*\Z", str(text or ""))
+        return int(m.group(1)) if m else None
+
+    def _content_user(self) -> Optional[int]:
+        """The ``--user`` for ``content query``, or None to keep the default.
+
+        ``content query`` reads user 0 unless told otherwise. On Android
+        Automotive user 0 is the headless system user and the driver is a
+        secondary user (usually 10), so the call log and SMS must be read as
+        the foreground user. A normal phone answers 0, or can't answer at all,
+        and keeps the plain command.
+
+        Never raises: a lookup that fails or times out means "no ``--user``",
+        and that answer is cached like any other, so a slow device doesn't
+        wait again for every query."""
+        cached = self._foreground_user_cache
+        now = time.monotonic()
+        if cached and cached[0] == self._serial and now - cached[1] < self._FOREGROUND_USER_TTL:
+            return cached[2]
+        try:
+            res = self._run(
+                ["shell", "am", "get-current-user"], timeout=self._FOREGROUND_USER_TIMEOUT
+            )
+        except ADBError as exc:
+            self._emit(logging.DEBUG, f"foreground user unknown, querying the default user: {exc}")
+            user = None
+        else:
+            user = (self.parse_current_user(res.text) if res.ok else None) or None  # 0 = default
+        self._foreground_user_cache = (self._serial, now, user)
+        return user
+
     def _query_rows(self, uri, fields, limit, free_last=False):
         """Run ``content query`` and parse its ``Row: N k=v, ...`` records.
 
         Rows are counted as RECORDS (a multi-line SMS body is one row, not
         several lines to ``head``), and provider errors such as a
-        SecurityException are raised instead of being hidden as "no rows"."""
+        SecurityException are raised instead of being hidden as "no rows".
+        The query runs as the foreground user (see :meth:`_content_user`)."""
         limit = int(limit)
+        user = self._content_user()
         r = self._run(
             self._shell_args(
                 "content", "query", "--uri", uri,
+                *(("--user", user) if user is not None else ()),
                 "--projection", ":".join(fields), "--sort", "date DESC",
             ),
             timeout=60,
             check=False,
         )
         if not r.ok or self._PROVIDER_ERROR_RE.search(self._combined_output(r)):
+            if user is not None:
+                self._foreground_user_cache = None  # the user may be gone: ask again next time
             raise self._command_error(f"shell content query --uri {uri}", r)
         body_re = None
         if free_last:
@@ -2150,9 +2261,10 @@ class ADBHandler:
                 return True
         return False
 
-    @classmethod
-    def parse_phone_support(cls, text: str) -> dict:
-        """The :meth:`phone_support` result from its shell output."""
+    @staticmethod
+    def _phone_sections(text: str) -> dict:
+        """``{name: [lines]}`` of the ``@@name`` sections that :meth:`phone_support`
+        prints (lines stripped, blank ones dropped)."""
         sections = {}
         current = None
         for raw in (text or "").splitlines():
@@ -2162,6 +2274,13 @@ class ADBHandler:
                 sections[current] = []
             elif current is not None and line:
                 sections[current].append(line)
+        return sections
+
+    @classmethod
+    def parse_phone_support(cls, text: str) -> dict:
+        """The telephony and phone-app part of :meth:`phone_support` from its
+        shell output."""
+        sections = cls._phone_sections(text)
 
         def handler(key):
             lines = sections.get(key)
@@ -2193,12 +2312,16 @@ class ADBHandler:
     def phone_support(self, *, safe: Optional[bool] = None):
         """What the device offers for calls and messages — found without calling anyone.
 
-        Returns ``{"telephony", "dialer", "caller", "messages", "phone_apps"}``:
-        whether it has the telephony feature (a SIM radio); the activity that
-        handles the dialler (``DIAL``), placing calls (``CALL``) and composing
-        SMS (``SENDTO``), each ``""`` when no app does and ``None`` when the
-        device can't say; and launchable apps that look like phone apps, such as
-        a customised head unit's own Bluetooth phone app.
+        Returns ``{"telephony", "dialer", "caller", "messages", "phone_apps",
+        "kind", "automotive", "phone_connected"}``: whether it has the telephony
+        feature (a SIM radio); the activity that handles the dialler (``DIAL``),
+        placing calls (``CALL``) and composing SMS (``SENDTO``), each ``""`` when
+        no app does and ``None`` when the device can't say; launchable apps that
+        look like phone apps, such as a customised head unit's own Bluetooth
+        phone app; the device kind (see :meth:`device_kind`) and whether it is a
+        car head unit; and, on a car, whether a phone is connected over
+        Bluetooth to call through (:meth:`phone_connected`). ``phone_connected``
+        is ``None`` on any other device and when the car can't tell.
         """
         script = "; ".join(
             (
@@ -2213,13 +2336,105 @@ class ADBHandler:
                 "echo @@apps",
                 "cmd package query-activities --brief -a android.intent.action.MAIN "
                 "-c android.intent.category.LAUNCHER 2>&1",
+                "echo @@kind",
+                "echo __turboadb_ch__; getprop ro.build.characteristics; "
+                "echo __turboadb_wm__; wm size 2>/dev/null",
             )
         )
-        return self._guard(
-            "phone_support",
-            lambda: self.parse_phone_support(self._run(["shell", script], timeout=30).text),
-            safe=safe,
-        )
+
+        def _do():
+            text = self._run(["shell", script], timeout=30).text
+            info = self.parse_phone_support(text)
+            sections = self._phone_sections(text)
+            kind = self.classify_device(
+                "\n".join((sections.get("features") or []) + (sections.get("kind") or []))
+            )
+            info.update(kind=kind["kind"], automotive=kind["automotive"], phone_connected=None)
+            if kind["automotive"]:
+                try:
+                    info["phone_connected"] = self.phone_connected(safe=False)
+                except ADBError as exc:  # the rest of the answer still stands
+                    self._emit(logging.DEBUG, f"phone connection unknown: {exc}")
+            return info
+
+        return self._guard("phone_support", _do, safe=safe)
+
+    # HeadsetClientStateMachine states in which the phone link is up.
+    _HFP_CONNECTED_STATES = ("Connected", "AudioOn")
+
+    @classmethod
+    def parse_phone_connection(cls, telecom: str = "", bluetooth: str = "") -> Optional[bool]:
+        """:meth:`phone_connected` from ``dumpsys telecom`` and, optionally,
+        ``dumpsys bluetooth_manager`` output.
+
+        * True: Telecom lists an enabled PhoneAccount of the Bluetooth HFP
+          client (``…hfpclient…ConnectionService``), or the HFP client profile
+          (``Profile: HeadsetClientService``) has a device ``Connected`` or
+          ``AudioOn``.
+        * False: that profile runs with no phone connected, or the HFP account
+          is registered but disabled.
+        * None: neither dump says — it is unreadable, Android's Bluetooth is
+          off (a head unit may pair phones through its own Bluetooth module,
+          which these dumps never show), or it links phones some other way.
+        """
+        telecom = telecom or ""
+        hfp_accounts = []  # enabled flag of each HFP client PhoneAccount
+        for line in telecom.splitlines():
+            if "PhoneAccount:" not in line:
+                continue
+            low = line.lower()
+            if "hfpclient" in low:
+                # "[[X] PhoneAccount: …" is enabled, "[[ ] PhoneAccount: …" is not.
+                mark = re.search(r"\[\[(.)\]\s*PhoneAccount:", line)
+                hfp_accounts.append(mark is None or mark.group(1) != " ")
+        if any(hfp_accounts):
+            return True
+
+        # The HFP client profile's block: its indented lines up to the next
+        # profile or top-level block. The state machine prints
+        # "name=HeadsetClientStateMachine state=Connected" / "curState=AudioOn".
+        section = None
+        for raw in (bluetooth or "").splitlines():
+            line = raw.strip()
+            if line.startswith("Profile:"):
+                if section is not None:
+                    break
+                if line[len("Profile:"):].strip() == "HeadsetClientService":
+                    section = []
+                continue
+            if section is None:
+                continue
+            if line and not raw[:1].isspace() and not line.startswith(("HeadsetClient", "curState=")):
+                break
+            section.append(line)
+        if section is not None:
+            states = re.findall(r"(?<!\w)(?:state|curState)=(\w+)", "\n".join(section))
+            return any(state in cls._HFP_CONNECTED_STATES for state in states)
+        if hfp_accounts:
+            return False
+        return None
+
+    def phone_connected(self, *, safe: Optional[bool] = None):
+        """Whether a phone is connected to this car head unit to call through:
+        True, False, or None when the device can't tell.
+
+        A car places calls through a phone paired over Bluetooth, whose HFP
+        client registers an enabled PhoneAccount with Telecom while the phone
+        is connected, so ``dumpsys telecom`` usually answers on its own.
+        ``dumpsys bluetooth_manager`` (the HFP client's connection state, or
+        Bluetooth being off) is read only when it doesn't. Meant for car head
+        units: :meth:`phone_support` asks it only there. See
+        :meth:`parse_phone_connection` for the rules.
+        """
+
+        def _do():
+            telecom = self._run(["shell", "dumpsys", "telecom"], timeout=20).text
+            if self.parse_phone_connection(telecom):
+                return True
+            bluetooth = self._run(["shell", "dumpsys", "bluetooth_manager"], timeout=20).text
+            return self.parse_phone_connection(telecom, bluetooth)
+
+        return self._guard("phone_connected", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # Properties / device info
@@ -2230,8 +2445,11 @@ class ADBHandler:
 
         def _do():
             if name:
-                return self._run(self._shell_args("getprop", name), timeout=15).text
-            res = self._run(["shell", "getprop"], timeout=20)
+                return self._run(self._shell_args("getprop", name), timeout=15, check=True).text
+            # check=True: a failed call used to return {} silently, so every
+            # caller (build_info, device_info, the GUI report) showed blanks
+            # instead of the error.
+            res = self._run(["shell", "getprop"], timeout=20, check=True)
             props = {}
             for line in res.stdout.splitlines():
                 m = re.match(r"\[(.+?)\]:\s*\[(.*)\]", line.strip())
@@ -2304,13 +2522,16 @@ class ADBHandler:
         except ADBError as exc:
             self._emit(logging.DEBUG, f"quick identity unavailable: {exc}")
             return {}
-        lines = [line.strip() for line in (res.text or "").splitlines()]
-        if not res.ok or len(lines) < 2 or not (lines[0] or lines[1]):
+        # res.text strips the WHOLE output, so a device that doesn't have the
+        # first property lost its empty line and shifted every field up by one
+        # (the model was reported as the manufacturer, and so on). The raw
+        # stdout keeps one line per getprop; a short tail is padded out.
+        keys = self._QUICK_IDENTITY_KEYS
+        lines = [line.strip() for line in (res.stdout or "").splitlines()]
+        lines += [""] * (len(keys) - len(lines))
+        if not res.ok or not (lines[0] or lines[1]):
             return {}
-        return {
-            key: (lines[index] if index < len(lines) else "")
-            for index, key in enumerate(self._QUICK_IDENTITY_KEYS)
-        }
+        return {key: lines[index] for index, key in enumerate(keys)}
 
     _KIND_SCRIPT = (
         "pm list features 2>/dev/null; echo __turboadb_ch__; "
@@ -2646,24 +2867,33 @@ class ADBHandler:
         save_to: Optional[str] = None,
         append: bool = True,
         clean: bool = True,
+        keep=None,
         timeout: Optional[float] = None,
         stop_event=None,
         encoding: str = "utf-8",
         safe: Optional[bool] = None,
     ):
         """Consume a streaming adb command with built-in matching + file logging.
-        Returns a :class:`StreamResult`. See :meth:`logcat` for the common case."""
+        Returns a :class:`StreamResult`. See :meth:`logcat` for the common case.
+
+        *keep* is an optional predicate applied first: a line it rejects is
+        dropped entirely — not counted, not written to *save_to*, not matched
+        and not passed to *on_line*. *save_to* is expanded (``~``) and its
+        folder created, as for :meth:`screenshot`."""
 
         def _do():
             pat = re.compile(match) if isinstance(match, str) else match
             matches, count = [], 0
-            fh = open(save_to, "a" if append else "w", encoding=encoding) if save_to else None
+            path = self._prepare_local_path(save_to)
+            fh = open(path, "a" if append else "w", encoding=encoding) if path else None
             try:
                 for line in self.iter_lines(
                     args, timeout=timeout, stop_event=stop_event, encoding=encoding
                 ):
                     if clean:
                         line = strip_ansi(line)
+                    if keep is not None and not keep(line):
+                        continue
                     count += 1
                     if fh:
                         fh.write(line + "\n")
@@ -2676,7 +2906,7 @@ class ADBHandler:
                             on_match(line)
                         if stop_on_match:
                             break
-                return StreamResult(count, matches, save_to)
+                return StreamResult(count, matches, path)
             finally:
                 if fh:
                     fh.close()
@@ -2693,6 +2923,8 @@ class ADBHandler:
         filterspecs: Optional[Sequence[str]] = None,
         dump: bool = False,
         tail: Optional[int] = None,
+        grep: Optional[str] = None,
+        crashes: bool = False,
         on_line=None,
         on_match=None,
         match=None,
@@ -2722,6 +2954,13 @@ class ADBHandler:
                            device's ENTIRE in-memory log buffer first (often
                            hundreds of thousands of cached lines) before
                            following — pass ``tail=1`` for live-only output.
+        :param grep:       case-insensitive regex kept CLIENT-side: only the
+                           lines it matches reach *on_line* and *save_to* (and
+                           only they are counted). Unlike *filterspecs* it can
+                           search the message text, not just tag and level.
+        :param crashes:    crashes and ANRs: defaults *buffers* to
+                           crash/main/system and *priority* to ``E`` when the
+                           caller set neither.
         :param match:      regex; matching lines collected + trigger on_match.
         :param clear_first: run ``logcat -c`` before streaming (fresh start).
 
@@ -2732,6 +2971,11 @@ class ADBHandler:
         def _do():
             if clear_first:
                 self.logcat_clear(safe=False)
+            use_buffers, use_priority = buffers, priority
+            if crashes:
+                use_buffers = use_buffers or ["crash", "main", "system"]
+                use_priority = use_priority or "E"
+            pat = re.compile(grep, re.I) if isinstance(grep, str) else grep
             args = ["logcat"]
             if dump:
                 args.append("-d")
@@ -2741,16 +2985,16 @@ class ADBHandler:
                 args += ["-t" if dump else "-T", str(int(tail))]
             if fmt:
                 args += ["-v", fmt]
-            for b in buffers or []:
+            for b in use_buffers or []:
                 args += ["-b", b]
             if filterspecs:
                 args += list(filterspecs)
-            elif tag and priority:
-                args += [f"{tag}:{priority}", "*:S"]
+            elif tag and use_priority:
+                args += [f"{tag}:{use_priority}", "*:S"]
             elif tag:
                 args += [f"{tag}:V", "*:S"]
-            elif priority:
-                args += [f"*:{priority}"]
+            elif use_priority:
+                args += [f"*:{use_priority}"]
             return self.stream(
                 args,
                 on_line=on_line,
@@ -2760,6 +3004,7 @@ class ADBHandler:
                 save_to=save_to,
                 append=append,
                 clean=clean,
+                keep=(pat.search if pat is not None else None),
                 timeout=timeout,
                 stop_event=stop_event,
                 safe=False,
@@ -2798,9 +3043,10 @@ class ADBHandler:
         ``permissions``, ``owner`` and ``exact`` (False when ``ls`` couldn't return
         the name unambiguously). Folder symlinks such as ``/sdcard`` count as
         folders. Raises ADBError when the folder can't be listed."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             target = remotefs._normalize_remote_path(path)
             rows, error = remotefs._list_remote_dir(self, target)
             if error and not rows:
@@ -2827,9 +3073,10 @@ class ADBHandler:
     def make_dir(self, path: str, *, safe: Optional[bool] = None):
         """Create a device folder, with any missing parents (``mkdir -p``).
         Returns the normalised path."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             target = remotefs._normalize_remote_path(path)
             self._file_command(f"mkdir {target}", remotefs._mkdir_cmd(target))
             return target
@@ -2838,9 +3085,10 @@ class ADBHandler:
 
     def touch(self, path: str, *, safe: Optional[bool] = None):
         """Create an empty device file (or update an existing file's time)."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             target = remotefs._normalize_remote_path(path)
             self._file_command(f"touch {target}", remotefs._touch_cmd(target))
             return target
@@ -2851,9 +3099,10 @@ class ADBHandler:
         """Delete device files, and folders too when *recursive* is True. Every
         path is checked first: a missing path or a folder without *recursive*
         raises ADBError and nothing is deleted. Returns the deleted paths."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             items = [paths] if isinstance(paths, str) else list(paths)
             targets = list(dict.fromkeys(remotefs._normalize_remote_path(p) for p in items))
             if not targets:
@@ -2877,11 +3126,10 @@ class ADBHandler:
         """Move or rename *src* to *dst* — into *dst* when it is an existing
         folder. Without *overwrite* an existing target is never replaced.
         Returns the new path."""
-        import posixpath
-
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             source = remotefs._normalize_remote_path(src)
             target = remotefs._normalize_remote_path(dst)
             info = self._probe_paths([source, target])
@@ -2903,11 +3151,10 @@ class ADBHandler:
         existing folder, merging into a folder of the same name that is already
         there. A folder is never copied into itself (also not through a
         symlinked path). Returns the new path."""
-        import posixpath
-
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             source = remotefs._normalize_remote_path(src)
             target = remotefs._normalize_remote_path(dst)
             info = self._probe_paths([source, target])
@@ -2938,9 +3185,10 @@ class ADBHandler:
         """``{"path", "real_path", "size", "mode", "type"}`` for what *path* points
         to (symlinks followed; *mode* is octal such as ``644``, *type* for
         example ``regular file`` or ``directory``)."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             target = remotefs._normalize_remote_path(path)
             res = self.shell(remotefs._edit_stat_cmd(target), timeout=30, safe=False)
             parsed = remotefs._parse_edit_stat(res.stdout, target) if res.ok else None
@@ -2953,9 +3201,10 @@ class ADBHandler:
 
     def chmod(self, path: str, mode: str, *, safe: Optional[bool] = None):
         """Set a device file's permission bits (octal, for example ``644``)."""
-        from . import remotefs
 
         def _do():
+            from . import remotefs
+
             if not re.fullmatch(r"[0-7]{3,4}", str(mode)):
                 raise ValueError(f"mode must be octal such as 644, got {mode!r}")
             target = remotefs._normalize_remote_path(path)
@@ -2963,6 +3212,57 @@ class ADBHandler:
             return True
 
         return self._guard("chmod", _do, safe=safe)
+
+    def edit_file(self, path: str, opener, *, editor: Optional[str] = None,
+                  safe: Optional[bool] = None):
+        """Edit a device text file on this machine and save it back.
+
+        The file is pulled to a temporary copy, *opener* is called with that
+        local path and returns the editor's exit code, and the copy is pushed
+        back ONLY when its bytes changed — restoring the octal mode, which
+        ``adb push`` resets. A non-zero editor exit leaves the device untouched.
+        *editor* is the command name, used only in the log line.
+
+        Returns ``{"changed": bool, "path": str, "editor_exit": int}``, where
+        *path* is the resolved device file. Raises ADBError when *path* is not
+        a regular file. The temporary copy is always removed.
+        """
+
+        def _do():
+            import tempfile
+
+            info = self.stat_path(path, safe=False)
+            if not str(info["type"]).startswith("regular"):
+                raise ADBError(f"{info['path']} is not a regular file ({info['type']})")
+            real = info["real_path"]
+            # keep the extension so the editor picks the right syntax mode
+            handle, tmp = tempfile.mkstemp(
+                prefix="turboadb-edit-", suffix=os.path.splitext(real)[1]
+            )
+            os.close(handle)
+            try:
+                self.pull(real, tmp, safe=False)
+                with open(tmp, "rb") as fh:
+                    before = fh.read()
+                self._emit(logging.INFO, f"Editing {real}" + (f" with {editor}" if editor else ""))
+                code = int(opener(tmp) or 0)
+                changed = False
+                if code == 0:
+                    with open(tmp, "rb") as fh:
+                        changed = fh.read() != before
+                if changed:
+                    self.push(tmp, real, safe=False)
+                    if info.get("mode"):
+                        self.chmod(real, info["mode"], safe=False)
+                    self._emit(logging.INFO, f"Saved {real}")
+                return {"changed": changed, "path": real, "editor_exit": code}
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+        return self._guard("edit_file", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # File transfer (push / pull) with progress
@@ -3279,7 +3579,11 @@ class ADBHandler:
         extras: Optional[Sequence[str]] = None,
         safe: Optional[bool] = None,
     ):
-        """Start an explicit activity/component (``am start -n pkg/.Activity``)."""
+        """Start an explicit activity/component (``am start -n pkg/.Activity``).
+
+        Returns ``am``'s output. Raises ADBCommandError when the activity did
+        not start: ``am`` prints "Error: Activity class … does not exist" and
+        still exits 0, so the exit code alone cannot be trusted."""
 
         def _do():
             args = ["am", "start", "-n", component]
@@ -3288,19 +3592,24 @@ class ADBHandler:
             if data:
                 args += ["-d", data]
             args += list(extras or [])
-            return self._run(self._shell_args(*args), timeout=30).text
+            res = self._run(self._shell_args(*args), timeout=30)
+            if self._output_failed(res):
+                raise self._command_error("shell " + " ".join(args), res)
+            return res.text
 
         return self._guard("start_activity", _do, safe=safe)
 
     def stop_app(self, package: str, *, safe: Optional[bool] = None):
-        """Force-stop an app (``am force-stop``)."""
-        return self._guard(
-            "stop_app",
-            lambda: self._run(
-                self._shell_args("am", "force-stop", package), timeout=30, check=True
-            ).ok,
-            safe=safe,
-        )
+        """Force-stop an app (``am force-stop``). Like every ``am`` call site,
+        the output decides — a refusal exits 0."""
+
+        def _do():
+            res = self._run(self._shell_args("am", "force-stop", package), timeout=30, check=True)
+            if self._output_failed(res):
+                raise self._command_error("shell am force-stop " + package, res)
+            return True
+
+        return self._guard("stop_app", _do, safe=safe)
 
     def grant(self, package: str, permission: str, *, safe: Optional[bool] = None):
         """Grant a runtime permission (``pm grant``)."""
@@ -3356,18 +3665,14 @@ class ADBHandler:
         """*data* as bytes when it carries the full PNG signature, else None."""
         return bytes(data) if data[:8] == cls._PNG_SIGNATURE else None
 
-    @staticmethod
-    def _screencap_display(display_id) -> list:
-        return ["-d", shlex.quote(str(display_id))] if display_id is not None else []
-
     def _cap_exec_out(self, display_id=None):
-        args = ["exec-out", "screencap", *self._screencap_display(display_id), "-p"]
+        args = ["exec-out", "screencap", *self._display_flag(display_id), "-p"]
         r = self._run(args, timeout=60, binary=True, check=False)
         d = self._bytes(r.stdout)
         return self._as_png(d), r, len(d)
 
     def _cap_shell(self, display_id=None):
-        args = ["shell", "screencap", *self._screencap_display(display_id), "-p"]
+        args = ["shell", "screencap", *self._display_flag(display_id), "-p"]
         r = self._run(args, timeout=60, binary=True, check=False)
         d = self._bytes(r.stdout)
         # Undo CRLF translation ONLY when the stream was actually translated;
@@ -3382,7 +3687,7 @@ class ADBHandler:
         remote = f"/data/local/tmp/_turboadb_cap_{_unique_token()}.png"
         try:
             self._run(
-                ["shell", "screencap", *self._screencap_display(display_id), "-p", remote],
+                ["shell", "screencap", *self._display_flag(display_id), "-p", remote],
                 timeout=60,
                 check=False,
             )
@@ -3400,7 +3705,7 @@ class ADBHandler:
         *,
         display_id: Optional[Union[int, str]] = None,
         safe: Optional[bool] = None,
-    ) -> bytes:
+    ):
         """Capture the screen as PNG bytes, trying several methods so it works on
         locked-down / automotive devices and over remote adb servers:
 
@@ -3413,7 +3718,9 @@ class ADBHandler:
         View (which captures many frames/second) doesn't re-probe the two failing
         methods on every frame (and, for method 3, doesn't do the failed probes'
         round-trips before the file write). Raises :class:`ADBError` with the
-        actual device output if none yield a valid PNG."""
+        actual device output if none yield a valid PNG. (Not annotated
+        ``-> bytes``: in safe mode it returns an OperationResult like every
+        other public method.)"""
         methods = [self._cap_exec_out, self._cap_shell, self._cap_file]
 
         def _do():
@@ -3422,12 +3729,11 @@ class ADBHandler:
             if cached is not None and cached in order:
                 order.remove(cached)
                 order.insert(0, cached)  # try the known-good one first
-            # A requested display is never silently swapped for another one;
-            # only "0" may retry without -d (older screencap rejects -d 0 for
-            # what is the default display anyway).
-            displays = [display_id]
-            if display_id is not None and str(display_id).strip() == "0":
-                displays.append(None)
+            # A requested display is never silently swapped for another one:
+            # every candidate names the same display (its physical id, then
+            # the logical id older screencap builds take); only display 0 is
+            # captured without -d, as the default display it is.
+            displays = self._screencap_candidates(display_id)
             last, errors = {}, []
             for disp in displays:
                 for i in order:
@@ -3441,6 +3747,9 @@ class ADBHandler:
                         self._cap_method = i  # remember for next frame
                         return png
             self._cap_method = None  # nothing worked — re-probe next time
+            if display_id is not None:
+                # the display may have been re-plugged under a new physical id
+                getattr(self, "_screencap_ids", {}).pop(int(display_id), None)
             errtxt = ""
             for i in (0, 1):
                 if i in last and last[i][0].stderr:
@@ -3459,6 +3768,137 @@ class ADBHandler:
 
         return self._guard("capture_png", _do, safe=safe)
 
+    @staticmethod
+    def screencap_display_arg(display) -> Optional[int]:
+        """The id ``screencap -d`` takes for *display* (an entry from
+        :meth:`list_displays`), or None for the default display.
+
+        ``input -d`` and ``wm size -d`` take the LOGICAL display id, but on
+        Android 10+ ``screencap -d`` takes the PHYSICAL one (``uniqueId
+        "local:<id>"``). Display 0 is captured without ``-d``; a display with
+        no physical id (older Android, a virtual display) keeps its logical id.
+        """
+        display = display or {}
+        logical = int(display.get("id", 0) or 0)
+        if logical == 0:
+            return None
+        physical = display.get("physical_id")
+        return int(physical) if physical is not None else logical
+
+    def _screencap_candidates(self, display_id) -> list:
+        """``screencap -d`` ids to try for logical *display_id*, best first.
+
+        The id is validated before any adb call (a caller's ``"1; reboot"``
+        must never reach the device shell). The physical id is looked up once
+        per handler with ``cmd display get-displays`` / ``dumpsys display``.
+        """
+        if display_id is None:
+            return [None]
+        logical = int(str(display_id).strip())
+        if logical == 0:
+            return [None]
+        cache = self.__dict__.setdefault("_screencap_ids", {})
+        if logical not in cache:
+            physical = None
+            try:
+                for display in self._list_displays_adb():
+                    if int(display.get("id", -1)) == logical:
+                        physical = display.get("physical_id")
+                        break
+            except (ADBError, ValueError, TypeError):
+                physical = None
+            cache[logical] = physical
+        physical = cache[logical]
+        return [physical, logical] if physical is not None and physical != logical else [logical]
+
+    SCREENCAP_STREAM_FORMATS = ("auto", "gzip", "raw", "png")
+    # printed (then the device's own error text) when the capture loop gives up
+    SCREENCAP_ERROR_MARKER = b"TURBOADB-SCREENCAP-ERROR:"
+
+    @classmethod
+    def screencap_stream_script(
+        cls, capture_id: Optional[int] = None, *, interval: float = 0.2, fmt: str = "auto"
+    ) -> str:
+        """The device-side loop behind :meth:`open_screencap_stream`.
+
+        One shell writes a capture every *interval* seconds (a capture that
+        takes longer simply starts the next one straight away): raw frames
+        (``fmt="raw"``), raw frames through ``gzip -1`` (``"gzip"``), PNG
+        (``"png"``), or ``"auto"`` — gzip when the device has it, else PNG.
+        Measured on a 1080x2400 phone over USB: gzip ~3.1 fps, PNG ~2.5 fps,
+        plain raw ~1.1-1.5 fps (10 MB a frame saturates the adb link). The
+        reader tells the formats apart by their first bytes. After three failed
+        captures in a row the loop prints :attr:`SCREENCAP_ERROR_MARKER` and
+        screencap's own error text, then exits; a capture killed by a signal
+        (the reader went away) ends it at once, so no loop outlives the reader.
+        """
+        fmt = str(fmt or "auto").lower()
+        if fmt not in cls.SCREENCAP_STREAM_FORMATS:
+            raise ValueError(f"unknown screencap stream format: {fmt!r}")
+        target = "" if capture_id is None else f" -d {int(capture_id)}"
+        cap = f"screencap{target}"
+        pause = f"{max(0.0, float(interval)):.3f}".rstrip("0").rstrip(".") or "0"
+        marker = cls.SCREENCAP_ERROR_MARKER.decode("ascii")
+
+        def loop(command):
+            return (
+                f"while :; do sleep {pause} 2>/dev/null & "
+                f"{command} && n=0 || fail $?; wait; done"
+            )
+
+        raw = loop(f"{cap} 2>/dev/null")
+        png = loop(f"{cap} -p 2>/dev/null")
+        packed = loop(f"{cap} 2>/dev/null | gzip -1")
+        parts = [
+            "n=0",
+            "fail() { r=$1; [ $r -gt 128 ] && exit $r; n=$((n+1)); [ $n -lt 3 ] && return 0; "
+            f'echo "{marker} $({cap} 2>&1 >/dev/null)"; exit 3; }}',
+        ]
+        if fmt in ("gzip", "auto"):
+            # a failed capture must fail the pipeline, not gzip's clean exit
+            parts.append("(set -o pipefail) 2>/dev/null && set -o pipefail")
+        if fmt == "auto":
+            parts.append(f"if command -v gzip >/dev/null 2>&1; then {packed}; else {png}; fi")
+        else:
+            parts.append({"gzip": packed, "raw": raw, "png": png}[fmt])
+        return "; ".join(parts)
+
+    def open_screencap_stream(
+        self,
+        *,
+        capture_id: Optional[int] = None,
+        max_fps: float = 5.0,
+        fmt: str = "auto",
+        safe: Optional[bool] = None,
+    ):
+        """Start ONE long-lived ``adb exec-out`` process that streams screen
+        captures of *capture_id* (see :meth:`screencap_display_arg`) at up to
+        *max_fps* frames per second, and return its Popen (binary ``stdout``,
+        adb's own messages on ``stderr``).
+
+        A process per frame is both slow and a pile of adb processes; this
+        keeps one for the whole session. The caller reads and splits the
+        stream and owns the process: ``kill()`` it to stop. A reader that stops
+        reading throttles the device-side loop (its writes block), so a paused
+        view costs no capture work.
+        """
+
+        def _do():
+            fps = max(0.1, float(max_fps or 5.0))
+            script = self.screencap_stream_script(capture_id, interval=1.0 / fps, fmt=fmt)
+            args = ["exec-out", script]
+            self._emit(logging.DEBUG, f"$ adb exec-out '{script}'  (screencap stream)")
+            return subprocess.Popen(
+                self._base(target=True) + args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                creationflags=NO_WINDOW,
+            )
+
+        return self._guard("open_screencap_stream", _do, safe=safe)
+
     def screenshot(
         self,
         local_path: Optional[str] = None,
@@ -3473,10 +3913,7 @@ class ADBHandler:
         def _do():
             data = self.capture_png(display_id=display_id, safe=False)
             if local_path:
-                lp = os.path.expanduser(local_path)
-                parent = os.path.dirname(lp)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
+                lp = self._prepare_local_path(local_path)
                 with open(lp, "wb") as fh:
                     fh.write(data)
                 self._emit(logging.INFO, f"Screenshot saved: {lp} ({len(data)} bytes)")
@@ -3498,16 +3935,23 @@ class ADBHandler:
         safe: Optional[bool] = None,
     ):
         """Record the screen on-device (``screenrecord``), then pull it to
-        *local_path*. Stops at *time_limit* seconds (max 180 per adb) or when
-        *stop_event* is set. *size* like ``1280x720``, *bit_rate* like ``8M``.
+        *local_path* — ``~`` expanded and its folder created, like
+        :meth:`screenshot`; the saved path is returned. Stops at *time_limit*
+        seconds (max 180 per adb) or when *stop_event* is set. *size* like
+        ``1280x720``, *bit_rate* like ``8M``.
 
         The default remote file and PID marker are unique to this invocation,
         so concurrent recordings cannot overwrite or interrupt one another.
         A *time_limit* above 180 is clamped (screenrecord rejects it); 0 means
         screenrecord's own default (180 s).
+
+        *display_id* is the LOGICAL display id (as for screenshots and input);
+        Android 10+ ``screenrecord --display-id`` takes the PHYSICAL one, so it
+        is looked up the same way :meth:`capture_png` does, and the logical id
+        is tried next when the device rejects the physical one at once.
         """
 
-        def _do():
+        def _record(record_display):
             limit = int(time_limit or 0)
             if limit < 0:
                 raise ValueError("time_limit must be 0 or a positive number of seconds")
@@ -3524,8 +3968,8 @@ class ADBHandler:
                 record_args += ["--size", size]
             if bit_rate:
                 record_args += ["--bit-rate", bit_rate]
-            if display_id is not None:
-                record_args += ["--display-id", str(display_id)]
+            if record_display is not None:
+                record_args += ["--display-id", str(record_display)]
             record_args.append(remote_path)
             self._run(
                 self._shell_args("rm", "-f", remote_path, pid_path),
@@ -3604,16 +4048,16 @@ class ADBHandler:
                     # the device may still be finalising the MP4 index
                     self._wait_remote_file_stable(remote_path)
                 stage = "pull"
-                self._transfer("pull", remote_path, local_path, None, None, None)
-                saved_path = os.path.expanduser(local_path)
+                saved_path = self._prepare_local_path(local_path)
+                self._transfer("pull", remote_path, saved_path, None, None, None)
                 if not os.path.isfile(saved_path) or os.path.getsize(saved_path) <= 0:
                     raise ADBTransferError(
                         f"adb reported success but the recording is empty; "
                         f"the device copy remains at {remote_path}"
                     )
                 self._run(self._shell_args("rm", "-f", remote_path), check=False, timeout=15)
-                self._emit(logging.INFO, f"Recording saved: {local_path}")
-                return local_path
+                self._emit(logging.INFO, f"Recording saved: {saved_path}")
+                return saved_path
             finally:
                 cleanup = [pid_path]
                 if stage == "record" and not remote_tmp:
@@ -3637,7 +4081,82 @@ class ADBHandler:
                     except Exception:
                         pass
 
+        def _do():
+            candidates = self._screencap_candidates(display_id)
+            for index, candidate in enumerate(candidates):
+                started = time.monotonic()
+                try:
+                    return _record(candidate)
+                except ADBCommandError:
+                    stopped = stop_event is not None and stop_event.is_set()
+                    if index + 1 >= len(candidates) or stopped or time.monotonic() - started > 8.0:
+                        raise
+                    self._emit(
+                        logging.INFO,
+                        f"screenrecord rejected display id {candidate}; "
+                        f"trying {candidates[index + 1]}",
+                    )
+
         return self._guard("screen_record", _do, safe=safe)
+
+    def screen_record_continuous(
+        self,
+        local_path: str,
+        *,
+        part_seconds: int = 180,
+        size: Optional[str] = None,
+        bit_rate: Optional[str] = None,
+        display_id: Optional[Union[int, str]] = None,
+        stop_event=None,
+        on_part=None,
+        safe: Optional[bool] = None,
+    ):
+        """Record back-to-back parts until *stop_event* is set, so a session can
+        run past ``screenrecord``'s three-minute cap.
+
+        Parts are named after *local_path*: ``drive.mp4``, ``drive-part02.mp4``,
+        ``drive-part03.mp4`` … Each one is pulled and handed to *on_part* as
+        soon as it is saved, so a long recording is never lost to a later
+        failure. Returns the list of saved paths.
+
+        Without a *stop_event* this records exactly one part. A failure in the
+        FIRST part is raised as-is; a later one stops the recording and is
+        re-raised after the parts already saved have been reported.
+        """
+
+        def _do():
+            base, ext = os.path.splitext(self._prepare_local_path(local_path))
+            ext = ext or ".mp4"
+            paths = []
+            while True:
+                part = len(paths)
+                target = local_path if part == 0 else f"{base}-part{part + 1:02d}{ext}"
+                try:
+                    saved = self.screen_record(
+                        target,
+                        time_limit=part_seconds,
+                        size=size,
+                        bit_rate=bit_rate,
+                        display_id=display_id,
+                        stop_event=stop_event,
+                        safe=False,
+                    )
+                except Exception:
+                    if paths:
+                        # the earlier parts are already reported through on_part
+                        self._emit(
+                            logging.ERROR,
+                            f"recording stopped after part {part} of "
+                            f"{local_path}; {len(paths)} part(s) were saved",
+                        )
+                    raise
+                paths.append(saved)
+                if on_part:
+                    on_part(saved)
+                if stop_event is None or stop_event.is_set():
+                    return paths
+
+        return self._guard("screen_record_continuous", _do, safe=safe)
 
     def _wait_remote_file_stable(self, remote_path: str, attempts: int = 20, interval: float = 0.25):
         """Poll the device file size until two reads agree (bounded), instead of
@@ -3759,6 +4278,8 @@ class ADBHandler:
         r"(?:, displayId (?P<id>\d+))?(?P<body>[^}]*)"
     )
 
+    _UNIQUE_ID_RE = re.compile(r'\buniqueId[ =]"(?P<unique>[^"]*)"')
+
     @classmethod
     def parse_display_info(cls, text: str) -> list:
         """Displays in ``cmd display get-displays`` / ``dumpsys display`` output.
@@ -3767,11 +4288,18 @@ class ADBHandler:
         display listed more than once keeps its last entry (the current,
         override size). Android 9 entries carry no id; they take it from the
         ``mDisplayId=`` line above them.
+
+        An entry that carries a ``uniqueId`` also gets ``"unique_id"`` (e.g.
+        ``"local:4630946650788219010"`` or ``"virtual:…"``) and, for a physical
+        (``local:``) display, ``"physical_id"``: the id ``screencap -d`` takes
+        on Android 10+, where ``input -d`` / ``wm size -d`` keep the logical
+        ``"id"``.
         """
         text = text or ""
         headers = [(m.start(), int(m.group(1))) for m in re.finditer(r"mDisplayId=\s*(\d+)", text)]
         found = {}
-        for match in cls._DISPLAY_INFO_RE.finditer(text):
+        matches = list(cls._DISPLAY_INFO_RE.finditer(text))
+        for index, match in enumerate(matches):
             raw_id = match.group("quoted_id") or match.group("id")
             if raw_id is None:
                 before = [did for pos, did in headers if pos < match.start()]
@@ -3784,7 +4312,24 @@ class ADBHandler:
             size = f"{real.group(1)}x{real.group(2)}" if real else ""
             if not size and display_id in found:
                 size = found[display_id]["size"]
-            found[display_id] = {"id": display_id, "size": size, "name": match.group("name").strip()}
+            entry = {"id": display_id, "size": size, "name": match.group("name").strip()}
+            # ``uniqueId`` sits after nested ``{…}`` lists (supportedModes), past
+            # where the body group stops: look through the rest of this entry.
+            end = text.find("\n", match.end())
+            end = len(text) if end < 0 else end
+            if index + 1 < len(matches):
+                end = min(end, matches[index + 1].start())
+            unique = cls._UNIQUE_ID_RE.search(text, match.start(), end)
+            if unique is None and display_id in found and "unique_id" in found[display_id]:
+                for key in ("unique_id", "physical_id"):
+                    if key in found[display_id]:
+                        entry[key] = found[display_id][key]
+            elif unique is not None:
+                entry["unique_id"] = unique.group("unique")
+                local = re.fullmatch(r"local:(\d+)", entry["unique_id"])
+                if local:
+                    entry["physical_id"] = int(local.group(1))
+            found[display_id] = entry
         return [found[key] for key in sorted(found)]
 
     def _list_displays_adb(self) -> list:
@@ -3809,9 +4354,9 @@ class ADBHandler:
         ``scrcpy --list-displays`` (no names). ``"auto"`` (the default) tries adb
         first and falls back to scrcpy.
         """
-        from .scrcpy import list_displays as _ld
-
         def _do():
+            from .scrcpy import list_displays as _ld
+
             if method not in ("auto", "adb", "scrcpy"):
                 raise ValueError(f"unknown display listing method: {method!r}")
             if method != "scrcpy":
@@ -3846,9 +4391,9 @@ class ADBHandler:
         widely-supported H.264 codec, caps the size/fps, and disables audio. Try
         it first when "scrcpy won't work" on a head unit.
         """
-        from .scrcpy import launch_scrcpy
-
         def _do():
+            from .scrcpy import launch_scrcpy
+
             if options is not None:
                 # a copy: compat mode must never mutate the caller's options,
                 # and keyword overrides apply on top of the given options

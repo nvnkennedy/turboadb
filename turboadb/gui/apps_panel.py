@@ -19,9 +19,8 @@ from PyQt5.QtWidgets import (
     QToolButton,
 )
 
-from ..results import CommandResult, OperationResult
 from .icons import icon
-from .qtutil import close_jobs, run_job
+from .qtutil import close_jobs, page_toolbar, run_job, unwrap
 
 
 def _glyph(name, tone, size=16):
@@ -35,23 +34,8 @@ def _glyph(name, tone, size=16):
     return b
 
 
-def _unwrap(res):
-    """Turn a safe-mode/raw handler result into a plain value or raise."""
-    if isinstance(res, OperationResult):
-        if not res.success:
-            raise res.error or RuntimeError(f"{res.action or 'ADB operation'} failed")
-        res = res.value
-    if isinstance(res, CommandResult):
-        if not res.ok:
-            raise RuntimeError(res.stderr or "ADB command failed")
-        res = res.text
-    if res is False:
-        raise RuntimeError("device rejected the command")
-    return res
-
-
 def _unwrap_packages(res) -> list:
-    res = _unwrap(res)
+    res = unwrap(res)
     if not isinstance(res, list):
         raise RuntimeError("ADB did not return a package list")
     return res
@@ -60,14 +44,22 @@ def _unwrap_packages(res) -> list:
 class AppsPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, automotive=False, parent=None):
+    def __init__(self, handler, automotive=False, parent=None, *, adb_gate=None):
+        """*adb_gate* (optional, from the device tab) has ``wrap(fn)``: device
+        jobs then wait for one of the tab's adb slots before starting adb."""
         super().__init__(parent)
         self.handler = handler
+        self._adb_gate = adb_gate
         self._jobs = []
         self._closed = False
         # Each refresh gets a generation; an older (slower) listing that
         # finishes after a newer one must not overwrite the newer result.
         self._list_generation = 0
+        # One `pm list packages` at a time: refreshes requested while one runs
+        # (Third-party toggled twice, Refresh clicked repeatedly) collapse into
+        # a single follow-up listing instead of one adb process per click.
+        self._listing = False
+        self._refresh_pending = False
         self._setting_automotive_default = False
         self._third_user_changed = False
         self._all = []
@@ -78,14 +70,8 @@ class AppsPanel(QWidget):
 
         # One page toolbar: Install left, the package filter in the middle,
         # then the actions that apply to the selected package on the right.
-        toolbar = QWidget()
-        toolbar.setObjectName("pageToolbar")
-        toolbar.setAttribute(Qt.WA_StyledBackground, True)
-        from .flowlayout import ToolbarFlowLayout
-
-        # Wraps instead of widening the window when the tab is narrow.
-        top = ToolbarFlowLayout(toolbar, hspacing=8, vspacing=6)
-        top.setContentsMargins(12, 8, 12, 8)
+        # It wraps instead of widening the window when the tab is narrow.
+        toolbar, top = page_toolbar()
         self.btn_install = self._button("Install APK(s)…", self._install, "ok",
                                         "Install one APK, or several split APKs together",
                                         "download", "on-accent")
@@ -138,7 +124,6 @@ class AppsPanel(QWidget):
         header.setAttribute(Qt.WA_StyledBackground, True)
         header_lay = QHBoxLayout(header)
         header_lay.setContentsMargins(12, 8, 12, 8)
-        header_lay.setSpacing(8)
         header_lay.setSpacing(6)
         title = QLabel("Installed packages")
         title.setObjectName("cardTitle")
@@ -164,7 +149,6 @@ class AppsPanel(QWidget):
         body.addWidget(card)
         lay.addLayout(body, 1)
 
-        self._all = []
         self._listed = False  # a package listing has arrived at least once
         self._loaded = False  # load lazily on first view (keeps connect fast)
         self._sync_actions()
@@ -236,22 +220,47 @@ class AppsPanel(QWidget):
             self._loaded = True
             self.refresh()
 
+    def _device_job(self, fn):
+        return self._adb_gate.wrap(fn) if self._adb_gate is not None else fn
+
     def refresh(self):
         if self._closed:
             return
         self.list.clear()
         self._status_row("Loading…", "refresh", "dim")
         self._sync_actions()
-        third = self.third.isChecked()
         self._list_generation += 1
+        if self._listing:
+            self._refresh_pending = True  # listed when the running one ends
+            return
+        self._start_listing()
+
+    def _start_listing(self):
+        self._listing = True
+        self._refresh_pending = False
+        third = self.third.isChecked()
         generation = self._list_generation
         handler = self.handler
         run_job(
             self._jobs,
-            lambda: _unwrap_packages(handler.list_packages(third_party=third, safe=True)),
-            lambda pkgs, g=generation: self._on_packages(g, pkgs),
-            lambda message, g=generation: self._on_packages_failed(g, message),
+            self._device_job(
+                lambda: _unwrap_packages(handler.list_packages(third_party=third, safe=True))
+            ),
+            lambda pkgs, g=generation: self._listing_done(g, pkgs, None),
+            lambda message, g=generation: self._listing_done(g, None, message),
         )
+
+    def _listing_done(self, generation, pkgs, message):
+        self._listing = False
+        if self._closed:
+            return
+        if self._refresh_pending:
+            self._start_listing()  # newer settings: this result is stale anyway
+            return
+        if message is None:
+            self._on_packages(generation, pkgs)
+        else:
+            self._on_packages_failed(generation, message)
 
     def _on_packages(self, generation, pkgs):
         if self._closed or generation != self._list_generation:
@@ -336,8 +345,11 @@ class AppsPanel(QWidget):
             def fn():
                 return handler.install(files[0], grant_perms=True, safe=True)
 
-        self.log.emit(f"installing {len(files)} APK(s)…")
-        self._do(fn, "install", refresh=True)
+        self.log.emit(f"[INFO] Installing {len(files)} APK(s)…")
+        # An install can push hundreds of MB for minutes: like a file transfer
+        # it takes no adb slot, so listings, Reboot and Health never queue
+        # behind it.
+        self._do(fn, "install", refresh=True, gated=False)
 
     def _uninstall(self):
         pkg = self._selected()
@@ -365,7 +377,8 @@ class AppsPanel(QWidget):
         if pkg:
             self._do(lambda h=self.handler: h.stop_app(pkg, safe=True), "stop")
 
-    def _do(self, fn, label, refresh=False):
+    def _do(self, fn, label, refresh=False, *, gated=True):
+        """Run a package action; *gated* False: it takes no adb slot."""
         if self._closed:
             return
 
@@ -374,14 +387,20 @@ class AppsPanel(QWidget):
             if refresh:
                 self.refresh()
 
+        def job():
+            return str(unwrap(fn()))
+
         run_job(
             self._jobs,
-            lambda: str(_unwrap(fn())),
+            self._device_job(job) if gated else job,
             done,
             lambda message: self.log.emit(f"[ERROR] {label}: " + message),
         )
 
     def close_panel(self):
-        """Detach running jobs (no waiting on the UI thread)."""
+        """Detach running jobs (no waiting on the UI thread) and drop the list."""
         self._closed = True
+        self._refresh_pending = False
         close_jobs(self._jobs)
+        self._all = []
+        self.list.clear()

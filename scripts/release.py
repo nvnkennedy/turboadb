@@ -54,10 +54,56 @@ def release_exe(version: str) -> Path:
     return ROOT / "dist" / f"TurboADB-{version}-win64.exe"
 
 
+# What the executable is built from: if any of this is newer than the exe on
+# disk, that exe is stale and must not be shipped.
+EXE_SOURCES = ("turboadb", "scripts", "turboadb-gui.spec")
+
+
+def newest_source_mtime() -> float | None:
+    """The newest mtime under :data:`EXE_SOURCES`, or None when none exists."""
+    newest = None
+    for name in EXE_SOURCES:
+        path = ROOT / name
+        if path.is_file():
+            candidates = [path]
+        elif path.is_dir():
+            candidates = [p for p in path.rglob("*") if p.is_file()]
+        else:
+            continue
+        for p in candidates:
+            if "__pycache__" in p.parts or p.name.endswith(".exe"):
+                continue  # build output, not a source
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    return newest
+
+
+def exe_is_stale(exe: Path) -> bool:
+    """True when *exe* predates the sources it was built from.
+
+    Matching only on the file NAME meant a rebuilt release could ship the binary
+    from an earlier build of the same version number."""
+    try:
+        built = exe.stat().st_mtime
+    except OSError:
+        return True
+    newest = newest_source_mtime()
+    return newest is not None and newest > built
+
+
 def bundle_exe(version: str, rebuild: bool = False) -> Path:
     """Copy this version's Windows executable into the package so the wheel
-    ships it, building the executable first when dist/ has none (or *rebuild*)."""
+    ships it, building the executable first when dist/ has none, when it is
+    older than the sources under turboadb/ or scripts/ (or the spec file), or
+    when *rebuild* is set."""
     exe = release_exe(version)
+    if not rebuild and exe.is_file() and exe_is_stale(exe):
+        print(f"  {exe.name} is older than the sources — rebuilding")
+        rebuild = True
     if rebuild or not exe.is_file():
         run([sys.executable, "scripts/build_exe.py"])
         if not exe.is_file():
@@ -154,8 +200,9 @@ def main(argv=None) -> int:
 
     print("\nUpdating version strings:")
     # The version must be bumped before building (the wheel embeds it), but a
-    # failed build/check must not leave the files bumped for a release that
-    # never happened — the next `patch` run would then skip a version number.
+    # failed build, check OR UPLOAD must not leave the files bumped for a
+    # release that never happened — the next `patch` run would then skip a
+    # version number. The guard covers everything up to a successful upload.
     originals = {path: path.read_text(encoding="utf-8") for path in (PYPROJECT, INIT)}
     set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")
     set_version(INIT, r'__version__\s*=\s*"([^"]+)"', new, "turboadb/__init__.py")
@@ -185,27 +232,29 @@ def main(argv=None) -> int:
                 if not wheel_has_exe(wheel):
                     sys.exit(f"{wheel.name} is missing {BUNDLED_EXE}")
         run([sys.executable, "-m", "twine", "check", *(str(p) for p in artifacts)])
+
+        if args.dry_run:
+            print("\n--dry-run: built and validated, skipping upload.")
+            return 0
+
+        if "TWINE_PASSWORD" not in os.environ:
+            sys.exit("Set TWINE_PASSWORD (your PyPI token) before uploading.")
+        os.environ.setdefault("TWINE_USERNAME", "__token__")
+        cmd = [sys.executable, "-m", "twine", "upload"]
+        if args.test_pypi:
+            cmd += ["--repository", "testpypi"]
+        if args.wheel_only:
+            cmd += [str(p) for p in sorted((ROOT / "dist").glob("*.whl"))]
+        else:
+            cmd += [str(p) for p in artifacts]
+        run(cmd)
     except BaseException:
+        # SystemExit included: every sys.exit() above means nothing reached
+        # PyPI, so the bump must be undone as well.
         for path, text in originals.items():
             path.write_text(text, encoding="utf-8")
-        print(f"\nBuild/check failed — version strings restored to {cur}.", file=sys.stderr)
+        print(f"\nRelease failed — version strings restored to {cur}.", file=sys.stderr)
         raise
-
-    if args.dry_run:
-        print("\n--dry-run: built and validated, skipping upload.")
-        return 0
-
-    if "TWINE_PASSWORD" not in os.environ:
-        sys.exit("Set TWINE_PASSWORD (your PyPI token) before uploading.")
-    os.environ.setdefault("TWINE_USERNAME", "__token__")
-    cmd = [sys.executable, "-m", "twine", "upload"]
-    if args.test_pypi:
-        cmd += ["--repository", "testpypi"]
-    if args.wheel_only:
-        cmd += [str(p) for p in sorted((ROOT / "dist").glob("*.whl"))]
-    else:
-        cmd += [str(p) for p in artifacts]
-    run(cmd)
 
     target = "TestPyPI" if args.test_pypi else "PyPI"
     print(f"\nDone. Published turboadb {new} to {target}.")

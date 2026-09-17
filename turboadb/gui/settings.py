@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import json
 import tempfile
@@ -10,19 +11,47 @@ import threading
 import time
 import warnings
 
-_DIR = os.path.join(os.path.expanduser("~"), ".turboadb")
-_FILE = os.path.join(_DIR, "settings.json")
+from ..config import user_dir, user_path
+
+_DIR = user_dir()
+_FILE = user_path("settings.json")
+# The import-time values, so an explicit override of _DIR/_FILE (tests,
+# embedders) can be told apart from "nobody touched them".
+_DEFAULT_DIR, _DEFAULT_FILE = _DIR, _FILE
+
+
+def settings_dir() -> str:
+    """``~/.turboadb`` resolved on call (see :func:`turboadb.config.user_dir`).
+    An explicit override of the module-level ``_DIR`` still wins."""
+    return _DIR if _DIR != _DEFAULT_DIR else user_dir()
+
+
+def settings_file() -> str:
+    """Path of settings.json, resolved on call.
+
+    The module-level ``_FILE`` used to be frozen at import time while the tool
+    cache was recomputed per call, so a process whose HOME changed afterwards
+    read its settings and its tools from two different directories. An explicit
+    override of ``_FILE`` still wins."""
+    return _FILE if _FILE != _DEFAULT_FILE else user_path("settings.json")
 
 # One zoom range for every terminal/log view and the Settings dialog.
 FONT_SIZE_MIN = 6
 FONT_SIZE_MAX = 40
 
+# Values of the "screen_backend" setting; the first is the default.
+SCREEN_BACKENDS = ("scrcpy", "screencap")
+
 DEFAULTS = {
     # Bumped when a stored value needs a one-time upgrade (see _load_cached).
-    "settings_version": 3,
+    "settings_version": 4,
     "theme": "dark",  # key from turboadb.gui.theme.THEMES
+    # The most recent dark and light theme: the ribbon's dark/light toggle
+    # returns to these (Graphite / Porcelain until another one is chosen).
+    "theme_last_dark": "dark",
+    "theme_last_light": "light",
     "term_font": "Consolas",
-    "term_font_size": 10,
+    "term_font_size": 12,
     "adb_path": "",  # blank = auto-detect
     "scrcpy_path": "",  # blank = auto-detect
     "ffmpeg_path": "",  # blank = auto (cache/PATH); for the Webcam tab
@@ -39,6 +68,9 @@ DEFAULTS = {
     "scrcpy_turn_screen_off": False,
     "scrcpy_stay_awake": True,
     "logcat_format": "threadtime",
+    # How a device screen is shown: "scrcpy" (fast video) or "screencap"
+    # (periodic `adb screencap` frames for builds where scrcpy doesn't work).
+    "screen_backend": "scrcpy",
     # ribbon density: icons-only (True, default — fits without maximizing) vs
     # icons + text (False, "standard"). Toggle with the 🗜 ribbon button / View menu.
     "compact_ribbon": True,
@@ -48,6 +80,9 @@ DEFAULTS = {
     # tab.  The terminal session owns independent Android Shell/CMD/PowerShell
     # processes but does not duplicate the full device workspace.
     "duplicate_device_action": "ask",  # ask | terminal | focus
+    # Add a device to Saved targets once its tab connects (USB by serial,
+    # network by host:port, remote by server + serial), unless already saved.
+    "auto_save_targets": True,
     "recent_network_hosts": [],
     "recent_remote_hosts": [],
     # remembered Remote-webcam connection (host/user/domain only — never the password)
@@ -62,10 +97,13 @@ DEFAULTS = {
 }
 
 # Serialises every read-modify-write so concurrent set()/save() calls (UI
-# thread, workers, debounced writes) never lose each other's updates.
+# thread, workers, debounced writes) never lose each other's updates *in this
+# process*; _file_lock() below adds the cross-process half.
 _LOCK = threading.RLock()
 # (path, (mtime_ns, size), data) of the last parsed/written file.
 _cache = None
+# lock-file path -> [depth, handle] for the locks this process currently holds.
+_held: dict = {}
 
 
 # The Remote-webcam password is kept in the OS credential vault (Windows
@@ -131,7 +169,7 @@ def add_recent(key: str, value: str, cap: int = 10) -> None:
     """Push *value* to the front of a recent-list setting (de-duped, capped)."""
     if not value:
         return
-    with _LOCK:
+    with _LOCK, _file_lock(settings_file()):
         data = load()
         lst = [x for x in (data.get(key) or []) if x != value]
         lst.insert(0, value)
@@ -205,7 +243,7 @@ def _load_cached() -> dict:
     """The parsed settings (shared, do not mutate) — re-read only when the
     file's mtime/size changed, so frequent get() calls don't hit the disk."""
     global _cache
-    path = _FILE
+    path = settings_file()
     sig = _signature(path)
     cached = _cache
     if cached is not None and cached[0] == path and cached[1] == sig:
@@ -220,13 +258,17 @@ def _load_cached() -> dict:
             for key, value in saved.items():
                 data[key] = _coerce(key, value) if key in DEFAULTS else value
             version = saved.get("settings_version")
-            if not isinstance(version, int) or version < 3:
+            if not isinstance(version, int):
+                version = 0
+            if version < DEFAULTS["settings_version"]:
                 # Older files store every default, so these values are the old
                 # defaults rather than choices; move them to the current ones.
-                # The terminal font is never touched: 10 pt is the default and
-                # any other size is the user's own choice.
-                if str(data.get("scrcpy_bit_rate") or "").upper() == "8M":
+                if version < 3 and str(data.get("scrcpy_bit_rate") or "").upper() == "8M":
                     data["scrcpy_bit_rate"] = DEFAULTS["scrcpy_bit_rate"]
+                # 10 pt was the terminal font default until 2.2.2; any other
+                # size is the user's own choice and stays.
+                if version < 4 and data.get("term_font_size") == 10:
+                    data["term_font_size"] = DEFAULTS["term_font_size"]
                 # Record the upgrade so the next save stores the current version
                 # and a value chosen afterwards is never reset again.
                 data["settings_version"] = DEFAULTS["settings_version"]
@@ -246,6 +288,91 @@ def load() -> dict:
     """A fresh, mutable copy of all settings (defaults filled in)."""
     with _LOCK:
         return _copy(_load_cached())
+
+
+def _lock_acquire(path: str, timeout: float):
+    """Take an exclusive OS lock on *path*, or return None if we can't.
+
+    Windows has no flock, so the first byte of the lock file is locked with
+    ``msvcrt.locking``; everywhere else ``fcntl.flock``."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        handle = open(path, "a+b")
+    except OSError:
+        return None
+    if os.name == "nt":
+        import msvcrt
+
+        def take():
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        def take():
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            take()
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                # Never fail a save just because another process is slow: this
+                # is the old, lock-free behaviour, not a regression.
+                handle.close()
+                return None
+            time.sleep(0.02)
+
+
+def _lock_release(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def _file_lock(path: str, timeout: float = 5.0):
+    """Hold ``<path>.lock`` for a whole load-modify-replace, across processes.
+
+    ``_LOCK`` only serialises threads inside ONE process, yet
+    :func:`_replace_with_retry` already anticipates a second TurboADB (a CLI
+    run, another window) touching the same file: both could read, modify and
+    atomically replace, and one set of changes would vanish. Re-entrant per
+    path, since :func:`update` holds it while :func:`save` takes it again."""
+    key = os.path.abspath(path) + ".lock"
+    with _LOCK:  # also guards _held, and is what makes re-entry safe
+        entry = _held.get(key)
+        if entry is not None:
+            entry[0] += 1
+            try:
+                yield
+            finally:
+                entry[0] -= 1
+            return
+        handle = _lock_acquire(key, timeout)
+        _held[key] = [1, handle]
+        try:
+            yield
+        finally:
+            _held.pop(key, None)
+            if handle is not None:
+                _lock_release(handle)
 
 
 def _replace_with_retry(src: str, dst: str, attempts: int = 6) -> None:
@@ -290,8 +417,8 @@ def save(data: dict) -> None:
     merged = dict(DEFAULTS)
     for key, value in data.items():
         merged[key] = _coerce(key, value) if key in DEFAULTS else value
-    with _LOCK:
-        path = _FILE
+    path = settings_file()
+    with _LOCK, _file_lock(path):
         _atomic_write_json(path, merged)
         _cache = (path, _signature(path), _copy(merged))
 
@@ -308,10 +435,14 @@ def get(key: str, default=None):
 
 def update(changes: dict) -> None:
     """Persist several settings at once, merged into the CURRENT file under the
-    lock (never a stale snapshot taken when a dialog opened)."""
+    lock (never a stale snapshot taken when a dialog opened).
+
+    The lock spans the read AND the write, and is held across processes, so a
+    second TurboADB editing other keys at the same moment cannot be overwritten.
+    """
     if not changes:
         return
-    with _LOCK:
+    with _LOCK, _file_lock(settings_file()):
         data = load()
         data.update(changes)
         save(data)

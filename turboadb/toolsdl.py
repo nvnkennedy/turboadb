@@ -24,6 +24,7 @@ import re
 import sys
 import json
 import shutil
+import logging
 import zipfile
 import tempfile
 import platform
@@ -50,8 +51,14 @@ PLATFORM_TOOLS_URLS = {
     "darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
     "linux": "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
 }
+PLATFORM_TOOLS_BASE = "https://dl.google.com/android/repository/"
 SCRCPY_RELEASES_API = "https://api.github.com/repos/Genymobile/scrcpy/releases/latest"
 _UA = {"User-Agent": "turboadb"}
+
+_log = logging.getLogger(__name__)
+
+# The <host-os> value Google's manifest uses for each of our platforms.
+_MANIFEST_HOST_OS = {"windows": "windows", "darwin": "macosx", "linux": "linux"}
 
 
 def _os_key() -> str:
@@ -224,16 +231,28 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     The archive is extracted to a STAGING directory and swapped in atomically,
     with the adb server stopped first — extracting straight over a live adb.exe
     fails on Windows (the running server locks its own file), and with the old
-    ``ignore_errors`` delete that failure was silent."""
+    ``ignore_errors`` delete that failure was silent.
+
+    The versioned archive named in Google's ``repository2-3.xml`` is preferred
+    over the ``-latest-`` alias, because only that one comes with a published
+    size and checksum to verify the download against before the swap."""
     existing = managed_adb()
     if existing and not force:
         return existing
-    url = PLATFORM_TOOLS_URLS[_os_key()]
+    archive = latest_adb_archive()
+    url = archive.get("url") or PLATFORM_TOOLS_URLS[_os_key()]
+    if not archive.get("url"):
+        archive = {}  # the alias isn't the artifact the manifest describes
+        _log.warning(
+            "Could not read Google's platform-tools manifest; downloading the "
+            "'latest' alias with no published checksum to verify it against."
+        )
     _ensure_tools_dir()
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, "platform-tools.zip")
         _download(url, zip_path, on_progress)
         _check_zip(zip_path)  # a truncated download must fail BEFORE the swap
+        _verify_platform_tools(zip_path, archive)
         # the zip contains a top-level "platform-tools/" folder
         staging = os.path.join(tmp, "new")
         _extract_zip(zip_path, staging)
@@ -260,11 +279,18 @@ def _release_cache_path() -> str:
     return os.path.join(tools_dir(), ".scrcpy-release.json")
 
 
-def _github_release_json(timeout: float = 30) -> dict:
-    """The scrcpy latest-release JSON, with **ETag caching** — repeated checks
-    send If-None-Match and reuse the cached body on 304, so the unauthenticated
-    GitHub rate limit (60 req/h/IP) stops making update checks randomly fail.
-    On any network/rate-limit error the last cached copy is used if available."""
+def _github_release(timeout: float = 30) -> tuple:
+    """``(release_json, authoritative)`` for scrcpy's latest release.
+
+    **ETag caching**: repeated checks send If-None-Match and reuse the cached
+    body on 304, so the unauthenticated GitHub rate limit (60 req/h/IP) stops
+    making update checks randomly fail.
+
+    *authoritative* is True for a fresh 200 **and** for a 304 (GitHub confirmed
+    the cached body is still current). It is False when the body is a STALE
+    fallback used because the request failed — offline, rate-limited, 5xx.
+    Conflating the two reported "up to date" for a check that never happened,
+    and meant the `unknown` branch could never fire for scrcpy."""
     cache_path = _release_cache_path()
     cached = None
     try:
@@ -286,17 +312,24 @@ def _github_release_json(timeout: float = 30) -> dict:
                 json.dump({"etag": etag, "data": data}, fh)
         except Exception:
             pass
-        return data
+        return data, True
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and cached and cached.get("data"):
-            return cached["data"]  # unchanged since last time
+            return cached["data"], True  # unchanged since last time
         if cached and cached.get("data"):
-            return cached["data"]  # rate-limited etc. — use the cache
+            return cached["data"], False  # rate-limited etc. — stale cache
         raise
     except Exception:
         if cached and cached.get("data"):
-            return cached["data"]
+            return cached["data"], False
         raise
+
+
+def _github_release_json(timeout: float = 30) -> dict:
+    """The scrcpy latest-release JSON, cached copy included (see
+    :func:`_github_release`). Use it where a stale body is still useful — for
+    picking a download asset — never to answer "is this up to date?"."""
+    return _github_release(timeout)[0]
 
 
 def _scrcpy_assets() -> tuple:
@@ -356,6 +389,53 @@ def _verify_sha256(path: str, name: str, sums_url: str) -> None:
         )
 
 
+def _file_digest(path: str, algorithm: str):
+    import hashlib
+
+    h = hashlib.new(algorithm)
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _verify_platform_tools(path: str, archive: dict) -> None:
+    """Check a downloaded platform-tools zip against Google's own manifest.
+
+    adb used to be installed on a CRC check alone while scrcpy was verified
+    against the release's SHA256SUMS, so a mirror or proxy serving different
+    bytes was accepted. A MISMATCH always raises; when the manifest published no
+    checksum the size is still checked and the gap is LOGGED rather than
+    silently skipped."""
+    size = archive.get("size")
+    actual = os.path.getsize(path)
+    if size and actual != size:
+        raise ADBError(
+            f"platform-tools download is {actual} bytes, but Google's manifest "
+            f"publishes {size}; nothing was installed. Try again."
+        )
+    digest, kind = archive.get("checksum"), archive.get("checksum_type") or "sha1"
+    if not digest:
+        _log.warning(
+            "Google published no checksum for platform-tools %s; verified the "
+            "archive's size (%s bytes) and CRC only.",
+            archive.get("version") or "?",
+            actual,
+        )
+        return
+    try:
+        got = _file_digest(path, kind)
+    except (ValueError, TypeError):
+        _log.warning("Google published an unsupported %s checksum; size/CRC only.", kind)
+        return
+    if got != digest:
+        raise ADBError(
+            f"{kind.upper()} mismatch for the platform-tools download (expected "
+            f"{digest}, got {got}) — it is corrupt or tampered with; nothing was "
+            "installed. Try again."
+        )
+
+
 def _check_zip(path: str) -> None:
     """CRC-check the whole archive so a truncated download fails BEFORE any
     swap, not halfway through extraction."""
@@ -409,6 +489,8 @@ def _stamp_path() -> str:
 
 
 def _read_stamp() -> str:
+    """The TurboADB version whose tools were last ensured (see
+    :func:`ensure_tools`, which skips its work when this matches)."""
     try:
         with open(_stamp_path(), encoding="utf-8") as fh:
             return fh.read().strip()
@@ -455,6 +537,11 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
     falls back to whatever's already on PATH. Thread-safe: concurrent callers
     wait for the first one instead of racing the same download.
 
+    A ``.stamp`` naming the TurboADB version whose tools were last ensured short-
+    circuits the whole function when everything it would check is already in the
+    cache — that is what :func:`_write_stamp` (also written by the GUI's startup
+    tool check) exists for.
+
     Disable entirely with the ``TURBOADB_AUTO_FETCH=0`` environment variable.
     """
     global _ensured
@@ -473,6 +560,15 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
         _ensured = True
         if not auto_fetch_enabled():
             return norm("disabled")
+        # The stamp only short-circuits when the tools it covers are still
+        # present, so deleting one from the cache still re-fetches it.
+        stamp_covers_scrcpy = bool(scrcpy) and scrcpy_download_supported()
+        if (
+            _read_stamp() == _pkg_version()
+            and managed_adb()
+            and (managed_scrcpy() if stamp_covers_scrcpy else True)
+        ):
+            return norm("stamped")
         errors = {}
         note = "up-to-date"
         try:
@@ -535,22 +631,74 @@ def installed_adb_version(adb_path: str | None = None) -> str | None:
         return None
 
 
-def latest_adb_version() -> str | None:
+def _parse_platform_tools_manifest(xml: str, host_os: str) -> dict:
+    """Pull everything we need out of Google's ``repository2-3.xml`` in ONE pass:
+    ``{"version", "url", "size", "checksum", "checksum_type"}`` (keys absent when
+    the manifest doesn't publish them) for the platform-tools archive matching
+    *host_os*. Returns ``{}`` when the entry can't be found at all."""
+    out: dict = {}
+    pkg = re.search(
+        r"<[\w:]*remotePackage[^>]*path=\"platform-tools\".*?</[\w:]*remotePackage>", xml, re.S
+    )
+    # Fall back to the old, looser revision-only match if the schema moves on:
+    # losing the checksum is bad, losing the version check entirely is worse.
+    block = pkg.group(0) if pkg else ""
+    if not block:
+        loose = re.search(r'path="platform-tools".*?</revision>', xml, re.S)
+        block_for_rev = loose.group(0) if loose else ""
+    else:
+        block_for_rev = block
+    rev = re.search(
+        r"<major>(\d+)</major>\s*<minor>(\d+)</minor>\s*<micro>(\d+)</micro>", block_for_rev
+    )
+    if rev:
+        out["version"] = ".".join(rev.groups())
+    if not block:
+        return out
+    archives = re.findall(r"<[\w:]*archive>.*?</[\w:]*archive>", block, re.S)
+    chosen = None
+    for archive in archives:
+        m = re.search(r"<[\w:]*host-os>([\w-]+)</[\w:]*host-os>", archive)
+        if m and m.group(1).strip().lower() == host_os:
+            chosen = archive
+            break
+    if chosen is None and len(archives) == 1:
+        chosen = archives[0]  # a single, OS-independent archive
+    if chosen is None:
+        return out
+    url = re.search(r"<[\w:]*url>([^<]+)</[\w:]*url>", chosen)
+    size = re.search(r"<[\w:]*size>(\d+)</[\w:]*size>", chosen)
+    checksum = re.search(r"<[\w:]*checksum(?:\s+type=\"([\w-]+)\")?\s*>([0-9a-fA-F]+)<", chosen)
+    if url:
+        href = url.group(1).strip()
+        out["url"] = href if "://" in href else PLATFORM_TOOLS_BASE + href.lstrip("/")
+    if size:
+        out["size"] = int(size.group(1))
+    if checksum:
+        out["checksum_type"] = (checksum.group(1) or "sha1").lower()
+        out["checksum"] = checksum.group(2).lower()
+    return out
+
+
+def latest_adb_archive() -> dict:
+    """Google's published platform-tools archive for THIS OS: ``{"version",
+    "url", "size", "checksum", "checksum_type"}``, or ``{}`` when the manifest
+    is unreachable. The same fetch answers both "is there a newer adb?" and
+    "what should the downloaded zip hash to?"."""
     try:
         req = urllib.request.Request(PLATFORM_TOOLS_REPO_XML, headers=_UA)
         with urllib.request.urlopen(req, timeout=30) as resp:
             xml = resp.read().decode("utf-8", "replace")
-        block = re.search(r'path="platform-tools".*?</revision>', xml, re.S)
-        if not block:
-            return None
-        rev = re.search(
-            r"<major>(\d+)</major>\s*<minor>(\d+)</minor>"
-            r"\s*<micro>(\d+)</micro>",
-            block.group(0),
-        )
-        return ".".join(rev.groups()) if rev else None
     except Exception:
-        return None
+        return {}
+    try:
+        return _parse_platform_tools_manifest(xml, _MANIFEST_HOST_OS[_os_key()])
+    except Exception:
+        return {}
+
+
+def latest_adb_version() -> str | None:
+    return latest_adb_archive().get("version")
 
 
 def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
@@ -566,12 +714,17 @@ def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
 
 
 def latest_scrcpy_version() -> str | None:
+    """The newest published scrcpy version, or None when it could NOT be
+    determined (offline, GitHub rate limit). A stale cached release body is not
+    an answer — reporting it as one turned a failed check into "up to date"."""
     try:
-        data = _github_release_json()  # ETag-cached, rate-limit friendly
-        tag = (data.get("tag_name") or "").lstrip("vV")
-        return tag or None
+        data, authoritative = _github_release()  # ETag-cached, rate-limit friendly
     except Exception:
         return None
+    if not authoritative:
+        return None
+    tag = (data.get("tag_name") or "").lstrip("vV")
+    return tag or None
 
 
 _vtuple = parse_version
@@ -590,22 +743,30 @@ def _decide(installed: str | None, latest: str | None) -> bool | None:
 
 def check_updates() -> dict:
     """Compare installed adb/scrcpy against the latest available. Returns
-    ``{"adb": {"installed","latest","upgrade","path","supported"}, "scrcpy": {...}}``
-    where ``upgrade`` is True / False / None (unknown) and ``supported`` says
-    whether TurboADB can download that tool on this OS. Makes no changes.
+    ``{"adb": {"installed","latest","upgrade","path","system","supported"},
+    "scrcpy": {...}}`` where ``upgrade`` is True / False / None (unknown) and
+    ``supported`` says whether TurboADB can download that tool on this OS.
+    Makes no changes.
 
-    The MANAGED copy (the one downloads replace, and the one TurboADB prefers)
-    is what gets version-checked when it exists — comparing a PATH/system adb
-    and then downloading into the cache made updates look like no-ops."""
+    Only the MANAGED copy (the one downloads replace, and the one TurboADB
+    prefers) is version-checked. ``installed`` is None when there is no managed
+    copy — so the decision is "install", not "up to date". Passing the missing
+    path straight to ``installed_*_version`` made it fall back to the PATH tool,
+    which reported everything current while the managed cache stayed EMPTY and
+    ``gui_adb_path()`` kept returning None forever. The PATH/system version is
+    reported separately as ``system``."""
     a_path, s_path = managed_adb(), managed_scrcpy()
-    ai, al = installed_adb_version(a_path), latest_adb_version()
-    si, sl = installed_scrcpy_version(s_path), latest_scrcpy_version()
+    ai = installed_adb_version(a_path) if a_path else None
+    si = installed_scrcpy_version(s_path) if s_path else None
+    al, sl = latest_adb_version(), latest_scrcpy_version()
     return {
         "adb": {
             "installed": ai,
             "latest": al,
             "upgrade": _decide(ai, al),
             "path": a_path,
+            # what a plain `adb` on this machine resolves to, for context only
+            "system": None if a_path else installed_adb_version(),
             "supported": True,
         },
         "scrcpy": {
@@ -613,6 +774,7 @@ def check_updates() -> dict:
             "latest": sl,
             "upgrade": _decide(si, sl),
             "path": s_path,
+            "system": None if s_path else installed_scrcpy_version(),
             "supported": scrcpy_download_supported(),
         },
     }

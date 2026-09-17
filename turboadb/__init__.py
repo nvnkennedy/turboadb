@@ -29,9 +29,17 @@ exceptions (ideal for GUIs). The raw adb path is always at ``dev.adb_path``.
 
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.2.2"
 
-from .config import ADBConfig, ScrcpyOptions
+from .config import (
+    ADBConfig,
+    ScrcpyOptions,
+    format_host_port,
+    parse_host_port,
+    user_dir,
+    user_path,
+    validate_port,
+)
 from .core import ADBHandler, ADBDevice, ShellSession, ForwardHandle
 from .devices import (
     Device,
@@ -85,6 +93,11 @@ __all__ = [
     "ADBDevice",
     "ADBConfig",
     "ScrcpyOptions",
+    "format_host_port",
+    "parse_host_port",
+    "validate_port",
+    "user_dir",
+    "user_path",
     "ShellSession",
     "ForwardHandle",
     "Device",

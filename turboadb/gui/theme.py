@@ -2,12 +2,18 @@
 
 Themes come in dark/light pairs that share one set of tokens and one
 stylesheet. The default pair is Graphite / Porcelain (layered, neither near-black
-nor near-white); Mocha/Latte,
-Forest/Sage, Plum/Rose and Deep teal/Mint are extra pairs selectable in
-Settings, and the ribbon toggle switches to the other half of the current pair.
+nor near-white); Black / White, Slate / Mist, Night / Paper and Mocha / Latte are
+extra pairs selectable in Settings. The ribbon toggle reads as "light mode / dark
+mode": it switches to the most recently chosen theme of the other kind (see
+:func:`toggle_target`). A retired theme name still found in a settings file
+resolves to the default of its kind (see :func:`resolve_name`).
 The stylesheet is deliberately "soft": surfaces are separated by fill and
 rounded corners rather than outlines, buttons are filled, and only text fields
 keep a hairline edge.
+
+Every palette is tuned for long sessions: no pure black or pure white surface,
+body text at roughly 9-13:1 on dark pages and 10-14:1 on light ones (brighter
+halates, dimmer strains), and muted accents instead of large saturated fills.
 
 Terminal-like surfaces (shell, logcat, the log dock) use the terminal colours
 below in both themes, so their ANSI and log-level colours are tuned for one
@@ -18,6 +24,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from functools import partial
 
 # Text tokens (text, dim, accent_text, section_text, sel_text) keep at least
 # 4.5:1 contrast on win/panel/raised/input/ribbon, ``text`` also on ``button``,
@@ -27,6 +34,9 @@ import tempfile
 # Layers, darkest to lightest (dark) / most to least recessed (light):
 # chrome (top bar, sidebar, status bar) → win (page canvas) → panel (cards, tables)
 # → raised (hover, elevated) ; ``border`` is the hairline that makes those layers read.
+# ``accent`` is a FILL (primary buttons, checked boxes, text selection) under
+# ``on_accent`` text and icons; focus rings, hovered outlines and the tab
+# underline use ``accent_text``, so a theme may choose a deep, low-glare fill.
 _DARK = dict(  # Graphite
     chrome="#1b1c1f", win="#202124", panel="#26272b", raised="#2d2e33",
     button="#35373c", button_hover="#3e4046", input="#1c1d20", ribbon="#1b1c1f",
@@ -47,91 +57,115 @@ _LIGHT = dict(  # Porcelain
     section_text="#30353d", danger="#a53028", danger_text="#a53028", on_danger="#fff8f7",
     warn_text="#704b00", ok_text="#2b6230",
 )
+# Black / White stay monochrome in character but soft. Pure #000000 behind
+# 17:1 text made every edge glare, so Black is a near-black page with gently
+# stepped greys and a deep, barely-blue steel primary under light text (the
+# light-grey fill outshone every button beside it). White is paper, not #ffffff.
+_BLACK = dict(
+    chrome="#0b0b0c", win="#0f0f10", panel="#161617", raised="#1d1d1f",
+    button="#252527", button_hover="#2e2e31", input="#0a0a0b", ribbon="#0b0b0c",
+    border="#2b2b2e", frame="#68686c", line="#6c6c70",
+    text="#cbcbce", dim="#949498", placeholder="#7a7a7e", sel="#2f343c", sel_text="#ececee",
+    accent="#3b424d", accent_hover="#474f5c", accent_text="#b1bac6", on_accent="#eef0f3",
+    section_text="#b4b4b8", danger="#a3403b", danger_text="#e98c86", on_danger="#fff4f3",
+    warn_text="#d6ab62", ok_text="#8dbd7c",
+)
+# Cards sit a shade below the paper page and fields a shade above it, so a
+# page full of cards never reads as one white sheet.
+_WHITE = dict(
+    chrome="#e9e9e6", win="#f5f5f3", panel="#efefec", raised="#f9f9f7",
+    button="#e3e3e0", button_hover="#d9d9d6", input="#fbfbf9", ribbon="#e9e9e6",
+    border="#d9d9d6", frame="#858588", line="#7f7f82",
+    text="#2e2e30", dim="#5f5f62", placeholder="#707073", sel="#dadbde", sel_text="#1b1b1d",
+    accent="#41464e", accent_hover="#353940", accent_text="#3a3e45", on_accent="#f7f7f5",
+    section_text="#3c3c3f", danger="#a8352e", danger_text="#a8352e", on_danger="#fff8f7",
+    warn_text="#6e4a00", ok_text="#2d6532",
+)
+# Slate / Mist: cool blue-greys with low saturation, in the spirit of Nord.
+_SLATE = dict(
+    chrome="#232831", win="#292f39", panel="#2f3642", raised="#363e4b",
+    button="#3d4655", button_hover="#465062", input="#242933", ribbon="#232831",
+    border="#3f4858", frame="#7a8597", line="#7e899b",
+    text="#e1e6ee", dim="#aab4c2", placeholder="#838ea0", sel="#3a4c64", sel_text="#eef2f7",
+    accent="#466782", accent_hover="#51728f", accent_text="#8fbad2", on_accent="#f1f5f9",
+    section_text="#b9c5d5", danger="#a54f58", danger_text="#e6979e", on_danger="#fdf4f5",
+    warn_text="#e0bf84", ok_text="#a6c48d",
+)
+_MIST = dict(
+    chrome="#cdd4dd", win="#d6dce4", panel="#dde2e9", raised="#e2e6ec",
+    button="#c9d1db", button_hover="#bfc8d4", input="#e6eaef", ribbon="#cdd4dd",
+    border="#b4bfcc", frame="#5d6979", line="#606c7c",
+    text="#212833", dim="#495465", placeholder="#616d7e", sel="#b7c7da", sel_text="#141e2b",
+    accent="#3b6183", accent_hover="#325371", accent_text="#325677", on_accent="#f5f8fb",
+    section_text="#2e3b4d", danger="#a03a3a", danger_text="#a03a3a", on_danger="#fff7f7",
+    warn_text="#694900", ok_text="#2c6033",
+)
+# Night / Paper: a warm pair for long reading sessions. Night is a warm
+# charcoal (greyer than the Mocha espresso) with a deep amber fill; Paper is a
+# sepia-leaning cream (lighter and less tan than Latte) with an amber-brown accent.
+_NIGHT = dict(
+    chrome="#1a1917", win="#1f1e1c", panel="#262422", raised="#2d2b28",
+    button="#35322e", button_hover="#3e3b36", input="#1b1a18", ribbon="#1a1917",
+    border="#38352f", frame="#7b756b", line="#80796f",
+    text="#ddd5c7", dim="#a99f90", placeholder="#8b8375", sel="#473c2c", sel_text="#f5eee2",
+    accent="#7a5b2c", accent_hover="#876633", accent_text="#d8b06d", on_accent="#fcf6eb",
+    section_text="#cdbfa8", danger="#a34a3f", danger_text="#e99585", on_danger="#fff6f0",
+    warn_text="#dfb566", ok_text="#a4c184",
+)
+_PAPER = dict(
+    chrome="#dfd7c7", win="#e8e1d3", panel="#ede7dc", raised="#f1ece3",
+    button="#dcd3c1", button_hover="#d3c8b3", input="#f4f0e8", ribbon="#dfd7c7",
+    border="#cec4b1", frame="#74685a", line="#716559",
+    text="#34291e", dim="#5d4f40", placeholder="#796b5b", sel="#d8c6a6", sel_text="#291e14",
+    accent="#7a5a2b", accent_hover="#6b4e25", accent_text="#6c4e24", on_accent="#fdf8ef",
+    section_text="#4e3c29", danger="#9b392c", danger_text="#9b392c", on_danger="#fff8f2",
+    warn_text="#694700", ok_text="#395e27",
+)
 _MOCHA = dict(
-    win="#1c1714", panel="#241e1a", raised="#2d2520", button="#3a302a", button_hover="#463a32",
-    input="#17120f", ribbon="#221c18", border="#3b322c", frame="#8a786a", line="#8a786a",
-    text="#efe6da", dim="#bfae9c", placeholder="#9a8a7b", sel="#4a3a2e", sel_text="#fff5ea",
+    chrome="#221c18", win="#1c1714", panel="#241e1a", raised="#2d2520",
+    button="#3a302a", button_hover="#463a32", input="#17120f", ribbon="#221c18",
+    border="#3b322c", frame="#8a786a", line="#8a786a",
+    text="#e4dacd", dim="#bfae9c", placeholder="#9a8a7b", sel="#4a3a2e", sel_text="#fff5ea",
     accent="#d9a066", accent_hover="#e5b27f", accent_text="#e8b884", on_accent="#1c1714",
     section_text="#e6cdb0", danger="#b84a3e", danger_text="#f08a7c", on_danger="#fff5ea",
     warn_text="#e3b25a", ok_text="#9cc27a",
 )
 _LATTE = dict(
-    win="#d1c6b7", panel="#cabdab", raised="#d7cfc2", button="#c3b49e", button_hover="#b8a68c",
-    input="#dcd6cc", ribbon="#c9bcaa", border="#b7a68e", frame="#6d5d4c", line="#695949",
-    text="#31241b", dim="#5b4a3a", placeholder="#736251", sel="#c6af94", sel_text="#271a11",
+    chrome="#c9bcaa", win="#d4c9ba", panel="#cabdab", raised="#d7cfc2",
+    button="#c3b49e", button_hover="#b8a68c", input="#dcd6cc", ribbon="#c9bcaa",
+    border="#b7a68e", frame="#6d5d4c", line="#695949",
+    text="#261a11", dim="#534337", placeholder="#736251", sel="#c6af94", sel_text="#271a11",
     accent="#7a461b", accent_hover="#683a16", accent_text="#6f3e18", on_accent="#fff8ef",
     section_text="#4e3523", danger="#963227", danger_text="#963227", on_danger="#fff8ef",
     warn_text="#6b4600", ok_text="#345c25",
 )
-_FOREST = dict(
-    win="#141c19", panel="#1b2521", raised="#222e29", button="#2c3a34", button_hover="#36463f",
-    input="#101714", ribbon="#19221e", border="#2f3d37", frame="#6d8479", line="#6f877c",
-    text="#e2ece6", dim="#a9bdb3", placeholder="#869a90", sel="#2f4a3e", sel_text="#f0f8f3",
-    accent="#7cc4a0", accent_hover="#93d2b1", accent_text="#93d2b1", on_accent="#0f1a15",
-    section_text="#c8ddd2", danger="#b5534e", danger_text="#ef8f89", on_danger="#f5fbf8",
-    warn_text="#dcb563", ok_text="#8fcf88",
-)
-_SAGE = dict(
-    win="#c9d1c6", panel="#bfc9bb", raised="#d1d7ce", button="#b4c2b0", button_hover="#a7b8a2",
-    input="#d8dcd6", ribbon="#bdc7b9", border="#a6b6a1", frame="#546550", line="#52634e",
-    text="#19271d", dim="#3d5044", placeholder="#5a6c61", sel="#a9c1b0", sel_text="#112118",
-    accent="#245e41", accent_hover="#1e4f36", accent_text="#20563c", on_accent="#f4faf6",
-    section_text="#254031", danger="#933128", danger_text="#933128", on_danger="#f7fbf8",
-    warn_text="#664800", ok_text="#295c2d",
-)
-_PLUM = dict(
-    win="#1b1621", panel="#231d2b", raised="#2b2434", button="#372e42", button_hover="#42374f",
-    input="#16121b", ribbon="#211b28", border="#382f43", frame="#83749a", line="#85759a",
-    text="#ece6f2", dim="#b9aec6", placeholder="#968aa4", sel="#43345a", sel_text="#f7f1fd",
-    accent="#b99ae6", accent_hover="#c8aff0", accent_text="#cbb2f0", on_accent="#1b1621",
-    section_text="#dac9ef", danger="#b84c63", danger_text="#f08aa0", on_danger="#fbf5ff",
-    warn_text="#e0b563", ok_text="#9ccb87",
-)
-_ROSE = dict(
-    win="#d3c9cd", panel="#cabec4", raised="#d9d1d4", button="#c6b7be", button_hover="#bba8b2",
-    input="#ddd8db", ribbon="#cabdc3", border="#bba9b2", frame="#6c5a64", line="#695761",
-    text="#2d2035", dim="#57475e", placeholder="#736279", sel="#c6b2c8", sel_text="#23172a",
-    accent="#653f86", accent_hover="#563574", accent_text="#5d3a7c", on_accent="#fbf6ff",
-    section_text="#48305a", danger="#943045", danger_text="#943045", on_danger="#fff7fa",
-    warn_text="#674600", ok_text="#335a25",
-)
-_TEAL = dict(
-    win="#10191b", panel="#162224", raised="#1c2b2e", button="#26383b", button_hover="#304548",
-    input="#0c1416", ribbon="#142022", border="#273b3e", frame="#678589", line="#6b898d",
-    text="#dfeceb", dim="#a3bdbb", placeholder="#809a98", sel="#1f4a4c", sel_text="#effafa",
-    accent="#5ec4b6", accent_hover="#7bd1c5", accent_text="#7bd1c5", on_accent="#0b1716",
-    section_text="#bfdcd8", danger="#b5504e", danger_text="#ee8c88", on_danger="#f4fbfb",
-    warn_text="#dcb560", ok_text="#8fcf88",
-)
-_MINT = dict(
-    win="#c5d2cf", panel="#bacac6", raised="#cfd9d7", button="#b0c5c1", button_hover="#a3bcb7",
-    input="#d6dddc", ribbon="#b8c9c5", border="#a1b8b3", frame="#4d6561", line="#4a625d",
-    text="#122422", dim="#38524e", placeholder="#546d6a", sel="#a4c2be", sel_text="#0c1e1d",
-    accent="#19625a", accent_hover="#14534b", accent_text="#175c55", on_accent="#f2fbfa",
-    section_text="#1f4344", danger="#933128", danger_text="#933128", on_danger="#f7fbfa",
-    warn_text="#664800", ok_text="#295c2d",
-)
 
 # (key, label, description, palette, pair) in the order shown in Settings.
+# Each description must fit on its Settings -> Themes card (about 36
+# characters; longer ones were cut off with "..." at the default dialog size).
 _THEME_TABLE = (
-    ("dark", "Graphite", "Layered graphite with crisp text — the default dark.", _DARK, "light"),
-    ("light", "Porcelain", "Soft neutral light with clear panels — the default light.", _LIGHT, "dark"),
-    ("mocha-dark", "Mocha", "Warm espresso dark with a caramel accent.", _MOCHA, "mocha-light"),
+    ("dark", "Graphite", "Layered graphite, the default dark.", _DARK, "light"),
+    ("light", "Porcelain", "Soft neutral grey, the default light.", _LIGHT, "dark"),
+    ("mono-dark", "Black", "Soft near-black with calm grey text.", _BLACK, "mono-light"),
+    ("mono-light", "White", "Paper white with soft dark text.", _WHITE, "mono-dark"),
+    ("slate-dark", "Slate", "Cool blue-grey with a frost accent.", _SLATE, "slate-light"),
+    ("slate-light", "Mist", "Pale blue-grey with a steel accent.", _MIST, "slate-dark"),
+    ("night-dark", "Night", "Warm charcoal, soft amber accent.", _NIGHT, "night-light"),
+    ("night-light", "Paper", "Sepia cream paper for easy reading.", _PAPER, "night-dark"),
+    ("mocha-dark", "Mocha", "Espresso dark with a caramel accent.", _MOCHA, "mocha-light"),
     ("mocha-light", "Latte", "Warm tan light with a toffee accent.", _LATTE, "mocha-dark"),
-    ("forest-dark", "Forest", "Deep green dark with a mint accent.", _FOREST, "forest-light"),
-    ("forest-light", "Sage", "Soft sage-green light with a forest accent.", _SAGE, "forest-dark"),
-    ("plum-dark", "Plum", "Deep aubergine dark with a lavender accent.", _PLUM, "plum-light"),
-    ("plum-light", "Rose", "Muted rose light with a violet accent.", _ROSE, "plum-dark"),
-    ("teal-dark", "Deep teal", "Dark teal-green with an aqua accent.", _TEAL, "teal-light"),
-    ("teal-light", "Mint", "Pale mint light with a teal accent.", _MINT, "teal-dark"),
 )
 THEMES = {key: pal for key, _label, _desc, pal, _pair in _THEME_TABLE}
 THEME_LABELS = {key: label for key, label, _desc, _pal, _pair in _THEME_TABLE}
 THEME_DESCRIPTIONS = {key: desc for key, _label, desc, _pal, _pair in _THEME_TABLE}
 _COUNTERPARTS = {key: pair for key, _label, _desc, _pal, pair in _THEME_TABLE}
-# The extra pairs predate the separate chrome layer; it matches their ribbon.
-for _tokens in THEMES.values():
-    _tokens.setdefault("chrome", _tokens["ribbon"])
+# Removed themes, mapped to the default of their kind: a settings file may
+# still name one as ``theme`` or as the remembered dark/light choice.
+_RETIRED = {
+    "forest-dark": "dark", "forest-light": "light",
+    "plum-dark": "dark", "plum-light": "light",
+    "teal-dark": "dark", "teal-light": "light",
+}
 
 # ---- terminal-like surfaces (identical in both themes) --------------------
 TERM_BG = "#0e0e10"
@@ -204,8 +238,23 @@ def theme_names() -> tuple[str, ...]:
     return tuple(THEME_LABELS)
 
 
+def resolve_name(name: str | None, fallback: str | None = "dark") -> str | None:
+    """The theme key to use for a stored or requested *name*.
+
+    A current key is returned as is; a retired one (Forest, Plum, Deep teal and
+    their light halves) becomes the default of its kind, so a settings file
+    naming Rose opens in Porcelain, not Graphite; anything else is *fallback*.
+    Every lookup in this module goes through here.
+    """
+    if not isinstance(name, str):
+        return fallback
+    if name in THEMES:
+        return name
+    return _RETIRED.get(name, fallback)
+
+
 def theme_label(name: str) -> str:
-    return THEME_LABELS.get(name, THEME_LABELS["dark"])
+    return THEME_LABELS[resolve_name(name)]
 
 
 def theme_description(name: str) -> str:
@@ -213,14 +262,14 @@ def theme_description(name: str) -> str:
 
 
 def current_name() -> str:
-    """The saved theme name, falling back to dark for unknown values."""
+    """The saved theme name (retired or unknown values resolved, see :func:`resolve_name`)."""
     try:
         from . import settings as settings_mod
 
         name = settings_mod.get("theme")
     except Exception:
         name = None
-    return name if name in THEMES else "dark"
+    return resolve_name(name)
 
 
 _ACTIVE_NAME = None  # the theme last applied to the app (live previews included)
@@ -228,7 +277,7 @@ _ACTIVE_NAME = None  # the theme last applied to the app (live previews included
 
 def palette(name: str | None = None) -> dict:
     """Colour tokens for *name* (default: the theme currently applied, else the saved one)."""
-    return THEMES.get(name or _ACTIVE_NAME or current_name(), _DARK)
+    return THEMES[resolve_name(name or _ACTIVE_NAME or current_name())]
 
 
 # Colour-coding hues for icons and tinted tiles: (dark themes, light themes).
@@ -286,7 +335,7 @@ def tint(tone: str, name: str | None = None, extra: float = 0.0) -> str:
 
 def _tone_rules(name: str) -> str:
     """Tinted buttons: ``setProperty("tone", "green")`` on a QPushButton/QToolButton."""
-    c = THEMES.get(name, _DARK)
+    c = THEMES[resolve_name(name)]
     rules = []
     for tone in TONES:
         sel = f'QPushButton[tone="{tone}"], QToolButton[tone="{tone}"]'
@@ -317,24 +366,128 @@ def _luminance(colour: str) -> float:
     return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
 
 
+def _contrast(fg: str, bg: str) -> float:
+    """WCAG contrast ratio of two hex colours (1 to 21)."""
+    hi, lo = sorted((_luminance(fg), _luminance(bg)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _readable_fill(track: str, fill: str, text: str, minimum: float = 4.6) -> str:
+    """*fill*, blended toward *track* only as far as *text* needs to stay readable on it.
+
+    For a surface that one text colour crosses, such as a progress bar whose
+    label sits over both the chunk and the empty track: Graphite's light-blue
+    and White's near-black accents left that label unreadable over the chunk.
+    """
+    for step in range(20, -1, -1):
+        colour = _mix(track, fill, step / 20)
+        if _contrast(text, colour) >= minimum:
+            return colour
+    return track
+
+
 def is_light(name: str | None = None) -> bool:
     """True when the palette's window colour is light (any palette, not a name)."""
     return _luminance(palette(name)["win"]) > 0.4
 
 
 def counterpart(name: str | None = None) -> str:
-    """The other half of *name*'s dark/light pair (what the ribbon toggle switches to)."""
-    return _COUNTERPARTS.get(name or current_name(), "dark")
+    """The other half of *name*'s dark/light pair in ``_THEME_TABLE``.
+
+    Not what the ribbon toggle switches to: that is :func:`toggle_target`."""
+    return _COUNTERPARTS.get(resolve_name(name or current_name(), None), "dark")
+
+
+# Settings keys holding the user's most recent theme of each kind, and the
+# defaults used until one is chosen.
+LAST_DARK_KEY = "theme_last_dark"
+LAST_LIGHT_KEY = "theme_last_light"
+
+
+def last_theme_key(name: str) -> str:
+    """The settings key that remembers the most recent theme of *name*'s kind."""
+    return LAST_LIGHT_KEY if is_light(name) else LAST_DARK_KEY
+
+
+def theme_choice(name: str, previous: str | None = None) -> dict:
+    """Settings changes for choosing theme *name* (menu, Settings or toggle).
+
+    Besides ``theme`` itself, *name* becomes the remembered theme of its kind.
+    *previous*, the theme being left, is recorded under its kind first: it was
+    the latest of that kind, and a settings file older than these keys names
+    it only as ``theme``.
+    """
+    changes = {}
+    for key in (previous, name):
+        key = resolve_name(key, None)
+        if key is not None:
+            changes[last_theme_key(key)] = key
+    changes["theme"] = resolve_name(name)
+    return changes
+
+
+def toggle_target(name: str | None = None) -> str:
+    """The theme the dark/light toggle switches to from *name* (default: the saved one).
+
+    Users read the toggle as "light mode / dark mode", so it goes to the most
+    recently chosen theme of the OTHER kind (Slate -> Porcelain -> Slate), not to
+    *name*'s pair; Graphite / Porcelain until a theme of that kind was chosen.
+    """
+    name = resolve_name(name, None) or current_name()
+    to_light = not is_light(name)
+    key, fallback = (LAST_LIGHT_KEY, "light") if to_light else (LAST_DARK_KEY, "dark")
+    try:
+        from . import settings as settings_mod
+
+        target = settings_mod.get(key)
+    except Exception:
+        target = None
+    # A hand-edited file may name an unknown theme, or one of the wrong kind;
+    # a retired one stands for the default of its kind.
+    target = resolve_name(target, fallback)
+    if is_light(target) != to_light:
+        target = fallback
+    return target
+
+
+# Settings files already checked for retired theme names (by path).
+_RETIRED_CHECKED = set()
+
+
+def _forget_retired_themes() -> None:
+    """Rewrite saved theme names that were retired, once, to their kind's default.
+
+    Lookups here resolve them anyway, but the Settings dialog preselects (and
+    its OK re-applies) the raw saved name; left in place, a Rose user would be
+    shown Graphite there and switched to it. Attempted once per settings file:
+    a read-only file would otherwise make every theme switch wait out the
+    write retries.
+    """
+    try:
+        from . import settings as settings_mod
+
+        path = settings_mod.settings_file()
+        if path in _RETIRED_CHECKED:
+            return
+        _RETIRED_CHECKED.add(path)
+
+        saved = {key: settings_mod.get(key) for key in ("theme", LAST_DARK_KEY, LAST_LIGHT_KEY)}
+        changes = {key: _RETIRED[value] for key, value in saved.items()
+                   if isinstance(value, str) and value in _RETIRED}
+        if changes:
+            settings_mod.update(changes)
+    except Exception:  # an unreadable or read-only settings file: resolve per lookup
+        pass
 
 
 def accent_text(name: str = "dark") -> str:
     """Accent colour which remains legible when used for text."""
-    return THEMES.get(name, _DARK)["accent_text"]
+    return THEMES[resolve_name(name)]["accent_text"]
 
 
 def section_text(name: str = "dark") -> str:
     """Sidebar section-heading colour for the active theme."""
-    return THEMES.get(name, _DARK)["section_text"]
+    return THEMES[resolve_name(name)]["section_text"]
 
 
 def status_colors(name: str | None = None) -> dict:
@@ -369,10 +522,24 @@ def apply_to_app(app, name: str | None = None) -> None:
     """Apply the stylesheet plus the palette roles QSS can't reach.
 
     Placeholder text colour is only settable through ``QPalette``, so it is
-    applied here to follow live theme switches too.
+    applied here to follow live theme switches too. So are link colours (rich
+    text links, such as the file link in a "Saved ..." toast, were Qt's default
+    dark blue, unreadable on dark themes) and the bevel roles (light, midlight,
+    mid, dark, shadow) that native controls still draw with: their Windows
+    defaults are white and light grey.
+
+    One such bevel was the bright rule above the device actions: in document
+    mode a QTabWidget has the native style paint a tab-bar base line behind
+    each corner widget (``setDrawBase(False)`` doesn't reach it), in the tab
+    bar's light/dark roles. Tab bars get those roles in the page colour, which
+    is what shows behind a corner widget, so the line disappears.
+
+    A retired theme name (see :func:`resolve_name`) is also rewritten in the
+    settings file here, which runs before any window opens.
     """
     global _ACTIVE_NAME
-    name = name if name in THEMES else current_name()
+    _forget_retired_themes()
+    name = resolve_name(name, None) or current_name()
     _ACTIVE_NAME = name  # glyph icons repaint in this palette on their next paint
     css = stylesheet(name)
     if app.styleSheet():
@@ -384,9 +551,36 @@ def apply_to_app(app, name: str | None = None) -> None:
     try:
         from PyQt5.QtGui import QColor, QPalette
 
+        c = THEMES[name]
         pal = app.palette()
-        pal.setColor(QPalette.PlaceholderText, QColor(THEMES[name]["placeholder"]))
-        app.setPalette(pal)
+        pal.setColor(QPalette.PlaceholderText, QColor(c["placeholder"]))
+        pal.setColor(QPalette.Link, QColor(c["accent_text"]))
+        pal.setColor(QPalette.LinkVisited, QColor(c["accent_text"]))
+        bevels =(QPalette.Light, QPalette.Midlight, QPalette.Mid, QPalette.Dark)
+        for role in bevels:
+            pal.setColor(role, QColor(c["border"]))
+        pal.setColor(QPalette.Shadow, QColor(c["chrome"]))
+        app.setPalette(pal)  # (this also drops the class palette below)
+        tab_bars = QPalette(pal)
+        for role in bevels + (QPalette.Shadow,):
+            tab_bars.setColor(role, QColor(c["win"]))
+        app.setPalette(tab_bars, "QTabBar")
+    except Exception:
+        pass
+    try:
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QApplication, QLabel
+
+        # A rich-text label takes its link colour from the application palette
+        # when its text is parsed, so a label already showing a link kept the
+        # previous theme's colour through a live switch. Setting the same text
+        # again is a no-op in QLabel, hence the empty string first.
+        for widget in QApplication.allWidgets():
+            if isinstance(widget, QLabel) and widget.textFormat() != Qt.PlainText:
+                text = widget.text()
+                if "<a " in text.lower():
+                    widget.setText("")
+                    widget.setText(text)
     except Exception:
         pass
 
@@ -481,15 +675,27 @@ def _dot_png(color: str) -> str:
     return _cached_png("dot", color, 20, 20, paint)
 
 
-def _down_arrow_png(color: str) -> str:
-    """A "v" chevron for QComboBox::down-arrow (a CSS triangle renders as a dot)."""
+# Chevron image size and its three stroke points, per direction.
+_CHEVRONS = {
+    "down": ((14, 9), ((3, 3), (7, 7), (11, 3))),
+    "up": ((14, 9), ((3, 6), (7, 2), (11, 6))),
+    "right": ((9, 14), ((3, 3), (7, 7), (3, 11))),
+    "left": ((9, 14), ((6, 3), (2, 7), (6, 11))),
+}
+
+
+def _arrow_png(color: str, direction: str = "down") -> str:
+    """A chevron for QSS arrow sub-controls (a CSS triangle renders as a dot):
+    the combo box drop-down, the theme toggle and tab bar scroll buttons."""
+    (width, height), (start, tip, end) = _CHEVRONS[direction]
 
     def paint(p, c):
         p.setPen(_pen(c, 1.8))
-        p.drawLine(3, 3, 7, 7)
-        p.drawLine(7, 7, 11, 3)
+        p.drawLine(*start, *tip)
+        p.drawLine(*tip, *end)
 
-    return _cached_png("arrow", color, 14, 9, paint)
+    kind = "arrow" if direction == "down" else f"arrow-{direction}"
+    return _cached_png(kind, color, width, height, paint)
 
 
 def _close_png(color: str) -> str:
@@ -503,6 +709,17 @@ def _close_png(color: str) -> str:
     return _cached_png("close", color, 14, 14, paint)
 
 
+def _tab_separator_png(color: str) -> str:
+    """A short vertical hairline drawn between adjacent tab headers."""
+
+    def paint(p, c):
+        from PyQt5.QtGui import QColor
+
+        p.fillRect(0, 0, 1, 16, QColor(c))
+
+    return _cached_png("tabsep", color, 1, 16, paint)
+
+
 def _image(fn, color: str) -> str:
     try:
         return fn(color)
@@ -511,14 +728,41 @@ def _image(fn, color: str) -> str:
 
 
 def stylesheet(name: str = "dark") -> str:
-    c = THEMES.get(name, _DARK)
+    c = THEMES[resolve_name(name)]
     check = _image(_checkmark_png, c["on_accent"])
     menu_check = _image(_checkmark_png, c["text"])
     dot = _image(_dot_png, c["on_accent"])
-    arrow = _image(_down_arrow_png, c["dim"])
+    arrow = _image(_arrow_png, c["dim"])
     close = _image(_close_png, c["dim"])
+    # A missing PNG (no QGuiApplication, or an unwritable cache) must drop the
+    # image property entirely: "image: url()" is invalid and Qt then paints its
+    # own fallback arrow/cross on top of the rule.
     close_image = f"image: url({close});" if close else ""
     arrow_image = f"image: url({arrow});" if arrow else ""
+    # Device and section tab headers are partitioned by a short hairline at
+    # each header's right edge, a little firmer than ``border`` so it reads on
+    # the tab row. The background shorthands of the :last, :next-selected,
+    # :hover and :selected rules drop it again: nothing trails the last header,
+    # and the selected or hovered header is never cut by a line of its own.
+    tab_sep = _image(_tab_separator_png, _mix(c["border"], c["frame"], 0.3))
+    tab_sep_image = (
+        f"background-image: url({tab_sep}); background-position: right center;"
+        " background-repeat: no-repeat;"
+    ) if tab_sep else ""
+    # Chevrons for the scroll buttons of an overflowing tab bar, enabled and disabled.
+    scroll_arrows = []
+    for direction in ("left", "right", "up", "down"):
+        size = "width: 9px; height: 14px;" if direction in ("left", "right") else (
+            "width: 14px; height: 9px;")
+        for state, colour in (("", c["text"]), (":disabled", c["frame"])):
+            image = _image(partial(_arrow_png, direction=direction), colour)
+            scroll_arrows.append(
+                f"QTabBar QToolButton::{direction}-arrow{state} {{ "
+                + (f"image: url({image}); " if image else "") + f"{size} }}"
+            )
+    scroll_arrow_rules = "\n    ".join(scroll_arrows)
+    # A progress bar's label crosses the chunk and the track in one colour.
+    progress_chunk = _readable_fill(c["button"], c["accent"], c["text"])
     return f"""
     QWidget {{
         background: {c["win"]}; color: {c["text"]};
@@ -607,13 +851,13 @@ def stylesheet(name: str = "dark") -> str:
         selection-color: {c["on_accent"]}; font-size: 9pt;
     }}
     QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {c["frame"]}; }}
-    QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border: 1px solid {c["accent"]}; }}
+    QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border: 1px solid {c["accent_text"]}; }}
     QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
         background: {c["panel"]}; color: {c["dim"]}; border-color: {c["panel"]};
     }}
     QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right;
         border: none; width: 22px; }}
-    QComboBox::down-arrow, QComboBox::down-arrow:disabled {{ image: url({arrow}); width: 12px;
+    QComboBox::down-arrow, QComboBox::down-arrow:disabled {{ {arrow_image} width: 12px;
         height: 8px; margin-right: 6px; }}
     QComboBox QAbstractItemView {{
         background: {c["raised"]}; color: {c["text"]}; border: 1px solid {c["border"]};
@@ -641,7 +885,7 @@ def stylesheet(name: str = "dark") -> str:
         border-radius: 4px; background: {c["input"]}; margin-right: 4px;
     }}
     QListWidget::indicator:hover, QTreeWidget::indicator:hover,
-    QListView::indicator:hover {{ border-color: {c["accent"]}; }}
+    QListView::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QListWidget::indicator:checked, QTreeWidget::indicator:checked,
     QListView::indicator:checked {{
         background: {c["accent"]}; border-color: {c["accent"]}; image: url({check}); }}
@@ -687,17 +931,23 @@ def stylesheet(name: str = "dark") -> str:
         border-top-left-radius: 6px; border-top-right-radius: 6px;
     }}
     QTabBar::tab:hover {{ background: {c["button"]}; color: {c["text"]}; }}
-    QTabBar::tab:selected {{ color: {c["accent_text"]}; border-bottom-color: {c["accent"]}; }}
+    QTabBar::tab:selected {{ color: {c["accent_text"]}; border-bottom-color: {c["accent_text"]}; }}
     /* Primary workspace tabs read as folder tabs merged into the page; device
        and terminal tabs rely on the animated underline. */
     QTabWidget#mainTabs::pane {{ border: 0; background: {c["win"]}; }}
     QTabWidget#mainTabs QTabBar {{ background: {c["chrome"]}; }}
-    QFrame#animatedTabIndicator {{ background: {c["accent"]}; border: none; border-radius: 1px; }}
+    /* The strip beside the tab bar (behind the + corner) is the widget's own
+       fill; it only paints with Qt.WA_StyledBackground set on the tab widget. */
+    QTabWidget#mainTabs {{ background: {c["chrome"]}; }}
+    QFrame#animatedTabIndicator {{ background: {c["accent_text"]}; border: none; border-radius: 1px; }}
     QTabWidget#mainTabs QTabBar::tab {{
         background: transparent; border: none; border-bottom: 3px solid transparent;
         margin: 4px 1px 0 1px; padding: 7px 14px; color: {c["dim"]};
-        border-top-left-radius: 8px; border-top-right-radius: 8px;
+        border-top-left-radius: 8px; border-top-right-radius: 8px; {tab_sep_image}
     }}
+    /* No hairline after the last header or on either side of the selected one. */
+    QTabWidget#mainTabs QTabBar::tab:last, QTabWidget#mainTabs QTabBar::tab:next-selected {{
+        background: transparent; }}
     QTabWidget#mainTabs QTabBar::tab:hover {{ background: {c["button"]}; color: {c["text"]}; }}
     QTabWidget#mainTabs QTabBar::tab:selected {{
         background: {c["win"]}; color: {c["accent_text"]}; border-bottom-color: transparent;
@@ -706,36 +956,29 @@ def stylesheet(name: str = "dark") -> str:
     QTabWidget#deviceTabs QTabBar {{ background: {c["win"]}; }}
     QTabWidget#deviceTabs QTabBar::tab {{
         background: transparent; border: none; border-bottom: 3px solid transparent;
-        margin: 2px 1px 0 1px; padding: 7px 12px; color: {c["dim"]};
+        margin: 2px 1px 0 1px; padding: 7px 12px; color: {c["dim"]}; {tab_sep_image}
     }}
+    QTabWidget#deviceTabs QTabBar::tab:last, QTabWidget#deviceTabs QTabBar::tab:next-selected {{
+        background: transparent; }}
     QTabWidget#deviceTabs QTabBar::tab:hover {{ background: {c["button"]}; color: {c["text"]}; }}
     QTabWidget#deviceTabs QTabBar::tab:selected {{
         background: transparent; color: {c["accent_text"]}; border-bottom-color: transparent;
     }}
-    /* The terminal's shell choices are a segmented control, not a second row
-       of document tabs. */
+    /* The terminal's shell choices are a segmented control, not a second row of
+       document tabs; its ::tab rules live with the rest of the shell below. */
     QTabWidget#terminalTabs::pane {{ border: none; border-radius: 0; background: {c["input"]}; }}
-    QTabWidget#terminalTabs QTabBar::tab {{
-        background: transparent; border: none; border-bottom: 3px solid transparent;
-        margin: 2px 1px 0 1px; padding: 6px 12px; color: {c["dim"]};
-    }}
-    QTabWidget#terminalTabs QTabBar::tab:hover {{ background: {c["button"]};
-        color: {c["text"]}; }}
-    QTabWidget#terminalTabs QTabBar::tab:selected {{
-        background: transparent; color: {c["accent_text"]}; border-bottom-color: transparent;
-    }}
 
     QCheckBox {{ background: transparent; color: {c["text"]}; spacing: 6px; font-size: 9pt; }}
     QCheckBox::indicator, QGroupBox::indicator {{ width: 15px; height: 15px;
         border: 1px solid {c["line"]}; border-radius: 4px; background: {c["input"]}; }}
-    QCheckBox::indicator:hover {{ border-color: {c["accent"]}; }}
+    QCheckBox::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QCheckBox::indicator:checked, QGroupBox::indicator:checked {{
         background: {c["accent"]}; border-color: {c["accent"]}; image: url({check}); }}
     QCheckBox::indicator:disabled {{ border-color: {c["border"]}; }}
     QRadioButton {{ background: transparent; color: {c["text"]}; spacing: 6px; font-size: 9pt; }}
     QRadioButton::indicator {{ width: 15px; height: 15px;
         border: 1px solid {c["line"]}; border-radius: 8px; background: {c["input"]}; }}
-    QRadioButton::indicator:hover {{ border-color: {c["accent"]}; }}
+    QRadioButton::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QRadioButton::indicator:checked {{ background: {c["accent"]}; border-color: {c["accent"]};
         image: url({dot}); }}
     QRadioButton::indicator:disabled {{ border-color: {c["border"]}; }}
@@ -746,7 +989,7 @@ def stylesheet(name: str = "dark") -> str:
     QSplitter::handle:hover {{ background: {c["button"]}; }}
     QProgressBar {{ border: none; border-radius: 6px; background: {c["button"]};
         text-align: center; color: {c["text"]}; height: 12px; font-size: 8pt; }}
-    QProgressBar::chunk {{ background: {c["accent"]}; border-radius: 6px; }}
+    QProgressBar::chunk {{ background: {progress_chunk}; border-radius: 6px; }}
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: {c["button_hover"]}; border-radius: 4px;
         min-height: 28px; }}
@@ -774,7 +1017,7 @@ def stylesheet(name: str = "dark") -> str:
     QPushButton#welcomeTile, QToolButton#welcomeTile {{ background: {c["raised"]};
         color: {c["text"]}; border: 1px solid {c["border"]}; border-radius: 10px; text-align: left; }}
     QPushButton#welcomeTile:hover, QToolButton#welcomeTile:hover {{
-        background: {c["button"]}; border-color: {c["accent"]}; }}
+        background: {c["button"]}; border-color: {c["accent_text"]}; }}
     QPushButton#welcomeTile:pressed, QToolButton#welcomeTile:pressed {{
         background: {c["sel"]}; }}
     QFrame#deviceControlCard {{ background: {c["panel"]}; border: 1px solid {c["border"]};
@@ -788,7 +1031,7 @@ def stylesheet(name: str = "dark") -> str:
     QWidget#splitWorkspace {{ background: {c["panel"]}; }}
     QFrame#splitPane {{ background: {c["panel"]}; border: none; }}
     QDialog#notificationToast {{
-        background: {c["raised"]}; border: 1px solid {c["accent"]}; border-radius: 10px;
+        background: {c["raised"]}; border: 1px solid {c["accent_text"]}; border-radius: 10px;
     }}
     QLabel#notificationToastTitle {{ color: {c["text"]}; font-weight: 700; font-size: 9.5pt; }}
     QLabel#notificationToastBody {{ color: {c["dim"]}; }}
@@ -798,6 +1041,10 @@ def stylesheet(name: str = "dark") -> str:
     QLabel#iviPreviewStatus {{ color: {c["dim"]}; font-size: 8.5pt; }}
     QLabel#settingsPageTitle {{ color: {c["accent_text"]}; font-size: 14pt; font-weight: 700; }}
     QLabel#settingsHint, QLabel#mutedHint {{ color: {c["dim"]}; font-size: 8.5pt; }}
+    /* Settings pages scroll inside the dialog: no frame, and the viewport and
+       body show the dialog's own fill instead of painting a second slab. */
+    QScrollArea#settingsPageScroll, QScrollArea#settingsPageScroll > QWidget,
+    QWidget#settingsPageBody {{ background: transparent; border: none; }}
     QLabel#sidebarSection {{
         color: {c["section_text"]}; font-weight: 800; font-size: 9.5pt;
         padding: 7px 2px 2px 2px; letter-spacing: 1px;
@@ -839,8 +1086,6 @@ def stylesheet(name: str = "dark") -> str:
         font-weight: 700; padding: 5px 12px; }}
     #ribbon QToolButton[role="ok"]:hover {{ background: {c["accent_hover"]}; }}
     QWidget#sidebarPanel QListWidget::item {{ padding: 6px 8px; }}
-    QLabel#sidebarSection {{ color: {c["dim"]}; font-size: 8pt; font-weight: 700;
-        letter-spacing: 1px; padding: 10px 2px 2px 2px; }}
     QGroupBox#logPanel {{ background: {c["chrome"]}; border: none; border-radius: 0;
         margin-top: 0; padding: 0; }}
     QWidget#sidePanel, QFrame#mirrorView {{ background: {c["panel"]};
@@ -865,6 +1110,22 @@ def stylesheet(name: str = "dark") -> str:
     QTabBar::close-button {{ {close_image} subcontrol-position: right; border-radius: 4px;
         margin: 2px; padding: 1px; }}
     QTabBar::close-button:hover {{ background: {c["button_hover"]}; }}
+    /* Scroll buttons of a tab bar whose headers overflow (a 1366 px screen
+       with a device open). The generic button padding left them as blank
+       boxes; they are opaque in the tab row's colour, since scrolled headers
+       paint underneath them, and carry a chevron. The scroller width covers
+       both buttons. */
+    QTabBar::scroller {{ width: 44px; }}
+    QTabBar QToolButton, QTabBar QToolButton:disabled {{ background: {c["win"]}; border: none;
+        border-radius: 0px; padding: 0px; }}
+    /* Child combinators: the device section tabs sit inside a main tab page. */
+    QTabWidget#mainTabs > QTabBar > QToolButton,
+    QTabWidget#mainTabs > QTabBar > QToolButton:disabled {{ background: {c["chrome"]}; }}
+    QTabBar QToolButton:hover, QTabWidget#mainTabs > QTabBar > QToolButton:hover {{
+        background: {c["button_hover"]}; border-radius: 6px; }}
+    QTabBar QToolButton:pressed, QTabWidget#mainTabs > QTabBar > QToolButton:pressed {{
+        background: {c["sel"]}; border-radius: 6px; }}
+    {scroll_arrow_rules}
     QFrame#sidebarCard {{ background: {c["panel"]}; border: 1px solid {c["border"]};
         border-radius: 8px; }}
     QFrame#sidebarCard QLabel#sidebarSection {{ padding: 0; color: {c["section_text"]};
@@ -875,6 +1136,10 @@ def stylesheet(name: str = "dark") -> str:
         border-right: 1px solid {c["border"]}; }}
     QWidget#sidebarHandle:hover {{ background: {c["button"]}; }}
     QWidget#deviceActions {{ background: transparent; }}
+    /* As a corner widget the device actions paint their tab row's colour over
+       the native tab-bar base line (see apply_to_app), which Fusion still
+       draws from the window colour; in split view they stay transparent. */
+    QTabWidget#deviceTabs > QWidget#deviceActions {{ background: {c["win"]}; }}
     QToolButton#sidebarHandleArrow {{ background: {c["sel"]}; border: 1px solid {c["border"]};
         border-radius: 6px; padding: 0; }}
     QToolButton#sidebarHandleArrow:hover {{ background: {c["button_hover"]}; }}
@@ -898,6 +1163,13 @@ def stylesheet(name: str = "dark") -> str:
     QToolButton#shellSwitch:checked {{ background: {c["raised"]}; color: {c["text"]};
         border: 1px solid {c["border"]}; }}
     QToolBar#ribbon QToolButton {{ padding: 5px 9px; }}
+    /* The ribbon theme toggle is a split button: the icon switches light/dark,
+       the arrow lists every theme. Other menu buttons hide their arrow. */
+    QToolBar#ribbon QToolButton#themeToggle {{ padding-right: 18px; }}
+    QToolButton#themeToggle::menu-button {{ border: none; width: 16px;
+        border-top-right-radius: 6px; border-bottom-right-radius: 6px; }}
+    QToolButton#themeToggle::menu-button:hover {{ background: {c["button_hover"]}; }}
+    QToolButton#themeToggle::menu-arrow {{ {arrow_image} width: 10px; height: 7px; }}
 
     /* ---- page details that used to be widget-level stylesheets ----
        Qt keeps a separate style engine for every widget with its own

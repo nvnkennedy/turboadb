@@ -102,6 +102,7 @@ A tabbed, multi-device workspace:
 - **Sidebar device manager** — saved targets **plus a LIVE `adb devices`** list
   that auto-refreshes; a **Quick connect** filter box; right-click context menu
   (New / Open / Edit / Duplicate / Delete). Double-click a live device to open it.
+  Connected devices are saved as targets automatically (Settings → Startup).
 - **Top bar** with the global actions — **Connect**, **ADB server** and **Tools**
   — plus theme, log panel, settings and help icons. The device list hides with
   the ‹ button in its header (or Ctrl+B) and comes back from the › bar on the
@@ -115,7 +116,9 @@ A tabbed, multi-device workspace:
     (TurboADB's adb first on PATH, `ANDROID_SERIAL` set), each under a boxed
     two-line welcome banner (the Android one shows the device type). Type
     straight into the terminal; **one Enter runs the command**
-    (reliable cooked line-editing, with Up/Down history and Ctrl+C). Full
+    (reliable cooked line-editing, with Up/Down history and Ctrl+C; inside an
+    `adb shell` typed in PowerShell / CMD, Stop stops only the device command
+    and keeps you in adb shell). Full
     **native text selection + copy/paste**, **save output to file**, a right-click
     menu (Copy / Paste / Save / Send-key: Tab/Esc/Ctrl-C/D/Z…), scrollback, and
     **auto-reconnect** — after a reboot or unplug it detects the dropped shell and
@@ -142,7 +145,7 @@ A tabbed, multi-device workspace:
   - **Webcam** — a host USB / laptop camera, local or on a remote Windows PC.
   - **IVI Displays** (cars and multi-display devices) — every display live and
     controllable, side by side, started one after another, with Start all /
-    Stop all / Rescan and Focus.
+    Stop all / Rescan, and Maximize / Restore on each display.
   - **More ▾ → Root and mount** — `adb root`, `remount`, `mount -o remount,rw /`,
     `disable-verity` (auto sync + reboot prompt).
   - **Screen** — scrcpy with a named display picker and compatibility mode, shown
@@ -156,9 +159,12 @@ A tabbed, multi-device workspace:
   toast with an alert sound.
 - **Settings** (persisted to `~/.turboadb/settings.json`, applied live):
   theme, terminal font + size, default scrcpy video and audio options,
-  adb/scrcpy/ffmpeg paths, logcat format and startup behaviour. The default pair is Graphite (dark) and Porcelain
-  (light): layered neutral surfaces with soft text, never pure black or glaring
-  white. Mocha/Latte, Forest/Sage, Plum/Rose and Deep teal/Mint are extra pairs;
+  adb/scrcpy/ffmpeg paths, logcat format, startup behaviour, and the screen
+  renderer (scrcpy, or ADB screencap for builds where scrcpy can't run). The
+  default pair is Graphite (dark) and Porcelain (light): layered neutral surfaces
+  with soft text. Black/White, Slate/Mist (cool blue-grey), Night/Paper (warm
+  reading) and Mocha/Latte are extra pairs, all with muted accents; the
+  toolbar toggle switches between your last dark and last light theme, and
   terminal and log views stay dark in every theme.
 - **Crash-proof:** a startup-failure native popup + crash log, a global
   exception hook that logs and shows a non-fatal popup, and clean thread
@@ -425,7 +431,7 @@ IVI-compatible screen profile and shows the type in the terminal banner.
 **IVI Displays** tab that shows every discovered display live, side by side.
 Each tile is a real, controllable screen with Start / Stop, Separate window,
 Screenshot and Record, and the displays start one after another when the tab
-first opens; **Focus** shows one display, and **Start all**, **Stop all** and
+first opens; **Maximize** shows one display (Esc restores), and **Start all**, **Stop all** and
 **Rescan** sit at the top (**Device Control → Options → All displays** opens it).
 The Device Control display picker lists every display with its name and size as
 soon as the device connects. If a
@@ -548,7 +554,7 @@ turboadb call-log [--limit N] | sms [--limit N] | send-sms NUMBER message…  [-
 turboadb phone-support [-s S]          # telephony + the dialler / call / SMS apps it has
 # sharing and maintenance:
 turboadb serve [--startup-task | --uninstall-startup | --status | --stop]   # share this PC's devices
-turboadb deploy-serve HOST [HOST…] -u USER [--ssl --test]   # needs turboadb[winrm]
+turboadb deploy-serve HOST [HOST…] -u USER [--ssl --test --password-stdin]  # turboadb[winrm]
 turboadb self-update [--check]        # upgrade TurboADB, then adb/scrcpy
 turboadb shortcut                     # desktop / Start-menu shortcut (Windows)
 turboadb gui                          # launch the desktop GUI

@@ -140,6 +140,10 @@ Two patterns recur and are worth preserving:
 - **Reliable stop.** With no PTY, `Ctrl+C` can't signal the device. The Stop path
   tears down the shell (killing the device-side process group), discards stale
   in-flight data via a current-reader guard, and reopens — preserving the cwd.
+  The PowerShell / CMD terminals start a typed `adb shell` with `-t -t` (a device
+  PTY), so there Stop sends a real Ctrl+C to the device and keeps the adb shell;
+  a second Stop before the device prompt returns (or no answer within 3 s)
+  reopens the local shell, re-enters the same adb shell and `cd`s back.
 
 ## Packaging
 
@@ -158,9 +162,16 @@ Two patterns recur and are worth preserving:
 
 ```
 ~/.turboadb/
-├── tools/            downloaded adb + scrcpy
-├── settings.json     theme, fonts, defaults
-├── sessions.json     saved targets
+├── tools/            downloaded adb + scrcpy (verified against the publisher's checksum)
+├── ffmpeg/           webcam encoder + ffmpeg.exe.sha256, re-checked on every reuse
+├── settings.json     theme, fonts, defaults   (+ .lock, cross-process writes)
+├── sessions.json     saved targets            (+ .lock; re-read and merged before each write)
 ├── logs/             temp scrollback archives (cleaned on close)
 └── crash.log         uncaught GUI errors
+```
+
+All of these resolve through `config.user_dir()` / `user_path()`, which re-read
+`HOME`/`USERPROFILE` on every call.
+
+```
 ```

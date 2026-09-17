@@ -20,7 +20,12 @@ class ADBTimeoutError(ADBError):
 
 
 class ADBNotConnectedError(ADBError):
-    """An operation needing a live device was attempted before connecting."""
+    """An operation needing a live device was attempted before connecting.
+
+    Raised when adb itself reports the target as not connected — a stale serial,
+    or a network device nobody ran ``adb connect`` for (see
+    :meth:`~turboadb.core.ADBHandler.wait_for_device`).
+    """
 
 
 class ADBCommandError(ADBError):

@@ -1124,21 +1124,23 @@ def test_console_standard_clipboard_shortcuts(qapp):
 
 
 def test_file_item_numeric_size_sorting(qapp):
+    """Size ordering is numeric, not alphabetical (10 MB after 2 MB)."""
     from PyQt5.QtCore import Qt
-    from turboadb.gui.file_browser import _FileItem
+    from turboadb.gui.file_browser import _FileItem, _FileTableWidget
 
-    item_small = _FileItem("500 B")
-    item_small.setData(Qt.UserRole, 500)
-
-    item_large = _FileItem("10 MB")
-    item_large.setData(Qt.UserRole, 10 * 1024 * 1024)
-
-    item_med = _FileItem("2 MB")
-    item_med.setData(Qt.UserRole, 2 * 1024 * 1024)
-
-    items = [item_large, item_small, item_med]
-    items.sort()
-    assert items == [item_small, item_med, item_large]
+    table = _FileTableWidget()
+    table.setColumnCount(2)
+    table.setRowCount(3)
+    for row, (text, size) in enumerate((("10 MB", 10 * 1024 * 1024), ("500 B", 500),
+                                        ("2 MB", 2 * 1024 * 1024))):
+        name = _FileItem(f"f{row}.bin")
+        name.setData(Qt.UserRole, (f"f{row}.bin", False))
+        table.setItem(row, 0, name)
+        item = _FileItem(text)
+        item.setData(Qt.UserRole, size)
+        table.setItem(row, 1, item)
+    table.sortByColumn(1, Qt.AscendingOrder)
+    assert [table.item(r, 1).text() for r in range(3)] == ["500 B", "2 MB", "10 MB"]
 
 
 def test_file_browser_robust_ls_regex():

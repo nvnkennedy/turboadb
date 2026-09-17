@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 
+from .config import user_path
 from .exceptions import ADBNotFoundError
 
 ADB_DOWNLOAD = "https://developer.android.com/tools/releases/platform-tools"
@@ -59,8 +60,12 @@ def _exe(name: str) -> str:
 
 
 def managed_tools_dir() -> str:
-    """Path of the managed download cache (``~/.turboadb/tools``). Never creates it."""
-    return os.path.join(os.path.expanduser("~"), ".turboadb", "tools")
+    """Path of the managed download cache (``~/.turboadb/tools``). Never creates it.
+
+    Resolved through :func:`turboadb.config.user_dir`, the single per-user state
+    directory resolver, so tools and settings can never come from two different
+    home directories in one process."""
+    return user_path("tools")
 
 
 def windowless_python() -> str:

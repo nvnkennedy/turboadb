@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QFileDialog,
+    QFrame,
+    QScrollArea,
     QWidget,
     QListWidget,
     QListWidgetItem,
@@ -23,6 +25,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
     QToolButton,
+    QSizePolicy,
 )
 from PyQt5.QtCore import QPointF, QRectF, QSize, Qt
 from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
@@ -48,7 +51,7 @@ def _theme_swatch(c: dict, size: int = 30) -> QIcon:
     p.setPen(Qt.NoPen)
     p.setBrush(QColor(c["panel"]))
     p.drawRoundedRect(QRectF(5, 5, size - 10, size * 0.42), 3, 3)
-    p.setBrush(QColor(c["accent"]))
+    p.setBrush(QColor(c["accent_text"]))  # the visible accent; "accent" is a deep fill in some themes
     p.drawEllipse(QPointF(size * 0.34, size * 0.72), size * 0.14, size * 0.14)
     p.setBrush(QColor(c["text"]))
     p.drawRoundedRect(QRectF(size * 0.55, size * 0.66, size * 0.3, size * 0.12), 1.5, 1.5)
@@ -79,11 +82,12 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("TurboADB — Settings")
-        self.resize(840, 560)  # theme chips show a swatch + the full description
+        # 840 wide: theme chips show a swatch + the full description. The height
+        # is set once the pages exist (see _open_height).
+        self.resize(840, 560)
         self.cfg = settings_mod.load()
-        self._orig_theme = self.cfg.get("theme", "dark")
-        if self._orig_theme not in theme_mod.THEMES:
-            self._orig_theme = "dark"
+        # A retired theme name stands for the default theme of its kind.
+        self._orig_theme = theme_mod.resolve_name(self.cfg.get("theme"))
         self._selected_theme = self._orig_theme
 
         outer = QVBoxLayout(self)
@@ -126,6 +130,7 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         footer_lay.addWidget(btns)
         outer.addWidget(footer)
+        self.resize(840, self._open_height())
         # What every control showed when the dialog opened: OK persists only
         # the keys the user actually changed, never a stale full snapshot.
         self._initial_values = self._dialog_values()
@@ -150,9 +155,45 @@ class SettingsDialog(QDialog):
         head.addWidget(title)
         head.addStretch(1)
         v.addLayout(head)
-        v.addWidget(content)
-        v.addStretch(1)
+        # The page body scrolls under its fixed title: the tallest pages (scrcpy,
+        # Themes) otherwise set the dialog's minimum height, which pushed OK and
+        # Cancel off a ~680 px work area. The footer sits outside the pages.
+        body = QWidget()
+        body.setObjectName("settingsPageBody")
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 6, 0)  # room beside a vertical scroll bar
+        body_lay.setSpacing(0)
+        body_lay.addWidget(content)
+        body_lay.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsPageScroll")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        v.addWidget(scroll, 1)
         self.pages.addWidget(page)
+
+    def _open_height(self) -> int:
+        """Tall enough to show the tallest page without scrolling, but never
+        taller than the screen's work area (minus the title bar): there the
+        page scrolls and OK/Cancel stay visible."""
+        chrome = self.minimumSizeHint() - self.pages.minimumSizeHint()
+        # Word-wrapped hints grow taller at the page's real width.
+        width = max(1, self.width() - chrome.width())
+        tallest = 0
+        for index in range(self.pages.count()):
+            page = self.pages.widget(index)
+            lay = page.layout()
+            body = page.findChild(QScrollArea, "settingsPageScroll").widget()
+            needed = max(body.heightForWidth(width), body.minimumSizeHint().height())
+            tallest = max(tallest, lay.itemAt(0).sizeHint().height() + lay.spacing() + needed)
+        height = max(560, chrome.height() + tallest)
+        parent = self.parentWidget()
+        handle = parent.window().windowHandle() if parent is not None else None
+        screen = handle.screen() if handle is not None else QApplication.primaryScreen()
+        if screen is not None:
+            height = min(height, screen.availableGeometry().height() - 60)
+        return max(height, self.minimumSizeHint().height())
 
     # ---- pages ----
     def _page_themes(self):
@@ -185,16 +226,22 @@ class SettingsDialog(QDialog):
             button.setCheckable(True)
             button.setChecked(name == self._selected_theme)
             button.setMinimumSize(230, 60)
+            # Every card fills its column: sized to their own text, a short
+            # description (Black) left a narrower card than its neighbours.
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setToolTip(f"{theme_mod.theme_label(name)}: {theme_mod.theme_description(name)}")
             # Each chip previews its own palette; only the selected one gets an
-            # accent outline (rows are dark/light pairs).
+            # accent outline (rows are dark/light pairs). The outline is a line,
+            # so it uses accent_text: the fill-only accent of the deep themes
+            # (Black, Slate, Night) barely showed against their own panels.
             button.setStyleSheet(
                 "QToolButton {"
                 f"background:{c['panel']}; color:{c['text']}; border:2px solid {c['panel']}; "
                 "border-radius:8px; text-align:left; padding:8px; font-weight:600; }"
                 "QToolButton:hover {"
-                f"background:{c['sel']}; border-color:{c['accent_hover']}; }}"
+                f"background:{c['sel']}; border-color:{c['accent_text']}; }}"
                 "QToolButton:checked {"
-                f"border-color:{c['accent']}; }}"
+                f"border-color:{c['accent_text']}; }}"
             )
             button.clicked.connect(lambda _checked=False, key=name: self._select_theme(key))
             self._theme_buttons[name] = button
@@ -221,7 +268,8 @@ class SettingsDialog(QDialog):
         self.font_size = QSpinBox()
         # the same range Ctrl+wheel / A+ A− zoom uses
         self.font_size.setRange(settings_mod.FONT_SIZE_MIN, settings_mod.FONT_SIZE_MAX)
-        self.font_size.setValue(int(self.cfg.get("term_font_size", 10)))
+        default_size = settings_mod.DEFAULTS["term_font_size"]
+        self.font_size.setValue(int(self.cfg.get("term_font_size", default_size)))
         f.addRow("Terminal font", self.font_combo)
         f.addRow("Terminal font size", self.font_size)
         f.addRow(
@@ -253,6 +301,22 @@ class SettingsDialog(QDialog):
     def _page_scrcpy(self):
         w = QWidget()
         f = _form(w)
+        self.screen_backend = QComboBox()
+        self.screen_backend.addItem("scrcpy (fast, recommended)", "scrcpy")
+        self.screen_backend.addItem(
+            "ADB screencap (slower fallback for builds where scrcpy doesn't work)", "screencap"
+        )
+        # An unknown stored value shows the default rather than an empty combo.
+        backend = self.cfg.get("screen_backend", settings_mod.SCREEN_BACKENDS[0])
+        self.screen_backend.setCurrentIndex(max(0, self.screen_backend.findData(backend)))
+        f.addRow("Screen renderer", self.screen_backend)
+        f.addRow(
+            "",
+            _hint(
+                "Screencap mode picks the display through dumpsys display, captures it with "
+                "adb screencap and supports touch, but cannot record."
+            ),
+        )
         self.max_size = QSpinBox()
         self.max_size.setRange(0, 8192)
         self.max_size.setValue(int(self.cfg.get("scrcpy_max_size", 0)))
@@ -365,8 +429,17 @@ class SettingsDialog(QDialog):
         current = self.cfg.get("duplicate_device_action", "ask")
         index = self.duplicate_device_action.findData(current)
         self.duplicate_device_action.setCurrentIndex(max(0, index))
+        self.auto_save_targets = QCheckBox(
+            "Add connected devices to Saved targets automatically"
+        )
+        self.auto_save_targets.setToolTip(
+            "When a device tab connects, save it (USB by serial, network by host:port, "
+            "remote by server and serial) unless a saved target already points at it."
+        )
+        self.auto_save_targets.setChecked(bool(self.cfg.get("auto_save_targets", True)))
         v.addWidget(self.shortcut)
         v.addWidget(self.autoupd)
+        v.addWidget(self.auto_save_targets)
         v.addSpacing(8)
         v.addWidget(QLabel("When the same device is opened again"))
         v.addWidget(self.duplicate_device_action)
@@ -379,18 +452,28 @@ class SettingsDialog(QDialog):
         return w
 
     def reject(self):
-        # revert the live theme preview if the user cancels
-        QApplication.instance().setStyleSheet(theme_mod.stylesheet(self._orig_theme))
+        # Revert the live theme preview through apply_to_app, not just the
+        # stylesheet: the active theme name drives icons, status dots and every
+        # status_colors() lookup, so restoring the sheet alone left the whole
+        # app on the cancelled palette until the next restart.
+        app = QApplication.instance()
+        if app is not None:
+            theme_mod.apply_to_app(app, self._orig_theme)
         super().reject()
 
     def changed_settings(self) -> dict:
         """Only the settings whose control differs from when the dialog opened."""
         initial = self._initial_values
-        return {
+        changes = {
             key: value
             for key, value in self._dialog_values().items()
             if initial.get(key) != value
         }
+        if "theme" in changes:
+            # Remember the chosen (and the replaced) theme per kind, as the
+            # Themes menu does, so the dark/light toggle returns to them.
+            changes.update(theme_mod.theme_choice(self._selected_theme, self._orig_theme))
+        return changes
 
     def accept(self):
         """Persist just the changed keys, merged into the CURRENT settings file
@@ -432,6 +515,7 @@ class SettingsDialog(QDialog):
                 "adb_path": self.adb_path.text().strip(),
                 "scrcpy_path": self.scrcpy_path.text().strip(),
                 "ffmpeg_path": self.ffmpeg_path.text().strip(),
+                "screen_backend": self.screen_backend.currentData(),
                 "scrcpy_max_size": self.max_size.value(),
                 "scrcpy_bit_rate": self._combo_value(self.bit_rate),
                 "scrcpy_video_codec": (
@@ -450,6 +534,7 @@ class SettingsDialog(QDialog):
                 "make_shortcut_first_run": self.shortcut.isChecked(),
                 "auto_update": self.autoupd.isChecked(),
                 "duplicate_device_action": self.duplicate_device_action.currentData(),
+                "auto_save_targets": self.auto_save_targets.isChecked(),
             }
         )
 

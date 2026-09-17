@@ -31,6 +31,11 @@ from PyQt5.QtWidgets import (
     QFrame,
 )
 
+# The one shared endpoint parser: a host typed WITH a port ("10.0.0.5:5037") is
+# split here so it is never doubled downstream, and a bare IPv6 literal
+# ("fe80::1") is never mistaken for a host:port pair.
+from ..config import parse_host_port as _split_host_port
+from ..scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 from . import settings as settings_mod
 from .adb_path import gui_adb_path
 from .icons import icon
@@ -42,38 +47,6 @@ TRANSPORT_ICONS = (("usb", "green"), ("wifi", "blue"), ("server", "purple"))
 
 # Device-list rows: a phone tinted by its adb state.
 _STATE_TONES = {"device": "green", "unauthorized": "amber", "offline": "red"}
-
-
-def _tunnel_port_range() -> str:
-    """The scrcpy remote-tunnel ports as a firewall range ("first-last").
-
-    Derived from the engine's constants so the rule can never drift from the
-    ports scrcpy actually uses (scrcpy's own ``TUNNEL_PORT_RANGE`` is written
-    in scrcpy's ``first:last`` syntax, which netsh does not accept)."""
-    try:
-        from ..scrcpy import TUNNEL_PORT, TUNNEL_PORT_LAST
-    except ImportError:  # older engine without the constants
-        return "27184-27199"
-    return f"{TUNNEL_PORT}-{TUNNEL_PORT_LAST}"
-
-
-def _split_host_port(text, default_port):
-    """Accept a host typed WITH a port ('10.0.0.5:5037') and return
-    (host, port), so the port is never accidentally doubled downstream."""
-    text = (text or "").strip()
-    if text.startswith("[") and "]" in text:
-        end = text.index("]")
-        host, rest = text[1:end], text[end + 1 :]
-        if rest.startswith(":") and rest[1:].isdigit():
-            return host, int(rest[1:])
-        return host, default_port
-    # A bare IPv6 literal contains multiple colons; only an unambiguous single
-    # colon form is a host:port pair here.
-    if text.count(":") == 1:
-        host, _, p = text.partition(":")
-        if host and p.isdigit():
-            return host, int(p)
-    return text, default_port
 
 
 def _dialog_footer(parent_layout):
@@ -153,7 +126,9 @@ class _ServeThread(QThread):
 
             msg = "Restarting the local ADB server; active sessions may reconnect briefly.  ·  "
             msg += start_shared_server(port=self.port, adb_path=self.adb_path)
-            msg += "  ·  " + open_firewall((self.port, _tunnel_port_range()))
+            # The engine's own firewall spelling of the scrcpy tunnel ports, so
+            # the rule can never drift from the ports scrcpy actually uses.
+            msg += "  ·  " + open_firewall((self.port, TUNNEL_PORT_FIREWALL_RANGE))
             if self.install_login:
                 path = install_startup(port=self.port)
                 msg += f"  ·  auto-starts at login ({path})"

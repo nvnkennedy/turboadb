@@ -9,7 +9,8 @@ keystrokes need several Enters). An incremental ANSI parser colours the output
 and handles carriage-return / backspace / line-erase.
 
 Up/Down recall history; Ctrl+C interrupts; selection + copy work like any
-terminal."""
+terminal.  A multi-line paste runs line by line, each line only after the
+previous one has finished, through the same path as Enter."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import weakref
 from collections import deque
 
 from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal
-from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor, QBrush
+from PyQt5.QtGui import QFont, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QBrush
 from PyQt5.QtWidgets import QAbstractSlider, QPlainTextEdit, QMenu, QApplication
 
 from ..results import strip_ansi
@@ -54,6 +55,10 @@ _CUBE_LEVELS = (0, 95, 135, 175, 215, 255)
 # A local shell that never echoes the typed command must not make the console
 # swallow matching output forever.
 _PENDING_ECHO_TTL_S = 2.0
+# How a local shell's last line ends while it waits for input: PowerShell
+# (``PS C:\>``, ``>>``), CMD (``C:\>``, ``More?``), a device or Unix shell
+# (``$``, ``#``) and REPLs such as Python's ``>>>``.
+_PROMPT_END_RE = re.compile(r"(?:> ?|[$#] |^More\? ?)\Z")
 _CD_FAILED_RE = re.compile(
     r"\bcd: .*(?:No such file|Not a directory|Permission denied|can't cd)", re.IGNORECASE
 )
@@ -81,7 +86,7 @@ class AnsiConsole(QPlainTextEdit):
         # EVERYTHING is also streamed to disk so Save writes the complete log
         self._sb = Scrollback(self, display_cap=80000)
         fam = settings_mod.get("term_font") or "Consolas"
-        size = int(settings_mod.get("term_font_size") or 10)
+        size = int(settings_mod.get("term_font_size") or settings_mod.DEFAULTS["term_font_size"])
         # Qt reports the inherited widget font after a stylesheet is applied,
         # not necessarily the terminal's visible CSS size.  Keep the explicit
         # zoom level so A+/A−, Ctrl+plus/minus and Ctrl+wheel always move one
@@ -139,6 +144,26 @@ class AnsiConsole(QPlainTextEdit):
         self._interrupt = None      # reliable stop (set by ShellPanel)
         self._shown_prompt = ""     # the prompt text currently displayed
         self._emulate_prompt = True
+        self._feed_count = 0        # output chunks shown so far (echo excluded)
+        self._submitted_at = 0.0    # monotonic time the last line was sent
+        self._submitted_feeds = 0   # _feed_count when the last line was sent
+        self._submitting = False    # inside send_fn for a submitted line
+        self._submit_count = 0
+        # True while the paste timer edits: leave the user's selection, caret
+        # and scroll position alone, as streaming output does
+        self._keep_view = False
+
+        # multi-line paste: lines still to run, one at a time (see _pump_paste)
+        self._paste_lines = deque()
+        self._paste_tail = ""       # text after the last line break (edit line)
+        self._paste_keys = deque()  # keys typed meanwhile: (key, modifiers, text)
+        self._pasting = False
+        self._paste_multi = False   # the paste spans more than one line
+        self._paste_block_watch = False  # complete a PowerShell ``>>`` block
+        self._paste_tail_open = False    # Enter on the left-over line ends the paste
+        self._paste_timer = QTimer(self)
+        self._paste_timer.setInterval(self._PASTE_TICK_MS)
+        self._paste_timer.timeout.connect(self._pump_paste)
 
         # after a command's output goes idle, auto-show the next prompt
         self._idle = QTimer(self)
@@ -148,6 +173,7 @@ class AnsiConsole(QPlainTextEdit):
         # ingestion decoupled from rendering
         self._inq = deque()         # queued text chunks awaiting render
         self._inq_len = 0
+        self._dropped = 0           # characters dropped from the queue, not yet announced
         self._drain = QTimer(self)
         self._drain.setInterval(15)
         self._drain.timeout.connect(self._drain_tick)
@@ -155,6 +181,13 @@ class AnsiConsole(QPlainTextEdit):
     _TICK_BUDGET = 0.030          # seconds of rendering per tick (keeps UI live)
     _SUB = 16 * 1024              # max chars handed to _process at once
     _MAX_INQ = 8 * 1024 * 1024    # cap the ON-SCREEN backlog
+
+    # Paste pacing: how quiet the output must be before the next pasted line
+    # runs, and the most one line may hold up the rest.
+    _PASTE_TICK_MS = 20
+    _PASTE_IDLE_S = 0.25          # Android shell (no echo, no prompt of its own)
+    _PASTE_LOCAL_IDLE_S = 0.06    # PowerShell / CMD, after their prompt is back
+    _PASTE_MAX_WAIT_S = 2.5
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
@@ -236,7 +269,7 @@ class AnsiConsole(QPlainTextEdit):
         return int(self._font_size)
 
     def _move_caret_end(self):
-        if self.textCursor().hasSelection():
+        if self._keep_view or self.textCursor().hasSelection():
             return
         c = self.textCursor()
         c.movePosition(QTextCursor.End)
@@ -373,6 +406,7 @@ class AnsiConsole(QPlainTextEdit):
         self._wc.movePosition(QTextCursor.End)
         self._line = ""
         self._cpos = 0
+        self._paste_tail_open = False
         self._pending_echo = None
         self._state = 0
         self._csi = ""
@@ -407,7 +441,7 @@ class AnsiConsole(QPlainTextEdit):
         result that arrives after the user has typed something else is stale and
         must never overwrite that newer input line.
         """
-        if not self._alive or query != self._line:
+        if not self._alive or self._pasting or query != self._line:
             return False
         self._apply_completion_result(newline, opts)
         return True
@@ -476,6 +510,11 @@ class AnsiConsole(QPlainTextEdit):
         restart: the caller can then show one concise recovery message instead
         of an alarming red disconnect line followed by a second status line.
         """
+        if not self._submitting:
+            # Stop, a reconnect or a dead shell: lines still waiting from a
+            # paste were meant for the old shell.  (A local shell that starts
+            # on its first command reports alive from inside send_fn.)
+            self._cancel_paste()
         if alive:
             self._alive = True
             self._line = ""
@@ -642,18 +681,28 @@ class AnsiConsole(QPlainTextEdit):
             pe = self._pending_echo = None
         if pe:
             if pe in ("\r\n", "\n"):
-                if text.startswith("\r\n"):
-                    text = text[2:]
-                elif text.startswith("\n"):
-                    text = text[1:]
-                self._pending_echo = None
+                if text == "\r" and pe == "\r\n":
+                    text = ""
+                    self._pending_echo = "\n"
+                else:
+                    if text.startswith("\r\n"):
+                        text = text[2:]
+                    elif text.startswith("\n"):
+                        text = text[1:]
+                    self._pending_echo = None
             elif text.startswith(pe):
                 text = text[len(pe):]
-                if text.startswith("\r\n"):
-                    text = text[2:]
-                elif text.startswith("\n"):
-                    text = text[1:]
-                self._pending_echo = None
+                if text in ("", "\r"):
+                    # PowerShell can write the echo and its line break
+                    # separately: drop that break too, not print a blank line.
+                    self._pending_echo = "\n" if text else "\r\n"
+                    text = ""
+                else:
+                    if text.startswith("\r\n"):
+                        text = text[2:]
+                    elif text.startswith("\n"):
+                        text = text[1:]
+                    self._pending_echo = None
             elif pe.startswith(text):
                 self._pending_echo = pe[len(text):]
                 text = ""
@@ -668,13 +717,19 @@ class AnsiConsole(QPlainTextEdit):
         if not self._emulate_prompt:
             text = self._style_local_prompts_stream(text)
         self._last_feed = time.monotonic()
+        self._feed_count += 1
         self._sb.archive(self._archive_text(text))
         self._idle.stop()
         self._inq.append(text)
         self._inq_len += len(text)
         if self._inq_len > self._MAX_INQ:
+            # The on-screen backlog is capped; the disk archive above already
+            # has every character.  Count what is dropped so the view says so
+            # instead of silently splicing two unrelated points together.
             while self._inq_len > self._MAX_INQ and len(self._inq) > 1:
-                self._inq_len -= len(self._inq.popleft())
+                chunk = self._inq.popleft()
+                self._inq_len -= len(chunk)
+                self._dropped += len(chunk)
         if not self._drain.isActive():
             self._drain.start()
 
@@ -690,6 +745,8 @@ class AnsiConsole(QPlainTextEdit):
         self.setUpdatesEnabled(False)
         try:
             self._consume_pending_prompt()
+            if self._dropped:
+                self._announce_drop()
             while self._inq and time.monotonic() < deadline:
                 chunk = self._inq.popleft()
                 self._inq_len -= len(chunk)
@@ -704,6 +761,23 @@ class AnsiConsole(QPlainTextEdit):
             self.setUpdatesEnabled(True)
         if at_bottom:
             sb.setValue(sb.maximum())
+
+    def _announce_drop(self):
+        """Mark the hole left by an over-full input queue, like the log view.
+
+        The escape parser is restarted as well: the dropped text can end in the
+        middle of a sequence, and a half-parsed CSI would then swallow the
+        output that follows it.
+        """
+        dropped, self._dropped = self._dropped, 0
+        self._state = 0
+        self._csi = ""
+        self._osc = ""
+        self._wc.movePosition(QTextCursor.End)
+        prefix = "" if self._wc.atBlockStart() else "\n"
+        self._wc.insertText(
+            f"{prefix}… ({dropped} characters skipped on screen — saved log has all)\n", self._fmt
+        )
 
     def _process(self, text):
         run = []
@@ -780,13 +854,18 @@ class AnsiConsole(QPlainTextEdit):
         if self._wc.atBlockEnd():
             self._wc.insertText(s, self._fmt)
             return
-        rem = s
-        while rem and not self._wc.atBlockEnd():
-            self._wc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-            self._wc.insertText(rem[0], self._fmt)
-            rem = rem[1:]
-        if rem:
-            self._wc.insertText(rem, self._fmt)
+        # Overwrite mode (the cursor went back over existing text after a \r):
+        # replace everything the new text covers with ONE selection and ONE
+        # insert.  Doing it per character — each with an O(n) ``rem = rem[1:]``
+        # slice and its own edit — made progress-style output stutter.
+        block = self._wc.block()
+        room = block.position() + block.length() - 1 - self._wc.position()
+        overlap = max(0, min(len(s), room))
+        if overlap:
+            self._wc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, overlap)
+            self._wc.insertText(s[:overlap], self._fmt)
+        if len(s) > overlap:
+            self._wc.insertText(s[overlap:], self._fmt)
 
     def _csi_dispatch(self, final, params):
         if final == "m":
@@ -966,6 +1045,8 @@ class AnsiConsole(QPlainTextEdit):
         offset = len(self._line) - self._cpos
         for _ in range(offset):
             self._wc.movePosition(QTextCursor.Left)
+        if self._keep_view:
+            return
         self.setTextCursor(self._wc)
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
@@ -974,6 +1055,9 @@ class AnsiConsole(QPlainTextEdit):
         for _ in range(old_len):
             self._wc.deletePreviousChar()
         self._wc.insertText(self._line, self._fmt)
+        if not self._line:
+            # the line a paste left for review was cleared (Esc, Backspace …)
+            self._paste_tail_open = False
         self._sync_cursor()
 
     def _erase_input(self):
@@ -1059,6 +1143,7 @@ class AnsiConsole(QPlainTextEdit):
     def _send_interrupt(self):
         """Stop the running command: the owner's reliable interrupt when there
         is one (keyboard Ctrl+C and the context menu share this path)."""
+        self._cancel_paste()
         if self._interrupt:
             self._interrupt()
         else:
@@ -1114,48 +1199,17 @@ class AnsiConsole(QPlainTextEdit):
         if ctrl and key == Qt.Key_L:
             self.clear()
             return
+        if self._pasting:
+            self._paste_type_ahead(event)
+            return
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
-            emulate = self._emulate_prompt
-            cmd = self._line
-
-            if cmd.strip():
-                self._history.append(cmd)
-            self._hidx = len(self._history)
-            self._last_feed = time.monotonic()
-
-            if emulate:
-                self._prompt_if_needed()
-                self._echo("\n")
-                self._sb.archive(strip_ansi(self._prompt_text()) + cmd + "\n")
-                self._cd_revert = None
-                if cmd.strip() and cmd.strip().split()[0] == "cd":
-                    self._apply_cd(cmd)
-                to_send = (self._columnize(cmd) + "\n").encode("utf-8")
-                try:
-                    self._send(to_send)
-                except Exception:
-                    pass
-                self._line = ""
-                self._cpos = 0
-                self._need_prompt = True
-                self._idle.start(40)
-            else:
-                # Local shell (PowerShell or CMD)
-                self._echo("\n")
-                self._sb.archive(cmd + "\n")
-                self._pending_echo = cmd if cmd else "\r\n"
-                self._pending_echo_at = time.monotonic()
-                self._feed_at_line_start = True
-                try:
-                    self._send((cmd + "\r\n").encode("utf-8"))
-                except Exception:
-                    pass
-                self._line = ""
-                self._cpos = 0
-                self._need_prompt = False
-
-            self._move_caret_end()
+            ends_paste = self._paste_tail_open
+            self._paste_tail_open = False
+            self._submit_line(self._line)
+            if ends_paste:
+                # This was the last line of a multi-line paste, left for review.
+                self._watch_paste_block()
             return
 
         if key == Qt.Key_Left:
@@ -1230,6 +1284,8 @@ class AnsiConsole(QPlainTextEdit):
             self._redraw_line(old_len)
             return
 
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            self._paste_tail_open = False  # history replaces the edit line
         if key == Qt.Key_Up:
             if self._history and self._hidx > 0:
                 self._hidx -= 1
@@ -1261,47 +1317,288 @@ class AnsiConsole(QPlainTextEdit):
             self._redraw_line(old_len)
             return
 
+    def _submit_line(self, cmd, *, typeahead=False):
+        """Run *cmd* as if it had been typed and Enter pressed.
+
+        Enter and every pasted line come through here, so echo suppression,
+        history, ``cd`` tracking, the archive and the prompt stay identical.
+
+        *typeahead* is for a pasted line that has to go to a local shell while
+        its previous command is still running (see ``_paste_ready``).  The shell
+        echoes the line itself, after its prompt, when it finally reads it, so
+        the line is neither drawn nor archived here and no echo is suppressed.
+        The Android shell never echoes, so it always draws the line.
+        """
+        emulate = self._emulate_prompt
+        typeahead = typeahead and not emulate
+        if not typeahead and cmd != self._line:
+            self._set_line(cmd)
+
+        if cmd.strip():
+            self._history.append(cmd)
+        self._hidx = len(self._history)
+        self._last_feed = time.monotonic()
+
+        if emulate:
+            self._prompt_if_needed()
+            self._echo("\n")
+            self._sb.archive(strip_ansi(self._prompt_text()) + cmd + "\n")
+            self._cd_revert = None
+            if cmd.strip() and cmd.strip().split()[0] == "cd":
+                self._apply_cd(cmd)
+            to_send = (self._columnize(cmd) + "\n").encode("utf-8")
+        else:
+            # Local shell (PowerShell or CMD)
+            if not typeahead:
+                self._echo("\n")
+                self._sb.archive(cmd + "\n")
+                self._pending_echo = cmd if cmd else "\r\n"
+                self._pending_echo_at = time.monotonic()
+                self._feed_at_line_start = True
+            to_send = (cmd + "\r\n").encode("utf-8")
+
+        self._submit_count += 1
+        self._submitted_at = time.monotonic()
+        self._submitted_feeds = self._feed_count
+        self._submitting = True
+        try:
+            self._send(to_send)
+        except Exception:
+            pass
+        finally:
+            self._submitting = False
+        if typeahead:
+            # send_fn may name a rewritten command's echo; this line has none
+            # to hide, since the shell's own echo is how it appears.
+            self._pending_echo = None
+
+        self._line = ""
+        self._cpos = 0
+        if emulate:
+            self._need_prompt = True
+            self._idle.start(40)
+        else:
+            self._need_prompt = False
+        self._move_caret_end()
+
     def _paste_into_line(self):
         txt = QApplication.clipboard().text()
+        if txt:
+            self._paste_text(txt)
+
+    def _paste_text(self, txt):
+        """Paste *txt* at the cursor like a terminal would.
+
+        Text without a line break is inserted into the edit line.  Otherwise
+        the text goes in at the cursor of what is already typed and every
+        complete line runs, in order and exactly once, each only after the
+        previous one had its turn (``_pump_paste``).  Whatever follows the last
+        line break stays in the edit line for review, so a trailing newline
+        runs the last line too.
+        """
+        txt = txt.replace("\r\n", "\n").replace("\r", "\n")
         if not txt:
             return
-        txt = txt.replace("\r\n", "\n").replace("\r", "\n")
-        emulate = self._emulate_prompt
-        if "\n" in txt:
-            lines = txt.split("\n")
-            for i, ln in enumerate(lines):
-                if i < len(lines) - 1:
-                    if emulate:
-                        self._prompt_if_needed()
-                        self._echo(ln + "\n")
-                        self._sb.archive(strip_ansi(self._prompt_text()) + ln + "\n")
-                        self._last_feed = time.monotonic()
-                        self._send((self._columnize(ln) + "\n").encode("utf-8"))
-                        self._need_prompt = True
-                    else:
-                        self._echo(ln + "\n")
-                        self._sb.archive(ln + "\n")
-                        self._last_feed = time.monotonic()
-                        self._send((ln + "\r\n").encode("utf-8"))
-                        self._need_prompt = False
-                    self._line = ""
-                    self._cpos = 0
-                else:
-                    if ln:
-                        if emulate:
-                            self._prompt_if_needed()
-                        old_len = len(self._line)
-                        self._line = self._line[:self._cpos] + ln + self._line[self._cpos:]
-                        self._cpos += len(ln)
-                        self._redraw_line(old_len)
-        else:
-            if emulate:
+        if self._pasting:
+            if self._paste_keys:
+                # Keys typed meanwhile are waiting: this paste comes after them.
+                self._paste_keys.append((None, None, txt))
+                return
+            # An earlier paste is still running: this one queues behind it.
+            lines = (self._paste_tail + txt).split("\n")
+            self._paste_tail = lines.pop()
+            if lines:
+                self._paste_lines.extend(lines)
+                self._paste_multi = True
+                self._paste_block_watch = False  # its last line is now a later one
+            return
+        if "\n" not in txt:
+            if self._emulate_prompt:
                 self._prompt_if_needed()
             old_len = len(self._line)
             self._line = self._line[:self._cpos] + txt + self._line[self._cpos:]
             self._cpos += len(txt)
-            self._redraw_line(old_len)
-        self._move_caret_end()
+            self._redraw_line(old_len)  # the caret stays right after the text
+            return
+        if not (self._send and self._alive):
+            return
+
+        lines = (self._line[:self._cpos] + txt + self._line[self._cpos:]).split("\n")
+        tail = lines.pop()
+        self._clear_tab_cycle()
+        self._paste_lines = deque(lines)
+        self._paste_tail = tail
+        self._paste_multi = len(lines) + (1 if tail else 0) > 1
+        self._paste_tail_open = False
+        self._paste_block_watch = False
+        self._pasting = True
+        self._submit_line(self._paste_lines.popleft())
+        if not (self._paste_lines or tail or self._paste_multi):
+            self._pasting = False  # one line and its newline: exactly Enter
+            return
+        self._paste_timer.start()
+
+    def _paste_type_ahead(self, event):
+        """A key pressed while a paste runs.
+
+        Esc drops the rest of the paste.  Any other key waits behind the
+        pasted lines, as a terminal's type-ahead does, and is replayed in order
+        once they have run and the left-over text is in the edit line.
+        """
+        if event.key() == Qt.Key_Escape:
+            self._cancel_paste()
+        else:
+            self._paste_keys.append((event.key(), event.modifiers(), event.text()))
+
+    def _replay_paste_keys(self):
+        """Replay the keys typed during the paste; True if there were any.
+
+        A key that runs a line (Enter) or starts another paste ends the replay
+        for this turn: the keys after it wait for that line, as they would in a
+        terminal.
+        """
+        replayed = False
+        while self._paste_keys and not self._pasting:
+            key, mods, text = self._paste_keys.popleft()
+            replayed = True
+            submitted = self._submit_count
+            if key is None:
+                self._paste_text(text)
+            else:
+                self.keyPressEvent(QKeyEvent(QEvent.KeyPress, key, mods, text))
+            if self._submit_count != submitted and self._paste_keys and not self._pasting:
+                self._pasting = True
+        return replayed
+
+    def _cancel_paste(self):
+        """Forget pasted lines that have not run yet (Ctrl+C, Stop, Esc)."""
+        self._paste_lines.clear()
+        self._paste_keys.clear()
+        self._paste_tail = ""
+        self._pasting = False
+        self._paste_multi = False
+        self._paste_block_watch = False
+        self._paste_tail_open = False
+        self._paste_timer.stop()
+
+    def _watch_paste_block(self):
+        """After a paste's last line, complete a PowerShell block if one is open.
+
+        PowerShell reading a pipe answers every line of a ``foreach``/``if``
+        block, even the closing ``}``, with its ``>>`` continuation prompt and
+        runs the block only after an empty line, so the paste looked hung.  The
+        empty line is sent only when that prompt is really showing: an ordinary
+        paste gets no stray extra prompt, and CMD (which has no ``>>``) never
+        receives one."""
+        if not self._emulate_prompt:
+            self._paste_block_watch = True
+            self._paste_timer.start()
+
+    def _at_continuation_prompt(self):
+        return self.document().lastBlock().text().rstrip() == ">>"
+
+    def _at_shell_prompt(self):
+        """True when the last output line looks like a prompt waiting for input.
+
+        Output that merely pauses mid-line (progress dots, a block-buffered
+        program) is not one: running the next line then would put it inside
+        that output."""
+        text = self.document().lastBlock().text()
+        if self._line and text.endswith(self._line):
+            text = text[: -len(self._line)]
+        return bool(_PROMPT_END_RE.search(text))
+
+    def _paste_ready(self):
+        """Whether the last submitted line has had its turn.
+
+        Returns ``"idle"`` once it finished, ``"timeout"`` after
+        ``_PASTE_MAX_WAIT_S`` and ``None`` while it still runs.  The bound
+        keeps a command that never goes quiet (``logcat``, ``ping -t``) from
+        holding up the rest of a paste; shells read stdin in order, so the next
+        line then simply waits in the shell's input.
+        """
+        now = time.monotonic()
+        if now - self._submitted_at >= self._PASTE_MAX_WAIT_S:
+            return "timeout"
+        if self._inq:
+            return None  # the previous line's output is still being drawn
+        quiet = now - max(self._submitted_at, self._last_feed)
+        if self._emulate_prompt:
+            # Over a pipe the Android shell prints no echo and no prompt: quiet
+            # output is the sign a command finished, as for the emulated prompt.
+            return "idle" if quiet >= self._PASTE_IDLE_S else None
+        # PowerShell and CMD echo the line, run it, then print their prompt
+        # without a newline.  Anything else waits for the bounded timeout.
+        if (
+            self._pending_echo is None
+            and self._feed_count > self._submitted_feeds
+            and quiet >= self._PASTE_LOCAL_IDLE_S
+            and self._at_shell_prompt()
+        ):
+            return "idle"
+        return None
+
+    def _pump_paste(self):
+        """Paste timer: run the next pasted line once the previous one is done.
+
+        One line per tick at most, so even thousands of lines never hold up
+        the UI thread.  A line run by the timer leaves the user's selection
+        and scroll position alone, like streaming output, and follows only a
+        view that was already at the bottom; so Ctrl+C on a selection made
+        meanwhile still copies instead of interrupting the shell."""
+        scrollbar = self.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 2
+        self._keep_view = True
+        try:
+            changed = self._paste_step()
+        finally:
+            self._keep_view = False
+        if changed and at_bottom:
+            if self.textCursor().hasSelection():
+                scrollbar.setValue(scrollbar.maximum())
+            else:
+                self._sync_cursor()
+
+    def _paste_step(self):
+        """One turn of the paste timer; True when it changed the terminal."""
+        if not (self._pasting or self._paste_block_watch):
+            self._paste_timer.stop()
+            return False
+        if not self._alive:
+            self._cancel_paste()
+            return False
+        ready = self._paste_ready()
+        if not ready:
+            return False
+        timed_out = ready == "timeout"
+        if self._pasting and self._paste_lines:
+            # Only the paste's last line may complete a PowerShell block.
+            self._paste_block_watch = False
+            self._submit_line(self._paste_lines.popleft(), typeahead=timed_out)
+            if not self._paste_lines and not self._paste_tail and self._paste_multi:
+                self._watch_paste_block()
+            return True
+        changed = False
+        if self._paste_block_watch:
+            self._paste_block_watch = False
+            if not timed_out and not self._line and self._at_continuation_prompt():
+                self._submit_line("")
+                changed = True
+                if self._pasting:
+                    return True  # the block runs now; place the edit line after it
+        if self._pasting:
+            tail, multi = self._paste_tail, self._paste_multi
+            self._pasting = False
+            self._paste_tail = ""
+            self._paste_multi = False
+            if tail:
+                self._set_line(tail)
+                self._paste_tail_open = multi
+                changed = True
+            changed = self._replay_paste_keys() or changed
+        if not (self._pasting or self._paste_block_watch):
+            self._paste_timer.stop()
+        return changed
 
     def _menu(self, pos):
         ico = theme.emoji_icon
@@ -1356,11 +1653,13 @@ class AnsiConsole(QPlainTextEdit):
         self._sb.reset()
         self._inq.clear()
         self._inq_len = 0
+        self._dropped = 0
         self._drain.stop()
         self._wc = QTextCursor(self.document())
         self._wc.movePosition(QTextCursor.End)
         self._line = ""
         self._cpos = 0
+        self._paste_tail_open = False
         self._pending_echo = None
         self._state = 0
         self._csi = ""
@@ -1370,5 +1669,6 @@ class AnsiConsole(QPlainTextEdit):
         self._need_prompt = True
 
     def close_archive(self):
+        self._cancel_paste()
         self._drain.stop()
         self._sb.close()

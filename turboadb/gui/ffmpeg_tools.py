@@ -9,6 +9,7 @@ one already on PATH) overrides the download for fully offline setups.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -21,16 +22,39 @@ import urllib.request
 import zipfile
 from typing import Optional
 
+from ..config import user_path
 from ..tools import NO_WINDOW as _NO_WINDOW
 
 _log = logging.getLogger(__name__)
 
-_CACHE = os.path.join(os.path.expanduser("~"), ".turboadb", "ffmpeg")
+_CACHE = user_path("ffmpeg")
 # BtbN's FFmpeg-Builds "latest" release — a stable, public Windows build URL.
+# It is a rolling asset, so TURBOADB_FFMPEG_URL can pin a dated build
+# (…/releases/download/autobuild-YYYY-MM-DD-hh-mm/…) and TURBOADB_FFMPEG_SHA256
+# the exact binary that build must extract to.
 _FFMPEG_URL = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
     "ffmpeg-master-latest-win64-gpl.zip"
 )
+_URL_ENV = "TURBOADB_FFMPEG_URL"
+_SHA_ENV = "TURBOADB_FFMPEG_SHA256"
+# The recorded checksum lives beside the binary, so a cached ffmpeg that changed
+# on disk is noticed instead of being executed forever on trust.
+_SHA_SUFFIX = ".sha256"
+
+
+def ffmpeg_url() -> str:
+    """The build to download; ``TURBOADB_FFMPEG_URL`` pins a specific release."""
+    return (os.environ.get(_URL_ENV) or "").strip() or _FFMPEG_URL
+
+
+def expected_sha256() -> str:
+    """A pinned binary hash from ``TURBOADB_FFMPEG_SHA256`` (lowercase hex), or ""."""
+    return (os.environ.get(_SHA_ENV) or "").strip().lower()
+
+
+class DownloadCancelled(RuntimeError):
+    """The caller's ``should_cancel()`` asked to abandon the one-time download."""
 
 
 def parse_dshow_devices(text: str) -> list:
@@ -97,6 +121,12 @@ def _auto_download_supported() -> bool:
 _DOWNLOAD_LOCK = threading.Lock()
 _PART_SUFFIX = ".part"
 _STALE_PART_S = 24 * 3600
+# Ceilings for the one-time fetch. urlopen's timeout is per read, so a throttled
+# server could hold the camera page for hours without either of these.
+_DOWNLOAD_DEADLINE_S = 30 * 60
+# Hashing 160 MB takes a moment; remember the copies already checked in this
+# process, keyed by what would change if the file were replaced.
+_VERIFIED = {}
 
 
 def _remove_quietly(path: str) -> None:
@@ -133,18 +163,127 @@ def _temp_path(folder: str, suffix: str) -> str:
     return path
 
 
-def _download_zip(url: str, dest: str, log) -> None:
-    """Stream *url* into *dest* (never held in memory)."""
+def _file_key(path: str):
+    """What changes when a file is replaced: (size, mtime)."""
+    st = os.stat(path)
+    return (st.st_size, st.st_mtime)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _recorded_hash(exe: str) -> str:
+    """The SHA-256 written beside *exe* by a previous download, or ""."""
+    try:
+        with open(exe + _SHA_SUFFIX, "r", encoding="ascii") as fh:
+            return fh.read().split()[0].strip().lower()
+    except (OSError, IndexError, UnicodeDecodeError):
+        return ""
+
+
+def _record_hash(exe: str, digest: str | None = None) -> str:
+    """Write *exe*'s SHA-256 next to it and remember it as verified."""
+    digest = (digest or _sha256_file(exe)).lower()
+    try:
+        with open(exe + _SHA_SUFFIX, "w", encoding="ascii") as fh:
+            fh.write(digest + "\n")
+    except OSError as exc:  # a read-only cache still runs, just unverifiable
+        _log.debug("couldn't record the ffmpeg checksum: %s", exc)
+    try:
+        _VERIFIED[exe] = _file_key(exe)
+    except OSError:
+        pass
+    return digest
+
+
+def verify_cached(exe: str, log=lambda m: None) -> bool:
+    """True when *exe* still matches the checksum recorded beside it, and the
+    pinned ``TURBOADB_FFMPEG_SHA256`` when one is set.
+
+    A copy left by an older TurboADB has no record yet; it is adopted (its hash
+    is written) rather than re-downloaded, unless a pin says otherwise.
+    """
+    pinned = expected_sha256()
+    recorded = _recorded_hash(exe)
+    try:
+        if _VERIFIED.get(exe) == _file_key(exe):  # unchanged since the last check
+            return True
+        if not pinned and not recorded:
+            log(f"Recorded the cached ffmpeg checksum (SHA-256 {_record_hash(exe)[:16]}…)")
+            return True
+        digest = _sha256_file(exe)
+    except OSError as exc:
+        _log.warning("couldn't check the cached ffmpeg (%s): %s", exe, exc)
+        return False
+    if pinned and digest != pinned:
+        log("The cached ffmpeg does not match TURBOADB_FFMPEG_SHA256 — fetching it again.")
+        _log.warning("cached ffmpeg %s is %s, pinned %s", exe, digest, pinned)
+        return False
+    if recorded and digest != recorded:
+        log("The cached ffmpeg changed since it was downloaded — fetching it again.")
+        _log.warning("cached ffmpeg %s is %s, recorded %s", exe, digest, recorded)
+        return False
+    _record_hash(exe, digest)
+    return True
+
+
+def _usable_cached(log) -> Optional[str]:
+    """:func:`cached_ffmpeg` with an integrity check on OUR downloaded copy.
+
+    A user-supplied path or an ffmpeg on PATH is theirs to manage and is used as
+    is; the managed copy is dropped when it no longer matches its checksum, so
+    the next call replaces it.
+    """
+    path = cached_ffmpeg()
+    managed = os.path.join(_CACHE, "ffmpeg.exe")
+    if not path or os.path.normcase(path) != os.path.normcase(managed):
+        if not os.path.exists(managed):
+            _remove_quietly(managed + _SHA_SUFFIX)  # a record without its binary
+        return path
+    if verify_cached(path, log):
+        return path
+    _remove_quietly(path)
+    _remove_quietly(path + _SHA_SUFFIX)
+    _VERIFIED.pop(path, None)
+    return None
+
+
+def _download_zip(url: str, dest: str, log, should_cancel=None) -> None:
+    """Stream *url* into *dest* (never held in memory).
+
+    ``urlopen``'s timeout only bounds a single read — a dead connection fails
+    there, but a trickling one never does — so the loop enforces an overall
+    elapsed ceiling as well, and honours *should_cancel()* between chunks. A
+    throttled server must not hold the main window indefinitely.
+    """
+    def cancelled() -> bool:
+        return bool(should_cancel and should_cancel())
+
+    if cancelled():
+        raise DownloadCancelled("cancelled before the download started")
     req = urllib.request.Request(url, headers={"User-Agent": "turboadb"})
+    start = time.monotonic()
     with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as fh:
         total = int(r.headers.get("Content-Length") or 0)
         got = last = 0
         while True:
             chunk = r.read(1024 * 256)
+            if cancelled():
+                raise DownloadCancelled("cancelled")
             if not chunk:
                 break
             fh.write(chunk)
             got += len(chunk)
+            if time.monotonic() - start > _DOWNLOAD_DEADLINE_S:
+                raise OSError(
+                    f"still downloading after {_DOWNLOAD_DEADLINE_S // 60} minutes "
+                    f"({got // (1024 * 1024)} MB so far)"
+                )
             mb = got // (1024 * 1024)
             if mb >= last + 5:  # report every ~5 MB
                 last = mb
@@ -184,15 +323,18 @@ def _install_from_zip(zip_path: str, out: str) -> None:
         _remove_quietly(tmp)
 
 
-def ensure_local_ffmpeg(log=lambda m: None) -> str:
+def ensure_local_ffmpeg(log=lambda m: None, should_cancel=None) -> str:
     """Return a usable ffmpeg(.exe), downloading + caching it on first use.
-    Raises RuntimeError if it can't be obtained.
+    Raises RuntimeError if it can't be obtained, or :class:`DownloadCancelled`
+    when *should_cancel()* asked to stop.
 
-    Integrity: BtbN's rolling "latest" release has no stable published checksum
-    to pin (the asset is rebuilt continuously), so the download relies on HTTPS
-    plus the zip's own CRC-32 check — there is deliberately no hard-coded hash.
+    Integrity: BtbN's "latest" asset is rebuilt continuously and has no stable
+    published checksum, so the download relies on HTTPS plus the zip's CRC-32,
+    and the SHA-256 of the binary we install is logged and recorded beside it.
+    Every later reuse re-checks that record, and ``TURBOADB_FFMPEG_URL`` /
+    ``TURBOADB_FFMPEG_SHA256`` pin an exact build for locked-down setups.
     """
-    have = cached_ffmpeg()
+    have = _usable_cached(log)
     if have:
         return have
     if not _auto_download_supported():
@@ -201,7 +343,7 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
             "Settings → ffmpeg path. (Auto-download is Windows-only.)"
         )
     with _DOWNLOAD_LOCK:
-        have = cached_ffmpeg()  # another thread finished it while we waited
+        have = _usable_cached(log)  # another thread finished it while we waited
         if have:
             return have
         os.makedirs(_CACHE, exist_ok=True)
@@ -211,7 +353,9 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
         try:
             log("Downloading ffmpeg (one-time, ~160 MB — please wait)…")
             try:
-                _download_zip(_FFMPEG_URL, zip_path, log)
+                _download_zip(ffmpeg_url(), zip_path, log, should_cancel)
+            except DownloadCancelled:
+                raise
             except Exception as exc:
                 raise RuntimeError(
                     f"Couldn't download ffmpeg ({exc}). Install ffmpeg (so it's on PATH) "
@@ -226,6 +370,20 @@ def ensure_local_ffmpeg(log=lambda m: None) -> str:
             _remove_quietly(zip_path)
     if not os.path.exists(out):
         raise RuntimeError("ffmpeg.exe not found after extraction.")
+    try:
+        digest = _sha256_file(out)
+    except OSError as exc:
+        raise RuntimeError(f"Couldn't read the installed ffmpeg to check it: {exc}")
+    pinned = expected_sha256()
+    if pinned and digest != pinned:
+        _remove_quietly(out)
+        raise RuntimeError(
+            f"the downloaded ffmpeg is SHA-256 {digest}, not the pinned {pinned}. "
+            f"Check {_URL_ENV} / {_SHA_ENV}."
+        )
+    _record_hash(out, digest)
+    _log.info("installed ffmpeg %s (SHA-256 %s)", out, digest)
+    log(f"ffmpeg ready (SHA-256 {digest[:16]}…)")
     return out
 
 

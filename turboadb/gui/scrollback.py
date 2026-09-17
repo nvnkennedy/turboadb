@@ -26,6 +26,8 @@ import shutil
 import tempfile
 import threading
 
+from ..config import user_path
+
 
 class ScrollbackSaveError(OSError):
     """The complete history could not be written (e.g. the writer is stuck)."""
@@ -38,6 +40,11 @@ class Scrollback:
     # open.  Larger sessions spill asynchronously and retain the same complete
     # history guarantee.
     _MEMORY_LIMIT = 64 * 1024
+    # Cap for the fallback buffer used when the writer FAILED (no log file to
+    # spill to).  It is a RAM budget, not the "don't touch the disk yet"
+    # threshold above, so it is far larger: a whole unbounded capture in memory
+    # is what this stops.  The oldest text goes first and the loss is recorded.
+    _MEMORY_FALLBACK_LIMIT = 8 * 1024 * 1024
     # How long a save waits for the background writer to drain.  Saves run on a
     # worker thread (see ``save_job``), so this can be generous; on timeout the
     # save FAILS loudly instead of silently writing a truncated history.
@@ -51,6 +58,7 @@ class Scrollback:
         self._fh = None
         self._memory = []
         self._memory_size = 0
+        self._truncated = 0  # characters the failed-writer fallback had to drop
         self._queue = None
         self._writer = None
         self._writer_error = None
@@ -75,11 +83,31 @@ class Scrollback:
         self._writer.start()
 
     def _keep_in_memory(self, generation: int, text: str) -> None:
-        """Writer fallback: make *text* visible to saves immediately."""
+        """Writer fallback: make *text* visible to saves immediately.
+
+        Bounded, unlike before: with a failed writer there is no file to spill
+        to, so an unattended capture buffered the whole session in RAM.  Past
+        ``_MEMORY_FALLBACK_LIMIT`` the oldest text is dropped and counted, and
+        :meth:`_memory_note` tells a save the history is no longer complete.
+        """
         with self._lock:
-            if generation == self._generation:
-                self._memory.append(text)
-                self._memory_size += len(text)
+            if generation != self._generation:
+                return
+            self._memory.append(text)
+            self._memory_size += len(text)
+            while self._memory_size > self._MEMORY_FALLBACK_LIMIT and len(self._memory) > 1:
+                oldest = self._memory.pop(0)
+                self._memory_size -= len(oldest)
+                self._truncated += len(oldest)
+
+    def _memory_note(self) -> str:
+        """A line for a save when the fallback buffer had to drop history."""
+        with self._lock:
+            dropped = self._truncated
+        if not dropped:
+            return ""
+        return (f"[TurboADB: the history file could not be written, so the oldest {dropped} "
+                "characters of this capture were dropped]\n")
 
     def _writer_main(self, work_queue, generation: int) -> None:
         """Write queued terminal output and remove the temporary file on close."""
@@ -87,7 +115,7 @@ class Scrollback:
         path = None
         current_item = None
         try:
-            d = os.path.join(os.path.expanduser("~"), ".turboadb", "logs")
+            d = user_path("logs")
             os.makedirs(d, exist_ok=True)
             fd, path = tempfile.mkstemp(prefix="turboadb-", suffix=".log", dir=d)
             fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
@@ -193,10 +221,11 @@ class Scrollback:
         if not self._flush():
             raise ScrollbackSaveError("the terminal history writer did not finish in time")
         _, path, fallback = self._snapshot()
+        note = self._memory_note()
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="replace") as a:
-                return a.read() + fallback
-        return fallback or self._edit.toPlainText()
+                return a.read() + note + fallback
+        return (note + fallback) if (note or fallback) else self._edit.toPlainText()
 
     def save_job(self):
         """Return ``write(path)`` producing the complete history.
@@ -226,14 +255,15 @@ class Scrollback:
                 "the terminal history writer did not finish in time; nothing was saved"
             )
         _, archive_path, fallback = self._snapshot()
+        note = self._memory_note()  # says so when the fallback dropped history
         if archive_path and os.path.exists(archive_path):
             shutil.copyfile(archive_path, path)
-            if fallback:
+            if note or fallback:
                 with open(path, "a", encoding="utf-8", newline="") as out:
-                    out.write(fallback)
+                    out.write(note + fallback)
         else:  # the writer failed before creating its file: everything is in memory
             with open(path, "w", encoding="utf-8", newline="") as out:
-                out.write(fallback)
+                out.write(note + fallback)
 
     def save_to(self, path: str) -> None:
         """Synchronous save (tests / scripts).  GUI code should prefer
@@ -253,6 +283,7 @@ class Scrollback:
             self._writer_error = None
             self._memory.clear()
             self._memory_size = 0
+            self._truncated = 0
             self._closed = close
             self._delete_when_finished = close
         if old_queue is not None:

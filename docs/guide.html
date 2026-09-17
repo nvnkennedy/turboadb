@@ -92,11 +92,14 @@ dev.connect()</code></pre></div></div>
             top shows the connection, device type, Android version, CPU and serial.</li>
             <li>Right-click for Copy / Paste / <b>Send key</b> / <b>Save full output to
             file…</b>; <b>Stop</b> (Ctrl+C) halts whatever is running. <b>A−</b> /
-            <b>A+</b> resize every terminal together.</li>
+            <b>A+</b> resize every terminal together (12 pt by default).</li>
             <li>Click <b>PowerShell</b> or <b>CMD</b> in the switcher for a Windows
             shell with TurboADB's <code>adb</code> first on PATH and
             <code>ANDROID_SERIAL</code> set — Python, Git and <code>where</code> work
-            like in a normal console.</li>
+            like in a normal console. Inside an <code>adb shell</code> typed there,
+            <b>Stop</b> stops only the device command and keeps you in adb shell;
+            if the command ignores it, Stop again reopens adb shell in the same
+            folder.</li>
           </ol></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL shell -- getprop ro.build.version.release</code></pre></div></div>
@@ -207,13 +210,19 @@ dev.open_url("https://maps.google.com"); dev.input_text("hello world")</code></p
             camera</b> (Back / Front), <b>Manage displays…</b> and <b>All
             displays</b>.</li>
             <li><b>Record…</b> records without restarting the live view;
-            <b>Maximize view</b> and <b>Hide controls</b> give the screen more room.
+            <b>Maximize view</b> and <b>Hide controls</b> give the screen more room
+            (<b>Show controls</b> works while maximized too).
             The controls sit beside the screen or below it, whichever shows the
             screen larger.</li>
             <li>On cars (and any device with several displays) the <b>IVI Displays</b>
-            tab shows every display live at once and starts them one after another.
-            <b>Focus</b> shows a single display; <b>Start all</b>, <b>Stop all</b> and
-            <b>Rescan</b> are at the top.</li>
+            tab shows every display live at once and starts them one after another,
+            each with its own Back, Home, Recents, volume, power and screenshot
+            buttons. <b>Maximize</b> shows a single display (Esc restores); <b>Start all</b>,
+            <b>Stop all</b> and <b>Rescan</b> are at the top.</li>
+            <li>If scrcpy can't run on a build, <b>Settings → scrcpy → Screen
+            renderer → ADB screencap</b> shows the screen through <code>adb
+            screencap</code> — slower, but touch, drag, scroll and typing still
+            work.</li>
           </ol>
           <p class="muted">The display picker lists every display with its name and
           size as soon as the device connects — TurboADB asks Android over adb, so
@@ -395,10 +404,11 @@ deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password", on_status=p
         <p class="desc">Small conveniences that make long sessions nicer.</p>
         <div class="mode"><span class="tag gui">GUI</span>
           <ul class="steps">
-            <li><b>Themes</b> — Graphite / Porcelain by default, plus Mocha / Latte,
-            Forest / Sage, Plum / Rose and Deep teal / Mint. The top-bar sun or moon
-            switches to the other half of the pair; pick any from the <b>Themes</b>
-            menu or <b>Settings → Themes</b>.</li>
+            <li><b>Themes</b> — Graphite / Porcelain by default, plus Black / White,
+            Slate / Mist, Night / Paper and Mocha / Latte, all soft on the eyes. The
+            top-bar sun or moon switches between your last dark and last light theme;
+            its arrow, the <b>Themes</b> menu and <b>Settings → Themes</b> pick any
+            theme directly.</li>
             <li><b>Split view</b> — <b>More ▾ → Split view</b> shows Terminal, Device
             Control, Files and Logcat side by side, stacked or in a grid.</li>
             <li><b>Maximize view</b> and <b>Hide controls</b> in Device Control give

@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 
 from . import icons, theme, settings as settings_mod
 from .icons import icon
-from .qtutil import disconnect_signals, park_thread, thread_running
+from .qtutil import disconnect_signals, page_toolbar, park_thread, thread_running
 from .scrollback import Scrollback
 
 _log = logging.getLogger(__name__)
@@ -113,6 +113,11 @@ class _LogcatThread(QThread):
     """
 
     _READ_SIZE = 65536
+    # Lines held for the panel to pull.  The panel drains this every render
+    # tick, but a flood while the UI is stalled (a modal dialog, a slow RDP
+    # repaint, a hidden page) would otherwise grow it without limit.  The
+    # oldest are dropped and counted; the archive still has every line.
+    _LINES_MAX = 20000
 
     def __init__(self, handler, args, clear_first: bool = False):
         super().__init__()
@@ -123,6 +128,7 @@ class _LogcatThread(QThread):
         self._stopping = False
         self._lock = threading.Lock()
         self._lines = []
+        self._dropped = 0
 
     def take_lines(self) -> list:
         """All lines read since the last call (thread-safe)."""
@@ -130,9 +136,19 @@ class _LogcatThread(QThread):
             lines, self._lines = self._lines, []
         return lines
 
+    def take_dropped(self) -> int:
+        """How many buffered lines were dropped since the last call (thread-safe)."""
+        with self._lock:
+            dropped, self._dropped = self._dropped, 0
+        return dropped
+
     def _publish(self, lines) -> None:
         with self._lock:
             self._lines.extend(lines)
+            overflow = len(self._lines) - self._LINES_MAX
+            if overflow > 0:
+                del self._lines[:overflow]
+                self._dropped += overflow
 
     def run(self):
         if self.clear_first and not self._stopping:
@@ -231,7 +247,7 @@ class _ZoomEdit(QPlainTextEdit):
 
     def _bump(self, step):
         f = self.font()
-        current = f.pointSize() or 10
+        current = f.pointSize() or settings_mod.DEFAULTS["term_font_size"]
         size = max(settings_mod.FONT_SIZE_MIN, min(settings_mod.FONT_SIZE_MAX, current + step))
         if size == current:
             return
@@ -251,6 +267,8 @@ class LogcatPanel(QWidget):
     _REFILTER_MAX = 5000
     # On-screen backlog cap; the archive always receives every line.
     _PENDING_MAX = 6000
+    # How often the view repaints while there is output (see _render_pending).
+    _RENDER_MS = 350
 
     def __init__(self, handler, parent=None):
         super().__init__(parent)
@@ -269,9 +287,10 @@ class LogcatPanel(QWidget):
         # A GUI-side timer paints at a FIXED low rate, decoupled from how fast
         # logcat arrives. Over RDP each repaint is a slow remote screen update,
         # so this is what stops the window going "not responding" under a flood.
+        # It runs only while there is (or may be) output: a panel whose logcat
+        # was never started must not tick in every open device tab forever.
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._render_pending)
-        self._render_timer.start(350)
         # debounce the on-screen re-filter so holding a key doesn't re-render the
         # (large) buffer on every character
         self._refilter_timer = QTimer(self)
@@ -282,15 +301,9 @@ class LogcatPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         # One page toolbar: capture actions left, filters in the middle (the
-        # regex box stretches), secondary actions right.
-        toolbar = QWidget()
-        toolbar.setObjectName("pageToolbar")
-        toolbar.setAttribute(Qt.WA_StyledBackground, True)
-        from .flowlayout import ToolbarFlowLayout
-
-        # Wraps instead of widening the window when the tab is narrow.
-        ctrl = ToolbarFlowLayout(toolbar, hspacing=8, vspacing=6)
-        ctrl.setContentsMargins(12, 8, 12, 8)
+        # regex box stretches), secondary actions right.  It wraps instead of
+        # widening the window when the tab is narrow.
+        toolbar, ctrl = page_toolbar()
         self.level = QComboBox()
         for label, name, tone in _LEVELS:
             self.level.addItem(icon(name, tone), label)
@@ -391,7 +404,8 @@ class LogcatPanel(QWidget):
 
         self.view = _ZoomEdit()
         fam = settings_mod.get("term_font") or "Consolas"
-        self.view.setFont(QFont(fam, int(settings_mod.get("term_font_size") or 10)))
+        size = settings_mod.get("term_font_size") or settings_mod.DEFAULTS["term_font_size"]
+        self.view.setFont(QFont(fam, int(size)))
         # generous on-screen scrollback; trimmed lines are archived so a long
         # capture is never lost and Save writes the COMPLETE log, not the tail
         self._sb = Scrollback(self.view, display_cap=120000)
@@ -471,7 +485,9 @@ class LogcatPanel(QWidget):
             recent = recent[: max(0, len(recent) - len(self._pending))]
         else:
             self._pending = []
-            self._skipped = 0
+            # ``_skipped`` is deliberately kept: those lines never reached the
+            # screen at all, so editing the filter must not quietly drop the
+            # "N lines skipped on screen" marker they are still owed.
         fre = self._filter_re
         if fre is not None:
             recent = [ln for ln in recent if fre.search(ln)]
@@ -531,9 +547,9 @@ class LogcatPanel(QWidget):
             args += [f"{tag}:V", "*:S"]
         elif lvl != "V":
             args += [f"*:{lvl}"]
-        if self.thread is not None:
-            # a finished worker whose final lines were not painted yet
-            self._on_batch(self.thread.take_lines())
+        # a finished worker whose final lines were not painted yet
+        self._pull(self.thread)
+        self._ensure_rendering()
         thread = _LogcatThread(self.handler, args, clear_first=clear_it)
         self.thread = thread
         thread.finished.connect(lambda t=thread: self._on_thread_finished(t))
@@ -557,7 +573,7 @@ class LogcatPanel(QWidget):
         # reference first so a later Start/Stop never touches a dead wrapper.
         if self._closed or thread is not self.thread:
             return
-        self._on_batch(thread.take_lines())
+        self._pull(thread)
         self.thread = None
         self._sync_start_button()
         self.log.emit("[OK] logcat stopped")
@@ -584,6 +600,8 @@ class LogcatPanel(QWidget):
         self._paused = not self._paused
         self.btn_pause.setText("Resume" if self._paused else "Pause")
         self.btn_pause.setIcon(icon("play", "green") if self._paused else icon("pause", "amber"))
+        if not self._paused:
+            self._ensure_rendering()  # paint what arrived while paused
 
     def _clear_view(self):
         self.view.clear()
@@ -621,13 +639,40 @@ class LogcatPanel(QWidget):
             self._skipped += overflow
             del self._pending[:overflow]
 
+    def _pull(self, thread):
+        """Drain one worker: what it had to drop first, then its lines."""
+        if thread is None:
+            return
+        self._skipped += thread.take_dropped()
+        self._on_batch(thread.take_lines())
+
+    def _ensure_rendering(self):
+        """Tick while output is running or waiting to be painted."""
+        if not self._closed and not self._render_timer.isActive():
+            self._render_timer.start(self._RENDER_MS)
+
+    def _stop_rendering_if_idle(self):
+        """Stop ticking once nothing is capturing and nothing is left to paint."""
+        if not thread_running(self.thread) and not (self._pending or self._skipped):
+            self._render_timer.stop()
+
+    def hideEvent(self, event):
+        # Another page is on screen: there is nothing to paint until this one
+        # comes back.  The worker keeps capturing (and archiving) meanwhile.
+        super().hideEvent(event)
+        self._render_timer.stop()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if thread_running(self.thread) or self._pending or self._skipped:
+            self._ensure_rendering()
+
     def _render_pending(self):
         """Pull the worker's lines, then paint what accumulated since the last
         tick — one insert, one scroll, at a fixed rate regardless of volume."""
-        thread = self.thread
-        if thread is not None:
-            self._on_batch(thread.take_lines())
+        self._pull(self.thread)
         if self._paused or not (self._pending or self._skipped):
+            self._stop_rendering_if_idle()
             return
         lines, self._pending = self._pending, []
         fre = self._filter_re
@@ -637,6 +682,7 @@ class LogcatPanel(QWidget):
             lines.insert(0, f"… ({self._skipped} lines skipped on screen — saved log has all)")
             self._skipped = 0
         self._draw_lines(lines)
+        self._stop_rendering_if_idle()
 
     def _draw_lines(self, lines):
         """Append *lines* to the view with level colouring + highlight marking.
@@ -724,4 +770,13 @@ class LogcatPanel(QWidget):
             thread.stop()
             disconnect_signals(thread, ("finished",))
             park_thread(thread)  # re-adds deleteLater; referenced until it ends
+            thread.take_lines()  # its unread backlog (up to _LINES_MAX lines)
         self._sb.close()  # drop the temp scrollback file
+        # The raw history (up to _RECENT_MAX lines), the paint backlog and the
+        # on-screen document are the panel's big buffers: release them now, not
+        # whenever the closed tab's widgets are finally deleted.
+        self._recent.clear()
+        self._pending = []
+        self._skipped = 0
+        self._fmt_cache.clear()
+        self.view.clear()

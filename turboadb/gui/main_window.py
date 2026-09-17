@@ -4,30 +4,34 @@ Files / Apps + Screen controls), and a color-coded log dock."""
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-import time
 
 from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QListWidget, QListWidgetItem, QPushButton,
                              QDockWidget, QLabel, QLineEdit, QMessageBox,
-                             QToolBar, QAction, QStatusBar, QShortcut, QToolButton,
+                             QToolBar, QAction, QShortcut, QToolButton,
                              QApplication, QMenu, QSizePolicy, QProgressDialog,
                              QInputDialog)
 
+from ..config import format_host_port, parse_host_port, user_path
 from ..results import OperationResult
 from ..scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 from . import icons, theme
 from .log_panel import LogPanel
-from .sessions import SessionStore
+from .sessions import SessionStore, session_identity
 from .session_dialog import SessionDialog
 from .settings_dialog import SettingsDialog
 from .device_tab import DeviceTab
 from . import settings as settings_mod
 from .adb_path import gui_adb_path
-from .qtutil import AnimatedTabWidget, FunctionThread, park_thread, thread_running
+from .qtutil import (AnimatedTabWidget, FunctionThread, disconnect_signals,
+                     park_thread, thread_running)
+
+_log = logging.getLogger("turboadb.gui")
 
 def _find_icon():
     """Locate icon.ico in both a normal install and the frozen one-file exe
@@ -50,6 +54,31 @@ ICON_PATH = _find_icon()
 # The GUI's local adb daemon.  The device tracker speaks its socket protocol.
 _LOCAL_ADB_HOST = "127.0.0.1"
 _LOCAL_ADB_PORT = 5037
+
+
+# The main window's background workers, and every result signal they emit.
+# closeEvent disconnects them all before parking; disconnect_signals ignores the
+# ones a given worker does not have.
+_WORKER_ATTRS = ("_poll", "_tracker", "_adb_init", "_as", "_dl", "_share",
+                 "_unshare", "_deploy", "_sc", "_upd_chk", "_upd_run",
+                 "_upd_quiet", "_disc", "_bcast", "_pair")
+_WORKER_SIGNALS = ("result", "failed", "ready", "done", "fail", "progress",
+                   "stage", "msg", "status", "line", "finished")
+
+
+def _theme_kind_icon(light):
+    """Sun for a light theme, moon for a dark one (menus and the ribbon toggle)."""
+    return icons.icon("sun", "amber") if light else icons.icon("moon", "blue")
+
+
+def _network_target(serial):
+    """``(host, port)`` when *serial* is a network device, else ``(None, None)``.
+
+    The one shared parser does the splitting, so a bare IPv6 serial such as
+    ``fe80::1`` is no longer read as host ``fe80:`` on port 1.
+    """
+    host, port = parse_host_port(serial, None)
+    return (host, port) if host and port is not None else (None, None)
 
 
 class _AdbInitThread(QThread):
@@ -441,9 +470,6 @@ class MainWindow(QMainWindow):
     # is replaced as soon as the live socket reports the real state.
     _DEVICE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
     _DEVICE_CACHE_HINT_MS = 1_500
-    # At most one warning/error toast in this window; the rest still reach the
-    # log and the status bar, so a burst never stacks up popups.
-    _TOAST_INTERVAL_S = 4.0
 
     def __init__(self):
         super().__init__()
@@ -462,8 +488,12 @@ class MainWindow(QMainWindow):
         theme.apply_to_app(QApplication.instance(), settings_mod.get("theme"))
 
         self.store = SessionStore()
-        self._last_toast = float("-inf")
-        # A timed status message clears to nothing; put the connection summary back.
+        # Set by closeEvent: worker results arriving during teardown must not
+        # restart the poll timer, the tracker or the ADB init thread.
+        self._closing = False
+        # The status bar has to exist before anything connects to it: replacing
+        # it afterwards (setStatusBar) dropped this connection, so a timed
+        # message left the bar blank instead of restoring the summary.
         self.statusBar().messageChanged.connect(
             lambda message: None if message else QTimer.singleShot(0, self._update_status)
         )
@@ -479,7 +509,6 @@ class MainWindow(QMainWindow):
         self._build_center()
         self._build_log_dock()
 
-        self.setStatusBar(QStatusBar())
         self._build_status_indicators()
         self._install_shortcuts()
         self.refresh_sessions()
@@ -488,10 +517,12 @@ class MainWindow(QMainWindow):
         # version is shown in the status bar only (not decorated elsewhere)
         self.log_panel.append("[OK] TurboADB ready")
         if self.store.load_error:
-            self.log_panel.append(
+            # Deferred by one event-loop turn: the notification toast is a tool
+            # window over this one, which has not been shown yet.
+            QTimer.singleShot(0, lambda: self._log(
                 "[WARNING] Saved targets could not be loaded; the file was left untouched. "
                 "Import a backup or repair sessions.json before saving new targets."
-            )
+            ))
 
         # A cold adb daemon can take several seconds for Windows USB
         # enumeration.  Show a clearly-labelled, last-confirmed device right
@@ -572,20 +603,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(ico("📋"), "Toggle log panel", self.toggle_log)
 
         m_theme = mb.addMenu("&Themes")
-        self._theme_menu_actions = {}
-        # Dark and light palettes are listed as two clearly separate groups.
-        for light in (False, True):
-            if light:
-                m_theme.addSeparator()
-            heading = m_theme.addAction("Light themes" if light else "Dark themes")
-            heading.setEnabled(False)
-            for key in theme.theme_names():
-                if theme.is_light(key) != light:
-                    continue
-                action = m_theme.addAction(ico("☀" if light else "🌙"), theme.theme_label(key))
-                action.setCheckable(True)
-                action.triggered.connect(lambda _checked=False, name=key: self._apply_theme(name))
-                self._theme_menu_actions[key] = action
+        self._theme_menu_actions = self._add_theme_choices(m_theme)
 
         m_dev = mb.addMenu("&Device")
         m_dev.addAction(ico("📱"), "Mirror (scrcpy)", self._mirror_current)
@@ -614,7 +632,7 @@ class MainWindow(QMainWindow):
 
     def make_shortcuts_now(self):
         if thread_running(getattr(self, "_sc", None)):
-            self.log_panel.append("[INFO] Shortcut update is already running.")
+            self._log("[INFO] Shortcut update is already running.")
             return
         # Creating shell links spawns PowerShell, so it never runs on the UI thread.
         self._sc = _shortcut_worker(force=True)
@@ -624,9 +642,9 @@ class MainWindow(QMainWindow):
     def _on_shortcuts_refreshed(self, res):
         bad = [k for k, v in (res or {}).items() if not v]
         if bad:
-            self.log_panel.append(f"[WARNING] Could not create: {', '.join(bad)}.")
+            self._log(f"[WARNING] Could not create: {', '.join(bad)}.")
         else:
-            self.log_panel.append("[OK] Desktop + Start-menu shortcuts refreshed.")
+            self._log("[OK] Desktop + Start-menu shortcuts refreshed.")
 
     def export_targets(self):
         from PyQt5.QtWidgets import QFileDialog
@@ -641,9 +659,9 @@ class MainWindow(QMainWindow):
             return
         try:
             n = self.store.export_to(path)
-            self.log_panel.append(f"[OK] exported {n} target(s) → {path}")
+            self._log(f"[OK] exported {n} target(s) → {path}")
         except Exception as exc:
-            self.log_panel.append(f"[ERROR] export targets: {exc}")
+            self._log(f"[ERROR] export targets: {exc}")
 
     def import_targets(self):
         from PyQt5.QtWidgets import QFileDialog
@@ -655,9 +673,9 @@ class MainWindow(QMainWindow):
         try:
             n = self.store.import_from(path)
             self.refresh_sessions()
-            self.log_panel.append(f"[OK] imported {n} target(s) from {path}")
+            self._log(f"[OK] imported {n} target(s) from {path}")
         except Exception as exc:
-            self.log_panel.append(f"[ERROR] import targets: {exc}")
+            self._log(f"[ERROR] import targets: {exc}")
             QMessageBox.warning(self, "Import targets",
                                 f"Couldn't import that file:\n\n{exc}")
 
@@ -781,10 +799,7 @@ class MainWindow(QMainWindow):
 
         # utility icons on the right: theme toggle (glyph = theme you switch TO),
         # log panel, settings, help.  Compact and Exit stay in the View/File menus.
-        self.act_theme = QAction(self)
-        self.act_theme.triggered.connect(self.toggle_theme)
-        tb.addAction(self.act_theme)
-        self._sync_theme_action()
+        self._build_theme_toggle(tb)
         self.act_logs = icon_action("panel-bottom", "teal", "Show or hide the log panel", self.toggle_log)
         icon_action("settings", "text", "Settings", self.show_settings)
         icon_action("help", "blue", "Help and documentation", self._open_docs)
@@ -934,6 +949,9 @@ class MainWindow(QMainWindow):
     def _build_center(self):
         self.tabs = AnimatedTabWidget(transition_ms=145)
         self.tabs.setObjectName("mainTabs")
+        # Paint the stylesheet background (the tab-bar colour) behind the whole
+        # tab row, including the strip behind the "+" new-tab corner button.
+        self.tabs.setAttribute(Qt.WA_StyledBackground, True)
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
@@ -1005,29 +1023,37 @@ class MainWindow(QMainWindow):
         self._log_dock = dock
 
     _LOG_LEVEL_RE = re.compile(
-        r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|ERROR|CRITICAL|FATAL)\]\s*",
+        r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|ERROR|CRITICAL|FATAL"
+        r"|CANCELLED|CANCELED)\]\s*",
         re.IGNORECASE,
     )
     _LEVEL_ALIASES = {
         "SUCCESS": "OK", "WARN": "WARNING", "STDERR": "WARNING",
         "CRITICAL": "ERROR", "FATAL": "ERROR",
+        # "[CANCELLED] pull a.txt" (Files) is information, and says so in words.
+        "CANCELLED": "INFO", "CANCELED": "INFO",
     }
 
     def _log(self, text: str):
         """Record *text* in the log panel and surface it outside the log.
 
         Every meaningful message updates the status bar. Unless the log panel
-        is open with Silent ticked, actions also show a small activity toast
-        (updated in place, never a stack), and errors show a large red toast
-        at the bottom with an alert sound.
+        is open with Silent ticked, every one also shows its toast: actions
+        update the one small activity toast in place, and errors update the
+        one large red toast at the bottom, which counts a burst ("Error (3)")
+        and sounds its alert at most once per burst. Nothing is skipped: a
+        second message right after the first ("Wi-Fi on", then "Bluetooth
+        off") replaces the first one's text instead of never appearing.
         """
         if not text:
             return
         self.log_panel.append(text)
         match = self._LOG_LEVEL_RE.match(text)
-        level = match.group(1).upper() if match else "INFO"
-        level = self._LEVEL_ALIASES.get(level, level)
+        tag = match.group(1).upper() if match else "INFO"
+        level = self._LEVEL_ALIASES.get(tag, tag)
         clean = (text[match.end():] if match else text).strip()
+        if clean and tag in ("CANCELLED", "CANCELED"):
+            clean = f"Cancelled: {clean}"
         # The raw adb command trace is DEBUG noise; it stays in the log only.
         if level == "DEBUG" or not clean or clean.startswith(("$ ", "-> ")):
             return
@@ -1043,7 +1069,6 @@ class MainWindow(QMainWindow):
             return
         from . import fileutil
 
-        self._last_toast = time.monotonic()
         if level == "ERROR":
             fileutil.error_toast(self, clean, action_text="Show log", action=self._show_log_dock)
         else:
@@ -1054,6 +1079,14 @@ class MainWindow(QMainWindow):
                 action_text="Show log" if level == "WARNING" else "",
                 action=self._show_log_dock,
             )
+
+    def _log_trace(self, text: str) -> None:
+        """Record an engine diagnostic line in the log panel only: no status
+        bar, no toast. A device tab's engine reports every failure itself
+        before the page that ran the action reports it, and a car head unit's
+        expected refusals must stay the calm hints the pages show."""
+        if text:
+            self.log_panel.append(text)
 
     def _show_log_dock(self):
         """Reveal and focus the diagnostic dock from a notification action.
@@ -1094,6 +1127,8 @@ class MainWindow(QMainWindow):
 
     # ---- live devices ----
     def _start_poll_timer(self):
+        if self._closing:
+            return
         if not self._timer.isActive():
             # The socket tracker publishes changes immediately.  Poll only as a
             # low-frequency reconciliation fallback rather than duplicating every
@@ -1109,7 +1144,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _recent_devices_path() -> str:
-        return os.path.join(os.path.expanduser("~"), ".turboadb", "recent-devices.json")
+        return user_path("recent-devices.json")
 
     def _load_recent_devices(self) -> list[dict]:
         """Return a small, fresh last-confirmed-device cache for launch UI."""
@@ -1180,7 +1215,7 @@ class MainWindow(QMainWindow):
 
     def _begin_adb_startup(self) -> None:
         """Start a cold local daemon once, without blocking the live tracker."""
-        if thread_running(getattr(self, "_adb_init", None)):
+        if self._closing or thread_running(getattr(self, "_adb_init", None)):
             return
         # Do not replace a result which the tracker/socket probe may already
         # have delivered during a warm launch.  A cold daemon is still started
@@ -1192,7 +1227,7 @@ class MainWindow(QMainWindow):
         self._adb_init.start()
 
     def _start_device_tracker(self):
-        if thread_running(getattr(self, "_tracker", None)):
+        if self._closing or thread_running(getattr(self, "_tracker", None)):
             return
         self._tracker = _DeviceTracker(adb_path=gui_adb_path())
         self._tracker.result.connect(self._on_devices)
@@ -1201,13 +1236,13 @@ class MainWindow(QMainWindow):
     def _on_adb_ready(self, ok: bool, msg: str):
         if ok:
             self._set_adb_indicator("ready")
-            self.log_panel.append(f"[OK] {msg}")
+            self._log(f"[OK] {msg}")
             self._poll_devices()
             self._start_device_tracker()
             self._start_poll_timer()
         else:
             self._set_adb_indicator("unavailable")
-            self.log_panel.append(f"[WARNING] {msg}")
+            self._log(f"[WARNING] {msg}")
             self._cached_devices = []
             self._set_live_message("⚠  ADB unavailable — see the log")
 
@@ -1219,7 +1254,7 @@ class MainWindow(QMainWindow):
         )
 
     def _poll_devices(self, *, socket_only: bool = False):
-        if thread_running(self._poll):
+        if getattr(self, "_closing", False) or thread_running(self._poll):
             return
         if self._server_task_running():
             # `adb devices` would auto-start a daemon in the kill→start gap (or
@@ -1232,7 +1267,7 @@ class MainWindow(QMainWindow):
 
     def _on_device_poll_error(self, detail: str):
         """Keep a known device list stable, but never hide a real ADB failure."""
-        self.log_panel.append(f"[WARNING] Device scan failed: {detail[:400]}")
+        self._log(f"[WARNING] Device scan failed: {detail[:400]}")
         self._set_adb_indicator("scan issue")
         if not self._last_device_sigs:
             self._cached_devices = []
@@ -1273,7 +1308,7 @@ class MainWindow(QMainWindow):
             it.setFlags(Qt.NoItemFlags)
             self.live_list.addItem(it)
             if self._seen_serials:
-                self.log_panel.append("[INFO] All devices disconnected")
+                self._log("[INFO] All devices disconnected")
                 self._seen_serials = set()
             self._update_status()
             return
@@ -1282,7 +1317,7 @@ class MainWindow(QMainWindow):
         if self._seen_serials is None or current_serials != self._seen_serials:
             for d in devices:
                 if self._seen_serials is None or d.serial not in self._seen_serials:
-                    self.log_panel.append(
+                    self._log(
                         f"[OK] Device found: {d.label or d.model or 'device'} · {d.serial} ({d.state})"
                     )
             self._seen_serials = current_serials
@@ -1310,11 +1345,12 @@ class MainWindow(QMainWindow):
             or getattr(live, "device", "")
             or serial
         )
-        is_net = ":" in serial and serial.rpartition(":")[2].isdigit()
+        host, port = _network_target(serial)
+        is_net = host is not None
         s = {"name": friendly, "type": "network" if is_net else "usb",
              "serial": "" if is_net else serial,
-             "host": serial.rpartition(":")[0] if is_net else "",
-             "port": int(serial.rpartition(":")[2]) if is_net else 5555}
+             "host": host or "",
+             "port": port if is_net else 5555}
         self._open_session(s, friendly)
 
     # ---- saved sessions ----
@@ -1404,17 +1440,16 @@ class MainWindow(QMainWindow):
         s["name"] = s.get("name", "device") + " (copy)"
         self.store.save(s)
         self.refresh_sessions()
-        self.log_panel.append(f"[OK] Duplicated '{name}'")
+        self._log(f"[OK] Duplicated '{name}'")
 
     def new_session(self, *_, prefill_host=None):
         dlg = SessionDialog(self)
         if prefill_host:
             dlg.mode.setCurrentIndex(1)
-            host, _, port = prefill_host.rpartition(":")
-            if port.isdigit():
-                dlg.host.setText(host); dlg.port.setValue(int(port))
-            else:
-                dlg.host.setText(prefill_host)
+            host, port = parse_host_port(prefill_host, None)
+            dlg.host.setText(host)
+            if port is not None:
+                dlg.port.setValue(port)
         # SessionDialog validates the target (name included) before accepting,
         # and deletes itself once closed.
         if dlg.exec_() != dlg.Accepted:
@@ -1422,7 +1457,7 @@ class MainWindow(QMainWindow):
         s = dlg.result_session()
         self.store.save(s)
         self.refresh_sessions()
-        self.log_panel.append(f"[OK] Saved target '{s['name']}'")
+        self._log(f"[OK] Saved target '{s['name']}'")
 
     def edit_session(self):
         name = self._selected_name()
@@ -1453,21 +1488,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _session_identity(session):
         """A stable device identity, independent of a user-editable tab name."""
-        if not isinstance(session, dict):
-            return None
-        kind = (session.get("type") or "usb").lower()
-        serial = str(session.get("serial") or "").strip()
-        if kind == "remote":
-            return (
-                "remote",
-                str(session.get("adb_host") or "").strip().strip("[]").lower(),
-                str(session.get("adb_port") or 5037),
-                serial,
-            )
-        host = str(session.get("host") or "").strip().strip("[]").lower()
-        if kind == "network" or host:
-            return ("network", host, str(session.get("port") or 5555))
-        return ("usb", serial)
+        return session_identity(session)
 
     def _resolve_identity(self, identity):
         """Map an 'only device' USB target (empty serial) to the one live USB
@@ -1477,8 +1498,7 @@ class MainWindow(QMainWindow):
         online = [d for d in self._live_devices if getattr(d, "is_online", False)]
         if len(online) == 1:
             serial = str(getattr(online[0], "serial", "") or "")
-            is_net = ":" in serial and serial.rpartition(":")[2].isdigit()
-            if serial and not is_net:
+            if serial and _network_target(serial) == (None, None):
                 return ("usb", serial)
         return identity
 
@@ -1542,13 +1562,20 @@ class MainWindow(QMainWindow):
             return
         self.tabs.setCurrentIndex(existing_index)
         self._update_center()
-        self._log(f"'{name}' is already open; focused its Device Control tab.")
+        self._log(f"[INFO] '{name}' is already open; focused its Device Control tab.")
 
     def _add_device_tab(self, session, name: str, *, terminal_only: bool = False) -> None:
         """Create either the full workspace or a deliberately slim terminal
         session.  Both use independent interactive terminal processes."""
         w = DeviceTab(session, terminal_only=terminal_only)
         w.log.connect(self._log)
+        # The engine's own diagnostics (the adb command trace and its
+        # "[ERROR] <action> failed" lines) go to the log only: the page that ran
+        # the action reports the outcome once, so one failure is one toast.
+        trace = getattr(w, "trace", None)
+        if trace is not None:
+            trace.connect(self._log_trace)
+        self._watch_connection(w)
         w.screen_active.connect(self._on_screen_active)
         if terminal_only:
             w.title_changed.connect(
@@ -1572,6 +1599,102 @@ class MainWindow(QMainWindow):
         if hasattr(w, "start_connect"):
             w.start_connect()
 
+    # ---- saving connected devices as targets ----
+    # Tab labels that say nothing about which device a target is.
+    _PLACEHOLDER_NAMES = frozenset({"", "device", "android"})
+
+    def _watch_connection(self, tab) -> None:
+        """Offer *tab*'s device to :meth:`_auto_save_target` once it connects
+        (``DeviceTab.connected`` fires once, after the tab is named)."""
+        tab.connected.connect(lambda: self._auto_save_target(tab))
+
+    def _connected_target(self, tab):
+        """The saved-target entry for a connected *tab*: USB by serial, network
+        by host:port, remote by adb server and serial. None when there is
+        nothing specific to save (a USB device without a serial)."""
+        session = getattr(tab, "session", None)
+        if not isinstance(session, dict):
+            return None
+        kind = str(session.get("type") or "usb").lower()
+        handler = getattr(tab, "handler", None)
+        serial = str(getattr(handler, "serial", "") or session.get("serial") or "").strip()
+        vague = set()
+        try:
+            if kind == "remote":
+                adb_host = str(session.get("adb_host") or "").strip()
+                adb_port = int(session.get("adb_port") or 5037)
+                server = format_host_port(adb_host, adb_port)
+                target = {"type": "remote", "adb_host": adb_host, "adb_port": adb_port,
+                          "serial": serial}
+                address = serial or server
+                # A remote tab opened without a name is labelled with its server.
+                vague = {adb_host.lower(), server.lower()}
+            else:
+                if kind == "network":
+                    host, port = session.get("host"), session.get("port") or 5555
+                else:
+                    host, port = _network_target(serial)  # an "only device" on Wi-Fi
+                if host:
+                    bare = str(host).strip().strip("[]")
+                    target = {"type": "network", "host": bare, "port": int(port)}
+                    address = format_host_port(bare, int(port))
+                    # An unnamed Connect -> Network tab is labelled with the bare
+                    # host; the saved name keeps the port.
+                    vague = {bare.lower(), f"[{bare.lower()}]"}
+                elif serial:
+                    target = {"type": "usb", "serial": serial}
+                    address = serial
+                else:
+                    return None
+        except (TypeError, ValueError):
+            return None
+        label = getattr(tab, "title_label", None)
+        try:
+            shown = str(label.text()).strip() if label is not None else ""
+        except RuntimeError:  # the label is already deleted
+            shown = ""
+        if shown.lower() in self._PLACEHOLDER_NAMES or shown.lower() in vague:
+            shown = ""
+        target["name"] = shown or address
+        return target
+
+    def _auto_save_target(self, tab) -> None:
+        """Add a freshly connected device to Saved targets unless it is there.
+
+        Targets match by device identity, never by name, and the target the
+        tab was opened from counts as saved, so opening a saved target or
+        reconnecting adds nothing. The name comes from the device ("vivo
+        V2318") or its serial / host:port, numbered when another device has
+        it. Controlled by the ``auto_save_targets`` setting. A failed save is
+        a warning in the log, never an error popup.
+        """
+        from .fileutil import _alive
+
+        if getattr(self, "_closing", False) or not _alive(tab):
+            return
+        if getattr(tab, "_session_closed", False) or getattr(tab, "handler", None) is None:
+            return
+        if not settings_mod.get("auto_save_targets"):
+            return
+        target = self._connected_target(tab)
+        if target is None:
+            return
+        try:
+            outcome, saved = self.store.remember(
+                target, also=(session_identity(getattr(tab, "session", None)),)
+            )
+        except Exception as exc:
+            _log.warning("could not save target %r: %s", target.get("name"), exc)
+            self._log(f"[WARNING] Could not add '{target.get('name')}' to Saved targets: {exc}")
+            return
+        if outcome == "known":
+            return
+        self.refresh_sessions()
+        if outcome == "updated":
+            self._log(f"[OK] Saved target '{saved['name']}' now uses port {saved['port']}")
+        else:
+            self._log(f"[OK] Saved target '{saved['name']}'")
+
     def open_webcam_tab(self):
         """Open the host Webcam as a standalone tab — available right away, with no
         device connected. Focuses the existing one if it's already open."""
@@ -1587,7 +1710,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabIcon(idx, icons.icon("video", "red"))
         self.tabs.setCurrentIndex(idx)
         self._update_center()
-        self.log_panel.append("Opened the host Webcam (no device needed).")
+        self._log("[OK] Opened the host Webcam (no device needed).")
 
     def _set_tab_title(self, widget, title):
         idx = self.tabs.indexOf(widget)
@@ -1686,8 +1809,7 @@ class MainWindow(QMainWindow):
         offer to connect to a 'connect'-ready one."""
         if thread_running(getattr(self, "_disc", None)):
             return
-        self.log_panel.append("Scanning the LAN for Wireless-debugging devices "
-                              "(adb mdns)…")
+        self._log("Scanning the LAN for Wireless-debugging devices (adb mdns)…")
         self._disc = _discover_worker(gui_adb_path())
         self._disc.done.connect(self._on_discovered)
         self._disc.start()
@@ -1699,9 +1821,9 @@ class MainWindow(QMainWindow):
             self.log_panel.append(f"[OK] found {d['service']}: {d['address']} "
                                   f"({d['name']})")
         if not found:
-            self.log_panel.append("[INFO] no Wireless-debugging devices found. "
-                                  "On the device: Settings → Developer options → "
-                                  "Wireless debugging (same Wi-Fi as this PC).")
+            self._log("[INFO] no Wireless-debugging devices found. "
+                      "On the device: Settings → Developer options → "
+                      "Wireless debugging (same Wi-Fi as this PC).")
             QMessageBox.information(
                 self, "Discover Wi-Fi devices",
                 "No Android 11+ Wireless-debugging devices were found on the "
@@ -1710,14 +1832,16 @@ class MainWindow(QMainWindow):
                 "this PC. New devices usually need Pair (with a code) once first.")
             return
         if pairing and not connectable:
-            self.log_panel.append("[INFO] found only PAIRING entries — use "
-                                  "Pair device to enter the code shown on-screen.")
+            self._log("[INFO] found only PAIRING entries — use "
+                      "Pair device to enter the code shown on-screen.")
         for d in connectable:
             s = {"name": d["address"], "type": "network",
                  "host": d["host"], "port": d["port"]}
             self.store.save(s)
         if connectable:
             self.refresh_sessions()
+            self._log(f"[OK] Found {len(connectable)} Wireless-debugging device(s); "
+                      "saved to Saved targets")
             first = connectable[0]
             if QMessageBox.question(
                     self, "Discover Wi-Fi devices",
@@ -1743,16 +1867,33 @@ class MainWindow(QMainWindow):
         if not ok or not cmd.strip():
             return
         if getattr(self, "_bcast", None) and self._bcast.isRunning():
-            self.log_panel.append("[WARNING] a broadcast is already running.")
+            self._log("[WARNING] a broadcast is already running.")
             return
-        self.log_panel.append(f"Running on {len(online)} device(s):  {cmd}")
+        self._log(f"Running on {len(online)} device(s):  {cmd}")
         self._bcast = _BroadcastThread(
             [d.serial for d in online], cmd.strip(), gui_adb_path()
         )
-        self._bcast.line.connect(self.log_panel.append)
-        self._bcast.done.connect(
-            lambda: self.log_panel.append("[OK] broadcast finished."))
+        self._bcast_failed = 0
+        self._bcast.line.connect(self._on_broadcast_line)
+        self._bcast.done.connect(lambda total=len(online): self._on_broadcast_done(total))
         self._bcast.start()
+
+    def _on_broadcast_line(self, line: str) -> None:
+        """One device's result: a success is detail for the log, a failure is
+        surfaced like any other (the error toast counts a burst in place)."""
+        if line.startswith("[OK]"):
+            self.log_panel.append(line)
+            return
+        self._bcast_failed = getattr(self, "_bcast_failed", 0) + 1
+        self._log(line)
+
+    def _on_broadcast_done(self, total: int) -> None:
+        failed = getattr(self, "_bcast_failed", 0)
+        if failed:
+            self._log(f"[WARNING] Broadcast finished: {failed} of {total} device(s) "
+                      "reported a failure — see the log")
+        else:
+            self._log(f"[OK] Broadcast finished on {total} device(s)")
 
     def pair_device(self):
         addr, ok = QInputDialog.getText(
@@ -1764,18 +1905,16 @@ class MainWindow(QMainWindow):
                                         "6-digit pairing code shown on the device:")
         if not ok or not code.strip():
             return
-        host, _, port = addr.strip().rpartition(":")
-        if not port.isdigit():
-            self.log_panel.append("[ERROR] pairing address must be host:port")
-            return
-        if not host:
-            self.log_panel.append("[ERROR] pairing address must be host:port")
+        host, port = parse_host_port(addr, None)
+        if not host or port is None:
+            self._log("[ERROR] pairing address must be host:port "
+                      "(an IPv6 address in brackets: [fe80::1]:37000)")
             return
         from ..core import ADBHandler
         from ..config import ADBConfig
 
         if thread_running(getattr(self, "_pair", None)):
-            self.log_panel.append("[INFO] Pairing is already in progress.")
+            self._log("[INFO] Pairing is already in progress.")
             return
         adb_path = gui_adb_path()
         pair_code = code.strip()
@@ -1786,18 +1925,18 @@ class MainWindow(QMainWindow):
                 host, int(port), pair_code, safe=True
             )
 
-        self.log_panel.append(f"[INFO] Pairing with {host}:{port}…")
+        self._log(f"[INFO] Pairing with {host}:{port}…")
         self._pair = FunctionThread(work)
         self._pair.done.connect(self._on_paired)
-        self._pair.fail.connect(lambda msg: self.log_panel.append(f"[ERROR] pair: {msg}"))
+        self._pair.fail.connect(lambda msg: self._log(f"[ERROR] pair: {msg}"))
         self._pair.start()
 
     def _on_paired(self, res):
         if isinstance(res, OperationResult) and not res.success:
-            self.log_panel.append(f"[ERROR] pair: {res.error}")
+            self._log(f"[ERROR] pair: {res.error}")
         else:
             val = res.value if isinstance(res, OperationResult) else res
-            self.log_panel.append(f"[OK] {val}")
+            self._log(f"[OK] {val}")
         self._poll_devices()
 
     def share_devices(self):
@@ -1805,7 +1944,7 @@ class MainWindow(QMainWindow):
         does): start a shared adb server + open the firewall so other PCs can
         drive the devices plugged in here — handy for RDP / lab setups."""
         if getattr(self, "_share", None) and self._share.isRunning():
-            self.log_panel.append("[WARNING] Share is already starting…")
+            self._log("[WARNING] Share is already starting…")
             return
         box = QMessageBox(self)
         box.setWindowTitle("Share devices over the network")
@@ -1826,8 +1965,7 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         if clicked not in (b_start_login, b_once):
             return
-        self.log_panel.append("Starting shared adb server (network device "
-                              "sharing)…")
+        self._log("Starting shared adb server (network device sharing)…")
         # pause the device poll: its `adb devices` would auto-start a plain
         # localhost server in the kill→bind gap and steal port 5037
         self._timer.stop()
@@ -1835,7 +1973,7 @@ class MainWindow(QMainWindow):
             install_startup=(clicked is b_start_login),
             adb_path=gui_adb_path(),
         )
-        self._share.msg.connect(self.log_panel.append)
+        self._share.msg.connect(self._log)
         self._share.finished.connect(
             lambda: (self._start_poll_timer(), self._poll_devices()))
         self._share.start()
@@ -1845,7 +1983,7 @@ class MainWindow(QMainWindow):
         login launcher and the SYSTEM startup task), so nothing runs on its own at
         boot/login anymore. Addresses 'turboadb keeps auto-starting locally'."""
         if getattr(self, "_unshare", None) and self._unshare.isRunning():
-            self.log_panel.append("[WARNING] Stop-sharing is already running…")
+            self._log("[WARNING] Stop-sharing is already running…")
             return
         if QMessageBox.question(
                 self, "Stop sharing & remove auto-start",
@@ -1855,10 +1993,10 @@ class MainWindow(QMainWindow):
                 "may need Administrator.",
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        self.log_panel.append("Stopping device sharing and removing auto-start…")
+        self._log("Stopping device sharing and removing auto-start…")
         self._timer.stop()          # keep the poll out of the kill→restart gap
         self._unshare = _StopShareThread(adb_path=gui_adb_path())
-        self._unshare.msg.connect(self.log_panel.append)
+        self._unshare.msg.connect(self._log)
         self._unshare.finished.connect(
             lambda: (self._start_poll_timer(), self._poll_devices()))
         self._unshare.start()
@@ -1867,7 +2005,7 @@ class MainWindow(QMainWindow):
         """Install/start `turboadb serve` on remote Windows hosts FROM here, over
         WinRM — so you don't have to RDP into each one to enable device sharing."""
         if getattr(self, "_deploy", None) and self._deploy.isRunning():
-            self.log_panel.append("[WARNING] A remote deploy is already running.")
+            self._log("[WARNING] A remote deploy is already running.")
             return
         from .deploy_dialog import DeployDialog
         dlg = DeployDialog(self)
@@ -1877,17 +2015,12 @@ class MainWindow(QMainWindow):
             dlg.deleteLater()
         if vals is None:
             return
-        if not vals["hosts"]:
-            QMessageBox.warning(self, "Deploy", "Enter at least one host.")
-            return
-        if not vals["user"] or not vals["password"]:
-            QMessageBox.warning(self, "Deploy",
-                                "Enter the admin user and password.")
-            return
+        # No re-validation here: DeployDialog refuses to accept until its own
+        # check passes, so hosts/user/password are always present by now.
         for h in reversed(vals["hosts"]):
             settings_mod.add_recent("recent_remote_hosts", h)
         n = len(vals["hosts"])
-        self.log_panel.append(f"Deploying ‘serve’ to {n} host(s) over WinRM…")
+        self._log(f"Deploying ‘serve’ to {n} host(s) over WinRM…")
         # a MODAL progress popup while the deploy runs — it takes a while
         # (pip update + server start per host) and used to happen invisibly in
         # the background, which made it look like the click did nothing
@@ -1902,6 +2035,8 @@ class MainWindow(QMainWindow):
         self._dep_dlg.setAutoClose(False); self._dep_dlg.setAutoReset(False)
         self._dep_dlg.show()
         self._dep_results = []
+        self._dep_hosts = n
+        self._dep_skipped = 0
         self._deploy = _DeployThread(vals["hosts"], vals["user"],
                                      vals["password"], vals["port"],
                                      vals["update"], vals.get("use_ssl", False))
@@ -1910,8 +2045,17 @@ class MainWindow(QMainWindow):
         self._deploy.start()
 
     def _on_deploy_status(self, msg):
-        self.log_panel.append(msg)
-        if msg.startswith(("[OK]", "[ERROR]")):
+        # Per-host progress is narration inside the modal popup, but a host that
+        # failed or was skipped has to reach the status bar and a toast like
+        # any other problem.
+        skipped = re.match(r"^\[WARNING\]\s*Skipped (\d+) host", msg)
+        if skipped:
+            self._dep_skipped = getattr(self, "_dep_skipped", 0) + int(skipped.group(1))
+        if msg.startswith(("[ERROR]", "[WARNING]")):
+            self._log(msg)
+        else:
+            self.log_panel.append(msg)
+        if msg.startswith(("[OK]", "[ERROR]")) or skipped:
             self._dep_results.append(msg)
         try:                                     # live line in the popup
             self._dep_dlg.setLabelText(
@@ -1928,25 +2072,36 @@ class MainWindow(QMainWindow):
                    if r != "[OK] Remote deploy finished."]
         ok = [r for r in results if r.startswith("[OK]")]
         bad = [r for r in results if r.startswith("[ERROR]")]
-        lines = "\n".join("• " + re.sub(r"^\[(OK|ERROR)\]\s*", "", r)[:160]
+        lines = "\n".join("• " + re.sub(r"^\[(OK|ERROR|WARNING)\]\s*", "", r)[:160]
                           for r in results) or "(no per-host output)"
-        if bad:
+        # Hosts the time budget skipped report neither OK nor ERROR: count them
+        # (and any host with no result at all) instead of calling it a success.
+        hosts = getattr(self, "_dep_hosts", 0) or 0
+        missing = max(getattr(self, "_dep_skipped", 0), hosts - len(ok) - len(bad))
+        if bad or missing:
+            problems = ", ".join(
+                part for part in (f"{len(bad)} failed" if bad else "",
+                                  f"{missing} skipped" if missing else "") if part
+            )
+            self._log(f"[WARNING] Remote deploy finished: {len(ok)} host(s) deployed, {problems}")
             QMessageBox.warning(
                 self, "Remote deploy finished (with errors)",
-                f"{len(ok)} host(s) OK, {len(bad)} failed:\n\n{lines}")
-        else:
-            QMessageBox.information(
-                self, "Remote deploy finished",
-                f"All {len(ok)} host(s) deployed:\n\n{lines}\n\n"
-                f"Connect to them via Connect → Remote.")
+                f"{len(ok)} host(s) OK, {problems}:\n\n{lines}")
+            self._poll_devices()
+            return
+        self._log(f"[OK] Remote deploy finished: {len(ok)} host(s) deployed")
+        QMessageBox.information(
+            self, "Remote deploy finished",
+            f"All {len(ok)} host(s) deployed:\n\n{lines}\n\n"
+            f"Connect to them via Connect → Remote.")
         self._poll_devices()
 
     def restart_adb_server(self):
         if thread_running(getattr(self, "_as", None)):
-            self.log_panel.append("[INFO] ADB restart is already in progress.")
+            self._log("[INFO] ADB restart is already in progress.")
             return
-        self.log_panel.append("Restarting ADB server… (fixes 'device not "
-                              "visible' from adb version mismatches)")
+        self._log("Restarting ADB server… (fixes 'device not visible' from adb "
+                  "version mismatches)")
         self._set_adb_indicator("restarting…")
         # Killing the shared daemon necessarily closes every adb shell.  Pause
         # their individual reconnect loops first; otherwise they hammer the old
@@ -1955,8 +2110,8 @@ class MainWindow(QMainWindow):
         for tab in self._device_tabs():
             try:
                 tab.prepare_for_adb_restart()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_teardown("pause a device shell for the ADB restart", exc)
         # Keep the fallback poll out of the kill→start gap; _poll_devices also
         # falls back to a socket-only probe while this worker runs.
         self._poll_timer_was_active = self._timer.isActive()
@@ -1970,7 +2125,7 @@ class MainWindow(QMainWindow):
     def _on_adb_restarted(self, message: str) -> None:
         if getattr(self, "_poll_timer_was_active", False):
             self._start_poll_timer()
-        self.log_panel.append(message)
+        self._log(message)
         success = message.startswith("[OK]")
         self._set_adb_indicator("ready" if success else "restart failed")
         if success:
@@ -1979,8 +2134,8 @@ class MainWindow(QMainWindow):
         for tab in self._device_tabs():
             try:
                 tab.finish_adb_restart(success)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_teardown("resume a device shell after the ADB restart", exc)
 
     # ---- tool download (adb / scrcpy, auto on install/upgrade) ----
     def _check_tools(self):
@@ -2014,20 +2169,20 @@ class MainWindow(QMainWindow):
         itself on PyPI; if newer, self-update (which also refreshes adb + scrcpy)
         and restart. Otherwise just check/refresh adb + scrcpy."""
         if thread_running(getattr(self, "_upd_run", None)):
-            self.log_panel.append("[WARNING] An update is already running.")
+            self._log("[WARNING] An update is already running.")
             return
         if thread_running(getattr(self, "_dl", None)) or thread_running(
             getattr(self, "_upd_chk", None)
         ):
-            self.log_panel.append("[WARNING] A tool task is already running.")
+            self._log("[WARNING] A tool task is already running.")
             return
         from .. import update as _upd
         if not _upd.can_self_update():
             # standalone executable: can't pip-upgrade itself, so just do adb/scrcpy
-            self.log_panel.append("Checking adb/scrcpy for updates…")
+            self._log("Checking adb/scrcpy for updates…")
             self._upgrade_tools_only()
             return
-        self.log_panel.append("Checking PyPI for a newer TurboADB…")
+        self._log("Checking PyPI for a newer TurboADB…")
         self._upd_chk = _update_check_worker()
         self._upd_chk.done.connect(self._upgrade_after_appcheck)
         self._upd_chk.start()
@@ -2037,7 +2192,7 @@ class MainWindow(QMainWindow):
         if latest and _upd.is_newer(latest):
             self._do_self_update(latest)        # also updates adb/scrcpy, then restarts
         else:
-            self.log_panel.append(
+            self._log(
                 f"[OK] TurboADB {self._version} is the latest — now checking "
                 f"adb/scrcpy…")
             self._upgrade_tools_only()
@@ -2046,7 +2201,7 @@ class MainWindow(QMainWindow):
                           show_stage=False) -> bool:
         """Run one adb/scrcpy download or upgrade with a progress dialog."""
         if thread_running(getattr(self, "_dl", None)):
-            self.log_panel.append("[WARNING] A tool task is already running.")
+            self._log("[WARNING] A tool task is already running.")
             return False
         self._dlg = QProgressDialog(text, None, 0, 100, self)
         self._dlg.setWindowTitle(title)
@@ -2073,7 +2228,7 @@ class MainWindow(QMainWindow):
             "TurboADB — upgrade",
             self._upgrade_done,
         ):
-            self.log_panel.append("Checking for adb/scrcpy updates…")
+            self._log("Checking for adb/scrcpy updates…")
 
     def _upgrade_done(self, res):
         try:
@@ -2090,7 +2245,7 @@ class MainWindow(QMainWindow):
                     f"latest {c.get('latest')}")
         unknown = res.get("unknown") or []
         if res.get("up_to_date"):
-            self.log_panel.append("[OK] adb & scrcpy match latest upstream versions.")
+            self._log("[OK] adb & scrcpy match latest upstream versions.")
             versions = " · ".join(
                 f"{label} {(checks.get(tool) or {}).get('latest')}"
                 for tool, label in (("adb", "ADB"), ("scrcpy", "Scrcpy"))
@@ -2110,12 +2265,12 @@ class MainWindow(QMainWindow):
             msg = ("Couldn't check " + " / ".join(unknown) + " for updates "
                    "(no network, or the version source is rate-limiting). "
                    "Nothing was changed — try again in a while.")
-            self.log_panel.append(f"[WARNING] {msg}")
+            self._log(f"[WARNING] {msg}")
             QMessageBox.warning(self, "Update check failed", msg)
         for tool, path in (res.get("updated") or {}).items():
-            self.log_panel.append(f"[OK] updated {tool} → {path}")
+            self._log(f"[OK] updated {tool} → {path}")
         for tool, err in (res.get("errors") or {}).items():
-            self.log_panel.append(f"[WARNING] {tool}: {err}")
+            self._log(f"[WARNING] {tool}: {err}")
         if res.get("updated"):
             QMessageBox.information(self, "Updated",
                                     "Updated: " + ", ".join(res["updated"].keys()))
@@ -2123,7 +2278,7 @@ class MainWindow(QMainWindow):
             custom = (os.environ.get("TURBOADB_ADB")
                       or (settings_mod.get("adb_path") or "").strip())
             if "adb" in res["updated"] and custom:
-                self.log_panel.append(
+                self._log(
                     f"[WARNING] a custom adb path is set ({custom}) and takes "
                     f"precedence over the freshly downloaded adb — clear it in "
                     f"Settings → Tools (or unset TURBOADB_ADB) to use the update.")
@@ -2147,18 +2302,26 @@ class MainWindow(QMainWindow):
             pass
         self._start_poll_timer()             # resume the fallback device poll
         if res.get("note") == "already-ensured":
-            self.log_panel.append(
+            self._log(
                 "[INFO] tools were already checked earlier in this session — "
                 "use the 🔄 Upgrade button to force a fresh check.")
         if res.get("adb"):
             self.log_panel.append(f"[OK] adb ready: {res['adb']}")
         if res.get("scrcpy"):
             self.log_panel.append(f"[OK] scrcpy ready: {res['scrcpy']}")
-        for tool, err in (res.get("errors") or {}).items():
-            self.log_panel.append(f"[WARNING] {tool}: {err}")
-        if res.get("note") == "up-to-date":
-            self.log_panel.append("[OK] adb / scrcpy already up to date")
-        elif not res.get("adb") and (res.get("errors")):
+        errors = res.get("errors") or {}
+        ready = [tool for tool in ("adb", "scrcpy") if res.get(tool)]
+        if errors:
+            # One outcome line: a failed download followed by a green "Tools
+            # ready" read as a success.
+            detail = "; ".join(f"{tool}: {err}" for tool, err in errors.items())
+            self._log(f"[WARNING] {detail}" + (f" ({', '.join(ready)} ready)" if ready else ""))
+        elif res.get("note") == "up-to-date":
+            self._log("[OK] adb / scrcpy already up to date")
+        elif ready and res.get("note") != "already-ensured":
+            # A finished download used to close its progress dialog silently.
+            self._log(f"[OK] Tools ready: {', '.join(ready)}")
+        if not res.get("adb") and errors:
             QMessageBox.warning(self, "Download failed",
                                 "Could not download the tools. Check your network, "
                                 "or install them manually (see Help).")
@@ -2171,7 +2334,7 @@ class MainWindow(QMainWindow):
 
     def _on_quiet_update(self, latest):
         if latest:
-            self.log_panel.append(
+            self._log(
                 f"[INFO] TurboADB {latest} is available (you have "
                 f"{self._version}) — click the 🔄 Upgrade button to update.")
 
@@ -2188,10 +2351,10 @@ class MainWindow(QMainWindow):
         made = [k for k, v in (res or {}).items() if v]
         failed = [k for k, v in (res or {}).items() if not v]
         if made:
-            self.log_panel.append(
+            self._log(
                 f"[OK] Added TurboADB shortcut to your {', '.join(made)}.")
         if failed:
-            self.log_panel.append(
+            self._log(
                 f"[WARNING] Could not create the {', '.join(failed)} shortcut "
                 f"(try: turboadb shortcut).")
 
@@ -2211,7 +2374,7 @@ class MainWindow(QMainWindow):
         self._upd_dlg.setMinimumDuration(0)
         self._upd_dlg.setAutoClose(False); self._upd_dlg.setAutoReset(False)
         self._upd_dlg.show()
-        self.log_panel.append(f"Updating TurboADB {self._version} -> {latest}…")
+        self._log(f"Updating TurboADB {self._version} -> {latest}…")
         self._upd_run = _AppUpgradeThread()
         self._upd_run.progress.connect(
             lambda m: (self._upd_dlg.setLabelText(m), self.log_panel.append(m)))
@@ -2226,23 +2389,23 @@ class MainWindow(QMainWindow):
         from .. import update as _upd
         if not res.get("ok"):
             err = res.get("error") or "unknown error"
-            self.log_panel.append(f"[ERROR] update failed: {err}")
+            self._log(f"[ERROR] update failed: {err}")
             QMessageBox.warning(
                 self, "Update failed",
                 "Could not update automatically:\n\n"
                 f"{err}\n\nUpdate manually with:\n    pip install --upgrade turboadb")
             return
         for tool, err in (res.get("tools_errors") or {}).items():
-            self.log_panel.append(f"[WARNING] {tool} refresh failed: {err}")
+            self._log(f"[WARNING] {tool} refresh failed: {err}")
         bits = []
         if res.get("adb"):
             bits.append(f"adb {res['adb']}")
         if res.get("scrcpy"):
             bits.append(f"scrcpy {res['scrcpy']}")
         tools = ("  ·  " + ", ".join(bits)) if bits else ""
-        self.log_panel.append(
+        self._log(
             f"[OK] Updated to TurboADB {res.get('new')}{tools}. Restarting…")
-        relaunched = _upd.relaunch()
+        relaunched = _upd.relaunch_on_exit()
         QMessageBox.information(
             self, "Updated",
             f"Updated to TurboADB {res.get('new')}.\n"
@@ -2259,15 +2422,24 @@ class MainWindow(QMainWindow):
             self._log_dock.raise_()
 
     def show_settings(self):
+        # Screens that follow the Settings renderer switch over only when it
+        # changes, so remember the one in force before the dialog opens.
+        old_backend = settings_mod.get("screen_backend", "scrcpy")
         dlg = SettingsDialog(self)
         # On OK the dialog itself persists only the keys that changed (merged
         # into the current file) and deletes itself afterwards.
         if dlg.exec_() != dlg.Accepted:
             return
         changes = dlg.changed_settings()
-        name = settings_mod.get("theme")
+        # The dialog already saved the theme (and the remembered theme per
+        # kind); apply exactly the one chosen there, not a re-derived one.
+        name = changes.get("theme") or settings_mod.get("theme")
         self._apply_theme(name, persist=False, announce=False)
-        self.log_panel.append(f"[OK] Settings saved — theme: {theme.theme_label(name)}")
+        self._log(f"[OK] Settings saved — theme: {theme.theme_label(name)}")
+        if "screen_backend" in changes:
+            from .mirror_panel import MirrorPanel
+
+            MirrorPanel.apply_default_backend(self, old_backend)
         if "adb_path" in changes:
             self._offer_adb_restart_for_new_binary()
 
@@ -2285,17 +2457,19 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self.restart_adb_server()
         else:
-            self.log_panel.append(
+            self._log(
                 "[WARNING] adb path changed but the running ADB server still uses the "
                 "previous binary — use Restart ADB server to switch.")
 
     def _apply_theme(self, name: str, *, persist: bool = True, announce: bool = True) -> None:
         """Apply any theme from ``theme.THEMES`` from any entry point (menu,
-        toolbar, or Settings) and keep every chooser in sync."""
-        if name not in theme.THEMES:
-            name = "dark"
+        toolbar, or Settings) and keep every chooser in sync. A retired theme
+        name applies the default theme of its kind."""
+        name = theme.resolve_name(name)
         if persist:
-            settings_mod.set("theme", name)
+            # One write: the theme plus the remembered dark/light choice that
+            # the toggle returns to (the theme being left is recorded too).
+            settings_mod.update(theme.theme_choice(name, previous=theme.current_name()))
         theme.apply_to_app(QApplication.instance(), name)
         # Terminal widgets have a small inline stylesheet for monospace
         # rendering; refresh it explicitly after a switch.
@@ -2310,38 +2484,86 @@ class MainWindow(QMainWindow):
         self._sync_theme_menu()
         self.refresh_sessions()
         if announce:
-            self.log_panel.append(f"[OK] Theme: {theme.theme_label(name)}")
+            self._log(f"[OK] Theme: {theme.theme_label(name)}")
+
+    def _add_theme_choices(self, menu) -> dict:
+        """List every theme in *menu* as a checkable item that applies exactly
+        that theme; dark and light palettes are two clearly separate groups.
+        Returns ``{theme key: action}`` for :meth:`_sync_theme_menu`.
+
+        The sun/moon sits on the group heading only: under the stylesheet a
+        menu item's icon replaces its check mark, so iconed items looked the
+        same checked or not and the active theme was never marked."""
+        actions = {}
+        for light in (False, True):
+            if light:
+                menu.addSeparator()
+            heading = menu.addAction(
+                _theme_kind_icon(light), "Light themes" if light else "Dark themes"
+            )
+            heading.setEnabled(False)
+            for key in theme.theme_names():
+                if theme.is_light(key) != light:
+                    continue
+                action = menu.addAction(theme.theme_label(key))
+                action.setCheckable(True)
+                action.triggered.connect(lambda _checked=False, name=key: self._apply_theme(name))
+                actions[key] = action
+        return actions
+
+    def _build_theme_toggle(self, tb):
+        """The ribbon's light/dark toggle, a split button: clicking it toggles,
+        its arrow lists every theme to pick an exact one.
+
+        Only the action's own ``triggered`` toggles. QToolButton.triggered (and
+        QToolBar.actionTriggered) also fire for the dropdown's items, so neither
+        may be connected to the toggle: picking Mist would then also flip to
+        a dark theme."""
+        self.act_theme = QAction(self)
+        self.act_theme.triggered.connect(self.toggle_theme)
+        menu = QMenu(self)
+        self._theme_button_actions = self._add_theme_choices(menu)
+        self.act_theme.setMenu(menu)
+        tb.addAction(self.act_theme)
+        button = tb.widgetForAction(self.act_theme)
+        if button is not None:
+            button.setObjectName("themeToggle")
+            button.setPopupMode(QToolButton.MenuButtonPopup)
+        self._sync_theme_action()
 
     def _sync_theme_action(self):
-        """Point the ribbon toggle at the theme you'll switch TO — the other half
-        of the current dark/light pair (moon = go dark, sun = go light)."""
+        """Point the ribbon toggle at the theme you'll switch TO — the most recent
+        theme of the other kind (moon = go dark, sun = go light)."""
         if not hasattr(self, "act_theme"):
             return
-        target = theme.counterpart(settings_mod.get("theme"))
-        self.act_theme.setIcon(
-            icons.icon("sun", "amber") if theme.is_light(target) else icons.icon("moon", "blue")
-        )
-        self.act_theme.setText(theme.theme_label(target))
-        self.act_theme.setToolTip(f"Switch to the {theme.theme_label(target)} theme")
+        target = theme.toggle_target()
+        label = theme.theme_label(target)
+        self.act_theme.setIcon(_theme_kind_icon(theme.is_light(target)))
+        self.act_theme.setText(label)
+        self.act_theme.setToolTip(f"Switch to the {label} theme (arrow: choose any theme)")
         self._sync_theme_menu()
 
     def _sync_theme_menu(self):
-        if not hasattr(self, "_theme_menu_actions"):
-            return
-        current = settings_mod.get("theme")
-        for key, action in self._theme_menu_actions.items():
-            action.setChecked(key == current)
+        current = theme.current_name()
+        for attr in ("_theme_menu_actions", "_theme_button_actions"):
+            for key, action in getattr(self, attr, {}).items():
+                action.setChecked(key == current)
 
     def toggle_theme(self):
-        """Switch to the other half of the current dark/light pair, live."""
-        self._apply_theme(theme.counterpart(settings_mod.get("theme")))
+        """Switch between light and dark, live: to the most recently chosen
+        theme of the other kind (Slate -> Porcelain -> Slate), never to the
+        current theme's table pair (Slate -> Mist)."""
+        self._apply_theme(theme.toggle_target())
 
     def _close_tab(self, index):
         w = self.tabs.widget(index)
+        label = self.tabs.tabText(index)
         try:
             w.close_session()
-        except Exception:
-            pass
+        except Exception as exc:
+            # The tab still closes, but a failed teardown is how an orphaned
+            # scrcpy survives a closed tab — say so instead of hiding it.
+            self._warn_teardown(f"close {label!r} cleanly", exc)
         self.tabs.removeTab(index)
         if w is not None and w is getattr(self, "_webcam_tab", None):
             # Forget the deleted panel so View -> Open webcam can reopen it.
@@ -2429,6 +2651,10 @@ class MainWindow(QMainWindow):
         webbrowser.open("https://nvnkennedy.github.io/turboadb/")
 
     def closeEvent(self, event):
+        # Every starter below checks this, so a worker finishing during teardown
+        # can no longer restart the poll timer, the device tracker or the ADB
+        # init thread on a window that is going away.
+        self._closing = True
         try:
             self._timer.stop()
         except Exception:
@@ -2438,18 +2664,44 @@ class MainWindow(QMainWindow):
                 self._tracker.stop()
             except Exception:
                 pass
-        # park any still-running worker threads — Qt crashes if a QThread object
-        # is destroyed (with this window) while its thread is alive
-        for attr in ("_poll", "_tracker", "_adb_init", "_as", "_dl", "_share", "_unshare", "_deploy",
-                     "_sc", "_upd_chk", "_upd_run", "_upd_quiet", "_disc",
-                     "_bcast", "_pair"):
-            park_thread(getattr(self, attr, None))
+        self._release_workers()
         for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
             try:
-                self.tabs.widget(i).close_session()
-            except Exception:
-                pass
+                tab.close_session()
+            except Exception as exc:
+                # A tab that cannot close cleanly can leave an orphaned scrcpy
+                # behind; the app still closes, but never silently.
+                self._warn_teardown(f"close {self.tabs.tabText(i)!r}", exc)
         super().closeEvent(event)
+
+    def _release_workers(self) -> None:
+        """Detach every worker's result signals, then park it.
+
+        A parked thread outlives the window, so its completion slot would
+        otherwise still run during teardown — restarting the device poll,
+        popping message boxes over a closed window, or spawning a tracker
+        nobody stops.  Parking afterwards re-arms finished->deleteLater (Qt
+        aborts if a QThread object is destroyed while its thread is alive).
+        """
+        for attr in _WORKER_ATTRS:
+            worker = getattr(self, attr, None)
+            disconnect_signals(worker, _WORKER_SIGNALS)
+            park_thread(worker)
+
+    def _warn_teardown(self, what: str, exc: BaseException) -> None:
+        """Record a non-fatal teardown failure instead of swallowing it."""
+        _log.warning("could not %s: %s: %s", what, type(exc).__name__, exc)
+        text = f"[WARNING] could not {what}: {exc}"
+        try:
+            # While the window itself is closing there is nothing left to toast
+            # over, so the line goes straight to the log.
+            if getattr(self, "_closing", False):
+                self.log_panel.append(text)
+            else:
+                self._log(text)
+        except Exception:  # the panel may already be gone during teardown
+            pass
 
 
 class _EdgeHandle(QWidget):

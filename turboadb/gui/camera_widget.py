@@ -310,15 +310,25 @@ class _FfmpegFinalizeThread(QThread):
 
 class _LocalPrep(QThread):
     """Make sure ffmpeg is available (download once if needed) and list local
-    cameras — off the UI thread so the app never freezes during the one-time fetch."""
+    cameras — off the UI thread so the app never freezes during the one-time fetch.
+
+    *cancel* is a :class:`threading.Event` the setup dialog's Cancel button sets;
+    the download checks it between chunks."""
 
     progress = pyqtSignal(str)
     done = pyqtSignal(str, list)  # ffmpeg path, cameras
     fail = pyqtSignal(str)
 
+    def __init__(self, cancel=None):
+        super().__init__()
+        self._cancel = cancel
+
     def run(self):
         try:
-            ff = ffmpeg_tools.ensure_local_ffmpeg(self.progress.emit)
+            ff = ffmpeg_tools.ensure_local_ffmpeg(
+                self.progress.emit,
+                should_cancel=None if self._cancel is None else self._cancel.is_set,
+            )
             self.done.emit(ff, ffmpeg_tools.list_local_cameras(ff))
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
@@ -346,6 +356,62 @@ class _RemotePrep(QThread):
             self.done.emit(ffmpeg, cams, diag)
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
+
+
+# A remote stream leaves BOTH an ffmpeg process and an inbound firewall rule on
+# the remote host, so its WinRM teardown has to finish before this process does.
+# The jobs are parked QThreads that nobody joined, so closing the app during a
+# remote stream used to leak both; aboutToQuit now waits for them, briefly.
+_REMOTE_STOPS = []
+_REMOTE_STOP_JOIN_S = 6.0
+_quit_hook_installed = False
+
+
+def _install_quit_hook() -> None:
+    global _quit_hook_installed
+    if _quit_hook_installed:
+        return
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    app.aboutToQuit.connect(join_remote_stops)
+    _quit_hook_installed = True
+
+
+def track_remote_stop(job) -> None:
+    """Remember a WinRM teardown job so the application waits for it on quit."""
+    _REMOTE_STOPS[:] = [j for j in _REMOTE_STOPS if thread_running(j)]
+    _REMOTE_STOPS.append(job)
+    _install_quit_hook()
+
+
+def join_remote_stops(timeout_s: float = _REMOTE_STOP_JOIN_S) -> bool:
+    """Wait (bounded) for the remote teardowns; True if they all finished.
+
+    Blocking here is deliberate and short: the alternative is a stranded ffmpeg
+    holding the remote camera with its stream port open to this PC.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    finished = True
+    for job in list(_REMOTE_STOPS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            finished = False
+            break
+        try:
+            if not job.wait(int(remaining * 1000)):
+                finished = False
+        except RuntimeError:  # the C++ wrapper is already gone
+            pass
+    _REMOTE_STOPS[:] = [j for j in _REMOTE_STOPS if thread_running(j)]
+    if not finished:
+        _log.warning(
+            "a remote webcam teardown did not finish within %.0f s; the remote ffmpeg "
+            "and its firewall rule may need to be cleared by the next start", timeout_s
+        )
+    return finished
 
 
 def _close_socket(sock) -> None:
@@ -520,6 +586,9 @@ class CameraPanel(QWidget):
         self._starter = None
         self._probe = None
         self._closing = False
+        # set by the setup dialog's Cancel button; the one-time ffmpeg download
+        # checks it between chunks
+        self._dl_cancel = threading.Event()
         # bumped on every start/stop; delayed callbacks from an older stream
         # (diagnostic timers, a late remote start) compare it and bail out
         self._stream_gen = 0
@@ -773,19 +842,34 @@ class CameraPanel(QWidget):
     def _ensure_dl_dialog(self):
         if self._dl_dialog is not None:
             return
-        dlg = QProgressDialog("Setting up ffmpeg (one-time, ~160 MB)…", None, 0, 100, self)
+        # Cancel really cancels: the download checks _dl_cancel between chunks,
+        # so a throttled network no longer pins a window-modal dialog over the
+        # main window with nothing but "wait" to offer.
+        dlg = QProgressDialog("Setting up ffmpeg (one-time, ~160 MB)…", "Cancel", 0, 100, self)
         dlg.setWindowTitle("TurboADB — camera setup")
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
-        dlg.setCancelButton(None)
         dlg.setValue(0)
+        dlg.canceled.connect(self._cancel_download)
         self._dl_dialog = dlg
         dlg.show()
 
+    def _cancel_download(self):
+        self._dl_cancel.set()
+        self._set_status("Cancelling the ffmpeg download…", "warn")
+        if self._dl_dialog is not None:
+            self._dl_dialog.setLabelText("Cancelling…")
+
     def _close_dl_dialog(self):
         if self._dl_dialog is not None:
+            try:
+                # Closing a QProgressDialog that has a Cancel button triggers it;
+                # a finished download must not look like a cancelled one.
+                self._dl_dialog.canceled.disconnect(self._cancel_download)
+            except (RuntimeError, TypeError):
+                pass
             try:
                 self._dl_dialog.close()
             except Exception:
@@ -836,23 +920,30 @@ class CameraPanel(QWidget):
             self._prep.progress.connect(lambda m: self._set_status(m, "info"))
             self._prep.done.connect(self._remote_ready)
             self._prep.fail.connect(self._prep_fail)
-            self._prep.start()
         else:
             self._set_status("Finding cameras…", "info")
-            self._prep = _LocalPrep()
+            self._dl_cancel.clear()
+            self._prep = _LocalPrep(self._dl_cancel)
             self._prep.progress.connect(self._on_progress)
             self._prep.done.connect(self._local_ready)
             self._prep.fail.connect(self._prep_fail)
-            self._prep.start()
+        # One place gives "Scan cameras" back: a worker that ends without a
+        # result (an unexpected error, a cancelled download) used to leave the
+        # button greyed out for the rest of the session.
+        self._prep.finished.connect(lambda t=self._prep: self._prep_finished(t))
+        self._prep.start()
+
+    def _prep_finished(self, thread=None):
+        if self._closing or (thread is not None and thread is not self._prep):
+            return  # a newer scan owns the button now
+        self.refresh_btn.setEnabled(True)
 
     def _local_ready(self, ffmpeg, cams):
         self._close_dl_dialog()
-        self.refresh_btn.setEnabled(True)
         self._ffmpeg = ffmpeg
         self._fill(cams, quiet=self._scan_quiet)
 
     def _remote_ready(self, ffmpeg, cams, diag):
-        self.refresh_btn.setEnabled(True)
         self._remote_ffmpeg = ffmpeg
         self._save_remote_details()  # remember host/user/domain (not password)
         self._fill(cams, diag, quiet=self._scan_quiet)
@@ -907,7 +998,10 @@ class CameraPanel(QWidget):
 
     def _prep_fail(self, msg):
         self._close_dl_dialog()
-        self.refresh_btn.setEnabled(True)
+        if self._dl_cancel.is_set():
+            # The user pressed Cancel in the setup dialog; that is not an error.
+            self._set_status("ffmpeg setup cancelled — Scan again to retry.", "warn")
+            return
         self._set_status("Couldn't list cameras.", "error")
         if not self._scan_quiet:
             QMessageBox.warning(self, "Camera", f"Couldn't list cameras:\n\n{msg}")
@@ -1033,7 +1127,7 @@ class CameraPanel(QWidget):
 
             remote_webcam.stop_remote_stream(host, login, pw, pid, stream_port=port)
 
-        run_job(self._jobs, stop)
+        track_remote_stop(run_job(self._jobs, stop))
 
     def _later(self, ms, fn):
         """Run *fn* after *ms* — only if the same stream is still current and the
@@ -1494,10 +1588,14 @@ class CameraPanel(QWidget):
         if self._closing:
             return
         self._closing = True
+        self._dl_cancel.set()  # abandon a one-time download nobody is waiting for
         self._close_dl_dialog()
         self._timer.stop()
         self._stop_stream()  # also cancels a pending remote start
-        for thread, names in ((self._prep, ("progress", "done", "fail")), (self._probe, ("done",))):
+        for thread, names in (
+            (self._prep, ("progress", "done", "fail", "finished")),
+            (self._probe, ("done",)),
+        ):
             disconnect_signals(thread, names)
             park_thread(thread)
         self._prep = self._probe = None

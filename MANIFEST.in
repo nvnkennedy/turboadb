@@ -1,0 +1,29 @@
+# What goes into the sdist on top of the package itself.
+#
+# setuptools only ships README.md, LICENSE, pyproject.toml and the package's own
+# declared data by default, so the reference docs the project points people at
+# (CLI.md in particular, which tests/test_cli_docs.py keeps in sync with the
+# CLI) were missing from every source release.
+include LICENSE
+include README.md
+include CHANGELOG.md
+include ARCHITECTURE.md
+include CLI.md
+include AGENTS.md
+include requirements.txt
+include ruff.toml
+include turboadb-gui.spec
+include turboadb/py.typed
+
+recursive-include turboadb *.md
+recursive-include turboadb/assets *.ico *.png
+# The bundled Windows GUI executable ships in the sdist as well as the wheel.
+recursive-include turboadb/bin *.exe *.txt
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include examples *.py
+
+# Build leftovers never belong in a source release.
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod]

@@ -67,17 +67,26 @@ These work on every device command, **before or after** the command name
 | `-V`, `--version` | Print the TurboADB version. |
 
 `doctor`, `fetch-tools`, `upgrade-tools`, `self-update`, `shortcut`, `gui` and
-`deploy-serve` don't talk to a device, so they take no device options.
+`deploy-serve` don't talk to a device, so of these options they take only
+`--json` (before or after the command name, like everything else).
 
 ## Output and exit codes
 
-With `--json`, commands that return data print it as JSON (`devices`, `info`,
-`shell`, `adb`, `push`, `pull`, `ls`, `stat`, `packages`, `displays`, `getprop`,
-`battery`, `health`, `build-info`, `call-log`, `sms`, `phone-support`, `targets list`,
-`forward --list` …). Actions print `{"ok": true, "message": "…"}`, and commands that
-save a file print `{"ok": true, "path": "…"}`. `logcat` streams plain lines, and the
-setup commands (`doctor`, `fetch-tools`, `upgrade-tools`, `serve`, `deploy-serve`)
-print text.
+With `--json`, every command prints **one** JSON document on stdout and nothing
+else; progress and warnings go to stderr, so `turboadb … --json | jq` always
+works.
+
+Commands that return data print it as JSON (`devices`, `info`, `shell`, `adb`,
+`push`, `pull`, `ls`, `stat`, `packages`, `displays`, `getprop`, `battery`,
+`health`, `build-info`, `call-log`, `sms`, `phone-support`, `targets list`,
+`forward --list`, `doctor`, `fetch-tools`, `upgrade-tools` …). Actions print
+`{"ok": true, "message": "…"}`; commands that return a value (`pair`,
+`disconnect`, `restart-server`, `connect`, `scrcpy` → `{"pid": N}` …) print
+`{"ok": true, "result": …}`; commands that save a file print
+`{"ok": true, "path": "…"}`. `health --full` and `build-info --full` print
+`{"ok": true, "report": "…"}` unless `-o FILE` is given, `record` prints
+`{"ok": true, "paths": [...]}` (every part of a `--continuous` recording), and
+`logcat` streams plain lines.
 
 | Exit code | Meaning |
 |---|---|
@@ -103,19 +112,24 @@ print text.
 ## Setup and tools
 
 ### `turboadb doctor`
-Report whether adb and scrcpy were found, and where.
+Report whether adb and scrcpy were found, and where. With `--json` it prints the
+whole diagnosis as one object.
 ```bash
 turboadb doctor
+turboadb doctor --json
 ```
 
 ### `turboadb fetch-tools`
-Download adb (and scrcpy) into `~/.turboadb/tools`.
+Download adb (and scrcpy) into `~/.turboadb/tools`. `--adb-only` and
+`--scrcpy-only` are mutually exclusive — asking for both leaves nothing to
+download.
 
 | Option | Meaning |
 |---|---|
 | `--adb-only` | Only platform-tools (adb). |
 | `--scrcpy-only` | Only scrcpy. |
 | `--force` | Download again even if present. |
+| `--json` | Print what was downloaded (and any errors) as one object. |
 
 ```bash
 turboadb fetch-tools
@@ -128,9 +142,11 @@ Update adb and scrcpy, downloading only when a newer version exists.
 | Option | Meaning |
 |---|---|
 | `--check` | Only report what would be updated. |
+| `--json` | Print the version check (with `--check`) or what was updated. |
 
 ```bash
 turboadb upgrade-tools --check
+turboadb upgrade-tools --check --json
 ```
 
 ### `turboadb self-update`
@@ -147,6 +163,11 @@ turboadb self-update
 
 ### `turboadb shortcut`
 Create Desktop and Start-menu shortcuts to the GUI (Windows).
+
+| Option | Meaning |
+|---|---|
+| `--json` | Print the outcome as `{"ok": …, "message": "…"}`. |
+
 ```bash
 turboadb shortcut
 ```
@@ -162,10 +183,12 @@ turboadb gui
 ## Devices and connection
 
 ### `turboadb devices`
-List the devices on the local adb server, or on another PC's with `--adb-host`.
+List the devices on the local adb server, or on another PC's with `--adb-host`
+(or `-s @NAME` for a saved remote target — the list comes from *that* server).
 ```bash
 turboadb devices
 turboadb --adb-host lab-pc-01 devices --json
+turboadb -s @lab-pc devices
 ```
 
 ### `turboadb info`
@@ -312,7 +335,7 @@ aren't read as TurboADB options. With no command, it opens an interactive shell.
 | Option | Meaning |
 |---|---|
 | `--su` | Run it as root (`su -c`). |
-| `--all` | Run the command on every online device, one after another. |
+| `--all` | Run the command on every online device, one after another — on the adb server `--adb-host` or `-s @NAME` selects. |
 | `--batch FILE` | Run each line of FILE as a command, in order (blank and `#` lines are skipped). Stops at the first failing command. |
 | `--keep-going` | With `--batch`: carry on after a failing command. |
 | `COMMAND…` | The command and its arguments. |
@@ -636,6 +659,7 @@ saves the file.
 | `--bit-rate RATE` | For example `8M`. |
 | `--display N` | Record this display. |
 | `--continuous` | Keep recording past the 3-minute cap, in 3-minute parts (`clip.mp4`, `clip-part02.mp4` …), until Ctrl+C. |
+| `--json` | One `{"ok": …, "paths": [...]}` object listing every part. A part that fails after earlier ones were saved still exits `1`. |
 
 ```bash
 turboadb -s SERIAL record clip.mp4 --time-limit 20 --size 1280x720 --bit-rate 8M
@@ -680,6 +704,7 @@ Mirror and control the screen with scrcpy.
 | `--camera-size WxH` | Camera resolution. |
 | `--log FILE` | Write scrcpy's own log to a file (for troubleshooting). |
 | `--wait` | Block until the scrcpy window closes. |
+| `--json` | Print `{"ok": true, "result": {"pid": N}}` instead of the launch message. |
 
 ```bash
 turboadb -s SERIAL scrcpy --max-size 1280 --bit-rate 8M
@@ -900,10 +925,12 @@ A one-shot health snapshot: battery, temperature, memory, CPU and uptime.
 |---|---|
 | `--full` | The detailed report, with the raw system dumps. |
 | `-o`, `--output FILE` | Save the `--full` report to a file. |
+| `--json` | The snapshot as data, or with `--full` the report as `{"ok": true, "report": "…"}` (or `{"ok": true, "path": "…"}` with `-o`). |
 
 ```bash
 turboadb -s SERIAL health
 turboadb -s SERIAL health --full -o health.txt
+turboadb -s SERIAL health --full --json
 ```
 
 ### `turboadb build-info`
@@ -913,6 +940,7 @@ Build and version properties.
 |---|---|
 | `--full` | The detailed report, with every property. |
 | `-o`, `--output FILE` | Save the `--full` report to a file. |
+| `--json` | The properties as data, or with `--full` the report as `{"ok": true, "report": "…"}` (or `{"ok": true, "path": "…"}` with `-o`). |
 
 ```bash
 turboadb -s SERIAL build-info
@@ -1114,7 +1142,11 @@ turboadb -s SERIAL reverse --remove-all
 ### `turboadb serve`
 Share this PC's adb server on the network so other machines can drive its
 devices (`--adb-host` on their side). Opens the firewall ports, which needs
-Administrator.
+Administrator; what it could not do is reported on stderr and exits `1`.
+
+`serve` never downloads adb by itself: the startup task runs it as SYSTEM, where
+a download would put a second adb in another profile and bind port 5037 with it.
+Run `turboadb fetch-tools` (or set `TURBOADB_ADB`) if adb is missing there.
 
 | Option | Meaning |
 |---|---|
@@ -1124,6 +1156,7 @@ Administrator.
 | `--uninstall-startup` | Remove the auto-start again. |
 | `--status` | Report whether the adb server is shared. |
 | `--stop` | Stop sharing and go back to a local-only adb server. |
+| `--json` | With `--status`, print `{"port": …, "shared": …}`. |
 
 ```bash
 turboadb serve
@@ -1147,6 +1180,7 @@ Set up `turboadb serve` on remote Windows PCs from your machine, over WinRM
 | `--winrm-port PORT` | WinRM port (default `5985`, or `5986` with `--ssl`). |
 | `--no-update` | Don't upgrade TurboADB on the targets. |
 | `--test` | Only check the WinRM connection. |
+| `--json` | Print `{"ok": …, "hosts": [...]}`; the running commentary moves to stderr. |
 
 ```bash
 turboadb deploy-serve lab-pc-01 -u "DOMAIN\user" --test

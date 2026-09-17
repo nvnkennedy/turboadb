@@ -10,12 +10,15 @@ so a live theme switch restyles the whole panel.
 The host (DeviceTab's side panel) supplies the card surface, so sections draw no
 boxes of their own. They flow into 1/2/3 columns by width (masonry, so a short
 section never leaves a gap), and every tile row reflows its own column count, so
-the panel never scrolls horizontally in the ~340 px side pane.
+the panel never scrolls horizontally in the ~340 px side pane. A column never
+grows past _COL_MAX, so buttons keep a sensible width on a big monitor; the host
+asks :meth:`ControlsPanel.layout_options` how wide and tall each column count is
+and sizes the panel to fit instead of stretching it.
 """
 
 from __future__ import annotations
 
-from PyQt5.QtCore import QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout,
@@ -33,8 +36,11 @@ _INPUT_H = 36          # text fields and the buttons beside them
 _SEG_H = 30            # the On | Off pair inside a quick-setting tile
 _SEG_W = 46
 _GROUP_W = 320         # px budget per section column
+_COL_MAX = 380         # a section column never grows wider than this
+_COL_GAP = 20          # between section columns
 _MAX_COLS = 3
 _SECTION_GAP = 18
+_HOST_MARGINS = (12, 6, 12, 16)  # left, top, right, bottom around the sections
 
 # Explanations some connectivity toggles return when every method was refused
 # by the device (rather than raising); surface them as warnings, not success.
@@ -112,6 +118,17 @@ class _TileGrid(_Surface):
             if n * need + (n - 1) * spacing <= width:
                 return n
         return self._choices[-1]
+
+    def height_for(self, width=None):
+        """Height at *width* (default: as placed now): the row count follows
+        the width. Only a prediction, for ControlsPanel.layout_options; a real
+        resize re-places the buttons."""
+        if not self.buttons:
+            return 0
+        columns = self._ncols if width is None else self.columns_for(width)
+        rows = -(-len(self.buttons) // max(1, columns))
+        row_h = max(max(b.sizeHint().height(), b.minimumHeight()) for b in self.buttons)
+        return rows * row_h + (rows - 1) * self._grid.verticalSpacing()
 
     def _place(self, ncols):
         if ncols == self._ncols:
@@ -221,7 +238,8 @@ class _QuickTile(QWidget):
 class ControlsPanel(QWidget):
     log = pyqtSignal(str)
 
-    def __init__(self, handler, compact=False, on_reboot=None, parent=None, dispatcher=None):
+    def __init__(self, handler, compact=False, on_reboot=None, parent=None, dispatcher=None,
+                 display_provider=None):
         """*compact=True* (the Control + Mirror side pane) allows a narrower
         minimum width so the mirror keeps most of the space — the sections
         simply reflow into a single column there."""
@@ -230,6 +248,8 @@ class ControlsPanel(QWidget):
         self._compact = compact
         self._on_reboot = on_reboot
         self._owns_dispatcher = dispatcher is None
+        # Which logical display keys and typing go to (None = the default one).
+        self._display_provider = display_provider
         self._dispatcher = dispatcher or DeviceCommandDispatcher()
         self._ncols = -1
         self._strip = False  # True: laid out as a wide strip under the screen
@@ -255,18 +275,32 @@ class ControlsPanel(QWidget):
 
         host = _Surface()
         host_lay = QVBoxLayout(host)
-        host_lay.setContentsMargins(12, 6, 12, 16)
+        host_lay.setContentsMargins(*_HOST_MARGINS)
         host_lay.setSpacing(0)
         self._grid_host = _Surface()           # ONE persistent host; rebuilt in place
         self._card_grid = QGridLayout(self._grid_host)
         self._card_grid.setContentsMargins(0, 0, 0, 0)
-        self._card_grid.setHorizontalSpacing(20)
+        self._card_grid.setHorizontalSpacing(_COL_GAP)
         self._card_grid.setVerticalSpacing(0)
         self._columns = []
-        host_lay.addWidget(self._grid_host)
+        # Columns stop at _COL_MAX; a wider panel centres them rather than
+        # stretching every button across the spare width.
+        centre = QHBoxLayout()
+        centre.setContentsMargins(0, 0, 0, 0)
+        centre.setSpacing(0)
+        centre.addStretch(1)
+        centre.addWidget(self._grid_host, 1000)
+        centre.addStretch(1)
+        host_lay.addLayout(centre)
         host_lay.addStretch(1)                 # sections keep their natural height
         scroll.setWidget(host)
         outer.addWidget(scroll)
+
+        # set_strip changes the minimum width, so the host resizes us right
+        # after; relayout once from the event loop, at the width we end up with.
+        self._strip_timer = QTimer(self)
+        self._strip_timer.setSingleShot(True)
+        self._strip_timer.timeout.connect(self._relayout_now)
 
         self.setMinimumWidth(340 if compact else 500)
         self._ready = True
@@ -280,6 +314,7 @@ class ControlsPanel(QWidget):
         if ncols == self._ncols:
             return
         self._ncols = ncols
+        self._grid_host.setMaximumWidth(ncols * _COL_MAX + (ncols - 1) * _COL_GAP)
         grid = self._card_grid
         for g in self._groups:                # detach (kept alive by self._groups)
             g.setParent(None)
@@ -300,21 +335,25 @@ class ControlsPanel(QWidget):
             heights.append(0)
             grid.addWidget(column, 0, c, Qt.AlignTop)
             grid.setColumnStretch(c, 1)        # equal columns fill the full width
+        column_w = self._column_width(self.width(), ncols)
         for g in self._groups:
             c = heights.index(min(heights))
             layouts[c].addWidget(g)
             g.setVisible(True)
-            heights[c] += g.sizeHint().height() + _SECTION_GAP
+            heights[c] += self._section_height(g, column_w) + _SECTION_GAP
         for lay in layouts:
             lay.addStretch(1)
 
+    def _relayout_now(self) -> None:
+        """Flow the sections into the column count the current width allows."""
+        if self._ready:
+            # use the panel width (not the scrollbar-reduced viewport) so a
+            # vertical scrollbar can't trap us in a too-narrow single column
+            self._relayout(self._columns_for(self.width()))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not self._ready:
-            return
-        # use the panel width (not the scrollbar-reduced viewport) so a vertical
-        # scrollbar can't trap us in a too-narrow single column
-        self._relayout(self._columns_for(self.width()))
+        self._relayout_now()
 
     STRIP_COLS = 6  # a strip under the screen is wide: up to six section columns
 
@@ -324,23 +363,92 @@ class ControlsPanel(QWidget):
 
     def set_strip(self, strip: bool) -> None:
         """Lay the sections out as a wide, short strip (under the device screen)
-        instead of a side panel; the side panel keeps its 340 px minimum."""
+        instead of a side panel; the side panel keeps its 340 px minimum.
+
+        The flip comes with a new width from the splitter, which arrives as a
+        resize just after this call. Relayouting here would rebuild every
+        section at the OLD width and the resize would rebuild them again, so
+        the work is deferred and the two collapse into one rebuild.
+        """
         strip = bool(strip)
         if strip == self._strip:
             return
         self._strip = strip
         self.setMinimumWidth(1 if strip else (340 if self._compact else 500))
         if self._ready:
-            self._relayout(self._columns_for(self.width()))
+            self._strip_timer.start(0)
 
     def content_height(self, width, strip=None) -> int:
         """Height the sections need when flowed into the columns *width* allows
         (packed like _relayout: each section into the shortest column)."""
-        heights = [0] * self._columns_for(width, strip)
+        return self.columns_height(self._columns_for(width, strip), width)
+
+    @staticmethod
+    def _column_width(width, ncols) -> int:
+        """One section column's width in a panel *width* px wide."""
+        ncols = max(1, int(ncols))
+        inner = int(width) - _HOST_MARGINS[0] - _HOST_MARGINS[2] - (ncols - 1) * _COL_GAP
+        return max(1, min(_COL_MAX, inner // ncols))
+
+    @staticmethod
+    def _section_height(group, column_width) -> int:
+        """A section's height in a column *column_width* px wide: its rows
+        added up, with each tile grid at the row count that width gives.
+        (Not the section's size hint: right after a resize that is still the
+        one from before its grids were re-placed.)"""
+        lay = group.layout()
+        if lay is None:
+            return max(1, group.sizeHint().height())
+        margins = lay.contentsMargins()
+        height, rows = margins.top() + margins.bottom(), 0
+        for index in range(lay.count()):
+            item = lay.itemAt(index)
+            if item is None or item.isEmpty():
+                continue
+            widget = item.widget()
+            if isinstance(widget, _TileGrid):
+                height += widget.height_for(column_width)
+            else:
+                height += item.sizeHint().height()
+            rows += 1
+        return max(1, height + max(0, lay.spacing()) * max(0, rows - 1))
+
+    def columns_height(self, ncols, width=None) -> int:
+        """Height of the sections packed into *ncols* columns of a panel
+        *width* px wide (default: the narrowest panel showing that many)."""
+        ncols = max(1, int(ncols))
+        if width is None:
+            width = self.width_range(ncols)[0]
+        column_w = self._column_width(width, ncols)
+        heights = [0] * ncols
         for g in self._groups:
             c = heights.index(min(heights))
-            heights[c] += g.sizeHint().height() + _SECTION_GAP
-        return max(heights) + 22  # the host's top and bottom margins
+            heights[c] += self._section_height(g, column_w) + _SECTION_GAP
+        # the last section's gap is not drawn; the host's margins are
+        return max(heights) - _SECTION_GAP + _HOST_MARGINS[1] + _HOST_MARGINS[3]
+
+    def width_range(self, ncols):
+        """``(narrowest, widest)`` panel widths that lay the sections out in
+        *ncols* columns: from where that many first fit, to where each column
+        reaches _COL_MAX (wider only adds side margins)."""
+        ncols = max(1, int(ncols))
+        side_min = 340 if self._compact else 500
+        low = max(side_min if ncols == 1 else 0, ncols * _GROUP_W)
+        high = (ncols * _COL_MAX + (ncols - 1) * _COL_GAP
+                + _HOST_MARGINS[0] + _HOST_MARGINS[2] + self._scrollbar_allowance())
+        return low, max(low, high)
+
+    def _scrollbar_allowance(self) -> int:
+        bar = self._scroll.verticalScrollBar()
+        return max(0, bar.sizeHint().width()) if bar is not None else 0
+
+    def layout_options(self, max_columns=_MAX_COLS):
+        """``[(columns, narrowest, widest, height), …]`` for 1..*max_columns*
+        section columns beside the device screen; the host picks one."""
+        return [
+            (n,) + self.width_range(n) + (self.columns_height(n),)
+            for n in range(1, max(1, int(max_columns)) + 1)
+        ]
 
     # ---- result / run plumbing ----
     @staticmethod
@@ -376,7 +484,7 @@ class ControlsPanel(QWidget):
         )
 
     def _run_info(self, label, fn):
-        self.log.emit(f"{label}…")
+        self.log.emit(f"[INFO] {label}…")
         self._dispatcher.submit(
             lambda: fn(self.handler),
             on_done=lambda result: self._show_info_result(label, result),
@@ -431,8 +539,29 @@ class ControlsPanel(QWidget):
         return b
 
     def _key_btn(self, text, icon_name, key, tone=None, **kwargs):
-        return self._btn(text, icon_name, lambda h, k=key: h.keyevent(k, safe=True),
-                         tone, **kwargs)
+        b = self._button(text, icon_name, tone, **kwargs)
+        b.clicked.connect(lambda _=False, t=text, k=key: self._send_key(t, k))
+        return b
+
+    def _target_display(self):
+        """The display the device screen shows — read on the UI thread, when the
+        button is pressed, never from the worker that sends the key."""
+        if self._display_provider is None:
+            return None
+        try:
+            return self._display_provider()
+        except Exception:
+            return None
+
+    def _display_kwargs(self):
+        """``{"display_id": N}`` for a secondary display, else nothing, so the
+        default display keeps the plain command."""
+        display_id = self._target_display()
+        return {} if display_id is None else {"display_id": display_id}
+
+    def _send_key(self, label, key):
+        extra = self._display_kwargs()
+        self._run(label, lambda h: h.keyevent(key, safe=True, **extra))
 
     def _icon_key(self, text, icon_name, key, tone, *, kind, height, icon_size):
         """An icon-only device key (nav bar, media): the label stays as the
@@ -676,7 +805,8 @@ class ControlsPanel(QWidget):
         if not t:
             return
         self.text.clear()
-        self._run(f"type {t!r}", lambda h: h.input_text(t, safe=True))
+        extra = self._display_kwargs()
+        self._run(f"type {t!r}", lambda h: h.input_text(t, safe=True, **extra))
 
     def close_panel(self):
         # Commands go through the dispatcher; a shared (device-tab) dispatcher

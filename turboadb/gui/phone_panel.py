@@ -6,11 +6,16 @@ field only opens the device dialler pre-filled, "Call back" only fills the
 number in, and composing opens the device's Messages app with a draft that the
 user sends there. The call log and messages load lazily the first time the
 page is shown, so connecting to a device never queries them.
+
+On a car head unit calls come from a phone connected over Bluetooth. With no
+phone connected the page says so calmly, disables the call actions and only
+re-checks the connection now and then while it is visible.
 """
 
 from __future__ import annotations
 
 import datetime
+import time
 
 from PyQt5.QtCore import QByteArray, QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QIconEngine, QPainter, QPixmap
@@ -37,10 +42,10 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..results import CommandResult, OperationResult
+from ..results import OperationResult
 from . import theme
-from .icons import icon, svg as icon_svg
-from .qtutil import close_jobs, run_job
+from .icons import svg as icon_svg
+from .qtutil import cached_icon, close_jobs, run_job, unwrap
 
 # Item data role holding a row's display dict (kind, label, icon, tone, ...).
 ROW_ROLE = Qt.UserRole + 1
@@ -96,33 +101,41 @@ _STATE_VIEW = {
     "none": ("No telephony", "error", "phone-off", "red"),
     # the device has no telephony at all (e.g. a head unit): expected, not a fault
     "unsupported": ("No telephony", "", "phone-off", "dim"),
+    # a car head unit with no phone connected over Bluetooth: expected as well
+    "no phone": ("No phone", "", "bluetooth", "dim"),
+    # a car head unit calling through the phone connected over Bluetooth
+    "phone": ("Phone connected", "ok", "bluetooth", "green"),
 }
+# states in which the page doesn't poll the call state
+_NO_CALL_STATE = (None, "none", "unsupported", "no phone", "phone")
 
 _HINT_DEFAULT = "Enter opens the dialler · Call rings the number"
 _HINT_NO_TELEPHONY = "This device reports no call state — calls may be unavailable"
 _HINT_UNSUPPORTED = "No SIM / telephony on this device — calls go through its own phone app"
+_HINT_NO_PHONE = "No phone connected — connect a phone over Bluetooth to make and take calls"
+_HINT_PHONE = "Calls go through the phone connected over Bluetooth"
+_TIP_NO_PHONE = "No phone connected — connect a phone to the head unit over Bluetooth first"
+_NO_PHONE_TITLE = "No phone connected"
+
+# Call actions that need a connected phone on a car (see _refresh_tips).
+_PHONE_ACTIONS = ("btn_call", "btn_dial", "btn_answer", "btn_end", "btn_compose")
 
 
-def _unwrap(res):
-    """Turn a safe-mode/raw handler result into a plain value or raise."""
+def _unwrap_rows(res) -> list:
+    rows = unwrap(res)
+    if not isinstance(rows, list):
+        raise RuntimeError("ADB did not return a list")
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _unwrap_flag(res):
+    """True / False / None from a safe- or raw-mode result (``unwrap`` treats a
+    plain False as a failed command, but "no phone connected" is an answer)."""
     if isinstance(res, OperationResult):
         if not res.success:
             raise res.error or RuntimeError(f"{res.action or 'ADB operation'} failed")
         res = res.value
-    if isinstance(res, CommandResult):
-        if not res.ok:
-            raise RuntimeError(res.stderr or "ADB command failed")
-        res = res.text
-    if res is False:
-        raise RuntimeError("device rejected the command")
-    return res
-
-
-def _unwrap_rows(res) -> list:
-    rows = _unwrap(res)
-    if not isinstance(rows, list):
-        raise RuntimeError("ADB did not return a list")
-    return [r for r in rows if isinstance(r, dict)]
+    return res if isinstance(res, bool) else None
 
 
 def format_when(ms, now=None) -> str:
@@ -184,10 +197,25 @@ def friendly_failure(message) -> str:
     return first if len(first) <= 160 else first[:157] + "…"
 
 
-def is_unsupported(message) -> bool:
-    """True when a failure only means the device lacks the feature altogether
-    (no call-log / SMS provider, no telephony service) — normal on head units."""
+def is_denied(message) -> bool:
+    """True when the device refused access (a SecurityException / permission denial)."""
     low = str(message or "").lower()
+    return any(
+        marker in low
+        for marker in ("securityexception", "permission denial", "requires android.permission")
+    )
+
+
+def is_unsupported(message, automotive=False) -> bool:
+    """True when a failure only means the device lacks the feature altogether
+    (no call-log / SMS provider, no telephony service) — normal on head units.
+
+    On a car head unit (*automotive*) a refused provider is just as expected:
+    its call log and messages belong to the phone app, not to adb. On a phone
+    a denial stays a real problem worth a warning."""
+    low = str(message or "").lower()
+    if automotive and is_denied(message):
+        return True
     return any(
         marker in low
         for marker in (
@@ -241,18 +269,6 @@ def _text_width(fm, text) -> int:
         return fm.horizontalAdvance(text)
     except AttributeError:  # Qt < 5.11
         return fm.width(text)
-
-
-_ICON_CACHE = {}
-
-
-def _cached_icon(name, tone):
-    """QIcons follow the live theme at paint time, so one instance per (name, tone) is enough."""
-    key = (name, tone)
-    cached = _ICON_CACHE.get(key)
-    if cached is None:
-        cached = _ICON_CACHE[key] = icon(name, tone)
-    return cached
 
 
 def _repolish(widget) -> None:
@@ -350,7 +366,7 @@ class _IconLabel(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        _cached_icon(self._name, self._tone).paint(painter, self.rect())
+        cached_icon(self._name, self._tone).paint(painter, self.rect())
         painter.end()
 
 
@@ -473,7 +489,7 @@ class _RowDelegate(QStyledItemDelegate):
         painter.setBrush(QColor(theme.tint(tone, extra=0.08)))
         painter.drawEllipse(badge)
         glyph = badge.adjusted(8.5, 8.5, -8.5, -8.5).toRect()
-        _cached_icon(row.get("icon") or "phone", tone).paint(painter, glyph)
+        cached_icon(row.get("icon") or "phone", tone).paint(painter, glyph)
 
         base = QFont(option.font)
         title_font = QFont(base)
@@ -571,6 +587,7 @@ class PhonePanel(QWidget):
     SMS_LIMIT = 100
     WIDE_MIN = 900  # side-by-side columns from this width, stacked below it
     POLL_MS = 4000  # call-state refresh while the page is visible
+    PHONE_CHECK_MS = 15000  # a car's phone-connection re-check while the page is visible
     STATE_AFTER_ACTION_MS = 1500
 
     PAGE_CALLS = 0
@@ -592,6 +609,13 @@ class PhonePanel(QWidget):
         self._support = None
         self._dial_missing = self._call_missing = self._sms_missing = False
         self._phone_apps = []
+        # A car head unit (phone_support "automotive") and whether a phone is
+        # connected to it over Bluetooth: True / False, None = can't tell.
+        self._car = False
+        self._phone_link = None
+        self._link_busy = False
+        self._link_reload = False
+        self._link_checked_at = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -620,6 +644,12 @@ class PhonePanel(QWidget):
         self._state_soon.setSingleShot(True)
         self._state_soon.setInterval(self.STATE_AFTER_ACTION_MS)
         self._state_soon.timeout.connect(lambda: self._load_state(quiet=True))
+        # On a car, re-check the phone connection now and then, only while the
+        # page is visible; nothing else is queried while no phone is connected.
+        self._link_poll = QTimer(self)
+        self._link_poll.setInterval(self.PHONE_CHECK_MS)
+        self._link_poll.timeout.connect(lambda: self._check_phone_link())
+        self._default_tips = {name: getattr(self, name).toolTip() for name in _PHONE_ACTIONS}
 
         self._set_state("checking")
         self.calls_empty.set_state("Loading recent calls…")
@@ -635,7 +665,7 @@ class PhonePanel(QWidget):
     def _button(text, icon_name, icon_tone=None, *, tone=None, role=None, tip="", slot=None):
         b = QPushButton(text)
         if icon_name:
-            b.setIcon(_cached_icon(icon_name, icon_tone))
+            b.setIcon(cached_icon(icon_name, icon_tone))
             b.setIconSize(QSize(16, 16))
         if tone:
             b.setProperty("tone", tone)
@@ -736,7 +766,7 @@ class PhonePanel(QWidget):
         self.number.textChanged.connect(lambda _t: self._sync_actions())
         self.btn_backspace = QToolButton()
         self.btn_backspace.setObjectName("iconButton")
-        self.btn_backspace.setIcon(_cached_icon("backspace", "dim"))
+        self.btn_backspace.setIcon(cached_icon("backspace", "dim"))
         self.btn_backspace.setIconSize(QSize(22, 22))
         self.btn_backspace.setAutoRepeat(True)
         self.btn_backspace.setFocusPolicy(Qt.NoFocus)
@@ -782,14 +812,21 @@ class PhonePanel(QWidget):
             "Call", "phone", "green", tone="green",
             tip="Place a call to this number on the device", slot=self._call,
         )
+        # Answer and End stay usable without telephony on this device: they send
+        # the standard call key events, which a head unit forwards to the phone
+        # paired over Bluetooth.  Nothing to hang up is reported as a hint, not
+        # as an error (see ``_action``).
         self.btn_end = self._button(
             "End", "phone-off", "text", role="danger",
-            tip="Hang up / reject the current call", slot=self._end_call,
+            tip="Hang up / reject the current call — sends the End-call key event to the device",
+            slot=self._end_call,
         )
         self.btn_end.setIcon(QIcon(_TokenIconEngine("phone-off", "on_danger")))
         self.btn_answer = self._button(
             "Answer", "phone-incoming", "green", tone="green",
-            tip="Answer the ringing call", slot=self._answer_call,
+            tip="Answer the ringing call — sends the Answer key event to the device "
+                "(works on a head unit with a phone paired over Bluetooth)",
+            slot=self._answer_call,
         )
         self.btn_dial = self._button(
             "Open in dialler", "dialpad", "accent", role="ghost",
@@ -925,13 +962,13 @@ class PhonePanel(QWidget):
         fields.setSpacing(8)
         self.sms_to = QLineEdit()
         self.sms_to.setPlaceholderText("To (number)")
-        self.sms_to.addAction(_cached_icon("user", "dim"), QLineEdit.LeadingPosition)
+        self.sms_to.addAction(cached_icon("user", "dim"), QLineEdit.LeadingPosition)
         self.sms_to.setMinimumWidth(120)
         self.sms_to.setMaximumWidth(200)
         self.sms_to.textChanged.connect(lambda _t: self._sync_actions())
         self.sms_body = QLineEdit()
         self.sms_body.setPlaceholderText("Message…")
-        self.sms_body.addAction(_cached_icon("message", "dim"), QLineEdit.LeadingPosition)
+        self.sms_body.addAction(cached_icon("message", "dim"), QLineEdit.LeadingPosition)
         self.sms_body.returnPressed.connect(self._compose)
         fields.addWidget(self.sms_to)
         fields.addWidget(self.sms_body, 1)
@@ -1012,22 +1049,63 @@ class PhonePanel(QWidget):
         if (self.state_pill.property("state") or "") != pill_state:
             self.state_pill.setProperty("state", pill_state)
             _repolish(self.state_pill)
-        hint = {"none": _HINT_NO_TELEPHONY, "unsupported": _HINT_UNSUPPORTED}.get(key, _HINT_DEFAULT)
+        hints = {
+            "none": _HINT_NO_TELEPHONY,
+            "unsupported": _HINT_UNSUPPORTED,
+            "no phone": _HINT_NO_PHONE,
+            "phone": _HINT_PHONE,
+        }
+        hint = hints.get(key, _HINT_DEFAULT)
         self.hint.setText(hint)
-        self.hint.setToolTip(tip if key in ("none", "unsupported") and tip else hint)
+        self.hint.setToolTip(tip if key in hints and tip else hint)
 
     def call_state_text(self) -> str:
         return self.state_pill.text()
 
+    def _no_phone(self) -> bool:
+        """A car head unit that positively has no phone connected."""
+        return self._car and self._phone_link is False
+
     def _sync_actions(self):
         has_number = bool(self._number_text())
-        self.btn_call.setEnabled(has_number and not self._call_missing)
-        self.btn_dial.setEnabled(has_number and not self._dial_missing)
+        no_phone = self._no_phone()
+        self.btn_call.setEnabled(has_number and not self._call_missing and not no_phone)
+        self.btn_dial.setEnabled(has_number and not self._dial_missing and not no_phone)
+        self.btn_answer.setEnabled(not no_phone)
+        self.btn_end.setEnabled(not no_phone)
         row = self._current_row(self.calls)
         usable = bool(row and is_callable(row.get("number")))
         for b in (self.btn_call_back, self.btn_message, self.btn_copy):
             b.setEnabled(usable)
-        self.btn_compose.setEnabled(is_callable(self.sms_to.text()) and not self._sms_missing)
+        self.btn_compose.setEnabled(
+            is_callable(self.sms_to.text()) and not self._sms_missing and not no_phone
+        )
+
+    def _refresh_tips(self):
+        """Say why a call action is disabled: no phone connected (a car) or no
+        app for it on the device; otherwise the button keeps its own tip."""
+        no_phone = self._no_phone()
+        for name, missing, tip in (
+            ("btn_call", self._call_missing, "No app on this device places phone calls"),
+            ("btn_dial", self._dial_missing, "This device has no dialler app"),
+            ("btn_compose", self._sms_missing, "This device has no messaging app"),
+            ("btn_answer", False, ""),
+            ("btn_end", False, ""),
+        ):
+            button = getattr(self, name)
+            if no_phone:
+                button.setToolTip(_TIP_NO_PHONE)
+            elif missing:
+                button.setToolTip(tip)
+            else:
+                button.setToolTip(self._default_tips[name])
+
+    def _needs_phone(self) -> bool:
+        """True (and a hint under the keypad) when a car has no phone to call through."""
+        if self._no_phone():
+            self.dial_hint.setText("No phone connected — connect a phone over Bluetooth first.")
+            return True
+        return False
 
     # ---------------------------------------------------------------- dialler
     def _number_text(self) -> str:
@@ -1063,6 +1141,8 @@ class PhonePanel(QWidget):
         return number
 
     def _dial(self):
+        if self._needs_phone():
+            return
         if self._dial_missing:
             self.dial_hint.setText("This device has no dialler app — use its own phone app.")
             return
@@ -1075,6 +1155,8 @@ class PhonePanel(QWidget):
             )
 
     def _call(self):
+        if self._needs_phone():
+            return
         if self._call_missing:
             self.dial_hint.setText("No app on this device places calls — use its own phone app.")
             return
@@ -1088,12 +1170,16 @@ class PhonePanel(QWidget):
             )
 
     def _answer_call(self):
+        if self._needs_phone():
+            return
         self._action("answer", lambda h: h.answer_call(safe=True), "[OK] Answer sent",
-                     then_state=True)
+                     then_state=True, expected_without_telephony=True)
 
     def _end_call(self):
+        if self._needs_phone():
+            return
         self._action("end call", lambda h: h.end_call(safe=True), "[OK] End call sent",
-                     then_state=True)
+                     then_state=True, expected_without_telephony=True)
 
     def use_number(self, number):
         """Fill the dialler with *number* (never places the call)."""
@@ -1151,15 +1237,15 @@ class PhonePanel(QWidget):
         number = row.get("number") or ""
         menu = QMenu(self)
         if is_callable(number):
-            menu.addAction(_cached_icon("dialpad", "green"), "Call back (fill the dialler)",
+            menu.addAction(cached_icon("dialpad", "green"), "Call back (fill the dialler)",
                            lambda: self.use_number(number))
-            menu.addAction(_cached_icon("message", "purple"), "Message…",
+            menu.addAction(cached_icon("message", "purple"), "Message…",
                            lambda: self.compose_to(number))
-            menu.addAction(_cached_icon("copy", "dim"), "Copy number",
+            menu.addAction(cached_icon("copy", "dim"), "Copy number",
                            lambda: QApplication.clipboard().setText(number))
         body = row.get("body") or ""
         if body:
-            menu.addAction(_cached_icon("copy", "dim"), "Copy message",
+            menu.addAction(cached_icon("copy", "dim"), "Copy message",
                            lambda: QApplication.clipboard().setText(body))
         if not menu.isEmpty():
             menu.exec_(view.viewport().mapToGlobal(pos))
@@ -1170,7 +1256,7 @@ class PhonePanel(QWidget):
         if not is_callable(to):
             self.sms_to.setFocus()
             return
-        if self._sms_missing:
+        if self._sms_missing or self._no_phone():
             return
         self._action(
             f"compose to {to}",
@@ -1179,7 +1265,15 @@ class PhonePanel(QWidget):
         )
 
     # ----------------------------------------------------------------- jobs
-    def _action(self, label, fn, ok_text, *, then_state=False):
+    def _action(self, label, fn, ok_text, *, then_state=False,
+                expected_without_telephony=False):
+        """Run one device action on a worker and report the outcome.
+
+        *expected_without_telephony* marks an action (Answer / End) that is
+        offered on purpose even where there is no call state: a device that has
+        nothing to answer is a normal condition, so it is reported as a hint
+        instead of an error the user has to investigate.
+        """
         if self._closed:
             return
         handler = self.handler
@@ -1192,10 +1286,19 @@ class PhonePanel(QWidget):
                 self._state_soon.start()
 
         def failed(message):
-            if not self._closed:
+            if self._closed:
+                return
+            expected = expected_without_telephony and (
+                self._call_state in ("none", "unsupported", "no phone", "phone")
+                or is_unsupported(message, automotive=self._car)
+            )
+            if expected:
+                self.log.emit(f"[INFO] {label}: {friendly_failure(message)} "
+                              "(this device has no call state of its own)")
+            else:
                 self.log.emit(f"[ERROR] {label}: {message}")
 
-        run_job(self._jobs, lambda: _unwrap(fn(handler)), done, failed)
+        run_job(self._jobs, lambda: unwrap(fn(handler)), done, failed)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1203,12 +1306,18 @@ class PhonePanel(QWidget):
         # page, so the initial connect stays fast (esp. over a remote link).
         if not self._loaded:
             self.refresh()
-        elif self._call_state not in (None, "none", "unsupported"):
+        elif self._call_state not in _NO_CALL_STATE:
             self._poll.start()
+        if self._loaded and self._car and self._phone_link is not None:
+            last = self._link_checked_at
+            if last is None or (time.monotonic() - last) * 1000 >= self.PHONE_CHECK_MS:
+                self._check_phone_link()  # back on the page after a while: look now
+        self._update_link_poll()
 
     def hideEvent(self, event):
         super().hideEvent(event)
         self._poll.stop()
+        self._link_poll.stop()
 
     def refresh(self):
         if self._closed:
@@ -1221,25 +1330,124 @@ class PhonePanel(QWidget):
             self._set_state("checking")
             run_job(
                 self._jobs,
-                lambda: _unwrap(probe(safe=True)),
+                lambda: unwrap(probe(safe=True)),
                 self._support_loaded,
                 lambda _message: self._support_loaded(None),
             )
             return
+        if self._car and self._phone_link is not None and callable(
+            getattr(self.handler, "phone_connected", None)
+        ):
+            # A car: see whether a phone is connected now, then load for that.
+            self._check_phone_link(reload=True)
+            return
         self._load_everything()
 
     def _load_everything(self):
+        if self._no_phone():
+            self._show_no_phone()
+            return
         if self._support and self._support.get("telephony") is False:
             self._poll.stop()
-            self._set_state(
-                "unsupported",
-                tip="This device has no telephony feature (no SIM). Calls through a paired "
-                "phone are handled by the device's own phone app.",
-            )
+            if self._car and self._phone_link:
+                self._set_state(
+                    "phone",
+                    tip="Calls and messages come from the phone connected to this head "
+                    "unit over Bluetooth.",
+                )
+            else:
+                self._set_state(
+                    "unsupported",
+                    tip="This device has no telephony feature (no SIM). Calls through a paired "
+                    "phone are handled by the device's own phone app.",
+                )
         else:
             self._load_state()
         self._load_calls()
         self._load_sms()
+        self._update_link_poll()
+
+    def _show_no_phone(self):
+        """A car with no phone connected: a calm state in place of the lists, the
+        call actions disabled, and nothing queried until a phone connects."""
+        self._poll.stop()
+        self._state_soon.stop()
+        for key in ("calls", "sms"):
+            self._generation[key] += 1  # drop answers still on their way
+            self._counts[key] = None
+            self._warned[key] = None
+        self._set_state("no phone", tip=_TIP_NO_PHONE)
+        self.calls.clear()
+        self.sms.clear()
+        self.calls_empty.set_state(
+            _NO_PHONE_TITLE,
+            "Connect a phone over Bluetooth to see its calls and messages.",
+            "bluetooth", "dim",
+        )
+        self.sms_empty.set_state(
+            _NO_PHONE_TITLE,
+            "Connect a phone over Bluetooth to see its messages.",
+            "bluetooth", "dim",
+        )
+        self._show_list(self.calls_stack, False)
+        self._show_list(self.sms_stack, False)
+        self._update_count()
+        self._sync_actions()
+        self._update_link_poll()
+
+    def _update_link_poll(self):
+        """Poll a car's phone connection only while the page is visible and the
+        answer is known; there is nothing to poll anywhere else."""
+        if self._closed or not self._car or self._phone_link is None or not self.isVisible():
+            self._link_poll.stop()
+        elif not self._link_poll.isActive():
+            self._link_poll.start()
+
+    def _check_phone_link(self, reload=False):
+        """Ask a car whether a phone is connected now (``phone_connected``: a
+        dumpsys or two, no call log or messages). *reload* loads the page for
+        the answer even when it hasn't changed (the Refresh button)."""
+        if self._closed:
+            return
+        probe = getattr(self.handler, "phone_connected", None)
+        if not callable(probe):
+            self._link_poll.stop()
+            return
+        self._link_reload = self._link_reload or reload
+        if self._link_busy:
+            return
+        if not self._link_reload and not self.isVisible():
+            self._link_poll.stop()
+            return
+        self._link_busy = True
+        # Raw mode: a failed check means "can't tell", which safe mode would
+        # log as an engine error.
+        run_job(
+            self._jobs,
+            lambda: _unwrap_flag(probe(safe=False)),
+            self._link_checked,
+            lambda _message: self._link_checked(None),
+        )
+
+    def _link_checked(self, value):
+        self._link_busy = False
+        if self._closed:
+            return
+        reload, self._link_reload = self._link_reload, False
+        self._link_checked_at = time.monotonic()
+        changed = isinstance(value, bool) and value != self._phone_link
+        if changed:
+            self._phone_link = value
+            self._refresh_tips()
+            self._sync_actions()
+            self.log.emit(
+                "[INFO] Phone connected to the head unit — loading its calls and messages"
+                if value else "[INFO] Phone disconnected from the head unit"
+            )
+        if changed or reload:
+            self._load_everything()
+        else:
+            self._update_link_poll()
 
     def _support_loaded(self, info):
         if self._closed:
@@ -1256,6 +1464,10 @@ class PhonePanel(QWidget):
         self._call_missing = info.get("caller") == ""
         self._sms_missing = info.get("messages") == ""
         self._phone_apps = [str(p) for p in info.get("phone_apps") or [] if p]
+        self._car = bool(info.get("automotive"))
+        link = info.get("phone_connected") if self._car else None
+        self._phone_link = link if isinstance(link, bool) else None
+        self._link_checked_at = time.monotonic() if self._car else None
         if self._dial_missing and self._call_missing:
             if self._phone_apps:
                 text = (
@@ -1282,13 +1494,7 @@ class PhonePanel(QWidget):
             self.dial_hint.setText("Place calls in the device's own phone app.")
         else:
             self.app_notice.hide()
-        for button, missing, tip in (
-            (self.btn_call, self._call_missing, "No app on this device places phone calls"),
-            (self.btn_dial, self._dial_missing, "This device has no dialler app"),
-            (self.btn_compose, self._sms_missing, "This device has no messaging app"),
-        ):
-            if missing:
-                button.setToolTip(tip)
+        self._refresh_tips()
         self._sync_actions()
 
     def _open_phone_app(self, package=None):
@@ -1301,22 +1507,24 @@ class PhonePanel(QWidget):
             )
 
     def _load_state(self, quiet=False):
-        if self._closed or self._state_busy:
+        if self._closed or self._state_busy or self._no_phone():
             return
+        if self._car and (self._support or {}).get("telephony") is False:
+            return  # a car without telephony has no call state (e.g. after Answer / End)
         self._state_busy = True
         if not quiet:
             self._set_state("checking")
         handler = self.handler
         run_job(
             self._jobs,
-            lambda: _unwrap(handler.call_state(safe=True)),
+            lambda: unwrap(handler.call_state(safe=True)),
             self._state_loaded,
             self._state_failed,
         )
 
     def _state_loaded(self, value):
         self._state_busy = False
-        if self._closed:
+        if self._closed or self._no_phone():  # the phone went away meanwhile
             return
         state = str(value or "").strip().lower()
         if state == "offhook":
@@ -1331,9 +1539,9 @@ class PhonePanel(QWidget):
 
     def _state_failed(self, message):
         self._state_busy = False
-        if self._closed:
+        if self._closed or self._no_phone():
             return
-        if is_unsupported(message):
+        if is_unsupported(message, automotive=self._car):
             # no telephony service at all (a head unit): expected, so no warning
             self._poll.stop()
             self._set_state("unsupported", tip=friendly_failure(message))
@@ -1367,7 +1575,10 @@ class PhonePanel(QWidget):
             self.calls_empty.set_state("Loading recent calls…")
             self._show_list(self.calls_stack, False)
         limit = self.CALL_LIMIT
-        self._load("calls", lambda h: h.call_log(limit, safe=True),
+        # On a car a refused or missing call log is expected: raw mode keeps the
+        # engine from logging it as an error, and the page shows it calmly.
+        safe = not self._car
+        self._load("calls", lambda h: h.call_log(limit, safe=safe),
                    self._fill_calls, self._calls_failed)
 
     def _load_sms(self):
@@ -1375,7 +1586,8 @@ class PhonePanel(QWidget):
             self.sms_empty.set_state("Loading messages…")
             self._show_list(self.sms_stack, False)
         limit = self.SMS_LIMIT
-        self._load("sms", lambda h: h.sms_list(limit, safe=True),
+        safe = not self._car
+        self._load("sms", lambda h: h.sms_list(limit, safe=safe),
                    self._fill_sms, self._sms_failed)
 
     @staticmethod
@@ -1415,13 +1627,20 @@ class PhonePanel(QWidget):
         reason = friendly_failure(message)
         self.calls.clear()
         self._counts["calls"] = None
-        if is_unsupported(message):
+        if is_unsupported(message, automotive=self._car):
             # normal on head units: there is no call log at all, so no warning
-            self.calls_empty.set_state(
-                "No call history on this device",
-                "It keeps no call log — a customised head unit shows calls in its own phone app.",
-                "phone", "dim", message,
-            )
+            if self._car:
+                self.calls_empty.set_state(
+                    "Call history not available on this head unit",
+                    "It doesn't share call history over adb — its own phone app shows the calls.",
+                    "phone", "dim", message,
+                )
+            else:
+                self.calls_empty.set_state(
+                    "No call history on this device",
+                    "It keeps no call log — a customised head unit shows calls in its own phone app.",
+                    "phone", "dim", message,
+                )
             self._show_list(self.calls_stack, False)
             self._update_count()
             self._sync_actions()
@@ -1452,12 +1671,19 @@ class PhonePanel(QWidget):
         reason = friendly_failure(message)
         self.sms.clear()
         self._counts["sms"] = None
-        if is_unsupported(message):
-            self.sms_empty.set_state(
-                "No messages on this device",
-                "It keeps no SMS store — messages, if any, live in its own apps.",
-                "message", "dim", message,
-            )
+        if is_unsupported(message, automotive=self._car):
+            if self._car:
+                self.sms_empty.set_state(
+                    "Messages not available on this head unit",
+                    "It doesn't share messages over adb — its own apps show them.",
+                    "message", "dim", message,
+                )
+            else:
+                self.sms_empty.set_state(
+                    "No messages on this device",
+                    "It keeps no SMS store — messages, if any, live in its own apps.",
+                    "message", "dim", message,
+                )
             self._show_list(self.sms_stack, False)
             self._update_count()
             return
@@ -1473,4 +1699,5 @@ class PhonePanel(QWidget):
         self._closed = True
         self._poll.stop()
         self._state_soon.stop()
+        self._link_poll.stop()
         close_jobs(self._jobs)

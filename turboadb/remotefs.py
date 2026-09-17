@@ -41,9 +41,26 @@ _LS_TOOLBOX_REGEX = re.compile(
     r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
     r' (.+)\Z'
 )
-# Anything else shaped "perms links user group size DATE TIME name".
+# Anything else shaped "perms links user group size DATE name".  The date is
+# matched as a WHOLE, because a locale listing writes it in three tokens
+# ("sept. 14  2026"): counting two tokens instead left the year glued to the
+# front of the file name.
+_LS_LOCALE_MONTH = r'[^\W\d_]{2,}\.?'          # "Jan", "sept.", "окт."
+_LS_CLOCK_OR_YEAR = r'\d{1,2}:\d{2}(?::\d{2})?|\d{4}'
+_LS_FALLBACK_DATE = (
+    r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:\s+[+-]\d{4})?'
+    r'|' + _LS_LOCALE_MONTH + r'\s+\d{1,2}\s+(?:' + _LS_CLOCK_OR_YEAR + r')'
+    r'|\d{1,2}\s+' + _LS_LOCALE_MONTH + r'\s+(?:' + _LS_CLOCK_OR_YEAR + r')'
+)
 _LS_FALLBACK_REGEX = re.compile(
-    r'^(' + _LS_PERMS + r')[.+@]?\s+(?:\d+|\?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\S+) (.+)\Z'
+    r'^(' + _LS_PERMS + r')[.+@]?\s+(?:\d+|\?)\s+(\S+)\s+(\S+)\s+(\d+)\s+'
+    r'(' + _LS_FALLBACK_DATE + r') (.+)\Z'
+)
+# Last resort: two unidentified tokens where the date belongs.  The name cannot
+# be trusted (an unrecognised three-token date puts its tail in front of it), so
+# rows parsed this way are reported as inexact and the listing is retried.
+_LS_LOOSE_REGEX = re.compile(
+    r'^(' + _LS_PERMS + r')[.+@]?\s+(?:\d+|\?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+\s+\S+) (.+)\Z'
 )
 _LS_TOTAL_RE = re.compile(r'^total \d+\Z')
 _ANSI_CSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
@@ -83,10 +100,17 @@ def _mkdir_cmd(path: str) -> str:
 
 
 def _touch_cmd(path: str) -> str:
+    """``touch``, falling back to a create-only redirect.  The fallback checks
+    the file first: ``: > file`` alone TRUNCATED an existing file on builds
+    whose toybox refuses ``touch`` (e.g. a read-only mtime)."""
     q = shlex.quote(path)
-    return f"touch {q} 2>/dev/null || : > {q}"
+    return f"touch {q} 2>/dev/null || [ -e {q} ] || : > {q}"
 
 
+# Superseded by _copy_into_cmd / _rename_cmd, which add the ``--`` terminator
+# and mv's ``-T``/``-n`` guards.  Nothing here calls them any more; they are
+# kept only because gui/file_browser.py still imports the pair.  Use the two
+# builders below for new code.
 def _cp_cmd(src: str, dst: str) -> str:
     return f"cp -r {shlex.quote(src)} {shlex.quote(dst)}"
 
@@ -163,8 +187,13 @@ def _link_dirs_cmd(paths) -> str:
 
 
 def _normalize_remote_path(path: str) -> str:
-    """Absolute, normalised device path (never starts with '-' or '//')."""
-    path = (path or "").strip()
+    """Absolute, normalised device path (never starts with '-' or '//').
+
+    Only line breaks are trimmed: a leading or trailing SPACE is a legal part of
+    an Android file name, and stripping it made ``rm "/sdcard/dup "`` delete the
+    neighbouring ``/sdcard/dup`` instead.
+    """
+    path = (path or "").strip("\r\n")
     if not path:
         return "/"
     return posixpath.normpath("/" + path.lstrip("/"))
@@ -181,8 +210,12 @@ def _result_error(res) -> str:
 
 
 def _output_lines(text) -> List[str]:
-    """Shell stdout split on ``\\n`` only, tolerating ``\\r\\n`` line ends."""
-    lines = _as_text(text).split("\n")
+    """Shell stdout split on ``\\n`` only, tolerating ``\\r\\n`` line ends.
+
+    Colour escapes are removed first: on a colourising device shell they made
+    every probe reply look unexpected, so ``rm``/``mv``/``cp`` failed outright.
+    """
+    lines = strip_ansi(_as_text(text)).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     return [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
@@ -268,31 +301,33 @@ def _parse_ls_entry(line: str, escaped: bool = False):
     *exact* is False when the name can't be recovered with certainty (e.g. a
     link whose name contains ' -> ').  *escaped* parses ``ls -b`` output.
     """
+    loose = False
     m = _LS_REGEX.match(line)
     if m:
         perms, _links, user, group, size_field, mtime, rest = m.groups()
     else:
-        m = _LS_TOOLBOX_REGEX.match(line)
-        if m:
-            perms, user, group, size_field, mtime, rest = m.groups()
-            size_field = size_field or ""
-        else:
-            m = _LS_FALLBACK_REGEX.match(line)
-            if not m:
+        m = _LS_TOOLBOX_REGEX.match(line) or _LS_FALLBACK_REGEX.match(line)
+        if m is None:
+            m = _LS_LOOSE_REGEX.match(line)
+            if m is None:
                 return None
-            perms, user, group, size_field, day, clock, rest = m.groups()
-            mtime = f"{day} {clock}"
+            loose = True  # the date wasn't recognised: the name may be truncated
+        perms, user, group, size_field, mtime, rest = m.groups()
+        size_field = size_field or ""
     perms = perms[:10]
     kind = perms[0]
     unknown = "?" in perms or size_field == "?"  # toybox couldn't stat the entry
-    exact = True
+    exact = not loose
     target = ""
     if kind == "l":
         if escaped:  # spaces in the name are escaped, so the first ' -> ' splits
             name, found, target = rest.partition(" -> ")
-            exact = bool(found)
+            exact = exact and bool(found)
         else:
-            name, target, exact = _split_link(rest, int(size_field) if size_field.isdigit() else -1)
+            name, target, split_ok = _split_link(
+                rest, int(size_field) if size_field.isdigit() else -1
+            )
+            exact = exact and split_ok
     else:
         name = rest
     if escaped:
@@ -388,10 +423,6 @@ def _parse_ls_listing(text, escaped: bool = False):
     return rows, uncertain, clean
 
 
-def _parse_ls_output(text) -> list:
-    return _parse_ls_listing(text)[0]
-
-
 def _list_remote_dir(handler, path: str):
     """Worker: list a device folder and resolve which symlinks are folders.
 
@@ -411,15 +442,16 @@ def _list_remote_dir(handler, path: str):
         if rows_b and (clean_b or len(uncertain_b) < len(uncertain)):
             rows, uncertain = rows_b, uncertain_b
     rows = _Listing(rows, uncertain)
-    links =[i for i, row in enumerate(rows) if row[5].startswith("l") and not row[7]]
-    batch = 100
-    for start in range(0, len(links), batch):
-        chunk = links[start:start + batch]
+    links = [i for i, row in enumerate(rows) if row[5].startswith("l") and not row[7]]
+    link_paths = [posixpath.join(path, rows[i][0]) for i in links]
+    # _chunks caps the command by character count too: a folder of long names
+    # otherwise built a shell line the device refused.
+    taken = 0
+    for group in _chunks(link_paths):
+        chunk = links[taken:taken + len(group)]
+        taken += len(group)
         try:
-            check = handler.shell(
-                _link_dirs_cmd([posixpath.join(path, rows[i][0]) for i in chunk]),
-                timeout=30, safe=False,
-            )
+            check = handler.shell(_link_dirs_cmd(group), timeout=30, safe=False)
         except Exception as exc:  # links stay "File Link"; the reason is reported
             error = error or f"could not resolve symlink types: {type(exc).__name__}: {exc}"
             break

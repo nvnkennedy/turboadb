@@ -103,6 +103,37 @@ def test_json_for_actions_results_and_saved_files(run):
     assert dev.called("screenshot") == [(("shot.png",), {"display_id": 2})]
 
 
+def test_json_for_pair_disconnect_restart_server_and_scrcpy(run):
+    """These four printed plain text whatever --json said."""
+    rc, out, _ = run(["--json", "pair", "192.168.1.50:37123", "482913"],
+                     FakeDev(pair="Successfully paired"))
+    assert rc == 0 and json.loads(out) == {"ok": True, "result": "Successfully paired"}
+    rc, out, _ = run(["pair", "nonsense", "482913", "--json"])
+    assert rc == 1 and json.loads(out)["ok"] is False
+
+    adb = types.SimpleNamespace(ok=True, exit_code=0, text="disconnected", stderr="")
+    rc, out, _ = run(["--json", "disconnect"], FakeDev(adb=adb))
+    assert rc == 0 and json.loads(out) == {"ok": True, "result": "disconnected"}
+
+    restarted = types.SimpleNamespace(text="restarted", stderr="")
+    rc, out, _ = run(["restart-server", "--json"], FakeDev(restart_server=restarted))
+    assert rc == 0 and json.loads(out) == {"ok": True, "result": "restarted"}
+
+    dev = FakeDev(mirror=types.SimpleNamespace(pid=7, wait=lambda: 0))
+    rc, out, _ = run(["--json", "scrcpy"], dev)
+    assert rc == 0 and json.loads(out) == {"ok": True, "result": {"pid": 7}}
+
+
+def test_json_full_reports_are_one_object(run, tmp_path):
+    rc, out, _ = run(["health", "--full", "--json"], FakeDev(health_report="REPORT"))
+    assert rc == 0 and json.loads(out) == {"ok": True, "report": "REPORT"}
+    saved = tmp_path / "build.txt"
+    rc, out, _ = run(["build-info", "--full", "-o", str(saved), "--json"],
+                     FakeDev(build_report="BUILD"))
+    assert rc == 0 and json.loads(out) == {"ok": True, "path": str(saved)}
+    assert saved.read_text() == "BUILD\n"
+
+
 def test_json_battery_build_and_health(run, tmp_path):
     rc, out, _ = run(["battery", "--json"], FakeDev(battery_status={"level": 80}))
     assert json.loads(out) == {"level": 80}
@@ -162,6 +193,54 @@ def test_shell_all_runs_on_every_online_device(run, monkeypatch, capsys):
     assert devs["A"].called("shell") == [(("getprop ro.product.model",), {"su": False})]
 
 
+def test_devices_and_discover_follow_a_saved_remote_target(run, monkeypatch, tmp_path):
+    """`-s @saved-remote devices` used to read args.adb_host directly and list
+    the LOCAL server instead."""
+    import turboadb.gui.sessions as sessions
+
+    monkeypatch.setattr(sessions, "_FILE", str(tmp_path / "sessions.json"))
+    assert run(["targets", "add", "lab", "remote", "lab-pc:5038", "SER1"])[0] == 0
+
+    asked = {}
+
+    def list_devices(adb_path=None, **kwargs):
+        asked.update(kwargs, adb_path=adb_path)
+        return [types.SimpleNamespace(serial="SER1", state="device")]
+
+    monkeypatch.setattr(cli, "list_devices", list_devices)
+    assert run(["-s", "@lab", "devices"])[0] == 0
+    assert (asked["server_host"], asked["server_port"]) == ("lab-pc", 5038)
+
+    import turboadb.devices as devices
+
+    monkeypatch.setattr(devices, "mdns_devices", lambda adb_path=None, **k: [])
+    assert run(["-s", "@lab", "--adb-path", "my-adb", "discover"])[0] == 0
+
+
+def test_shell_all_enumerates_the_targets_own_server(monkeypatch, capsys, tmp_path):
+    """The devices listed and the devices driven must come from one server."""
+    import turboadb.gui.sessions as sessions
+
+    monkeypatch.setattr(sessions, "_FILE", str(tmp_path / "sessions.json"))
+    assert cli.main(["targets", "add", "lab", "remote", "lab-pc:5038", "SER1"]) == 0
+    capsys.readouterr()
+
+    asked, ran = {}, []
+    monkeypatch.setattr(cli, "adb_available", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "list_devices", lambda adb_path=None, **kw: (
+        asked.update(kw) or [types.SimpleNamespace(serial="SER2", state="device")]))
+
+    def handler(args, **overrides):
+        ran.append(cli._config(args, **overrides))
+        return FakeDev(shell=_result("ok\n"))
+
+    monkeypatch.setattr(cli, "_handler", handler)
+    assert cli.main(["-s", "@lab", "shell", "--all", "--", "id"]) == 0
+    assert (asked["server_host"], asked["server_port"]) == ("lab-pc", 5038)
+    # the enumerated serial wins over the saved target's, on that same server
+    assert [(c.target, c.adb_server_host) for c in ran] == [("SER2", "lab-pc")]
+
+
 def test_discover_connect_only_ready_devices(run, monkeypatch):
     import turboadb.devices as devices
 
@@ -175,19 +254,22 @@ def test_discover_connect_only_ready_devices(run, monkeypatch):
 
 # --- logs ------------------------------------------------------------------- #
 def test_logcat_crashes_filter_and_grep(run):
+    """--grep and --crashes are the engine's job; the CLI only validates the
+    pattern up front and prints what reaches on_line."""
     def logcat(**kw):
-        for line in ("E AndroidRuntime: FATAL crash", "I fine"):
-            kw["on_line"](line)
+        kw["on_line"]("E AndroidRuntime: FATAL crash")
         return types.SimpleNamespace(matches=[])
 
     dev = FakeDev(logcat=logcat)
     rc, out, _ = run(["logcat", "--crashes", "--dump", "--grep", "fatal",
                       "--filter", "AndroidRuntime:E"], dev)
-    assert rc == 0 and "FATAL crash" in out and "fine" not in out
+    assert rc == 0 and "FATAL crash" in out
     kwargs = dev.called("logcat")[0][1]
-    assert kwargs["buffers"] == ["crash", "main", "system"] and kwargs["priority"] == "E"
+    assert kwargs["grep"] == "fatal" and kwargs["crashes"] is True
+    assert kwargs["buffers"] is None and kwargs["priority"] is None  # the engine defaults them
     assert kwargs["filterspecs"] == ["AndroidRuntime:E"] and kwargs["dump"] is True
-    assert run(["logcat", "--grep", "("])[0] == 2
+    rc, _, err = run(["logcat", "--grep", "("])
+    assert rc == 2 and "invalid --grep" in err
 
 
 def test_bugreport_uses_the_timeout(run):
@@ -221,38 +303,53 @@ def test_file_commands(run):
     assert json.loads(out) == info
 
 
-def _edit_dev(tmp_file_type="regular file"):
-    from pathlib import Path
+def _edit_dev(changed=True, editor_exit=0):
+    """A device whose edit_file runs the opener the CLI handed it, then reports
+    the outcome the engine would."""
+    def edit_file(path, opener, editor=None):
+        opener("/tmp/turboadb-edit.ini")
+        return {"changed": changed, "path": path, "editor_exit": editor_exit}
 
-    def pull(remote, local, **kw):
-        Path(local).write_text("a=1\n")
-
-    info = {"path": "/data/x.ini", "real_path": "/data/x.ini", "type": tmp_file_type,
-            "size": 4, "mode": "600"}
-    return FakeDev(stat_path=info, pull=pull)
+    return FakeDev(edit_file=edit_file)
 
 
-def test_edit_pushes_back_only_changes(run, monkeypatch):
-    from pathlib import Path
+def test_edit_picks_the_editor_and_reports_the_engine_result(run, monkeypatch):
+    """The CLI only chooses/runs the editor; pull, push and the file mode are
+    ADBHandler.edit_file's."""
+    seen = {}
 
     def editor(cmd):
-        Path(cmd[-1]).write_text("a=2\n")
+        seen["cmd"] = cmd
         return 0
 
     monkeypatch.setattr(cli.subprocess, "call", editor)
     dev = _edit_dev()
     rc, out, _ = run(["edit", "/data/x.ini", "--editor", "myeditor"], dev)
     assert rc == 0 and "Saved /data/x.ini" in out
-    (local, remote), _ = dev.called("push")[0]
-    assert remote == "/data/x.ini" and not Path(local).exists()  # temp file cleaned up
-    assert dev.called("chmod") == [(("/data/x.ini", "600"), {})]
+    assert seen["cmd"] == ["myeditor", "/tmp/turboadb-edit.ini"]
+    (path, _opener), kwargs = dev.called("edit_file")[0]
+    assert path == "/data/x.ini" and kwargs == {"editor": "myeditor"}
+    assert not dev.called("push") and not dev.called("stat_path")
 
-    monkeypatch.setattr(cli.subprocess, "call", lambda cmd: 0)
-    dev = _edit_dev()
-    rc, out, _ = run(["edit", "/data/x.ini", "--editor", "myeditor"], dev)
-    assert rc == 0 and "No changes" in out and not dev.called("push")
+    rc, out, _ = run(["edit", "/data/x.ini", "--editor", "myeditor"], _edit_dev(changed=False))
+    assert rc == 0 and "No changes" in out
 
-    assert run(["edit", "/data"], _edit_dev("directory"))[0] == 1
+    rc, _, err = run(["edit", "/data/x.ini", "--editor", "myeditor"], _edit_dev(editor_exit=3))
+    assert rc == 1 and "exited with 3" in err
+
+    def not_a_file(*a, **k):
+        raise ValueError("/data is not a regular file (directory)")
+
+    assert run(["edit", "/data"], FakeDev(edit_file=not_a_file))[0] == 1
+
+
+def test_edit_uses_the_EDITOR_environment_variable(run, monkeypatch):
+    seen = {}
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("EDITOR", "nano -w")
+    monkeypatch.setattr(cli.subprocess, "call", lambda cmd: seen.setdefault("cmd", cmd) and 0)
+    assert run(["edit", "/data/x.ini"], _edit_dev())[0] == 0
+    assert seen["cmd"][:2] == ["nano", "-w"]
 
 
 # --- apps ------------------------------------------------------------------- #
@@ -276,17 +373,40 @@ def test_app_flags(run):
 
 # --- screen and input ------------------------------------------------------- #
 def test_record_continuous_saves_every_part(run):
-    dev = FakeDev()
-
-    def screen_record(path, **kw):
-        assert kw["time_limit"] == 180 and kw["display_id"] == 1
-        if len(dev.called("screen_record")) == 2:
-            kw["stop_event"].set()
-        return path
-
-    dev.returns["screen_record"] = screen_record
+    """Splitting into parts is the engine's; the CLI hands it the stop event."""
+    dev = FakeDev(screen_record_continuous=lambda path, **kw: [path, "clip-part02.mp4"])
     rc, out, _ = run(["record", "clip.mp4", "--continuous", "--display", "1"], dev)
     assert rc == 0 and "Saved clip.mp4" in out and "Saved clip-part02.mp4" in out
+    kwargs = dev.called("screen_record_continuous")[0][1]
+    assert kwargs["part_seconds"] == 180 and kwargs["display_id"] == 1
+    assert kwargs["stop_event"] is not None and callable(kwargs["on_part"])
+    assert not dev.called("screen_record")
+
+
+def test_record_one_part_uses_the_time_limit(run):
+    dev = FakeDev(screen_record=lambda path, **kw: path)
+    rc, out, _ = run(["record", "clip.mp4", "--time-limit", "20"], dev)
+    assert rc == 0 and "Saved clip.mp4" in out
+    assert dev.called("screen_record")[0][1]["time_limit"] == 20
+    assert not dev.called("screen_record_continuous")
+
+
+def test_record_continuous_is_one_json_document_and_fails_loudly(run):
+    """A part that fails after the first one was saved used to exit 0, and each
+    part printed its own JSON document."""
+    def screen_record_continuous(path, **kw):
+        kw["on_part"](path)
+        raise RuntimeError("the device went away")
+
+    rc, out, err = run(["record", "clip.mp4", "--continuous", "--json"],
+                       FakeDev(screen_record_continuous=screen_record_continuous))
+    payload = json.loads(out)  # a second document would make this raise
+    assert rc == 1 and payload["ok"] is False and payload["paths"] == ["clip.mp4"]
+    assert "went away" in payload["error"]
+
+    rc, out, _ = run(["record", "clip.mp4", "--continuous", "--json"],
+                     FakeDev(screen_record_continuous=lambda path, **kw: [path]))
+    assert rc == 0 and json.loads(out) == {"ok": True, "paths": ["clip.mp4"]}
 
 
 def test_displays_and_scrcpy_options(run):
@@ -335,6 +455,18 @@ def test_reboot_wait_and_verity_reboot(run):
     assert dev.called("shell") == [(("sync",), {})] and dev.called("reboot")
 
 
+def test_verity_reboot_json_is_one_document(run):
+    """_result plus _report printed two JSON documents, and jq choked on them."""
+    dev = FakeDev(disable_verity="verity disabled on /system")
+    rc, out, _ = run(["disable-verity", "--reboot", "--json"], dev)
+    payload = json.loads(out)  # a second document would make this raise
+    assert rc == 0 and payload["ok"] is True
+    assert payload["result"] == "verity disabled on /system"
+    rc, out, _ = run(["enable-verity", "--reboot", "--json"],
+                     FakeDev(enable_verity="done", reboot=False))
+    assert rc == 1 and json.loads(out)["ok"] is False
+
+
 def test_forward_list_remove_and_no_wait(run):
     rc, out, _ = run(["forward", "--list", "--json"], FakeDev(list_forwards=["S tcp:1 tcp:2"]))
     assert json.loads(out) == ["S tcp:1 tcp:2"]
@@ -360,6 +492,91 @@ def test_serve_status_and_deploy_ssl(run, monkeypatch):
     monkeypatch.setattr(remote_deploy, "deploy_serve", lambda *a, **k: seen.update(k) or 0)
     assert run(["deploy-serve", "pc1", "-u", "D\\u", "-p", "pw", "--ssl"])[0] == 0
     assert seen["use_ssl"] is True and seen["winrm_port"] == 5986
+
+
+def test_serve_failures_go_to_stderr(run, monkeypatch):
+    """serve exits 1 on these, so the reason must not be on stdout."""
+    import turboadb.devices as devices
+
+    monkeypatch.setattr(devices, "start_shared_server", lambda **kw: "adb server shared")
+    monkeypatch.setattr(devices, "open_firewall", lambda ports: "firewall rules added")
+
+    def refuse(port=5037):
+        raise RuntimeError("access denied — run as Administrator")
+
+    monkeypatch.setattr(devices, "install_serve_task", refuse)
+    monkeypatch.setattr(devices, "install_startup", refuse)
+    rc, out, err = run(["serve", "--startup-task", "--install-startup"])
+    assert rc == 1
+    assert "access denied" in err and "access denied" not in out
+    assert "adb server shared" in out  # the good news still goes to stdout
+
+
+def test_serve_never_auto_fetches_tools(run, monkeypatch):
+    """A SYSTEM scheduled task runs serve under another profile: a fetch there
+    drops a SECOND adb in and binds port 5037 with it."""
+    import turboadb.devices as devices
+    import turboadb.toolsdl as toolsdl
+
+    fetched = []
+    monkeypatch.setattr(toolsdl, "ensure_tools", lambda **kw: fetched.append(kw))
+    monkeypatch.setattr(cli, "adb_available", lambda *a, **k: False)
+    monkeypatch.setattr(devices, "server_is_shared", lambda port=5037, adb_path=None: False)
+    rc, out, _ = run(["serve", "--status", "--json"])
+    assert rc == 0 and json.loads(out) == {"port": 5037, "shared": False}
+    assert not fetched
+
+
+def test_auto_fetch_honours_an_explicit_scrcpy_path(run, monkeypatch):
+    """`--scrcpy-path X scrcpy` downloaded a whole toolchain because the guard
+    asked scrcpy_available() with no argument."""
+    import turboadb.toolsdl as toolsdl
+
+    asked, fetched = [], []
+    monkeypatch.setattr(toolsdl, "ensure_tools", lambda **kw: fetched.append(kw))
+    monkeypatch.setattr(cli, "adb_available", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "scrcpy_available", lambda explicit=None: asked.append(explicit) or True)
+    dev = FakeDev(mirror=types.SimpleNamespace(pid=1, wait=lambda: 0))
+    assert run(["--scrcpy-path", "C:/tools/scrcpy.exe", "scrcpy"], dev)[0] == 0
+    assert asked == ["C:/tools/scrcpy.exe"] and not fetched
+
+    # a missing scrcpy fetches scrcpy; any other command must not ask for it
+    monkeypatch.setattr(cli, "scrcpy_available", lambda explicit=None: False)
+    assert run(["scrcpy"], dev)[0] == 0
+    assert fetched[-1]["scrcpy"] is True
+    monkeypatch.setattr(cli, "adb_available", lambda *a, **k: False)
+    assert run(["state"], FakeDev(get_state="device"))[0] == 0
+    assert fetched[-1]["scrcpy"] is False
+
+
+def test_setup_commands_take_json_before_or_after(run, monkeypatch):
+    import turboadb.tools as tools
+    import turboadb.toolsdl as toolsdl
+
+    diag = {"adb": "1.0.41", "adb_path": "adb.exe", "scrcpy": "2.4", "scrcpy_path": "scrcpy.exe"}
+    monkeypatch.setattr(tools, "diagnose", lambda: diag)
+    assert json.loads(run(["--json", "doctor"])[1]) == diag
+    assert json.loads(run(["doctor", "--json"])[1]) == diag
+
+    monkeypatch.setattr(toolsdl, "tools_dir", lambda: "tools")
+    monkeypatch.setattr(toolsdl, "fetch_tools", lambda **kw: {"adb": "adb.exe", "errors": {}})
+    rc, out, _ = run(["fetch-tools", "--adb-only", "--json"])
+    assert rc == 0 and json.loads(out)["adb"] == "adb.exe"
+
+    checks = {"adb": {"installed": "1", "latest": "1", "upgrade": False},
+              "scrcpy": {"installed": "2", "latest": "2", "upgrade": False}}
+    monkeypatch.setattr(toolsdl, "check_updates", lambda: checks)
+    rc, out, _ = run(["--json", "upgrade-tools", "--check"])
+    assert rc == 0 and json.loads(out) == checks
+    rc, out, _ = run(["upgrade-tools", "--json"])
+    assert rc == 0 and json.loads(out)["updated"] == {}
+
+
+def test_fetch_tools_only_flags_are_mutually_exclusive():
+    """Both together downloaded nothing and exited 1 without saying why."""
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(["fetch-tools", "--adb-only", "--scrcpy-only"])
+    assert exc.value.code == 2
 
 
 def test_self_update_check(run, monkeypatch):

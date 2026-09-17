@@ -71,35 +71,35 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
-          <h3><span class="ver">v2.1.0</span> Head units, done right</h3>
+          <h3><span class="ver">v2.2.2</span> Every screen, any build</h3>
           <ul>
-            <li><b>Every display at once</b> — the Displays tab shows the centre stack,
-            cluster and passenger screens live side by side, each controllable.</li>
-            <li><b>All displays in the picker</b> as soon as a device connects, with
-            their names and sizes.</li>
-            <li><b>Big monitors</b> — Device Control puts its buttons beside or below
-            the screen, whichever shows it larger.</li>
+            <li><b>ADB screencap renderer</b> — when scrcpy can't run on a build, see
+            and control the screen through <code>adb screencap</code> instead.</li>
+            <li><b>Controls on every IVI display</b> — Back, Home, Recents, volume and
+            more on each display in the Displays tab.</li>
+            <li><b>Keys reach the right display</b> — typing on a display always goes
+            to that display.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.1.0</span> Complete command line</h3>
+          <h3><span class="ver">v2.2.2</span> Terminals &amp; phone</h3>
           <ul>
-            <li><b>94 commands</b> — everything the app does, now also as a
-            <a href="cli.html">scriptable command</a>.</li>
-            <li><b>Device files</b> — <code>ls</code>, <code>rm</code>, <code>mv</code>,
-            <code>cp</code> and <code>edit</code> a device file in your own editor.</li>
-            <li><b>Built for IVI</b> — <code>--display N</code>, saved targets with
-            <code>-s @name</code>, and <code>--json</code> on every command.</li>
+            <li><b>Multi-line paste</b> — each line runs once, in order, in the
+            Android shell, PowerShell and Command Prompt.</li>
+            <li><b>Call history in cars</b> — shows the connected phone's calls, or a
+            calm "No phone connected".</li>
+            <li><b>Black &amp; White themes</b>, and a toggle that remembers your dark
+            and light choice.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.1.0</span> Phone &amp; terminal</h3>
+          <h3><span class="ver">v2.2.2</span> Lighter &amp; sturdier</h3>
           <ul>
-            <li><b>Phone tab on head units</b> — no more errors on customised units;
-            it opens the unit's own phone app when there's no standard dialler.</li>
-            <li><b>The real prompt</b> — the terminal shows the device's own
-            <code>user@host</code>, just like <code>adb shell</code>.</li>
-            <li><b>Faster to find</b> — the new CLI page has live command search.</li>
+            <li><b>Half the adb processes</b> — one connect probe, shells and pages
+            started only when you open them.</li>
+            <li><b>Less memory</b> per device tab.</li>
+            <li><b>Code-review pass</b> — dozens of fixes, verified downloads, and CI
+            that runs every desktop test.</li>
           </ul>
         </div>
       </div>
@@ -152,9 +152,10 @@
           <div class="ic">📱</div>
           <h3>Mirroring &amp; capture</h3>
           <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
-          IVI units. The <strong>IVI Displays</strong> tab shows every display of a
-          head unit live at once — centre stack, cluster, passenger — or use the
-          device <strong>camera</strong>.
+          IVI units, and an <strong>ADB screencap</strong> renderer for builds where
+          scrcpy can't run. The <strong>IVI Displays</strong> tab shows every display
+          of a head unit live at once — centre stack, cluster, passenger — each with
+          its own controls, or use the device <strong>camera</strong>.
           Screenshots and recording that work over RDP.</p>
         </div>
 
@@ -195,9 +196,10 @@
         <div class="card">
           <div class="ic">🎨</div>
           <h3>Calm themes</h3>
-          <p>Graphite and Porcelain by default, plus Mocha / Latte, Forest / Sage,
-          Plum / Rose and Deep teal / Mint. Soft text, dimmed light themes, and
-          colour-coded icons for every section.</p>
+          <p>Graphite and Porcelain by default, plus Black / White, Slate / Mist,
+          Night / Paper and Mocha / Latte. Soft text, muted accents, one click
+          between your dark and light theme, and colour-coded icons for every
+          section.</p>
         </div>
 
         <div class="card">
@@ -244,7 +246,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-2.1.0-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-2.2.2-win64.exe</code> from the latest release
           and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
           on first run and adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>

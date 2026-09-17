@@ -22,7 +22,6 @@ from PyQt5.QtWidgets import (
     QLabel,
     QHBoxLayout,
     QPushButton,
-    QWidget,
     QMessageBox,
 )
 
@@ -187,8 +186,8 @@ class SessionDialog(QDialog):
         self._scan.finished.connect(
             lambda t=self._scan: self._clear_scan_thread(t)
         )
-        self._scan.start()
         park_thread(self._scan)  # survive the dialog closing mid-scan
+        self._scan.start()
 
     def _clear_scan_thread(self, thread):
         if self._scan is thread:
@@ -272,9 +271,3 @@ class SessionDialog(QDialog):
             # SessionStore.save() uses this to rename rather than copy.
             out["previous_name"] = self._original_name
         return out
-
-
-def _wrap(layout):
-    w = QWidget()
-    w.setLayout(layout)
-    return w

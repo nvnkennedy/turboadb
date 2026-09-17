@@ -7,7 +7,6 @@ import shlex
 import threading
 import time
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
@@ -976,9 +975,7 @@ def test_connect_dialog_session_is_side_effect_free(qapp, monkeypatch):
         assert dlg._closing  # done() released the scan/serve threads
     finally:
         dlg.deleteLater()
-    assert connect_dialog._tunnel_port_range() == (
-        f"{scrcpy.TUNNEL_PORT}-{scrcpy.TUNNEL_PORT_LAST}"
-    )
+    assert connect_dialog.TUNNEL_PORT_FIREWALL_RANGE == scrcpy.TUNNEL_PORT_FIREWALL_RANGE
 
 
 def test_local_shell_env_dedupes_and_close_kills_tree_async(monkeypatch):
@@ -1360,7 +1357,8 @@ def test_ensure_local_ffmpeg_atomic_download(tmp_path, monkeypatch):
     got = ffmpeg_tools.ensure_local_ffmpeg()
     assert got == str(cache / "ffmpeg.exe")
     assert (cache / "ffmpeg.exe").read_bytes() == payload
-    assert sorted(os.listdir(cache)) == ["ffmpeg.exe"]  # temp zip / part files gone
+    # temp zip / part files gone; the checksum record stays next to the binary
+    assert sorted(os.listdir(cache)) == ["ffmpeg.exe", "ffmpeg.exe.sha256"]
 
     def offline(req, timeout=0):
         raise OSError("offline")
@@ -1550,3 +1548,381 @@ def test_late_remote_start_after_close_stops_remote_not_reader(camera_panel, mon
     assert hit.wait(5)
     assert ("rhost", 100, 28100) in stops
     assert late_sock.closed and camera_panel.reader is None and camera_panel._sock is None
+
+
+# ---- second review round: shared helpers, buffers and device-path safety ----
+
+
+def test_fileutil_alive_treats_none_as_alive(qapp, tmp_path, monkeypatch):
+    from PyQt5 import sip
+    from PyQt5.QtWidgets import QWidget
+    from turboadb.gui import fileutil
+
+    # A second, widget-only definition used to shadow this one and raise
+    # AttributeError for the unparented case write_file_async relies on.
+    assert fileutil._alive(None) is True
+    widget = QWidget()
+    assert fileutil._alive(widget) is True
+    sip.delete(widget)
+    assert fileutil._alive(widget) is False
+
+    saved = []
+    monkeypatch.setattr(fileutil, "saved_toast", lambda parent, path, what="file": saved.append(path))
+    target = str(tmp_path / "unparented.log")
+    fileutil.write_file_async(None, target, lambda p: fileutil.write_text_file(p, "hi"), what="log")
+    assert _pump(qapp, lambda: saved == [target])
+
+
+def test_file_browser_remote_delete_goes_through_the_engine(qapp, monkeypatch):
+    from turboadb.gui import file_browser as fb
+
+    removed = []
+
+    class Handler:
+        def remove(self, paths, *, recursive=False, safe=None):
+            removed.append((sorted(paths), recursive, safe))
+            return list(paths)
+
+    jobs = []
+    monkeypatch.setattr(
+        fb, "run_job",
+        lambda tracked, fn, on_done=None, on_fail=None: jobs.append((fn, on_done, on_fail)),
+    )
+    monkeypatch.setattr(fb.QMessageBox, "question", staticmethod(lambda *a, **k: fb.QMessageBox.Yes))
+    browser = fb.FileBrowser(Handler())
+    try:
+        browser.remote_cwd = "/sdcard"
+        browser._populate(browser.remote_table, [
+            ("keep.txt", 1, "1 B", "File", "", "-rw-rw-rw-", "", False),
+            ("logs", 0, "<DIR>", "Folder", "", "drwx------", "", True),
+        ], parent_row=True)
+        browser.remote_table.selectAll()  # the '..' row is never a target
+        batches = []
+        monkeypatch.setattr(browser, "_run_shell_batch",
+                            lambda commands, timeout=30: batches.append(commands))
+        jobs.clear()
+        browser._remote_delete()
+        assert batches == []  # no hand-built, unbounded `rm -rf` any more
+        work, _done, _fail = jobs[-1]
+        work()
+        assert removed == [(["/sdcard/keep.txt", "/sdcard/logs"], True, False)]
+    finally:
+        browser.close_panel()
+
+
+def test_file_browser_new_item_names_cannot_escape_the_shown_folder(qapp, tmp_path, monkeypatch):
+    from turboadb.gui import file_browser as fb
+
+    warned = []
+    monkeypatch.setattr(fb.QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a[2])))
+    browser = fb.FileBrowser(None)
+    try:
+        ran = []
+        created = []
+        monkeypatch.setattr(browser, "_run_shell_batch",
+                            lambda commands, timeout=30: ran.extend(commands))
+        monkeypatch.setattr(browser, "_local_job",
+                            lambda label, fn, error_title="": created.append(label))
+        browser.remote_cwd = "/sdcard"
+        browser._remote_loading_path = None
+        browser.local_cwd = str(tmp_path)
+        browser._local_loading_path = None
+        for typed in ("/etc/passwd", "../..", ".", "sub/name"):
+            monkeypatch.setattr(fb.QInputDialog, "getText",
+                                staticmethod(lambda *a, _text=typed, **k: (_text, True)))
+            browser._remote_mkdir()
+            browser._remote_newfile()
+            browser._local_mkdir()
+            browser._local_newfile()
+        assert ran == [] and created == []
+        assert len(warned) == 16
+
+        # Plain names still work, on both sides.
+        monkeypatch.setattr(fb.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("notes.txt", True)))
+        browser._remote_newfile()
+        assert shlex.split(ran[-1][1])[1] == "/sdcard/notes.txt"
+        browser._local_newfile()
+        assert created == ["create notes.txt"]
+
+        assert browser._valid_new_name("notes.txt", "t", local=True)
+        assert not browser._valid_new_name("..", "t", local=False)
+        if os.name == "nt":  # a backslash or a drive letter escapes just as well
+            assert not browser._valid_new_name("sub" + os.sep + "x", "t", local=True)
+            assert not browser._valid_new_name("C:x", "t", local=True)
+    finally:
+        browser.close_panel()
+
+
+def test_file_browser_imports_only_the_remotefs_helpers_it_uses():
+    from turboadb.gui import file_browser as fb
+
+    for gone in ("_ANSI_CSI_RE", "_as_text", "_chunks", "_dir_arg", "_EDIT_STAT_RE",
+                 "_link_dirs_cmd", "_Listing", "_LS_B_ESCAPES", "_LS_DATE", "_ls_escaped_cmd",
+                 "_LS_FALLBACK_REGEX", "_LS_PERMS", "_LS_REGEX", "_LS_TOOLBOX_REGEX",
+                 "_LS_TOTAL_RE", "_parse_ls_entry", "_parse_ls_output", "_PERMS_RE",
+                 "_probe_cmd", "_split_link", "_unescape_ls_b"):
+        assert not hasattr(fb, gone), f"{gone} is unused here and must not be re-exported"
+    # Still reached through this module: by the panel itself, or patched by tests.
+    for kept in ("_probe_remote", "_parse_ls_line", "_parse_ls_listing", "_rm_cmd", "_ls_cmd",
+                 "_cp_cmd", "_mv_cmd", "_human_size"):
+        assert hasattr(fb, kept)
+
+
+def test_file_item_has_no_dead_comparison():
+    from turboadb.gui.file_browser import _FileItem
+
+    # The table keeps Qt's own sorting disabled and orders its rows itself in
+    # _FileTableWidget.sortByColumn, so an item never compares against another.
+    assert "__lt__" not in vars(_FileItem)
+
+
+def _fake_local_shell(monkeypatch):
+    """A LocalShellSession whose process and environment never touch the system."""
+    import turboadb.tools as tools
+    from turboadb.gui import local_terminal as lt
+
+    class FakeProc:
+        pid = 4242
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(lt.subprocess, "Popen", lambda argv, **kwargs: FakeProc())
+    monkeypatch.setattr(lt, "find_adb", lambda *_a, **_k: None)
+    monkeypatch.setattr(tools, "find_scrcpy", lambda *_a, **_k: None)
+    monkeypatch.setattr(lt, "_get_registry_env", lambda: {})
+    return lt, lt.LocalShellSession("cmd", adb_path="__missing__")
+
+
+def test_local_shell_interrupt_kills_the_tree_off_the_ui_thread(monkeypatch):
+    lt, session = _fake_local_shell(monkeypatch)
+    gate = threading.Event()
+    killed = threading.Event()
+
+    def slow_kill(proc, wait_s=2.0):
+        gate.wait(5)
+        killed.set()
+
+    monkeypatch.setattr(lt, "_kill_process_tree", slow_kill)
+    landed = threading.Event()
+    started = time.monotonic()
+    session.interrupt(on_done=landed.set)
+    # Ctrl+C used to block the UI thread here for taskkill plus two waits.
+    assert time.monotonic() - started < 1.0
+    assert not killed.is_set() and not landed.is_set()
+    assert not session.running
+    gate.set()
+    assert landed.wait(5) and killed.is_set()
+
+
+def test_local_shell_read_holds_a_split_character_across_idle_polls(monkeypatch):
+    _lt, session = _fake_local_shell(monkeypatch)
+    cafe = "café".encode("utf-8")
+    chunks = [cafe[:-1], b"", b"", cafe[-1:]]
+    monkeypatch.setattr(session, "_read_raw", lambda size: chunks.pop(0) if chunks else b"")
+    assert session.read() == b"caf"
+    # The idle polls used to force final=True, printing the half character as mojibake.
+    assert session.read() == b""
+    assert session.read() == b""
+    assert session.read() == cafe[-2:]
+
+
+def test_output_transcoder_releases_held_bytes_only_after_the_grace_period():
+    from turboadb.gui.local_terminal import OutputTranscoder
+
+    transcoder = OutputTranscoder("utf-8")
+    assert transcoder.feed(b"x\xc3") == b"x"
+    assert not transcoder.held_expired()
+    assert transcoder.feed(b"") == b""  # an idle poll must not restart the clock either
+    assert not transcoder.held_expired()
+    assert transcoder.feed(b"\xa9") == b"\xc3\xa9"
+    assert not transcoder.held_expired()
+
+    transcoder.HOLD_GRACE_S = 0.0  # the rest is clearly never coming
+    assert transcoder.feed(b"y\xc3") == b"y"
+    assert transcoder.held_expired()
+    assert transcoder.feed(b"", final=True)
+
+
+def test_logcat_worker_line_buffer_is_capped_and_counts_drops(qapp):
+    from turboadb.gui.logcat_view import _LogcatThread
+
+    thread = _LogcatThread(None, ["logcat"])
+    thread._LINES_MAX = 5
+    thread._publish([f"line {i}" for i in range(8)])
+    assert thread.take_dropped() == 3
+    assert thread.take_lines() == [f"line {i}" for i in range(3, 8)]
+    assert thread.take_dropped() == 0 and thread.take_lines() == []
+
+
+def test_logcat_render_timer_only_ticks_while_there_is_output(qapp):
+    from PyQt5.QtGui import QHideEvent, QShowEvent
+    from turboadb.gui.logcat_view import LogcatPanel
+
+    panel = LogcatPanel(None)
+    try:
+        # A device tab whose logcat was never started used to tick every 350 ms.
+        assert not panel._render_timer.isActive()
+        panel._ensure_rendering()
+        panel._on_batch(["one"])
+        assert panel._render_timer.isActive()
+        panel._render_pending()
+        assert panel.view.toPlainText().splitlines() == ["one"]
+        assert not panel._render_timer.isActive()  # nothing running, nothing to paint
+
+        panel._ensure_rendering()
+        panel._on_batch(["two"])
+        panel.hideEvent(QHideEvent())
+        assert not panel._render_timer.isActive()
+        panel.showEvent(QShowEvent())
+        assert panel._render_timer.isActive()
+    finally:
+        panel.close_panel()
+    assert not panel._render_timer.isActive()
+
+
+def test_logcat_refilter_keeps_the_skip_count(qapp):
+    from turboadb.gui.logcat_view import LogcatPanel
+
+    panel = LogcatPanel(None)
+    try:
+        panel._PENDING_MAX = 2
+        panel._paused = True
+        panel._on_batch(["a", "b", "c", "d"])
+        assert panel._skipped == 2
+        panel._paused = False
+        panel._refilter_view()  # editing the filter must not discard the marker
+        assert panel._skipped == 2
+        panel._render_pending()
+        assert panel._skipped == 0
+        assert panel.view.toPlainText().splitlines()[-1] == (
+            "… (2 lines skipped on screen — saved log has all)"
+        )
+    finally:
+        panel.close_panel()
+
+
+def test_scrollback_memory_fallback_is_bounded_and_says_so(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtWidgets import QPlainTextEdit
+    from turboadb.gui import scrollback as sb_mod
+
+    def unwritable(*_args, **_kwargs):
+        raise OSError("profile not writable")
+
+    monkeypatch.setattr(sb_mod.tempfile, "mkstemp", unwritable)
+    sb = sb_mod.Scrollback(QPlainTextEdit())
+    sb._MEMORY_LIMIT = 150            # spill (and so fail) almost immediately
+    sb._MEMORY_FALLBACK_LIMIT = 500   # then keep only a bounded tail in RAM
+    chunk = "x" * 100 + "\n"
+    for _ in range(20):
+        sb.archive(chunk)
+    assert sb._flush(10)
+    out = tmp_path / "saved.log"
+    sb.save_to(str(out))
+    text = out.read_text(encoding="utf-8")
+    assert sb._truncated > 0
+    assert len(text) < 20 * len(chunk)  # the whole session is no longer held in memory
+    assert text.startswith("[TurboADB: the history file could not be written")
+    assert text.endswith(chunk)  # the newest output is what survived
+    sb.close()
+
+
+def test_console_input_queue_overflow_is_marked_and_resets_the_parser(qapp):
+    con = _plain_console()
+    try:
+        con._MAX_INQ = 16
+        con.feed("old" * 8)
+        con.feed("tail-kept")
+        assert con._dropped == 24
+        # The hole can cut an escape in half; a half-parsed CSI used to eat
+        # everything that followed it.
+        con._state, con._csi = 2, "31"
+        while con._inq:
+            con._drain_tick()
+        assert con._state == 0 and con._csi == ""
+        text = con.toPlainText()
+        assert "24 characters skipped on screen" in text
+        assert text.endswith("tail-kept")
+        assert con._sb.full_text().endswith("tail-kept")  # the archive kept everything
+    finally:
+        con.close_archive()
+        con.close()
+
+
+def test_console_overwrite_after_carriage_return_is_one_edit(qapp):
+    con = _plain_console()
+    try:
+        _render(con, b"100% done\rok\n")
+        assert con.toPlainText() == "ok0% done\n"
+        con.clear()
+        _render(con, b"ab\rlonger\n")
+        assert con.toPlainText() == "longer\n"
+
+        con.clear()
+        _render(con, b"abcdefghij\r")
+        changes = []
+        con.document().contentsChange.connect(lambda *args: changes.append(args))
+        _render(con, b"XYZ")
+        # One selection + one insert for the overlap, not one edit per character.
+        assert len(changes) == 1
+        assert con.toPlainText() == "XYZdefghij"
+    finally:
+        con.close_archive()
+        con.close()
+
+
+def test_phone_answer_without_telephony_is_reported_as_a_hint(qapp, monkeypatch):
+    from turboadb.gui import phone_panel
+
+    jobs = []
+    monkeypatch.setattr(
+        phone_panel, "run_job",
+        lambda tracked, fn, on_done=None, on_fail=None: jobs.append((fn, on_done, on_fail)),
+    )
+    panel = phone_panel.PhonePanel(object())
+    try:
+        logged = []
+        panel.log.connect(logged.append)
+        # Answer/End stay enabled on purpose: they send the call key events a
+        # head unit forwards to the phone paired over Bluetooth.
+        assert panel.btn_answer.isEnabled() and panel.btn_end.isEnabled()
+        assert "key event" in panel.btn_answer.toolTip()
+        assert "key event" in panel.btn_end.toolTip()
+
+        panel._set_state("unsupported")
+        jobs.clear()
+        panel._answer_call()
+        jobs[-1][2]("Can't find service: phone")
+        assert logged[-1].startswith("[INFO] answer:")
+
+        panel._set_state("idle")  # a real phone: a failure is still a failure
+        panel._end_call()
+        jobs[-1][2]("adb: device offline")
+        assert logged[-1].startswith("[ERROR] end call:")
+    finally:
+        panel.close_panel()
+
+
+def test_panels_share_one_unwrap_icon_cache_and_page_toolbar(qapp):
+    from turboadb.gui import apps_panel, file_browser, logcat_view, phone_panel, qtutil
+    from turboadb.results import CommandResult, OperationResult
+
+    assert apps_panel.unwrap is qtutil.unwrap and phone_panel.unwrap is qtutil.unwrap
+    assert file_browser.cached_icon is qtutil.cached_icon
+    assert phone_panel.cached_icon is qtutil.cached_icon
+    for module in (apps_panel, phone_panel):
+        assert not hasattr(module, "_unwrap")
+    for module in (file_browser, phone_panel):
+        assert not hasattr(module, "_cached_icon")
+    for module in (apps_panel, file_browser, logcat_view):
+        assert module.page_toolbar is qtutil.page_toolbar
+
+    assert qtutil.unwrap(OperationResult(True, "x", value=7)) == 7
+    with pytest.raises(RuntimeError):
+        qtutil.unwrap(CommandResult("c", 1, "", "boom", 0.0))
+    assert qtutil.cached_icon("apps", "orange") is qtutil.cached_icon("apps", "orange")
+    toolbar, row = qtutil.page_toolbar()
+    assert toolbar.objectName() == "pageToolbar" and toolbar.layout() is row

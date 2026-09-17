@@ -5,7 +5,10 @@ Mirror (scrcpy), Screenshot, and Reboot actions in a header bar."""
 from __future__ import annotations
 
 import os
+import queue
 import shlex
+import threading
+import time
 
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QEvent, QSize, QTimer
 from PyQt5.QtWidgets import (
@@ -235,29 +238,98 @@ def config_from_session(s: dict) -> ADBConfig:
     )
 
 
+class _GateClosed(RuntimeError):
+    """The device tab closed while a background command waited for a slot."""
+
+
+class _AdbGate:
+    """At most *slots* one-shot adb commands of one device tab run at once.
+
+    A background job still gets its own worker thread, but it waits here for a
+    slot before starting adb, so a burst of refreshes queues up instead of
+    forking several adb.exe processes at the same moment.  Closing the tab
+    wakes every waiting job with :class:`_GateClosed`: a job that had not
+    started yet never starts adb for a tab that is gone.  Persistent streams
+    (the shell, logcat, transfers) don't take a slot.
+    """
+
+    def __init__(self, slots: int = 2):
+        self._cond = threading.Condition()
+        self._free = max(1, int(slots))
+        self._closed = False
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._free <= 0 and not self._closed:
+                self._cond.wait()
+            if self._closed:
+                raise _GateClosed("the device tab was closed")
+            self._free -= 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._free += 1
+            self._cond.notify()
+
+    def wrap(self, fn):
+        """*fn*, run inside a slot (for ``run_job`` workers)."""
+
+        def gated(*args, **kwargs):
+            self.acquire()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self.release()
+
+        return gated
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
 class _ConnectThread(QThread):
     ok = pyqtSignal(object, object)
     fail = pyqtSignal(str)
-    log = pyqtSignal(str)
+    log = pyqtSignal(str)  # this worker's own progress and outcome lines
+    # The handler's engine diagnostics ("[DEBUG] $ adb …", "… failed: …" from
+    # ADBHandler._guard): log panel only, never a notification — the panel
+    # that ran a failing command reports it itself.
+    trace = pyqtSignal(str)
+    # (handler, probe result): the rest of the connect-time probe, after ``ok``
+    details = pyqtSignal(object, object)
 
-    def __init__(self, cfg, *, fetch_identity: bool = True):
+    IDENTITY_TIMEOUT = 1.5
+
+    def __init__(self, cfg, *, fetch_identity: bool = True, gate=None):
         super().__init__()
         self.cfg = cfg
         self.fetch_identity = bool(fetch_identity)
+        self.gate = gate
+        self._probe = None
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
+        probe = self._probe
+        if probe is not None:
+            probe.close()  # never leave the probe's adb shell behind a closed tab
+
+    def _make_handler(self):
+        """The tab's handler. Its engine log lines go to ``trace`` (the log
+        panel), never ``log`` (notifications)."""
+        return ADBHandler(
+            self.cfg,
+            safe=True,
+            log_callback=lambda m: None if self._cancelled else self.trace.emit(m),
+        )
 
     def run(self):
         try:
             if self._cancelled:
                 return
-            h = ADBHandler(
-                self.cfg,
-                safe=True,
-                log_callback=lambda m: None if self._cancelled else self.log.emit(m),
-            )
+            h = self._make_handler()
             res = h.connect()
             if self._cancelled:
                 try:
@@ -268,22 +340,54 @@ class _ConnectThread(QThread):
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error))
                 return
-            quick = None
-            if self.fetch_identity:
-                # Fields for a friendly first banner. A terminal-only duplicate
-                # needs no device profile, so it skips this round-trip. The
-                # probe is quiet: it used to run with a 0.45 s limit and log an
-                # ERROR, so a phone that was a little slow right after connecting
-                # raised a red error popup and a banner without device details.
-                try:
-                    ident = h.quick_identity(timeout=1.5)
-                except Exception:
-                    ident = {}
-                if ident:
-                    quick = dict(ident, _quick_identity=True)
-            self.ok.emit(h, quick)
+            if not self.fetch_identity:
+                # A terminal-only duplicate needs no device profile.
+                self.ok.emit(h, None)
+                return
+            self._probe_and_emit(h)
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
+
+    def _probe_and_emit(self, handler):
+        """One adb shell for identity, prompt, device kind and displays.
+
+        ``ok`` goes out as soon as the identity sections are in (at most
+        ``IDENTITY_TIMEOUT`` s, as the old quick-identity call), so the tab,
+        its title and banner never wait for the slower feature list; the rest
+        follows as ``details`` from the same process.  The probe is quiet: a
+        phone that is slow right after connecting gets a plain banner, not an
+        error popup.
+        """
+        probe = _DeviceProbe(handler)
+        self._probe = probe
+        emitted = []
+
+        def identity(payload):
+            if not self._cancelled:
+                emitted.append(True)
+                self.ok.emit(handler, dict(payload, _probe_pending=True))
+
+        if self._cancelled:  # cancel() ran before the probe existed
+            probe.close()
+        try:
+            result = probe.run(gate=self.gate, on_identity=identity,
+                               identity_timeout=self.IDENTITY_TIMEOUT)
+        except Exception as exc:
+            # The device is connected: a probe failure must never reach
+            # run()'s handler and turn into "Connect failed".
+            probe.close()
+            if not emitted:
+                identity({})
+            result = {"info": None, "prompt": None, "displays": None,
+                      "error": f"{type(exc).__name__}: {exc}"}
+        if self._cancelled:
+            if not emitted:
+                try:
+                    handler.disconnect()
+                except Exception:
+                    pass
+            return
+        self.details.emit(handler, result)
 
 
 class _DeviceInfoThread(QThread):
@@ -304,6 +408,28 @@ class _DeviceInfoThread(QThread):
             self.done.emit(OperationResult(True, "device_info", value=info))
         except Exception as exc:
             self.done.emit(OperationResult(False, "device_info", error=exc))
+
+
+class _ProbeThread(QThread):
+    """Run the connect-time :class:`_DeviceProbe` for a tab that was handed a
+    handler directly (not through its own connect worker)."""
+
+    details = pyqtSignal(object)
+
+    def __init__(self, handler, gate=None):
+        super().__init__()
+        self.probe = _DeviceProbe(handler)
+        self.gate = gate
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        self.probe.close()
+
+    def run(self):
+        result = self.probe.run(gate=self.gate)
+        if not self._cancelled:
+            self.details.emit(result)
 
 
 _ActionThread = FunctionThread
@@ -420,6 +546,282 @@ class _PromptThread(QThread):
         except Exception:
             pass
         self.ready.emit(root, identity)
+
+
+class _DeviceProbe:
+    """Everything a new device tab asks the device, in ONE ``adb shell``.
+
+    Opening a tab used to start five short adb processes beside the
+    interactive shell (quick identity, the prompt's ``user@host``, a full
+    ``getprop`` dump, the device-kind script and a display scan), three of
+    them at the same moment.  This script prints the same facts as delimited
+    sections of one stream: the prompt and build properties come first (the
+    tab title, banner and prompt need nothing else), then the feature list,
+    ``wm size`` and the display list.  Parsing reuses the engine's own
+    ``classify_device`` and ``parse_display_info``.
+
+    Plain Python (no Qt): :meth:`run` blocks, so call it from a worker.
+    """
+
+    MARK = "__turboadb_probe_{}__"
+    SECTIONS = ("prompt", "props", "kind", "displays", "end")
+    # The first six are quick_identity's fields, in its order.
+    PROPS = (
+        "ro.product.manufacturer",
+        "ro.product.model",
+        "ro.build.version.release",
+        "ro.build.version.sdk",
+        "ro.product.device",
+        "ro.product.cpu.abi",
+        "ro.product.brand",
+        "ro.product.name",
+        "ro.build.display.id",
+        "ro.serialno",
+        "ro.build.characteristics",
+    )
+    IDENTITY_KEYS = ("manufacturer", "model", "android_version", "sdk", "device", "abi")
+    # device_info's getprop (20 s) and device_kind (20 s) limits, as one budget.
+    TIMEOUT = 25.0
+    _PROP_RE = re.compile(r"\[(.+?)\]:\s*\[(.*)\]")
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.sections = {}
+        self.error = ""
+        self._marks = {self.MARK.format(name): name for name in self.SECTIONS}
+        self._current = None
+        self._lines = queue.Queue()
+        self._lock = threading.Lock()
+        self._proc = None
+        self._eof = False
+        self._closed = False
+
+    @classmethod
+    def script(cls) -> str:
+        mark = cls.MARK.format
+        return "; ".join((
+            f"echo {mark('prompt')}",
+            _PromptThread.COMMAND,
+            f"echo {mark('props')}",
+            f'for p in {" ".join(cls.PROPS)}; do echo "[$p]: [$(getprop $p)]"; done',
+            f"echo {mark('kind')}",
+            ADBHandler._KIND_SCRIPT,
+            f"echo {mark('displays')}",
+            # list_displays(method="adb"): dumpsys only when cmd lists nothing
+            'd="$(cmd display get-displays 2>/dev/null)"; case "$d" in '
+            '*DisplayInfo*) echo "$d" ;; *) dumpsys display 2>/dev/null ;; esac',
+            f"echo {mark('end')}",
+        ))
+
+    # ---- the process ----
+    def run(self, gate=None, on_identity=None, identity_timeout=1.5) -> dict:
+        """Run the probe and return :meth:`result`.
+
+        *on_identity(payload)* is called exactly once: when the prompt and
+        property sections are complete, after *identity_timeout* seconds, or
+        at once when the probe can't run (so a caller never waits on it).
+        """
+        slot = started = False
+        try:
+            if gate is not None:
+                gate.acquire()
+                slot = True
+            started = self.start()
+            if started:
+                self.read_until("kind", identity_timeout)
+        except _GateClosed as exc:
+            self.error = str(exc)
+        try:
+            if on_identity is not None:
+                on_identity(self.identity_payload())
+            if started:
+                self.read_until("end", self.TIMEOUT)
+        finally:
+            self.close(wait=2.0)
+            if slot:
+                gate.release()
+        return self.result()
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._closed:
+                self._eof = True
+                return False
+        try:
+            proc = self.handler.popen(["shell", self.script()])
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self._eof = True
+            return False
+        with self._lock:
+            self._proc = proc
+            closed = self._closed
+        if closed:
+            self._kill(proc)
+            self._eof = True
+            return False
+        threading.Thread(
+            target=self._pump, args=(proc,), name="turboadb-device-probe", daemon=True
+        ).start()
+        return True
+
+    def _pump(self, proc) -> None:
+        tail = b""
+        try:
+            read = getattr(proc.stdout, "read1", None) or proc.stdout.read
+            while True:
+                chunk = read(65536)
+                if not chunk:
+                    break
+                lines = (tail + chunk).split(b"\n")
+                tail = lines.pop()
+                for line in lines:
+                    self._lines.put(line)
+        except (OSError, ValueError, AttributeError):
+            pass  # pipe closed by close()
+        if tail:
+            self._lines.put(tail)
+        self._lines.put(None)
+
+    def read_until(self, section, timeout) -> bool:
+        """Consume output until *section* has started; False at EOF, on
+        :meth:`close` or after *timeout* seconds."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while section not in self.sections:
+            if self._eof or self._closed:
+                return False
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            try:
+                raw = self._lines.get(timeout=min(left, 0.2))
+            except queue.Empty:
+                continue
+            if raw is None:
+                self._eof = True
+                return False
+            line = raw.decode("utf-8", "replace").rstrip("\r")
+            name = self._marks.get(line.strip())
+            if name is not None:
+                self._current = name
+                self.sections[name] = []
+            elif self._current is not None:
+                self.sections[self._current].append(line)
+        return True
+
+    def close(self, wait: float = 0.0) -> None:
+        """End the probe's adb process (idempotent, any thread)."""
+        with self._lock:
+            self._closed = True
+            proc = self._proc
+        if proc is None:
+            return
+        if wait:
+            try:
+                proc.wait(timeout=wait)
+            except Exception:
+                pass
+        self._kill(proc)
+
+    @staticmethod
+    def _kill(proc) -> None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    # ---- parsing ----
+    def props(self) -> dict:
+        found = {}
+        for line in self.sections.get("props", ()):
+            match = self._PROP_RE.match(line.strip())
+            if match:
+                found[match.group(1)] = match.group(2)
+        return found
+
+    def prompt(self):
+        """``(root, "user@host")`` once the prompt section is complete, else None."""
+        if "props" not in self.sections:
+            return None
+        return _PromptThread.parse("\n".join(self.sections["prompt"]))
+
+    def quick_identity(self) -> dict:
+        """``ADBHandler.quick_identity()``'s dict, or {} before the properties are in."""
+        if "kind" not in self.sections:
+            return {}
+        props = self.props()
+        ident = {key: props.get(prop, "") for key, prop in zip(self.IDENTITY_KEYS, self.PROPS)}
+        return ident if (ident["manufacturer"] or ident["model"]) else {}
+
+    def identity_payload(self) -> dict:
+        """What ``_ConnectThread.ok`` carries: quick identity and the prompt."""
+        quick = self.quick_identity()
+        payload = dict(quick, _quick_identity=True) if quick else {}
+        prompt = self.prompt()
+        if prompt is not None:
+            payload["_prompt"] = prompt
+        return payload
+
+    def device_info(self):
+        """``ADBHandler.device_info()``'s dict, or None when no properties came back."""
+        if "kind" not in self.sections:
+            return None
+        props = self.props()
+        if not any(props.get(p) for p in self.PROPS[:4]):
+            return None
+        characteristics = props.get("ro.build.characteristics", "")
+        info = {
+            "serial": getattr(self.handler, "serial", None) or props.get("ro.serialno", ""),
+            "model": props.get("ro.product.model", ""),
+            "brand": props.get("ro.product.brand", ""),
+            "name": props.get("ro.product.name", ""),
+            "device": props.get("ro.product.device", ""),
+            "manufacturer": props.get("ro.product.manufacturer", ""),
+            "android_version": props.get("ro.build.version.release", ""),
+            "sdk": props.get("ro.build.version.sdk", ""),
+            "build_id": props.get("ro.build.display.id", ""),
+            "abi": props.get("ro.product.cpu.abi", ""),
+            "characteristics": characteristics,
+            "automotive": "automotive" in characteristics,
+        }
+        if "displays" in self.sections:  # the feature list / wm size section is complete
+            kind = ADBHandler.classify_device("\n".join(self.sections["kind"]))
+            info.update(
+                kind=kind["kind"],
+                kind_label=kind["label"],
+                kind_reason=kind["reason"],
+                telephony=kind["telephony"],
+                display_size=kind["display_size"],
+            )
+            info["automotive"] = bool(info["automotive"] or kind["automotive"])
+        return info
+
+    def displays(self):
+        """``list_displays(method="adb")``'s list, or None when the scan didn't finish."""
+        if "end" not in self.sections:
+            return None
+        return ADBHandler.parse_display_info("\n".join(self.sections["displays"]))
+
+    def result(self) -> dict:
+        info = self.device_info()
+        error = ""
+        if info is None:
+            error = self.error or (
+                "the device did not answer in time" if not self._eof
+                else "the device returned no properties"
+            )
+        return {
+            "info": info,
+            "prompt": self.prompt(),
+            "displays": self.displays(),
+            "error": error,
+        }
 
 
 class _TerminalWidgetBase(QWidget):
@@ -690,7 +1092,17 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._started = False
         self._in_adb_shell = False
         self._adb_shell_cwd = "/"
-        self._strip_startup_banner = True
+        self._adb_shell_command = ""  # the adb shell command as sent, to reopen it
+        # the adb shell printed its prompt or an adb error, so a local prompt
+        # after that means it ended (not an earlier prompt still arriving)
+        self._adb_answered = False
+        self._adb_reentry_cwd = None  # device folder to cd into once reopened
+        self._adb_interrupt_pending = False  # Ctrl+C sent, device prompt not back yet
+        self._adb_interrupt_heard = False
+        self._adb_interrupt_timer = QTimer(self)
+        self._adb_interrupt_timer.setSingleShot(True)
+        self._adb_interrupt_timer.timeout.connect(self._on_adb_interrupt_timeout)
+        self._strip_startup_banner = False  # set for each new CMD session
         self._prompt_tail = ""
 
     def _get_prompt(self) -> str:
@@ -1003,8 +1415,25 @@ class _LocalShellWidget(_TerminalWidgetBase):
         """
         self._in_adb_shell = False
         self._adb_shell_cwd = "/"
+        self._adb_shell_command = ""
+        self._adb_answered = False
+        self._adb_reentry_cwd = None
+        self._clear_adb_interrupt()
         self.term._cwd = self._shell_cwd
         self.term.set_completion_fn(self._local_complete)
+
+    def _enter_adb_shell(self, command: str) -> bytes:
+        """Follow an interactive adb shell started here; returns the line to send."""
+        self._in_adb_shell = True
+        self._adb_shell_command = command
+        self._adb_shell_cwd = "/"
+        self._adb_answered = False
+        self._adb_reentry_cwd = None
+        self._prompt_tail = ""
+        self._clear_adb_interrupt()
+        self.term._cwd = self._adb_shell_cwd
+        self.term.set_completion_fn(self._adb_shell_complete)
+        return (command + "\r\n").encode("utf-8")
 
     def _local_adb_reboot_mode(self, tokens: list[str]):
         """Return the requested reboot mode for this terminal's device, if any."""
@@ -1042,6 +1471,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
         try:
             self.session = LocalShellSession(self.shell_type, serial=self.serial, cwd=self._shell_cwd)
+            # CMD's copyright banner, also after Stop reopens the shell
+            self._strip_startup_banner = True
             if show_banner:
                 from .. import __version__
 
@@ -1090,11 +1521,16 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     data = clean.encode("utf-8")
                 except Exception:
                     pass
+            if self._adb_interrupt_pending:
+                self._adb_interrupt_heard = True
             self._track_prompt_cwd(data)
             self.term.feed(data)
 
     _PS_PROMPT_TAIL = re.compile(r"(?:^|[\r\n])PS ([^\r\n>]+)> ?$")
     _CMD_PROMPT_TAIL = re.compile(r"(?:^|[\r\n])([A-Za-z]:\\[^\r\n<>|*?\"]*)>$")
+    # an Android shell prompt ("PD2318:/sdcard $ ", "/ # ") ending the output
+    _DEVICE_PROMPT_TAIL = re.compile(r"[:/][^\r\n]* [$#] ?$")
+    _ADB_ERROR_LINE = re.compile(r"(?:^|[\r\n])(?:adb(?:\.exe)?|error): ")
 
     def _track_prompt_cwd(self, data) -> None:
         """Follow the folder the shell reports in its own prompt.
@@ -1103,17 +1539,46 @@ class _LocalShellWidget(_TerminalWidgetBase):
         ``Set-Location ~\\x`` and profile functions, which left Tab completion
         (and ``.\\tool.exe`` suggestions) looking in the wrong folder and made
         Stop reopen the shell somewhere else."""
-        if self._in_adb_shell:
-            self._prompt_tail = ""
-            return
         if isinstance(data, bytes):
             data = data.decode("utf-8", "replace")
         tail = (getattr(self, "_prompt_tail", "") + data)[-1024:]
         self._prompt_tail = tail
+        if self._in_adb_shell:
+            self._track_adb_shell_output(tail)
+            return
+        match = self._local_prompt_match(tail)
+        if match:
+            self._shell_cwd = match.group(1)
+
+    def _local_prompt_match(self, tail: str):
         pattern = self._PS_PROMPT_TAIL if self.shell_type == "powershell" else self._CMD_PROMPT_TAIL
         match = pattern.search(tail)
-        if match and os.path.isdir(match.group(1)):
+        return match if match and os.path.isdir(match.group(1)) else None
+
+    def _track_adb_shell_output(self, tail: str) -> None:
+        """Follow an adb shell started here from its output.
+
+        The device prompt settles a pending Ctrl+C and, after a reopen, moves
+        back to the device folder. PowerShell's or CMD's own prompt after the
+        adb shell answered means it ended by itself (``exit`` in a script, the
+        device unplugged), so Tab completion and Stop act locally again."""
+        text = strip_ansi(tail)
+        if self._DEVICE_PROMPT_TAIL.search(text):
+            self._adb_answered = True
+            self._clear_adb_interrupt()
+            cwd, self._adb_reentry_cwd = self._adb_reentry_cwd, None
+            if cwd and self.session and self.session.running:
+                self.session.send(("cd " + shlex.quote(cwd) + "\r\n").encode("utf-8"))
+            return
+        if self._ADB_ERROR_LINE.search(text):
+            self._adb_answered = True
+        if not self._adb_answered:
+            return
+        match = self._local_prompt_match(tail)
+        if match:
+            self.reset_adb_shell_context()
             self._shell_cwd = match.group(1)
+            self.term._cwd = self._shell_cwd
 
     def _on_closed(self):
         if not self._closing:
@@ -1134,6 +1599,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
             was_in_adb_shell = self._in_adb_shell
             if was_in_adb_shell:
                 self._track_adb_shell_directory(line)
+                # input after a Ctrl+C: the next Stop sends Ctrl+C again
+                self._clear_adb_interrupt()
             if not was_in_adb_shell and parts and parts[0].lower() in ("cd", "chdir"):
                 if len(parts) > 1:
                     target = parts[1].strip().strip('"\'')
@@ -1155,30 +1622,22 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     self._shell_cwd = new_cwd
 
             # Track entry and exit from interactive adb shell
-            if line.lower() in ("exit", "exit 0", "logout"):
-                self._in_adb_shell = False
-                self.term.set_completion_fn(self._local_complete)
+            if was_in_adb_shell and line.lower() in ("exit", "exit 0", "logout"):
+                self.reset_adb_shell_context()
 
             tokens = line.split()
             local_reboot_mode = (
                 self._local_adb_reboot_mode(tokens) if not was_in_adb_shell else None
             )
+            adb_shell = None
             if len(tokens) == 2 and tokens[0].lower() == "adb" and tokens[1].lower() == "shell":
-                self._in_adb_shell = True
-                self._adb_shell_cwd = "/"
-                self.term._cwd = self._adb_shell_cwd
-                self.term.set_completion_fn(self._adb_shell_complete)
-                data = b"adb shell -t -t\r\n"
-                if hasattr(self.term, "_pending_echo"):
-                    self.term._pending_echo = "adb shell -t -t"
+                adb_shell = "adb shell -t -t"
             elif len(tokens) == 4 and tokens[0].lower() == "adb" and tokens[1].lower() in ("-s", "-t") and tokens[3].lower() == "shell":
-                self._in_adb_shell = True
-                self._adb_shell_cwd = "/"
-                self.term._cwd = self._adb_shell_cwd
-                self.term.set_completion_fn(self._adb_shell_complete)
-                data = f"adb {tokens[1]} {tokens[2]} shell -t -t\r\n".encode("utf-8")
+                adb_shell = f"adb {tokens[1]} {tokens[2]} shell -t -t"
+            if adb_shell is not None:
+                data = self._enter_adb_shell(adb_shell)
                 if hasattr(self.term, "_pending_echo"):
-                    self.term._pending_echo = f"adb {tokens[1]} {tokens[2]} shell -t -t"
+                    self.term._pending_echo = adb_shell
 
             if not getattr(self, "_in_adb_shell", False):
                 rewritten = self._interactive_rewrite(line)
@@ -1287,15 +1746,69 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
                 park_thread(reader)
 
+    # how long the adb shell gets to answer a Ctrl+C before it is reopened
+    ADB_INTERRUPT_WAIT_MS = 3000
+
     def interrupt(self):
-        """Hard-stop a local command instead of sending an inert Ctrl+C byte."""
+        """Stop the running command.
+
+        Inside an adb shell started here, Ctrl+C goes to the device: the shell
+        runs on a device terminal (``-t -t``), so only the device command stops
+        and the adb shell stays. If the adb shell doesn't answer, or Stop is
+        pressed again before its prompt is back, the same adb shell is reopened
+        in the same device folder. A local command is hard-stopped, since over
+        pipes a Ctrl+C byte is only input."""
         if self._closing or not (self.session and self.session.running):
+            return
+        if self._in_adb_shell:
+            if self._adb_interrupt_pending:
+                self._reopen_adb_shell()
+            else:
+                self._adb_interrupt_pending = True
+                self._adb_interrupt_heard = False
+                self.session.send(b"\x03")
+                self._adb_interrupt_timer.start(self.ADB_INTERRUPT_WAIT_MS)
+                self.term.setFocus(Qt.OtherFocusReason)
             return
         self._stop_session(interrupt=True)
         self.reset_adb_shell_context()
         self._started = True
         self.term._echo("\n^C  — stopped; fresh local shell ready\n", theme.ECHO_ERROR)
         self._start_session(show_banner=False)
+        self.term.set_alive(True)
+        self.term.setFocus(Qt.OtherFocusReason)
+
+    def _clear_adb_interrupt(self) -> None:
+        self._adb_interrupt_pending = False
+        self._adb_interrupt_heard = False
+        self._adb_interrupt_timer.stop()
+
+    def _on_adb_interrupt_timeout(self) -> None:
+        if self._closing or not (self._in_adb_shell and self._adb_interrupt_pending):
+            return
+        if not self._adb_interrupt_heard:
+            self._reopen_adb_shell()  # not even an echo: adb itself is stuck
+
+    def _reopen_adb_shell(self) -> None:
+        """End a stuck adb shell and start it again in its device folder."""
+        command, cwd = self._adb_shell_command, self._adb_shell_cwd
+        self._stop_session(interrupt=True)
+        self._clear_adb_interrupt()
+        self._started = True
+        if command:
+            self.term._echo(f"\n^C  — stopped; reopening adb shell in {cwd}\n", theme.ECHO_ERROR)
+        else:
+            self.reset_adb_shell_context()
+            self.term._echo("\n^C  — stopped; fresh local shell ready\n", theme.ECHO_ERROR)
+        self._start_session(show_banner=False)
+        if not (self.session and self.session.running):
+            self.reset_adb_shell_context()  # _start_session has shown why
+            return
+        if command:
+            line = self._enter_adb_shell(command)
+            self._adb_shell_cwd = self.term._cwd = cwd
+            self._adb_reentry_cwd = cwd if cwd != "/" else None
+            self.session.send(line)
         self.term.set_alive(True)
         self.term.setFocus(Qt.OtherFocusReason)
 
@@ -1312,6 +1825,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
     def close_panel(self):
         self._closing = True
+        self._adb_interrupt_timer.stop()
         self._park_completion_thread()
         self._stop_session()
         try:
@@ -1324,16 +1838,25 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     """A native interactive ``adb shell`` with local prompt emulation and auto-completion."""
     disconnected = pyqtSignal()
 
-    def __init__(self, handler, device_name="", info=None, parent=None):
+    def __init__(self, handler, device_name="", info=None, parent=None, *, autostart=True):
+        """*autostart=False* opens the ``adb shell`` only when the widget is
+        first shown (or :meth:`ensure_started` is called): it is a persistent
+        adb process, and a tab whose Terminal is never on screen needs none."""
         super().__init__(handler, parent)
         self.setObjectName("terminalPanel")
         self.device_name = device_name or (handler.serial or "android")
         self._info = info or {}
         self._pt = None
+        self._started = False
         self._banner_shown = False
         self._banner_pending = False
         self._banner_waited = False
         self._adb_restart_paused = False
+        # "unknown": the next shell open asks the device for user@host;
+        # "pending": the tab's connect-time probe will deliver it;
+        # "known": delivered, so reopening after Stop asks nothing.
+        self._prompt_state = "unknown"
+        self._prompt_root = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1348,7 +1871,17 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         self.term.set_completion_fn(self._complete)
         self.term.set_interrupt_fn(self.interrupt)
         self._attach_terminal(lay)
-        self._open()
+        if autostart:
+            self.ensure_started()
+
+    def ensure_started(self):
+        """Open the interactive shell the first time the terminal is needed."""
+        if not self._started and not self._closing and self.handler:
+            self._open()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.ensure_started()
 
     def _complete(self, line):
         """Schedule an ADB completion query instead of blocking the Tab key."""
@@ -1360,6 +1893,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     def _open(self, *, focus=True):
         if not self.handler:
             return
+        self._started = True
         res = self.handler.open_shell(tty=False)
         self.session = res.value if isinstance(res, OperationResult) else res
         if self.session is None:
@@ -1382,7 +1916,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if focus:
             self.term.setFocus(Qt.OtherFocusReason)
 
-        self.term.set_prompt(self._prompt_identity(False), root=False)
+        self.term.set_prompt(self._prompt_identity(self._prompt_root), root=self._prompt_root)
         if not self._banner_shown and self.term._alive and not (
             self._info.get("kind") or self._banner_waited
         ):
@@ -1392,7 +1926,8 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             QTimer.singleShot(2500, self._flush_pending_banner)
         else:
             self._show_banner_and_prompt()
-        self._start_prompt_probe()
+        if self._prompt_state == "unknown":
+            self._start_prompt_probe()
 
     def _show_banner_and_prompt(self):
         self._banner_pending = False
@@ -1411,10 +1946,36 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             self._show_banner_and_prompt()
 
     def update_identity(self, details):
-        """Full device details arrived; show the waiting banner with them."""
+        """Full device details arrived; show the waiting banner with them.
+
+        They are final: a shell that opens later (the Terminal is opened when
+        first shown) shows its banner at once instead of waiting 2.5 s for a
+        device-type probe that has already answered, or never runs."""
         self._info = dict(details or {})
+        self._banner_waited = True
         if self._banner_pending and not self._closing:
             self._show_banner_and_prompt()
+
+    def expect_prompt(self):
+        """The tab's connect-time probe will deliver ``user@host``: opening
+        the shell before it arrives must not start a second query."""
+        if self._prompt_state != "known":
+            self._prompt_state = "pending"
+
+    def apply_prompt(self, is_root, identity):
+        """The probe's answer (``identity`` empty: it had none)."""
+        if identity:
+            self._on_prompt(is_root, identity)
+        else:
+            self.prompt_unavailable()
+
+    def prompt_unavailable(self):
+        """The probe could not tell: ask the device the usual way."""
+        if self._prompt_state != "pending":
+            return
+        self._prompt_state = "unknown"
+        if self.session is not None and not self._closing:
+            self._start_prompt_probe()  # the shell is already open
 
     def _start_prompt_probe(self):
         """Ask the device for root state; a stale probe is detached and parked."""
@@ -1504,6 +2065,10 @@ class _AndroidShellWidget(_TerminalWidgetBase):
 
     def reconnect(self, *, focus=True):
         self._adb_restart_paused = False
+        # adbd may have restarted (reboot, adb root): ask for user@host again.
+        self._prompt_state = "unknown"
+        if not self._started:
+            return  # never shown: the shell opens when the Terminal first is
         self._close_stream()
         self.term.feed(b"\n")
         self._open(focus=focus)
@@ -1524,7 +2089,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         self._pause_stream("ADB server restarting")
 
     def _pause_stream(self, reason):
-        if self._closing:
+        if self._closing or not self._started:
             return
         self._adb_restart_paused = True
         self._close_stream()
@@ -1539,6 +2104,8 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         # friendly model name shown in the banner.
         if identity:
             self._prompt_id = identity
+            self._prompt_state = "known"
+        self._prompt_root = bool(is_root)
         if not self._closing:
             self.term.set_prompt(self._prompt_identity(is_root), is_root)
 
@@ -1635,7 +2202,10 @@ class ShellPanel(QWidget):
         self.subtabs.setDocumentMode(True)
         self.subtabs.tabBar().setDrawBase(False)
 
-        self.android_widget = _AndroidShellWidget(handler, device_name=device_name, info=info)
+        # Opened when the Terminal is first on screen, not when the tab connects.
+        self.android_widget = _AndroidShellWidget(
+            handler, device_name=device_name, info=info, autostart=False
+        )
         self.android_widget.log.connect(self.log)
         self.android_widget.disconnected.connect(self.disconnected)
         self.subtabs.addTab(self.android_widget, "Android shell")
@@ -1764,29 +2334,77 @@ def choose_control_layout(width, height, aspect, side_width, strip_height, curre
     return "below" if below > side * margin else "side"
 
 
+def plan_side_layout(width, height, aspect, chrome, toolbar_width, options, *,
+                     frame=4, screen_min=300):
+    """Split a Device Control row between the screen card and the controls
+    beside it: ``(screen_width, controls_width, columns)``.
+
+    *chrome* is the screen card's height above the picture with a one-row
+    toolbar, *toolbar_width* the width that toolbar needs, and *options* the
+    controls' ``(columns, narrowest, widest, height)`` layouts (see
+    ``ControlsPanel.layout_options``; widths and heights of the whole card).
+
+    * The screen card asks for the width its picture can use at this height —
+      and at least its one-row toolbar, since every wrapped toolbar row costs
+      the picture height.
+    * The controls take the fewest columns that show every control without
+      scrolling (fewer, fuller columns instead of a wide panel with empty space
+      below it), or else the most columns that fit; each column stops growing
+      at the panel's comfortable maximum.
+    * Whatever is left goes to the screen card, which centres the picture.
+    """
+    aspect = aspect if aspect and aspect > 0 else 16.0 / 9.0
+    width, height = max(0, int(width)), max(0, int(height))
+    options = sorted(options) or [(1, 340, 400, 0)]
+    first = options[0]
+    picture = int(max(0, height - chrome) * aspect) + frame
+    wanted = max(picture, int(toolbar_width), screen_min)
+    wanted = min(wanted, max(screen_min, width - first[1]))  # one column always fits
+    room = width - wanted
+    fitting = [option for option in options if option[1] <= room] or [first]
+    unscrolled = [option for option in fitting if option[3] <= height]
+    columns, narrowest, widest, _height = unscrolled[0] if unscrolled else fitting[-1]
+    controls = max(narrowest, min(widest, room))
+    controls = max(1, min(controls, width - min(screen_min, width // 2)))
+    return width - controls, controls, columns
+
+
 class _ControlView(QWidget):
     """Device Control: the device screen with its controls beside or below it.
 
     The controls go wherever the screen ends up larger for this window and the
-    screen's shape: a portrait phone keeps them at the side, a wide head-unit
-    screen in a wide window gets them as a strip below. Beside the screen, the
-    screen gets all the width it can use and the controls the rest, so a
-    landscape screen is never squeezed by a two-column controls panel.
+    screen's shape (choose_control_layout): a portrait phone keeps them at the
+    side, a wide head-unit screen in a wide window gets them as a strip below.
+    Beside the screen, plan_side_layout sizes both cards: the picture as large
+    as the height allows with a one-row screen toolbar, the controls in the
+    fewest comfortable columns that need no scrolling, and any spare width
+    around the picture.
+
+    Maximize view (the screen toolbar, Esc to restore) hides the controls so
+    the screen card fills the tab; restoring brings back exactly what was shown.
     """
 
     SIDE_WIDTH = 360  # the controls' single-column width
-    SCREEN_MIN = 480  # beside the controls: keeps the screen toolbar to two rows
     STRIP_MAX = 0.45  # a strip never takes more than this share of the height
+    # Until the cards are laid out and can be measured: the controls card's
+    # caption, and a card's border + margin on both sides.
+    CARD_TITLE = 35
+    CARD_FRAME = 4
 
-    def __init__(self, mirror, screen_card, controls, controls_card, parent=None):
+    def __init__(self, mirror, screen_card, controls, controls_card, parent=None, toggle=None):
         super().__init__(parent)
         self.mirror = mirror
         self.screen_card = screen_card
         self.controls = controls
         self.controls_card = controls_card
+        self.toggle = toggle  # the screen toolbar's show/hide-controls button
         self.mode = "side"
         self._user_sized = False
         self._applying = False
+        self._controls_wanted = True  # the user's latest show/hide choice
+        self._maximized = False
+        # Maximize view hides the controls until the user asks for them again
+        self._max_hides_controls = False
 
         self.split = QSplitter(Qt.Horizontal)
         self.split.setHandleWidth(6)
@@ -1806,7 +2424,54 @@ class _ControlView(QWidget):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._apply)
         mirror.display_shape_changed.connect(self.schedule_layout)
+        mirror.toolbar_changed.connect(self.schedule_layout)
+        mirror.max_view_changed.connect(self.set_maximized)
+        if toggle is not None:
+            toggle.toggled.connect(self.set_controls_visible)
+        self._sync_controls()
 
+    # ---- showing and hiding the controls ----
+    def controls_visible(self) -> bool:
+        """Whether the controls panel is shown: the user's choice, unless
+        Maximize view hid the controls and the user hasn't asked for them since."""
+        return self._controls_wanted and not self._max_hides_controls
+
+    def set_controls_visible(self, visible) -> None:
+        """The user's Show / Hide controls choice. It works while maximized too
+        (the view stays maximized) and is what Restore view keeps."""
+        self._controls_wanted = bool(visible)
+        self._max_hides_controls = False
+        self._sync_controls()
+
+    def set_maximized(self, on) -> None:
+        """Maximize view: the screen card fills the tab; off shows the
+        controls as the user last chose."""
+        on = bool(on)
+        if on == self._maximized:
+            return
+        self._maximized = on
+        self._max_hides_controls = on
+        self._sync_controls()
+
+    def _sync_controls(self) -> None:
+        shown = self.controls_visible()
+        self.controls_card.setVisible(shown)
+        toggle = self.toggle
+        if toggle is not None:
+            # the button always says what a click does next, maximized or not
+            toggle.blockSignals(True)
+            toggle.setChecked(shown)
+            toggle.blockSignals(False)
+            text = "Hide controls" if shown else "Show controls"
+            toggle.setText(text)
+            toggle.setAccessibleName(text)
+            toggle.setToolTip(
+                "Hide the device controls panel" if shown else "Show the device controls panel"
+            )
+        self.schedule_layout()
+        QTimer.singleShot(0, self.mirror._fit)
+
+    # ---- layout ----
     def schedule_layout(self, *_args):
         self._timer.start(40)
 
@@ -1818,15 +2483,39 @@ class _ControlView(QWidget):
         if not self._applying:
             self._user_sized = True  # respect a dragged divider until the mode changes
 
+    def _card_frame(self) -> int:
+        """Width a card adds around its page (border and margin, both sides)."""
+        card, inner = self.screen_card, self.mirror
+        if card.width() > 1 and inner.width() > 1 and card.width() > inner.width():
+            return card.width() - inner.width()
+        return self.CARD_FRAME
+
+    def _card_title(self) -> int:
+        card, inner = self.controls_card, self.controls
+        if card.height() > 1 and inner.height() > 1 and card.height() > inner.height():
+            return card.height() - inner.height() - self._card_frame()
+        return self.CARD_TITLE
+
+    def _controls_options(self):
+        """The controls' column layouts as card sizes (frame and caption added)."""
+        frame, title = self._card_frame(), self._card_title()
+        return [
+            (columns, narrowest + frame, widest + frame, height + title + frame)
+            for columns, narrowest, widest, height in self.controls.layout_options()
+        ]
+
     def _apply(self):
         width, height = self.split.width(), self.split.height()
         if width < 200 or height < 150 or not self.controls_card.isVisibleTo(self):
             return
         aspect = self.mirror.display_aspect()
-        chrome = self.mirror.chrome_height() + 4  # + the screen card's frame
+        frame = self._card_frame()
+        toolbar = self.mirror.toolbar_width() + frame
+        # the picture's height with a one-row toolbar (+ the screen card's frame)
+        chrome = self.mirror.chrome_height(toolbar - frame) + frame
         handle = self.split.handleWidth()
         strip = min(
-            self.controls.content_height(width, strip=True) + 34,  # + the card title
+            self.controls.content_height(width, strip=True) + self._card_title() + frame,
             int(height * self.STRIP_MAX),
         )
         mode = choose_control_layout(
@@ -1843,12 +2532,11 @@ class _ControlView(QWidget):
                 if mode == "below":
                     self.split.setSizes([max(1, height - strip - handle), strip])
                 else:
-                    screen = min(width - handle - self.SIDE_WIDTH, int((height - chrome) * aspect) + 4)
-                    # a narrow (portrait) screen still gets room for its toolbar,
-                    # which would otherwise wrap and shrink the screen itself
-                    floor = min(self.SCREEN_MIN, width - handle - self.SIDE_WIDTH)
-                    screen = max(self.screen_card.minimumWidth(), floor, screen)
-                    self.split.setSizes([screen, max(1, width - handle - screen)])
+                    screen, controls, _columns = plan_side_layout(
+                        width - handle, height, aspect, chrome, toolbar, self._controls_options(),
+                        screen_min=self.screen_card.minimumWidth(),
+                    )
+                    self.split.setSizes([screen, controls])
         finally:
             self._applying = False
         QTimer.singleShot(0, self.mirror._fit)
@@ -1893,11 +2581,76 @@ class _StatePill(QLabel):
         return self._full_text
 
 
+class _LazyPage(QWidget):
+    """A section page that is built the first time it is shown.
+
+    Logcat, Files, Apps, Phone and Webcam hold widgets, caches and (for Files
+    and Webcam) start-up workers that an unvisited page never needs.  This
+    holder is the persistent page object for the tab order and split view;
+    :attr:`page` is the real panel once built.
+    """
+
+    def __init__(self, factory, parent=None):
+        super().__init__(parent)
+        self._factory = factory
+        self.page = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+    def ensure_built(self):
+        """Build the page now if it wasn't yet; returns it (None once released)."""
+        if self.page is None and self._factory is not None:
+            factory, self._factory = self._factory, None
+            self.page = factory()
+            self.layout().addWidget(self.page)
+            if self.isVisible():
+                self.page.show()
+        return self.page
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.ensure_built()
+
+    def release(self):
+        """Never build after the tab closed; returns the page if it was built."""
+        self._factory = None
+        return self.page
+
+
+def _lazy_page(key):
+    """``DeviceTab.logcat`` and friends: the real page, built on first use,
+    so code that reads the attribute keeps working while unvisited pages cost
+    nothing.  Missing (AttributeError) before the tab has connected."""
+
+    def get(self):
+        holder = self.__dict__.get("_lazy_pages", {}).get(key)
+        if holder is None:
+            raise AttributeError(key)
+        return holder.ensure_built()
+
+    return property(get)
+
+
 class DeviceTab(QWidget):
     log = pyqtSignal(str)
+    # Engine diagnostic lines — for the log panel only, never a notification.
+    trace = pyqtSignal(str)
     title_changed = pyqtSignal(str)
     # Relays Device Control's screen session state (True while video shows).
     screen_active = pyqtSignal(bool)
+    # Once per tab, after its first successful connect has named the tab
+    # (a later reconnect is not a new connection).
+    connected = pyqtSignal()
+
+    # Built on first show (see _LazyPage); Terminal and Device Control are not.
+    logcat = _lazy_page("logcat")
+    files = _lazy_page("files")
+    apps = _lazy_page("apps")
+    phone = _lazy_page("phone")
+    webcam = _lazy_page("webcam")
+    # One-shot adb commands of one tab running at the same time (_AdbGate).
+    ADB_SLOTS = 2
 
     def __init__(self, session: dict, parent=None, *, terminal_only: bool = False):
         super().__init__(parent)
@@ -1911,8 +2664,12 @@ class DeviceTab(QWidget):
         self._reboot_in_progress = False
         self._adb_restart_in_progress = False
         self._info_thread = None
+        self._probe_thread = None
+        self._lazy_pages = {}
+        self._adb_gate = _AdbGate(self.ADB_SLOTS)
         self._device_dispatcher = None
         self._session_closed = False
+        self._announced_connected = False
         self._subtab_meta = {}
         self._split_keys = ()
         self._split_panes = {}
@@ -2105,7 +2862,7 @@ class DeviceTab(QWidget):
 
         previous = self._ct
         if previous is not None:
-            for sig in ("ok", "fail", "log"):
+            for sig in ("ok", "details", "fail", "log", "trace"):
                 try:
                     getattr(previous, sig).disconnect()
                 except Exception:
@@ -2114,10 +2871,14 @@ class DeviceTab(QWidget):
                 previous.cancel()
                 park_thread(previous)
         cfg = config_from_session(self.session)
-        self._ct = _ConnectThread(cfg, fetch_identity=not self._terminal_only)
+        self._ct = _ConnectThread(
+            cfg, fetch_identity=not self._terminal_only, gate=self._adb_gate
+        )
         self._ct.ok.connect(self._on_connected)
+        self._ct.details.connect(self._on_probe_details)
         self._ct.fail.connect(self._on_fail)
         self._ct.log.connect(self.log)
+        self._ct.trace.connect(self.trace)
         self._started_connect = False
 
     def start_connect(self):
@@ -2227,7 +2988,7 @@ class DeviceTab(QWidget):
         handler = self.handler
         run_job(
             self._threads,
-            handler.get_state,
+            self._adb_gate.wrap(handler.get_state),
             lambda state, h=handler: self._on_shell_lost_state(h, state),
             lambda _msg, h=handler: self._on_shell_lost_state(h, None),
         )
@@ -2324,13 +3085,15 @@ class DeviceTab(QWidget):
                 "If it's in recovery/bootloader this is expected; otherwise replug and click Reconnect."
             )
 
-    def _run_action(self, label, fn, on_ok, *, on_error=None):
+    def _run_action(self, label, fn, on_ok, *, on_error=None, gated=True):
         """Run one engine call off the UI thread and report its outcome.
 
         *fn* calls the engine with ``safe=True``.  A failed ``OperationResult``
         and a raised exception both go to *on_error* (default: an
         ``[ERROR] label: …`` log line); success passes the unwrapped value to
-        *on_ok*.
+        *on_ok*.  The call waits for one of the tab's adb slots (_AdbGate)
+        unless *gated* is False: a minutes-long bugreport must not hold one,
+        and a reboot the header already announces must not wait for one.
         """
 
         def report(message):
@@ -2346,13 +3109,13 @@ class DeviceTab(QWidget):
             else:
                 on_ok(self._action_value(result))
 
-        run_job(self._threads, fn, finished, report)
+        run_job(self._threads, self._adb_gate.wrap(fn) if gated else fn, finished, report)
 
     def _op(self, label, fn):
         if not self.handler:
             return
         handler = self.handler
-        self.log.emit(f"{label}…")
+        self.log.emit(f"[INFO] {label}…")
         self._run_action(
             label,
             lambda: fn(handler),
@@ -2370,7 +3133,7 @@ class DeviceTab(QWidget):
             handler.shell("sync", safe=True)
             return out
 
-        self.log.emit(f"{label}…")
+        self.log.emit(f"[INFO] {label}…")
         self._run_action(label, work, lambda value: self._after_verity(label, value))
 
     def _after_verity(self, label, value):
@@ -2385,6 +3148,12 @@ class DeviceTab(QWidget):
         ):
             self._start_reboot(None, confirm=False)
 
+    def _announce_connected(self) -> None:
+        if self._session_closed or self.handler is None or self._announced_connected:
+            return
+        self._announced_connected = True
+        self.connected.emit()
+
     def _on_connected(self, handler, info=None):
         if self._session_closed or self.handler is not None:
             # A queued result can arrive after the tab closed (or after a
@@ -2394,8 +3163,12 @@ class DeviceTab(QWidget):
             return
         self.handler = handler
         self.btn_reconnect.hide()
-        quick = dict(info) if isinstance(info, dict) and info.get("_quick_identity") else {}
-        quick.pop("_quick_identity", None)
+        payload = dict(info) if isinstance(info, dict) else {}
+        # The connect worker's probe (_DeviceProbe) sends the rest of the
+        # device profile and the display list later, from the same adb shell.
+        probe_pending = bool(payload.pop("_probe_pending", False))
+        prompt = payload.pop("_prompt", None)
+        quick = payload if payload.pop("_quick_identity", False) else {}
         friendly = " ".join(
             bit for bit in (quick.get("manufacturer"), quick.get("model")) if bit
         ).strip()
@@ -2404,6 +3177,8 @@ class DeviceTab(QWidget):
         self.title_label.setText(dev_name)
         self.log.emit(f"[OK] {self.session.get('name')}: connected")
         self._enable_actions(True)
+        # After this slot has named the tab from the device identity.
+        QTimer.singleShot(0, self._announce_connected)
 
         # Do not block the usable terminal on a complete `getprop` dump.  Some
         # vendor/IVI images take seconds to serve it right after USB comes up.
@@ -2419,6 +3194,15 @@ class DeviceTab(QWidget):
             self.shell.cmd_widget.term,
         ):
             terminal.installEventFilter(self)
+        # Connected without the connect worker (and not handed full details):
+        # this tab runs the probe itself, below.
+        runs_probe = not (self._terminal_only or probe_pending) and (info is None or bool(quick))
+        # Before the Terminal is added: on a visible tab adding it opens the
+        # shell, which would otherwise start its own user@host query.
+        if prompt is not None:
+            self.shell.android_widget.apply_prompt(*prompt)
+        elif probe_pending or runs_probe:
+            self.shell.android_widget.expect_prompt()
         if self._terminal_only:
             # No identity probe runs for a terminal-only tab: show the banner now.
             self.shell.android_widget.update_identity(quick)
@@ -2427,59 +3211,124 @@ class DeviceTab(QWidget):
             if friendly:
                 self.title_changed.emit(friendly)
             return
-        self.logcat = LogcatPanel(handler)
-        self.logcat.log.connect(self.log)
-        self.files = FileBrowser(handler, start="/sdcard")
-        self.files.log.connect(self.log)
-        self.apps = AppsPanel(handler, automotive=self._automotive)
-        self.apps.log.connect(self.log)
         self.combo_view = self._build_control_view(handler)
-        self.webcam = CameraPanel()
-        self.webcam.log.connect(self.log)
-        # Loads call history and messages only when the tab is first shown.
-        self.phone = PhonePanel(handler)
-        self.phone.log.connect(self.log)
 
+        # Logcat, Files, Apps, Phone and Webcam are built when first shown.
+        # Phone loads call history and messages only then, too.
         self._add_subtab(self.shell, "⌨", "Terminal")
-        self._add_subtab(self.logcat, "📜", "Logcat")
-        self._add_subtab(self.files, "📁", "Files")
+        self._add_lazy_page("logcat", "📜", "Logcat", self._build_logcat)
+        self._add_lazy_page("files", "📁", "Files", self._build_files)
         self._add_subtab(self.combo_view, "🎛", "Device Control")
-        self._add_subtab(self.apps, "📦", "Apps")
-        self._add_subtab(self.phone, "📞", "Phone")
-        self._add_subtab(self.webcam, "📹", "Webcam")
+        self._add_lazy_page("apps", "📦", "Apps", self._build_apps)
+        self._add_lazy_page("phone", "📞", "Phone", self._build_phone)
+        self._add_lazy_page("webcam", "📹", "Webcam", self._build_webcam)
 
+        pages = self._lazy_pages
         self._subtabs = {
             "shell": self.shell,
             "terminal": self.shell,
-            "logcat": self.logcat,
-            "files": self.files,
+            "logcat": pages["logcat"],
+            "files": pages["files"],
             "mirror": self.combo_view,
             "controls": self.combo_view,
-            "apps": self.apps,
-            "phone": self.phone,
-            "webcam": self.webcam,
+            "apps": pages["apps"],
+            "phone": pages["phone"],
+            "webcam": pages["webcam"],
         }
-        # List the displays straight away (plain adb, never scrcpy), so the
-        # Device Control picker and the displays tab have all of them from the start.
         self.mirror_tab.displays_changed.connect(self._on_displays_found)
         self.mirror_tab.all_displays_requested.connect(self._show_all_displays)
-        self.mirror_tab.refresh_displays(quiet=True)
+
+        if probe_pending:
+            if friendly:
+                self.title_changed.emit(friendly)
+            return  # the rest arrives as _on_probe_details
 
         if info is not None and not quick:
             # Retain the direct-call path used by tests and integrations, but
             # only after all widgets exist so it cannot delay first paint.
+            self.mirror_tab.refresh_displays(quiet=True)
             self._on_device_info(handler, info)
             return
 
         if friendly:
             self.title_changed.emit(friendly)
 
-        self._info_thread = _DeviceInfoThread(handler)
-        self._info_thread.done.connect(
-            lambda result, h=handler: self._on_device_info(h, result)
-        )
-        self._info_thread.finished.connect(self._info_thread.deleteLater)
-        self._info_thread.start()
+        # Connected without the connect worker: the same single probe lists the
+        # device profile and the displays (plain adb, never scrcpy).
+        thread = _ProbeThread(handler, gate=self._adb_gate)
+        thread.details.connect(lambda result, h=handler: self._on_probe_details(h, result))
+        thread.finished.connect(thread.deleteLater)
+        self._probe_thread = thread
+        thread.start()
+
+    def _add_lazy_page(self, key, emoji, label, factory):
+        holder = _LazyPage(factory)
+        self._lazy_pages[key] = holder
+        self._add_subtab(holder, emoji, label)
+        return holder
+
+    def _built_page(self, key):
+        """The page behind *key* if it has been built; never builds it."""
+        holder = self._lazy_pages.get(key)
+        return holder.page if holder is not None else None
+
+    def _build_logcat(self):
+        page = LogcatPanel(self.handler)
+        page.log.connect(self.log)
+        return page
+
+    def _build_files(self):
+        page = FileBrowser(self.handler, start="/sdcard", adb_gate=self._adb_gate)
+        page.log.connect(self.log)
+        return page
+
+    def _build_apps(self):
+        page = AppsPanel(self.handler, automotive=self._automotive, adb_gate=self._adb_gate)
+        page.log.connect(self.log)
+        return page
+
+    def _build_phone(self):
+        page = PhonePanel(self.handler)
+        page.log.connect(self.log)
+        return page
+
+    def _build_webcam(self):
+        page = CameraPanel()
+        page.log.connect(self.log)
+        return page
+
+    def _on_probe_details(self, handler, result) -> None:
+        """The connect-time probe finished: device profile, prompt and displays."""
+        if self._session_closed or handler is not self.handler:
+            return
+        result = result if isinstance(result, dict) else {}
+        shell = getattr(self, "shell", None)
+        android = getattr(shell, "android_widget", None)
+        if android is not None:
+            prompt = result.get("prompt")
+            if prompt is not None:
+                android.apply_prompt(*prompt)
+            else:
+                android.prompt_unavailable()
+            if result.get("info") is None:
+                # No profile is coming: the banner keeps the quick identity and
+                # shows as soon as the Terminal opens, not 2.5 s later.
+                android.update_identity(android._info)
+        mirror = getattr(self, "mirror_tab", None)
+        if mirror is not None:
+            # Displays first: an automotive profile below opens the displays
+            # tab, which would otherwise start a scan of its own.
+            displays = result.get("displays")
+            if displays is not None:
+                mirror.set_displays(displays, quiet=True)
+            else:
+                # The probe did not get that far: the panel's own quiet adb scan.
+                mirror.refresh_displays(quiet=True)
+        info = result.get("info")
+        if info is None:
+            error = result.get("error") or "no reply"
+            info = OperationResult(False, "device_info", error=error)
+        self._on_device_info(handler, info)
 
     def _on_device_info(self, handler, info) -> None:
         """Apply optional build identity without affecting transport readiness."""
@@ -2516,7 +3365,7 @@ class DeviceTab(QWidget):
             ]
             + self._session_chips()
         )
-        apps = getattr(self, "apps", None)
+        apps = self._built_page("apps")  # an unbuilt Apps page reads _automotive when built
         if apps is not None:
             apps.set_automotive_default(self._automotive)
         mirror = getattr(self, "mirror_tab", None)
@@ -2885,6 +3734,7 @@ class DeviceTab(QWidget):
             compact=True,
             on_reboot=lambda: self.reboot(None),
             dispatcher=self._device_dispatcher,
+            display_provider=self.mirror_tab.input_display_id,
         )
         self.controls.log.connect(self.log)
         m_card = card("", self.mirror_tab, "mirrorView")
@@ -2892,26 +3742,21 @@ class DeviceTab(QWidget):
         c_card = card("Device controls", self.controls, "sidePanel")
         c_card.setMinimumWidth(280)
 
-        btn_tog = QPushButton("Hide controls")
-        btn_tog.setProperty("role", "ghost")
+        # An icon toggle at the end of the screen toolbar (checked while the
+        # controls show), so the toolbar keeps to one row; its label is the
+        # tooltip and accessible name. _ControlView keeps it in step.
+        btn_tog = QToolButton()
+        btn_tog.setObjectName("iconButton")
         btn_tog.setIcon(icons.icon("sliders", "purple"))
-        btn_tog.setToolTip("Show or hide the device-controls panel")
-
-        def toggle_device_controls():
-            visible = c_card.isVisible()
-            c_card.setVisible(not visible)
-            btn_tog.setText("Show controls" if visible else "Hide controls")
-            view = getattr(self, "_control_view", None)
-            if view is not None:
-                view.schedule_layout()
-            self.mirror_tab._fit()
-
-        btn_tog.clicked.connect(toggle_device_controls)
+        btn_tog.setIconSize(QSize(18, 18))
+        btn_tog.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        btn_tog.setCheckable(True)
+        btn_tog.setChecked(True)
         self._device_controls_card = c_card
         self._device_controls_toggle = btn_tog
         self.mirror_tab.add_toolbar_widget(btn_tog)
 
-        view = _ControlView(self.mirror_tab, m_card, self.controls, c_card)
+        view = _ControlView(self.mirror_tab, m_card, self.controls, c_card, toggle=btn_tog)
         self._control_view = view
         return view
 
@@ -2930,6 +3775,8 @@ class DeviceTab(QWidget):
             QMessageBox.information(self, "Save output", "Connect a device first.")
             return
         w = self.inner.currentWidget()
+        if isinstance(w, _LazyPage):
+            w = w.page
         if isinstance(w, ShellPanel):
             w.term._save_output()
         elif isinstance(w, LogcatPanel):
@@ -2965,7 +3812,9 @@ class DeviceTab(QWidget):
     def _on_subtab_changed(self, *_):
         w = self.inner.currentWidget()
         sh = getattr(self, "shell", None)
-        if sh is not None and w is sh:
+        if sh is not None and w is sh and not self._session_closed:
+            # (closing: the strip rebuilt by _leave_split must not start a
+            # PowerShell/CMD session through focus_terminal)
             QTimer.singleShot(0, sh.focus_terminal)
         self.set_workspace_active(self.isVisible())
 
@@ -3051,14 +3900,14 @@ class DeviceTab(QWidget):
         if not self.handler:
             return
         handler = self.handler
-        self.log.emit("reading device health…")
+        self.log.emit("[INFO] Reading device health…")
         self._run_action("health", lambda: handler.health_report(safe=True), self._show_health_dialog)
 
     def show_build(self):
         if not self.handler:
             return
         handler = self.handler
-        self.log.emit("reading build report…")
+        self.log.emit("[INFO] Reading the build report…")
         self._run_action(
             "build report", lambda: handler.build_report(safe=True), self._show_build_dialog
         )
@@ -3100,7 +3949,7 @@ class DeviceTab(QWidget):
             != QMessageBox.Yes
         ):
             return
-        self.log.emit("switching device to wireless (USB → Wi-Fi)…")
+        self.log.emit("[INFO] Switching the device to wireless (USB → Wi-Fi)…")
         handler = self.handler
         self._run_action(
             "go wireless",
@@ -3123,12 +3972,13 @@ class DeviceTab(QWidget):
         )
         if not path:
             return
-        self.log.emit("capturing bugreport (this takes a few minutes)…")
+        self.log.emit("[INFO] Capturing a bugreport (this takes a few minutes)…")
         handler = self.handler
         self._run_action(
             "bugreport",
             lambda: handler.bugreport(path, safe=True),
             lambda p: self.log.emit(f"[OK] bugreport saved: {p}"),
+            gated=False,
         )
 
     @staticmethod
@@ -3199,6 +4049,9 @@ class DeviceTab(QWidget):
             lambda: handler.reboot(mode, safe=True),
             lambda _value, m=mode: self._on_reboot_sent(m),
             on_error=self._on_reboot_failed,
+            # The header already says "Rebooting…" with actions disabled: the
+            # command must go out now, never queue behind busy slots.
+            gated=False,
         )
 
     def _on_reboot_failed(self, message: str) -> None:
@@ -3258,6 +4111,19 @@ class DeviceTab(QWidget):
             return
         self._session_closed = True
         pending_workers = []
+        # Background jobs still waiting for an adb slot give up now: nothing
+        # may start adb for this tab once it is closing.
+        self._adb_gate.close()
+
+        # Nothing may start while the tab is torn down.  Leaving split view
+        # below puts the pages back in the tab strip and shows the current one:
+        # a first show would open the Terminal's adb shell (only to kill it
+        # again) or build a lazy page.  release() drops a page's factory and
+        # returns the page if it was built.
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            shell.android_widget._closing = True
+        pages = {key: holder.release() for key, holder in self._lazy_pages.items()}
 
         # Keep ownership simple while the persistent child panels stop their
         # workers.  This does not recreate anything; it only detaches split
@@ -3267,7 +4133,7 @@ class DeviceTab(QWidget):
         # These workers may have already finished and deleted themselves
         # (finished -> deleteLater), so every Qt call is guarded; one stale
         # wrapper must not abort the rest of the teardown.
-        for attr in ("_ct", "_rc", "_info_thread"):
+        for attr in ("_ct", "_rc", "_info_thread", "_probe_thread"):
             t = getattr(self, attr, None)
             if t is None:
                 continue
@@ -3276,7 +4142,7 @@ class DeviceTab(QWidget):
                     t.cancel()
             except RuntimeError:
                 pass
-            for sig in ("ok", "fail", "log", "done"):
+            for sig in ("ok", "details", "fail", "log", "done"):
                 try:
                     getattr(t, sig).disconnect()
                 except Exception:
@@ -3291,11 +4157,12 @@ class DeviceTab(QWidget):
         pending_workers.extend(t for t in self._threads if thread_running(t))
         close_jobs(self._threads)
 
+        # A page that was never shown was never built (pages[key] is None).
         for attr in (
             "shell", "logcat", "files", "apps", "controls",
             "mirror_tab", "display_wall", "webcam", "phone",
         ):
-            p = getattr(self, attr, None)
+            p = pages[attr] if attr in pages else self.__dict__.get(attr)
             if p is not None:
                 try:
                     p.close_panel()

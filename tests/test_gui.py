@@ -13,15 +13,6 @@ pytest.importorskip("PyQt5")  # CI's [test] extra doesn't install the GUI
 from PyQt5.QtWidgets import QApplication
 
 
-@pytest.fixture(scope="session")
-def qapp():
-    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
-
-
 def _contrast(fg, bg):
     def luminance(colour):
         channels = [int(colour.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)]
@@ -55,7 +46,7 @@ def test_theme_stylesheet(qapp):
     names = theme.theme_names()
     assert names[:2] == ("dark", "light") and len(names) == 10
     for name in names:
-        # every theme belongs to a dark/light pair the ribbon toggle flips between
+        # every theme belongs to a dark/light pair
         pair = theme.counterpart(name)
         assert pair in names and theme.counterpart(pair) == name
         assert theme.is_light(name) != theme.is_light(pair)
@@ -589,13 +580,6 @@ def test_mirror_panel_display_actions(qapp, monkeypatch):
     mp._scrcpy = None
     mp._recording = False
     mp.close()
-
-
-def test_live_thread_accepts_a_specific_display(qapp):
-    from turboadb.gui.mirror_panel import _LiveThread
-
-    live = _LiveThread(object(), max_fps=2, display_id=3)
-    assert live.display_id == 3
 
 
 def test_scrcpy_launch_worker_does_not_add_an_adb_preflight(qapp):

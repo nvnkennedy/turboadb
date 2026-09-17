@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
@@ -56,20 +55,6 @@ def test_file_table_names_are_plain_with_icons_and_sort_by_real_name(qapp):
                          "app.apk", "alpha.PNG"]
     finally:
         browser.close_panel()
-
-
-def test_file_item_lt_uses_the_name_not_the_visible_text(qapp):
-    from PyQt5.QtCore import Qt
-    from turboadb.gui.file_browser import _FileItem
-
-    def item(name, is_dir):
-        it = _FileItem(name)
-        it.setData(Qt.UserRole, (name, is_dir))
-        return it
-
-    items = [item("b.txt", False), item("..", True), item("A.txt", False),
-             item("zdir", True), item("Adir", True)]
-    assert [i.text() for i in sorted(items)] == ["..", "Adir", "zdir", "A.txt", "b.txt"]
 
 
 def test_file_table_drag_payload_and_row_entries_use_plain_names(qapp):

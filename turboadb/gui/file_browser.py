@@ -39,16 +39,13 @@ from PyQt5.QtGui import QKeySequence, QFont, QTextCursor, QDrag
 from ..results import strip_ansi
 from .fileutil import _alive, write_text_file
 from .icons import icon
-from .qtutil import close_jobs, disconnect_signals, park_thread, run_job, thread_running
+from .qtutil import (cached_icon, close_jobs, disconnect_signals, page_toolbar, park_thread,
+                     run_job, thread_running)
 from ..remotefs import (  # device file helpers, shared with the engine and CLI
-    _ANSI_CSI_RE, _as_text, _chmod_cmd, _chunks, _copy_into_cmd, _cp_cmd, _dir_arg,
-    _edit_stat_cmd, _EDIT_STAT_RE, _human_size, _link_dirs_cmd, _list_remote_dir, _Listing,
-    _LS_B_ESCAPES, _ls_cmd, _LS_DATE, _ls_escaped_cmd, _LS_FALLBACK_REGEX, _LS_PERMS,
-    _LS_REGEX, _LS_TOOLBOX_REGEX, _LS_TOTAL_RE, _mkdir_cmd, _mode_cmd, _mv_cmd,
-    _normalize_remote_path, _output_lines, _parse_edit_stat, _parse_ls_entry, _parse_ls_line,
-    _parse_ls_listing, _parse_ls_output, _PERMS_RE, _probe_cmd, _probe_remote,
-    _rename_check_cmd, _rename_cmd, _result_error, _rm_cmd, _split_link, _touch_cmd,
-    _unescape_ls_b,
+    _chmod_cmd, _copy_into_cmd, _cp_cmd, _edit_stat_cmd, _human_size, _list_remote_dir,
+    _ls_cmd, _mkdir_cmd, _mode_cmd, _mv_cmd, _normalize_remote_path, _output_lines,
+    _parse_edit_stat, _parse_ls_line, _parse_ls_listing, _probe_remote, _rename_check_cmd,
+    _rename_cmd, _result_error, _rm_cmd, _touch_cmd,
 )
 
 
@@ -79,7 +76,8 @@ _TEXT_EXT = frozenset(
     ".txt .log .md .json .xml .csv .ini .cfg .conf .yaml .yml .prop .properties .sh .py "
     ".bat .ps1 .rc .html .htm .js .kt .java .c .h .cpp .toml".split()
 )
-_ICONS = {}  # (name, tone) -> QIcon, shared by every row (icons follow the theme)
+# Row icons come from qtutil.cached_icon: one QIcon per (name, tone), shared by
+# every row (icons read the palette at paint time, so they follow the theme).
 
 # Pane operation buttons and their context-menu twins: (icon, tone).
 _PANE_OP_ICONS = {
@@ -93,14 +91,6 @@ _PANE_OP_ICONS = {
     "Push to device": ("arrow-right", "blue"),
     "Pull to this PC": ("arrow-left", "green"),
 }
-
-
-def _cached_icon(name: str, tone: str):
-    key = (name, tone)
-    cached = _ICONS.get(key)
-    if cached is None:
-        cached = _ICONS[key] = icon(name, tone)
-    return cached
 
 
 def _entry_icon_key(name: str, is_dir: bool, ftype: str = "") -> Tuple[str, str]:
@@ -129,27 +119,14 @@ def _entry_icon_key(name: str, is_dir: bool, ftype: str = "") -> Tuple[str, str]
     return ("file", "dim")
 
 
-def _name_sort_key(item) -> tuple:
-    """'..' first, then folders, then files; names compare case-insensitively."""
-    data = item.data(Qt.UserRole)
-    if isinstance(data, (tuple, list)) and len(data) > 1:
-        name = str(data[0])
-        return (0 if name == ".." else 1, 0 if data[1] else 1, name.lower())
-    return (1, 1, item.text().lower())
-
-
 class _FileItem(QTableWidgetItem):
-    """Custom table item that sorts numerically when size data is present, and
-    by the real name (never the displayed text) for name cells."""
-    def __lt__(self, other):
-        if not isinstance(other, QTableWidgetItem):
-            return super().__lt__(other)
-        d1 = self.data(Qt.UserRole)
-        d2 = other.data(Qt.UserRole)
-        if (isinstance(d1, (int, float)) and isinstance(d2, (int, float))
-                and not isinstance(d1, bool) and not isinstance(d2, bool)):
-            return d1 < d2
-        return _name_sort_key(self) < _name_sort_key(other)
+    """A listing cell: the plain name/size text plus its raw value in
+    ``Qt.UserRole``.
+
+    Ordering lives in :meth:`_FileTableWidget.sortByColumn` — the table keeps
+    Qt's own sorting disabled and reorders the rows itself, so an item never
+    needs to compare against another one.
+    """
 
 
 # ---- editor file helpers (pure; run on worker threads) ----------------------
@@ -866,10 +843,10 @@ def _plan_pull(handler, sources, dst_dir: str, windows: Optional[bool] = None):
             continue
         real = resolved if is_link and resolved else src
         if real != src:
-            notes.append(f"{name} is a symbolic link; pulling its target {real}")
+            notes.append(f"[INFO] {name} is a symbolic link; pulling its target {real}")
         local_name = _safe_local_name(name, windows)
         if local_name != name:
-            notes.append(f"{name!r} is saved as {local_name!r} (the name isn't valid on this PC)")
+            notes.append(f"[WARNING] {name!r} is saved as {local_name!r} (the name isn't valid on this PC)")
         dst = os.path.join(dst_dir, local_name)
         key = os.path.normcase(dst)
         if key in targets:
@@ -974,9 +951,12 @@ class FileBrowser(QWidget):
 
     _parse_ls_line = staticmethod(_parse_ls_line)
 
-    def __init__(self, handler, start="/sdcard", parent=None):
+    def __init__(self, handler, start="/sdcard", parent=None, *, adb_gate=None):
+        """*adb_gate* (optional, from the device tab) has ``wrap(fn)``: device
+        jobs then wait for one of the tab's adb slots before starting adb."""
         super().__init__(parent)
         self.handler = handler
+        self._adb_gate = adb_gate
         self.local_cwd = os.path.expanduser("~")
         self.remote_cwd = start
         self._jobs = []           # listing / file-op workers (detached on close)
@@ -1002,15 +982,11 @@ class FileBrowser(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Page toolbar: quick jumps for this PC (left) and the device (right).
-        toolbar = QWidget()
-        toolbar.setObjectName("pageToolbar")
-        toolbar.setAttribute(Qt.WA_StyledBackground, True)
         from .flowlayout import ToolbarFlowLayout
 
-        # Rows that wrap instead of widening the window when the tab is narrow.
-        qbar = ToolbarFlowLayout(toolbar, hspacing=8, vspacing=6)
-        qbar.setContentsMargins(12, 8, 12, 8)
+        # Page toolbar: quick jumps for this PC (left) and the device (right).
+        # Its rows wrap instead of widening the window when the tab is narrow.
+        toolbar, qbar = page_toolbar()
         # Colour language: this PC is blue, the device is green (Push/Pull match).
         jump_pc = QLabel("PC folders")
         jump_pc.setObjectName("mutedHint")
@@ -1303,7 +1279,11 @@ class FileBrowser(QWidget):
             fn(*args)
         return call
 
-    def _job(self, fn, on_done=None, on_fail=None):
+    def _job(self, fn, on_done=None, on_fail=None, *, device=False):
+        """*device=True*: *fn* runs adb, so it waits for an adb slot (``adb_gate``);
+        PC-side listings never queue behind a slow device."""
+        if device and self._adb_gate is not None:
+            fn = self._adb_gate.wrap(fn)
         return run_job(self._jobs, fn, self._guarded(on_done), self._guarded(on_fail))
 
     def _local_job(self, label: str, fn, error_title: str = ""):
@@ -1327,7 +1307,7 @@ class FileBrowser(QWidget):
     def _set_loading(table: QTableWidget):
         table.setRowCount(0)
         table.insertRow(0)
-        it = QTableWidgetItem(_cached_icon("refresh", "dim"), "Loading…")
+        it = QTableWidgetItem(cached_icon("refresh", "dim"), "Loading…")
         it.setFlags(Qt.ItemIsEnabled)
         table.setItem(0, 0, it)
 
@@ -1481,7 +1461,8 @@ class FileBrowser(QWidget):
         handler = self.handler
         self._ls = self._job(lambda: _list_remote_dir(handler, path),
                              lambda result: self._on_remote_listed(gen, path, result),
-                             lambda msg: self._on_remote_list_failed(gen, path, msg))
+                             lambda msg: self._on_remote_list_failed(gen, path, msg),
+                             device=True)
 
     def _restart_pending_remote(self, gen: int) -> bool:
         """True when this result must be dropped (stale, or superseded by a pending refresh)."""
@@ -1563,7 +1544,7 @@ class FileBrowser(QWidget):
         it_name = _FileItem(name)
         it_name.setData(Qt.UserRole, (name, is_dir))
         glyph, tone = _entry_icon_key(name, is_dir, ftype)
-        it_name.setIcon(_cached_icon(glyph, tone))
+        it_name.setIcon(cached_icon(glyph, tone))
         it_name.setData(ICON_ROLE, glyph)
         it_size = _FileItem(sz_str)
         it_size.setData(Qt.UserRole, raw_size)
@@ -1620,6 +1601,24 @@ class FileBrowser(QWidget):
             "Nothing was done, so the wrong item can't be affected. Use a device shell for these.")
         return True
 
+    def _valid_new_name(self, name: str, title: str, *, local: bool) -> bool:
+        """True when *name* names an entry IN the folder on screen.
+
+        ``posixpath.join("/sdcard", "/etc/passwd")`` is ``/etc/passwd``, so a
+        typed path (or ``.`` / ``..``) would create the item somewhere the user
+        can't see.  Locally a backslash or a drive letter does the same.
+        """
+        bad = "/" in name or name in (".", "..")
+        if local:
+            bad = bad or os.sep in name or bool(os.path.splitdrive(name)[0])
+        if bad:
+            QMessageBox.warning(
+                self, title,
+                f"{name!r} is not a valid name.\n\nEnter a name, not a path: the item is always "
+                "created in the folder shown here.")
+            return False
+        return True
+
     def _local_dir_for_action(self, title: str) -> Optional[str]:
         """The local folder the user is looking at, or None while another one is loading."""
         loading = self._local_loading_path
@@ -1673,7 +1672,7 @@ class FileBrowser(QWidget):
         self._job(lambda: _plan_push(handler, sources, dst_dir),
                   lambda plan: self._apply_transfer_plan(
                       "Push", "Pushing", dst_dir, plan[0], plan[1], plan[2], (), "on the device"),
-                  lambda msg: self._report_errors("Push", [msg]))
+                  lambda msg: self._report_errors("Push", [msg]), device=True)
 
     def _start_pull(self, sources, dst_dir: str):
         """Resolve links and check the local side on a worker, ask, then queue."""
@@ -1684,7 +1683,7 @@ class FileBrowser(QWidget):
         self._job(lambda: _plan_pull(handler, sources, dst_dir),
                   lambda plan: self._apply_transfer_plan(
                       "Pull", "Pulling", dst_dir, plan[0], plan[1], plan[2], plan[3], "on the PC"),
-                  lambda msg: self._report_errors("Pull", [msg]))
+                  lambda msg: self._report_errors("Pull", [msg]), device=True)
 
     def _apply_transfer_plan(self, title, verb, dst_dir, jobs, collisions, errors, notes, where):
         for note in notes:
@@ -1694,7 +1693,7 @@ class FileBrowser(QWidget):
         if not jobs:
             return
         if collisions and not self._ask_overwrite(collisions, where):
-            self.log.emit(f"{title} cancelled: nothing was overwritten.")
+            self.log.emit(f"[INFO] {title} cancelled: nothing was overwritten.")
             return
         self._enqueue_transfers(jobs, f"{verb} {len(jobs)} item(s) to {dst_dir}…")
 
@@ -1776,7 +1775,7 @@ class FileBrowser(QWidget):
         t = self._transfer
         if t is None:
             if dropped:
-                self.log.emit(f"Cleared {dropped} queued transfer(s).")
+                self.log.emit(f"[OK] Cleared {dropped} queued transfer(s).")
             return
         self._cancelled_transfer = t
         try:
@@ -1791,29 +1790,35 @@ class FileBrowser(QWidget):
     # ---- File Operations: Local ----
     def _local_mkdir(self):
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
-        if ok and name.strip():
+        name = name.strip() if ok else ""
+        if name:
+            if not self._valid_new_name(name, "New Folder", local=True):
+                return
             base = self._local_dir_for_action("New Folder")
             if base is None:
                 return
-            target = os.path.join(base, name.strip())
-            self._local_job(f"mkdir {name.strip()}",
+            target = os.path.join(base, name)
+            self._local_job(f"mkdir {name}",
                             lambda: os.makedirs(target, exist_ok=True), "Error")
 
     def _local_newfile(self):
         name, ok = QInputDialog.getText(self, "New File", "File name:")
-        if ok and name.strip():
+        name = name.strip() if ok else ""
+        if name:
+            if not self._valid_new_name(name, "New File", local=True):
+                return
             base = self._local_dir_for_action("New File")
             if base is None:
                 return
-            target = os.path.join(base, name.strip())
-            self._local_job(f"create {name.strip()}", lambda: _create_empty_file(target), "Error")
+            target = os.path.join(base, name)
+            self._local_job(f"create {name}", lambda: _create_empty_file(target), "Error")
 
     def _local_copy(self):
         items = self._selected_local()
         if items:
             self._clipboard = [p for p, _ in items]
             self._clipboard_src = "local"
-            self.log.emit(f"Copied {len(self._clipboard)} local item(s) to clipboard.")
+            self.log.emit(f"[OK] Copied {len(self._clipboard)} local item(s) to clipboard.")
 
     def _local_paste(self):
         if not self._clipboard:
@@ -1868,21 +1873,25 @@ class FileBrowser(QWidget):
     # ---- File Operations: Remote ----
     def _remote_mkdir(self):
         name, ok = QInputDialog.getText(self, "New Device Folder", "Folder name:")
-        if ok and name.strip():
+        name = name.strip() if ok else ""
+        if name:
+            if not self._valid_new_name(name, "New Device Folder", local=False):
+                return
             base = self._remote_dir_for_action("New Device Folder")
             if base is None:
                 return
-            self._run_shell(f"mkdir {name.strip()}",
-                            _mkdir_cmd(posixpath.join(base, name.strip())))
+            self._run_shell(f"mkdir {name}", _mkdir_cmd(posixpath.join(base, name)))
 
     def _remote_newfile(self):
         name, ok = QInputDialog.getText(self, "New Device File", "File name:")
-        if ok and name.strip():
+        name = name.strip() if ok else ""
+        if name:
+            if not self._valid_new_name(name, "New Device File", local=False):
+                return
             base = self._remote_dir_for_action("New Device File")
             if base is None:
                 return
-            self._run_shell(f"create {name.strip()}",
-                            _touch_cmd(posixpath.join(base, name.strip())))
+            self._run_shell(f"create {name}", _touch_cmd(posixpath.join(base, name)))
 
     def _remote_copy(self):
         items = self._selected_remote()
@@ -1891,7 +1900,7 @@ class FileBrowser(QWidget):
                 return
             self._clipboard = [posixpath.join(self.remote_cwd, name) for name, _ in items]
             self._clipboard_src = "remote"
-            self.log.emit(f"Copied {len(self._clipboard)} device item(s) to clipboard.")
+            self.log.emit(f"[OK] Copied {len(self._clipboard)} device item(s) to clipboard.")
 
     def _remote_paste(self):
         if not self._clipboard:
@@ -1918,12 +1927,12 @@ class FileBrowser(QWidget):
             if not commands:
                 return
             if collisions and not self._ask_overwrite(collisions, "in this device folder"):
-                self.log.emit("Paste cancelled: nothing was overwritten.")
+                self.log.emit("[INFO] Paste cancelled: nothing was overwritten.")
                 return
             self._run_shell_batch(commands, timeout=600)
 
         self._job(lambda: _plan_remote_copy(handler, sources, dst_dir), planned,
-                  lambda msg: self._report_errors("Paste", [msg]))
+                  lambda msg: self._report_errors("Paste", [msg]), device=True)
 
     def _remote_rename(self):
         rows = self._selected_rows(self.remote_table)
@@ -1936,15 +1945,14 @@ class FileBrowser(QWidget):
         new_name = new_name.strip() if ok else ""
         if not new_name or new_name == old_name:
             return
-        if "/" in new_name or new_name in (".", ".."):
-            QMessageBox.warning(self, "Rename", f"{new_name!r} is not a valid name.")
+        if not self._valid_new_name(new_name, "Rename", local=False):
             return
         src = posixpath.join(self.remote_cwd, old_name)
         dst = posixpath.join(self.remote_cwd, new_name)
         handler = self.handler
         self._job(lambda: handler.shell(_rename_check_cmd(src, dst), timeout=30, safe=False),
                   lambda res: self._on_rename_checked(old_name, new_name, src, dst, res),
-                  lambda msg: self._report_errors("Rename", [msg]))
+                  lambda msg: self._report_errors("Rename", [msg]), device=True)
 
     def _on_rename_checked(self, old_name: str, new_name: str, src: str, dst: str, res):
         lines = _output_lines(getattr(res, "stdout", ""))
@@ -1977,7 +1985,23 @@ class FileBrowser(QWidget):
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
         targets = [posixpath.join(self.remote_cwd, n) for n, _ in items]
-        self._run_shell_batch([(f"delete {len(items)} item(s)", _rm_cmd(targets))], timeout=600)
+        label = f"delete {len(targets)} device item(s)"
+        handler = self.handler
+
+        def done(_removed):
+            self.log.emit(f"[OK] {label}")
+            self.refresh_remote()
+
+        def fail(msg):
+            self.log.emit(f"[ERROR] {label}: {msg}")
+            self.refresh_remote()
+
+        # Deletion belongs to the engine: it refuses '/', refuses a folder
+        # without recursive, and splits the paths into shell-sized `rm` calls.
+        # One unbounded `rm -rf` built here did none of that.  Like a paste
+        # batch it can run for minutes, so it takes no adb slot (device=False):
+        # listings keep working meanwhile.
+        self._job(lambda: handler.remove(targets, recursive=True, safe=False), done, fail)
 
     def _run_shell(self, label, cmd):
         self._run_shell_batch([(label, cmd)])
@@ -2006,6 +2030,7 @@ class FileBrowser(QWidget):
             self.log.emit(f"[ERROR] {commands[0][0] if commands else 'device command'}: {msg}")
             self.refresh_remote()
 
+        # No adb slot: a paste batch may copy for minutes (timeout 600 s).
         self._job(work, done, fail)
 
     # ---- Context Menus ----
@@ -2048,7 +2073,7 @@ class FileBrowser(QWidget):
         """Show the (window-modal, non-blocking) editor; *write(file_text)* runs on a worker."""
         if mixed:
             ending = _LINE_ENDING_NAMES.get(newline, "LF")
-            self.log.emit(f"{name} has mixed line endings; saving will use {ending} throughout.")
+            self.log.emit(f"[INFO] {name} has mixed line endings; saving will use {ending} throughout.")
         dlg = _FileEditorDialog(name, path, text, None, self)
 
         def save_fn(new_text):
@@ -2215,7 +2240,8 @@ class FileBrowser(QWidget):
                   lambda result: self._handle_edit_load(name, target["path"], result, write,
                                                         self.refresh_remote),
                   lambda msg: QMessageBox.critical(
-                      self, "Edit Remote File", f"Could not pull {name} from device:\n{msg}"))
+                      self, "Edit Remote File", f"Could not pull {name} from device:\n{msg}"),
+                  device=True)  # at most _EDIT_MAX_BYTES (2 MB): a short job
 
     # ---- Drag and drop ----
     def _on_local_dropped(self, paths: list, is_external: bool, target_dir: str = ""):
@@ -2276,3 +2302,8 @@ class FileBrowser(QWidget):
         close_jobs(self._jobs)
         self._ls = None
         self._release_editors()
+        # Listings of big folders are thousands of table items: free them now
+        # rather than whenever the closed tab is finally deleted.
+        self._clipboard = []
+        for table in (self.local_table, self.remote_table):
+            table.setRowCount(0)

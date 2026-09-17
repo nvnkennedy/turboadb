@@ -71,7 +71,10 @@ turboadb -s @bench info                           # …and use it by name</code>
         <h3>Global options, output and exit codes</h3>
         <p class="desc">Device options work before or after the command name, so
         <code>turboadb -s SERIAL info</code> and <code>turboadb info -s SERIAL</code> are
-        the same.</p>
+        the same. The setup commands (<code>doctor</code>, <code>fetch-tools</code>,
+        <code>upgrade-tools</code>, <code>self-update</code>, <code>shortcut</code>,
+        <code>gui</code>, <code>deploy-serve</code>) drive no device, so of these they
+        take only <code>--json</code>.</p>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
           <tbody>
@@ -81,7 +84,7 @@ turboadb -s @bench info                           # …and use it by name</code>
             <tr><td><code>--adb-path PATH</code></td><td>Use this adb executable.</td></tr>
             <tr><td><code>--scrcpy-path PATH</code></td><td>Use this scrcpy executable.</td></tr>
             <tr><td><code>--timeout SECONDS</code></td><td>Timeout for each command, and for push, pull and bugreport too (defaults: 60 s, transfers 600 s).</td></tr>
-            <tr><td><code>--json</code></td><td>JSON output: data as JSON, actions as <code>{"ok": …, "message": …}</code>, saved files as <code>{"ok": …, "path": …}</code>. <code>logcat</code> and the setup commands print text.</td></tr>
+            <tr><td><code>--json</code></td><td>One JSON document on stdout (progress and warnings go to stderr): data as JSON, actions as <code>{"ok": …, "message": …}</code>, returned values as <code>{"ok": …, "result": …}</code>, saved files as <code>{"ok": …, "path": …}</code>, a <code>--full</code> report as <code>{"ok": …, "report": …}</code>. The setup commands take it too; <code>logcat</code> streams plain lines.</td></tr>
             <tr><td><code>-V, --version</code></td><td>Print the TurboADB version.</td></tr>
           </tbody>
         </table></div>
@@ -118,11 +121,11 @@ turboadb -s @bench info                           # …and use it by name</code>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Options</th></tr></thead>
           <tbody>
-            <tr data-cmd="doctor"><td><code>doctor</code></td><td>Report whether adb and scrcpy were found, and where.</td><td></td></tr>
-            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>.</td><td><code>--adb-only</code> <code>--scrcpy-only</code> <code>--force</code></td></tr>
-            <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code></td></tr>
-            <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from PyPI, then adb and scrcpy.</td><td><code>--check</code></td></tr>
-            <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows).</td><td></td></tr>
+            <tr data-cmd="doctor"><td><code>doctor</code></td><td>Report whether adb and scrcpy were found, and where.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>. <code>--adb-only</code> and <code>--scrcpy-only</code> are mutually exclusive.</td><td><code>--adb-only</code> | <code>--scrcpy-only</code> <code>--force</code> <code>--json</code></td></tr>
+            <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code> <code>--json</code></td></tr>
+            <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from PyPI, then adb and scrcpy.</td><td><code>--check</code> <code>--json</code></td></tr>
+            <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows).</td><td><code>--json</code></td></tr>
             <tr data-cmd="gui"><td><code>gui</code></td><td>Launch the desktop app.</td><td></td></tr>
           </tbody>
         </table></div>
@@ -135,15 +138,15 @@ turboadb self-update --check</code></pre></div>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="devices"><td><code>devices</code></td><td>List devices on the local adb server, or another PC's with <code>--adb-host</code>.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="devices"><td><code>devices</code></td><td>List devices on the local adb server, or the one <code>--adb-host</code> (or <code>-s @NAME</code>) selects.</td><td><code>--json</code></td></tr>
             <tr data-cmd="info"><td><code>info</code></td><td>Identity and build: model, Android, CPU, device type (phone, tablet, tv, watch, automotive, head unit), telephony, display size.</td><td><code>--json</code></td></tr>
             <tr data-cmd="connect"><td><code>connect</code></td><td><code>adb connect</code> to a network device.</td><td><code>HOST:PORT</code></td></tr>
-            <tr data-cmd="disconnect"><td><code>disconnect</code></td><td>Disconnect one network device, or all.</td><td><code>[HOST:PORT]</code></td></tr>
-            <tr data-cmd="pair"><td><code>pair</code></td><td>Pair with an Android 11+ device (Wireless debugging).</td><td><code>HOST:PORT CODE</code></td></tr>
+            <tr data-cmd="disconnect"><td><code>disconnect</code></td><td>Disconnect one network device, or all.</td><td><code>[HOST:PORT]</code> <code>--json</code></td></tr>
+            <tr data-cmd="pair"><td><code>pair</code></td><td>Pair with an Android 11+ device (Wireless debugging).</td><td><code>HOST:PORT CODE</code> <code>--json</code></td></tr>
             <tr data-cmd="tcpip"><td><code>tcpip</code></td><td>Restart adbd on a USB device in TCP mode.</td><td><code>[PORT=5555]</code></td></tr>
             <tr data-cmd="wireless"><td><code>wireless</code></td><td>USB → Wi-Fi in one step: read the IP, <code>tcpip</code>, connect.</td><td><code>[PORT=5555]</code></td></tr>
             <tr data-cmd="discover"><td><code>discover</code></td><td>Find Wireless-debugging devices on the network (mDNS).</td><td><code>--connect</code> <code>--json</code></td></tr>
-            <tr data-cmd="restart-server"><td><code>restart-server</code></td><td>Kill and start the adb server (devices not showing up).</td><td></td></tr>
+            <tr data-cmd="restart-server"><td><code>restart-server</code></td><td>Kill and start the adb server (devices not showing up).</td><td><code>--json</code></td></tr>
             <tr data-cmd="wait"><td><code>wait</code></td><td>Wait until the device is online.</td><td><code>[SECONDS]</code></td></tr>
             <tr data-cmd="state"><td><code>state</code></td><td>The adb state: device, offline, unauthorized, recovery, bootloader… (works while rebooting).</td><td></td></tr>
             <tr data-cmd="serialno"><td><code>serialno</code></td><td>The device's serial number.</td><td></td></tr>
@@ -164,7 +167,7 @@ turboadb -s @lab screenshot lab.png</code></pre></div>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="shell"><td><code>shell</code></td><td>Run a command on the device (put <code>--</code> before it), on every device, or a batch file; no command opens an interactive shell.</td><td><code>COMMAND…</code> <code>--su</code> <code>--all</code> <code>--batch FILE</code> <code>--keep-going</code> <code>--json</code></td></tr>
+            <tr data-cmd="shell"><td><code>shell</code></td><td>Run a command on the device (put <code>--</code> before it), on every device of the selected adb server, or a batch file; no command opens an interactive shell.</td><td><code>COMMAND…</code> <code>--su</code> <code>--all</code> <code>--batch FILE</code> <code>--keep-going</code> <code>--json</code></td></tr>
             <tr data-cmd="adb"><td><code>adb</code></td><td>Any adb command for the selected device (<code>-s</code>, <code>--adb-host</code> added for you).</td><td><code>-- ARGS…</code></td></tr>
             <tr data-cmd="logcat"><td><code>logcat</code></td><td>Stream logcat live, filtered, and save it.</td><td><code>--tag TAG</code> <code>--priority V|D|I|W|E|F</code> <code>--filter TAG:LEVEL</code> (repeat) <code>--buffer NAME</code> (repeat) <code>--crashes</code> <code>--grep REGEX</code> <code>--match REGEX</code> <code>--stop-on-match</code> <code>--format threadtime</code> <code>--save FILE</code> <code>--clear</code> <code>--dump</code> <code>--tail N</code></td></tr>
             <tr data-cmd="logcat-clear"><td><code>logcat-clear</code></td><td>Clear the logcat buffers.</td><td></td></tr>
@@ -238,8 +241,8 @@ turboadb -s SERIAL grant com.example.app android.permission.ACCESS_FINE_LOCATION
           <tbody>
             <tr data-cmd="displays"><td><code>displays</code></td><td>List the device's displays: id, size, name.</td><td><code>--method auto|adb|scrcpy</code> <code>--json</code></td></tr>
             <tr data-cmd="screenshot"><td><code>screenshot</code></td><td>Save a PNG screenshot.</td><td><code>PATH</code> <code>--display N</code></td></tr>
-            <tr data-cmd="record"><td><code>record</code></td><td>Record on the device and pull the MP4 (works over RDP; Ctrl+C stops and saves). <code>--continuous</code> records past the 3-minute cap in parts.</td><td><code>PATH</code> <code>--time-limit 30</code> <code>--size WxH</code> <code>--bit-rate 8M</code> <code>--display N</code> <code>--continuous</code></td></tr>
-            <tr data-cmd="scrcpy"><td><code>scrcpy</code></td><td>Mirror and control the screen, or the device camera. <code>--compat</code> is the profile for head units that won't mirror with the defaults.</td><td><code>--display-id N</code> <code>--compat</code> <code>--max-size PX</code> <code>--bit-rate</code> <code>--max-fps</code> <code>--video-codec h264|h265|av1</code> <code>--crop W:H:X:Y</code> <code>--render-driver</code> <code>--keyboard sdk|uhid|aoa</code> <code>--force-adb-forward</code> <code>--no-audio</code> <code>--audio-source</code> <code>--audio-codec</code> <code>--audio-bit-rate</code> <code>--audio-buffer</code> <code>--audio-output-buffer</code> <code>--audio-dup</code> <code>--record FILE</code> <code>--record-format mp4|mkv</code> <code>--no-playback</code> <code>--turn-screen-off</code> <code>--no-stay-awake</code> <code>--show-touches</code> <code>--no-control</code> <code>--fullscreen</code> <code>--always-on-top</code> <code>--window-borderless</code> <code>--window-title</code> <code>--video-source display|camera</code> <code>--camera-facing</code> <code>--camera-size</code> <code>--log FILE</code> <code>--wait</code></td></tr>
+            <tr data-cmd="record"><td><code>record</code></td><td>Record on the device and pull the MP4 (works over RDP; Ctrl+C stops and saves). <code>--continuous</code> records past the 3-minute cap in parts.</td><td><code>PATH</code> <code>--time-limit 30</code> <code>--size WxH</code> <code>--bit-rate 8M</code> <code>--display N</code> <code>--continuous</code> <code>--json</code></td></tr>
+            <tr data-cmd="scrcpy"><td><code>scrcpy</code></td><td>Mirror and control the screen, or the device camera. <code>--compat</code> is the profile for head units that won't mirror with the defaults.</td><td><code>--display-id N</code> <code>--compat</code> <code>--max-size PX</code> <code>--bit-rate</code> <code>--max-fps</code> <code>--video-codec h264|h265|av1</code> <code>--crop W:H:X:Y</code> <code>--render-driver</code> <code>--keyboard sdk|uhid|aoa</code> <code>--force-adb-forward</code> <code>--no-audio</code> <code>--audio-source</code> <code>--audio-codec</code> <code>--audio-bit-rate</code> <code>--audio-buffer</code> <code>--audio-output-buffer</code> <code>--audio-dup</code> <code>--record FILE</code> <code>--record-format mp4|mkv</code> <code>--no-playback</code> <code>--turn-screen-off</code> <code>--no-stay-awake</code> <code>--show-touches</code> <code>--no-control</code> <code>--fullscreen</code> <code>--always-on-top</code> <code>--window-borderless</code> <code>--window-title</code> <code>--video-source display|camera</code> <code>--camera-facing</code> <code>--camera-size</code> <code>--log FILE</code> <code>--wait</code> <code>--json</code></td></tr>
             <tr data-cmd="screen"><td><code>screen</code></td><td>Turn the device screen on or off.</td><td><code>on|off</code></td></tr>
           </tbody>
         </table></div>
@@ -352,7 +355,7 @@ turboadb -s SERIAL send-sms 1800123456 "on my way"</code></pre></div>
             <tr data-cmd="unroot"><td><code>unroot</code></td><td>Restart adbd without root.</td><td></td></tr>
             <tr data-cmd="remount"><td><code>remount</code></td><td><code>adb remount</code> read-write.</td><td></td></tr>
             <tr data-cmd="mount-rw"><td><code>mount-rw</code></td><td>Remount a partition read-write.</td><td><code>[PATH=/]</code></td></tr>
-            <tr data-cmd="disable-verity"><td><code>disable-verity</code></td><td><code>adb disable-verity</code> (reboot to apply).</td><td><code>--reboot</code></td></tr>
+            <tr data-cmd="disable-verity"><td><code>disable-verity</code></td><td><code>adb disable-verity</code> (reboot to apply).</td><td><code>--reboot</code> <code>--json</code></td></tr>
             <tr data-cmd="enable-verity"><td><code>enable-verity</code></td><td><code>adb enable-verity</code> (reboot to apply).</td><td><code>--reboot</code></td></tr>
             <tr data-cmd="reboot"><td><code>reboot</code></td><td>Reboot, optionally into another mode, and wait for the boot (head units often have no recovery UI).</td><td><code>[recovery|bootloader|fastboot|sideload]</code> <code>--wait</code> <code>--wait-timeout 180</code></td></tr>
           </tbody>
@@ -378,11 +381,15 @@ turboadb -s SERIAL reverse --remove tcp:3000</code></pre></div>
 
       <article class="feature cli-group" id="sharing">
         <h3>Sharing devices with other PCs</h3>
+        <p class="desc"><code>serve</code> never downloads adb by itself: its startup task
+        runs as SYSTEM, where that would put a second adb in another profile and bind
+        port 5037 with it. Run <code>turboadb fetch-tools</code> there first if adb is
+        missing.</p>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="serve"><td><code>serve</code></td><td>Share this PC's adb server so others can use <code>--adb-host</code> (opens the firewall; needs Administrator), check it, or stop sharing.</td><td><code>--port 5037</code> <code>--startup-task</code> <code>--install-startup</code> <code>--uninstall-startup</code> <code>--status</code> <code>--stop</code></td></tr>
-            <tr data-cmd="deploy-serve"><td><code>deploy-serve</code></td><td>Set up <code>serve</code> on remote Windows PCs over WinRM (needs <code>turboadb[winrm]</code>).</td><td><code>HOST…</code> <code>-u USER</code> <code>-p PASSWORD</code> <code>--port 5037</code> <code>--ssl</code> <code>--winrm-port</code> <code>--no-update</code> <code>--test</code></td></tr>
+            <tr data-cmd="serve"><td><code>serve</code></td><td>Share this PC's adb server so others can use <code>--adb-host</code> (opens the firewall; needs Administrator), check it, or stop sharing.</td><td><code>--port 5037</code> <code>--startup-task</code> <code>--install-startup</code> <code>--uninstall-startup</code> <code>--status</code> <code>--stop</code> <code>--json</code></td></tr>
+            <tr data-cmd="deploy-serve"><td><code>deploy-serve</code></td><td>Set up <code>serve</code> on remote Windows PCs over WinRM (needs <code>turboadb[winrm]</code>).</td><td><code>HOST…</code> <code>-u USER</code> <code>-p PASSWORD</code> <code>--port 5037</code> <code>--ssl</code> <code>--winrm-port</code> <code>--no-update</code> <code>--test</code> <code>--json</code></td></tr>
           </tbody>
         </table></div>
         <div class="code"><pre><code># on the PC with the device:

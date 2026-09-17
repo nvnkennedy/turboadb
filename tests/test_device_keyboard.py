@@ -14,19 +14,6 @@ import pytest
 pytest.importorskip("PyQt5")
 
 
-_APP = []  # a QApplication whose only Python reference dies is destroyed
-
-
-@pytest.fixture(scope="session")
-def app():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt5.QtWidgets import QApplication
-
-    if not _APP:
-        _APP.append(QApplication.instance() or QApplication(["test-device-keyboard"]))
-    return _APP[0]
-
-
 class _Dispatcher:
     """Queues commands like DeviceCommandDispatcher; the test decides when each
     one starts (``start_next``) and when its result arrives."""

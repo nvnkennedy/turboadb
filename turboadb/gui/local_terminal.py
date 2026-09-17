@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ..tools import find_adb, NO_WINDOW
@@ -385,6 +386,11 @@ class OutputTranscoder:
     ``dir`` of ``café`` no longer renders as ``caf�``.
     """
 
+    # How long the tail of a character split across two reads may wait for the
+    # rest of its bytes before it is emitted anyway.  A shell writes the rest
+    # within microseconds, so this only ever fires for genuinely broken output.
+    HOLD_GRACE_S = 0.25
+
     def __init__(self, fallback: str = "oem"):
         try:
             codecs.lookup(fallback)
@@ -392,14 +398,27 @@ class OutputTranscoder:
             fallback = "latin-1"
         self.fallback = fallback
         self._held = b""
+        self._held_at = 0.0
+
+    def held_expired(self, grace: Optional[float] = None) -> bool:
+        """True when held bytes have waited longer than *grace* for their rest."""
+        if not self._held:
+            return False
+        limit = self.HOLD_GRACE_S if grace is None else grace
+        return time.monotonic() - self._held_at >= limit
 
     def feed(self, data: bytes, final: bool = False) -> bytes:
+        previous_at = self._held_at
         buf = self._held + data if self._held else data
         self._held = b""
+        self._held_at = 0.0
         if not final:
             cut = _incomplete_utf8_tail(buf)
             if cut:
                 self._held, buf = buf[-cut:], buf[:-cut]
+                # The clock starts when a tail is first held back; an idle poll
+                # (no new data) must not keep restarting it.
+                self._held_at = time.monotonic() if (data or not previous_at) else previous_at
         if not buf:
             return b""
         try:
@@ -524,8 +543,14 @@ class LocalShellSession:
         raw = self._read_raw(size)
         if raw:
             return self._transcoder.feed(raw)
-        # Idle pipe: release a byte held back as a possible split character.
-        return self._transcoder.feed(b"", final=True)
+        # Idle pipe.  A byte held back as a possible split character is released
+        # only once its rest has clearly not come, or the shell has exited:
+        # forcing the final flush on EVERY empty poll defeated the guard, so a
+        # character cut at a read boundary was printed as mojibake at once.
+        proc = self._proc
+        if self._transcoder.held_expired() or proc is None or proc.poll() is not None:
+            return self._transcoder.feed(b"", final=True)
+        return b""
 
     def _read_raw(self, size: int) -> bytes:
         try:
@@ -565,17 +590,37 @@ class LocalShellSession:
             daemon=True,
         ).start()
 
-    def interrupt(self) -> None:
-        """Stop the local shell and every command it started.
+    def interrupt(self, on_done=None) -> None:
+        """Stop the local shell and every command it started, without blocking.
 
         With redirected Windows pipes a literal Ctrl+C byte is only input; it
         is not a console-control event.  The embedded terminal therefore ends
         the shell process tree and its widget opens a clean replacement shell.
+
+        The tree kill (``taskkill`` plus its waits) runs on a daemon thread,
+        exactly like :meth:`close`: doing it inline froze the window for
+        seconds on every Ctrl+C.  *on_done* is called from that thread once the
+        kill has landed, for a widget that wants to reopen its shell only then.
         """
         proc = self._proc
         if not proc or proc.poll() is not None:
+            if on_done is not None:
+                on_done()
             return
-        _kill_process_tree(proc, wait_s=1.0)
+        self._closed = True
+
+        def kill():
+            try:
+                _kill_process_tree(proc, wait_s=1.0)
+            finally:
+                if on_done is not None:
+                    on_done()
+
+        threading.Thread(
+            target=kill,
+            name="turboadb-local-shell-interrupt",
+            daemon=True,
+        ).start()
 
 
 def _close_pipes(proc) -> None:

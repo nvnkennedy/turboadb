@@ -238,6 +238,64 @@ def run_job(jobs, fn, on_done=None, on_fail=None):
     return job
 
 
+def unwrap(res):
+    """Turn a safe-mode/raw handler result into a plain value or raise.
+
+    Shared by every panel that calls the engine from a worker thread, so one
+    result convention is decoded in one place.
+    """
+    from ..results import CommandResult, OperationResult
+
+    if isinstance(res, OperationResult):
+        if not res.success:
+            raise res.error or RuntimeError(f"{res.action or 'ADB operation'} failed")
+        res = res.value
+    if isinstance(res, CommandResult):
+        if not res.ok:
+            raise RuntimeError(res.stderr or "ADB command failed")
+        res = res.text
+    if res is False:
+        raise RuntimeError("device rejected the command")
+    return res
+
+
+_ICON_CACHE = {}
+
+
+def cached_icon(name, tone=None):
+    """One shared ``QIcon`` per ``(name, tone)``.
+
+    Icons read their colour from the palette at paint time, so a single
+    instance still follows live theme switches — a fresh icon per table row or
+    list item only wasted memory.
+    """
+    key = (name, tone)
+    cached = _ICON_CACHE.get(key)
+    if cached is None:
+        from .icons import icon
+
+        cached = _ICON_CACHE[key] = icon(name, tone)
+    return cached
+
+
+def page_toolbar(hspacing: int = 8, vspacing: int = 6, margins=(12, 8, 12, 8)):
+    """``(widget, layout)`` for a page's top toolbar row.
+
+    The layout is a :class:`flowlayout.ToolbarFlowLayout`, so a narrow tab wraps
+    the row instead of widening the whole window (see ARCHITECTURE.md).
+    """
+    from PyQt5.QtWidgets import QWidget
+
+    from .flowlayout import ToolbarFlowLayout
+
+    toolbar = QWidget()
+    toolbar.setObjectName("pageToolbar")
+    toolbar.setAttribute(Qt.WA_StyledBackground, True)
+    row = ToolbarFlowLayout(toolbar, hspacing=hspacing, vspacing=vspacing)
+    row.setContentsMargins(*margins)
+    return toolbar, row
+
+
 def disconnect_signals(obj, names=("done", "fail")) -> None:
     """Disconnect every slot from the named signals of *obj* (missing/deleted ok)."""
     if obj is None:

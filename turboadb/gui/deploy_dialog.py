@@ -227,6 +227,8 @@ class DeployDialog(QDialog):
         }
 
     def _problem(self):
+        """The single validation of this form: Deploy refuses to accept while it
+        returns a message, so callers of :meth:`values` never re-check it."""
         v = self.values()
         if not v["hosts"]:
             return "Enter at least one host."
