@@ -144,6 +144,10 @@ abort a run.
   PC's devices, stop sharing), **Tools ▾** (check for updates, reinstall ADB and
   scrcpy, open the host webcam, create shortcuts), then icons for the theme, the
   log panel, settings and help.
+- **Closing TurboADB closes ADB and scrcpy** — any mirror window it opened is
+  closed and the adb server is stopped, so nothing keeps the device busy after
+  you quit. A server shared with other machines (`turboadb serve`) is left
+  alone, and **Settings → Startup** turns this off.
 - **Devices sidebar** — **Connected** devices and **Saved targets**. Every device
   you connect is saved as a target automatically (named after the device, never
   twice; turn this off in **Settings → Startup**). Type in the search box to
@@ -259,6 +263,14 @@ Select files and press **Push** or **Pull**, or drag and drop between the panes
 a built-in editor), **Copy** / **Paste**, **Rename** (F2) and **Delete**, plus
 quick folders such as Downloads and `/sdcard`.
 
+Selecting works like a file manager: drag beside the names for a block of files,
+**Ctrl+A** for all of them, **Enter** to open, **Backspace** to go up,
+**Ctrl+Shift+N** for a new folder. On Windows **Delete** moves local files to the
+Recycle Bin and **Shift+Delete** deletes them for good; device files always go
+for good. Each pane shows what it holds and what is selected. When the device
+refuses a change, TurboADB offers **adb root**, **adb disable-verity** and **adb
+remount** and retries afterwards (see Root & mount).
+
 **CLI**:
 
 ```bash
@@ -326,6 +338,28 @@ turboadb -s SERIAL tap                # tap the centre of the screen
 dev.keyevent("home")
 dev.scroll("down")
 dev.tap_center()
+```
+
+### Rapid taps (soak and stress testing)
+
+Thousands of taps on one point, as one loop **on the device** — no tap waits for
+the PC. With `--method events` (what `auto` picks when the adb shell may write to
+the touchscreen) the taps go straight to the touch device and run several times
+faster than `input tap`, which starts a JVM per tap. `--rate` caps taps per
+second, and `--duration` taps for a while instead of counting.
+
+**GUI** — not in the GUI: this is a command-line and API tool.
+
+```bash
+turboadb -s SERIAL tap-burst 540 1200 --count 5000
+turboadb -s SERIAL tap-burst 540 1200 --rate 20 --duration 60
+turboadb -s SERIAL touch-device        # which touchscreen, and may the shell write to it?
+```
+
+```python
+report = dev.tap_burst(540, 1200, count=5000)          # {'method': 'events', 'taps': 5000, …}
+dev.tap_burst(540, 1200, rate=20, duration=60, on_progress=print)
+dev.touch_device()
 ```
 
 ### Media & connectivity
@@ -569,6 +603,15 @@ print(dev.phone_support())  # which dialler / SMS / phone apps exist (calls no o
 For rooted / engineering builds.
 
 **GUI** — **More ▾ → Root and mount** (at the right end of the section tabs).
+After `adb root` or `adb unroot` (from that menu, or typed in PowerShell or
+Command Prompt) every terminal follows: the Android shell reconnects with the new
+prompt (`#` as root), and a PowerShell or CMD tab that was inside `adb shell`
+opens it again in the same folder.
+
+When the Files tab can't change a device file (permission denied or a read-only
+file system), it asks which of **adb root**, **adb disable-verity** and **adb
+remount** to run, runs them with any reboot they need, and then retries. **More
+▾ → Root and mount → Make files writable…** opens the same choices at any time.
 
 **CLI**:
 
@@ -577,6 +620,8 @@ turboadb -s SERIAL root            # restart adbd as root  (unroot to undo)
 turboadb -s SERIAL remount         # adb remount
 turboadb -s SERIAL mount-rw        # mount -o remount,rw /
 turboadb -s SERIAL disable-verity  # syncs and offers the required reboot
+turboadb -s SERIAL access          # root, build type, verity, bootloader
+turboadb -s SERIAL make-writable   # root + remount, rebooting when needed
 ```
 
 **Python**:
@@ -585,6 +630,8 @@ turboadb -s SERIAL disable-verity  # syncs and offers the required reboot
 dev.root(); dev.unroot()
 dev.remount(); dev.mount_rw()
 dev.disable_verity(); dev.enable_verity()
+dev.access_status()                        # {'root': True, 'verity': 'enforcing', …}
+dev.make_writable(disable_verity=True)     # root, disable-verity, reboot, root, remount
 ```
 
 ## Reboot
@@ -730,18 +777,18 @@ target); add `--adb-host HOST` for a remote server.
 
 ```
 devices  info  state  serialno  ip  wait  targets  connect  disconnect  pair
-tcpip  wireless  discover  restart-server
+tcpip  wireless  discover  restart-server  stop-server
 shell  adb  logcat  logcat-clear  bugreport
 push  pull  ls  mkdir  touch  rm  mv  cp  stat  edit
 packages  install  uninstall  clear  start  start-activity  activity  stop
 grant  revoke  close-apps
 displays  screenshot  record  scrcpy  screen
-key  text  tap  swipe  scroll  media  brightness  notifications
+key  text  tap  tap-burst  touch-device  swipe  scroll  media  brightness  notifications
 wifi  bluetooth  airplane  hotspot  mobile-data
 settings  open  search  camera  gallery  calculator
 battery  health  build-info  getprop
 dial  call  answer  end-call  call-state  call-log  sms  send-sms  phone-support
-root  unroot  remount  mount-rw  disable-verity  enable-verity  reboot
+root  unroot  remount  access  make-writable  mount-rw  disable-verity  enable-verity  reboot
 forward  reverse  serve  deploy-serve
 doctor  fetch-tools  upgrade-tools  self-update  shortcut  gui
 ```

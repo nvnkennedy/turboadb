@@ -470,8 +470,7 @@ def _fit_toast(toast, width=None, min_height: int = 0) -> None:
     that ignored the wrapped lines; Windows grew the window and Qt printed
     "QWindowsWindow::setGeometry: Unable to set geometry" on every toast.
     Going straight from the old fixed size to the new one also keeps a visible
-    toast from shrinking below what Windows accepts in between. An unchanged
-    size is not set again.
+    toast from shrinking below what Windows accepts in between.
     """
     from PyQt5.QtCore import QSize
 
@@ -479,8 +478,16 @@ def _fit_toast(toast, width=None, min_height: int = 0) -> None:
     # Stylesheet padding and fonts apply at polish time; measuring an
     # unpolished toast gave a height the shown window then outgrew.
     toast.ensurePolished()
+    # Measure against the new text, not the previous message's fixed size, and
+    # only drop the layout's cached hints: activating it would first resize a
+    # shown toast to the layout minimum — a height that ignores the wrapped
+    # lines and a width the old maximum forbids. Windows refuses that
+    # in-between geometry ("QWindowsWindow::setGeometry: Unable to set
+    # geometry ... minimum size: 706x51 maximum size: 263x51"). The one size
+    # this call settles on is set at the end, before anything is painted.
+    toast.setMinimumSize(0, 0)
+    toast.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
     layout.invalidate()
-    layout.activate()
     if width is None:
         width = layout.totalSizeHint().width()
     width = max(int(width), toast.minimumSizeHint().width())
@@ -489,9 +496,7 @@ def _fit_toast(toast, width=None, min_height: int = 0) -> None:
     else:
         height = layout.totalSizeHint().height()
     height = max(height, toast.minimumSizeHint().height(), int(min_height))
-    size = QSize(width, height)
-    if toast.minimumSize() != size or toast.maximumSize() != size:
-        toast.setFixedSize(size)
+    toast.setFixedSize(QSize(width, height))
 
 
 def _font_scale(widget) -> float:

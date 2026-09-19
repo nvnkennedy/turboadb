@@ -140,7 +140,12 @@ for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
           <p class="step"><b>Files</b> tab → <b>This PC</b> and <b>Device</b> side by
           side → select files and press <b>Push</b> or <b>Pull</b>, or drag and drop
           (also from Explorer). New folder, New file, Edit (F4), Copy / Paste, Rename
-          (F2) and Delete work in both panes.</p></div>
+          (F2) and Delete work in both panes.</p>
+          <p class="step">Drag beside the names to select a block, <b>Ctrl+A</b> for
+          all, <b>Enter</b> to open, <b>Backspace</b> to go up. <b>Delete</b> sends
+          local files to the Recycle Bin, <b>Shift+Delete</b> deletes for good. If the
+          device refuses a change, TurboADB offers <b>adb root</b>,
+          <b>disable-verity</b> and <b>remount</b>, then tries again.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL push app.apk /data/local/tmp/
 turboadb -s SERIAL pull /sdcard/Download/log.txt .</code></pre></div></div>

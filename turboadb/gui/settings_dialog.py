@@ -264,6 +264,9 @@ class SettingsDialog(QDialog):
         w = QWidget()
         f = _form(w)
         self.font_combo = QFontComboBox()
+        # A picker, not a text field: an editable combo puts a caret in the box
+        # and lets a half-typed font name stand as the setting.
+        self.font_combo.setEditable(False)
         self.font_combo.setCurrentFont(QFont(self.cfg.get("term_font", "Consolas")))
         self.font_size = QSpinBox()
         # the same range Ctrl+wheel / A+ A− zoom uses
@@ -322,7 +325,6 @@ class SettingsDialog(QDialog):
         self.max_size.setValue(int(self.cfg.get("scrcpy_max_size", 0)))
         self.max_size.setSpecialValueText("native")
         self.bit_rate = QComboBox()
-        self.bit_rate.setEditable(True)
         for label, value in (
             ("8M — low bandwidth / Remote Desktop", "8M"),
             ("16M — balanced (recommended)", "16M"),
@@ -351,7 +353,6 @@ class SettingsDialog(QDialog):
         self.audio_codec.addItems(["opus", "aac", "flac", "raw"])
         self.audio_codec.setCurrentText(self.cfg.get("scrcpy_audio_codec", "opus"))
         self.audio_bit_rate = QComboBox()
-        self.audio_bit_rate.setEditable(True)
         for value in ("64K", "128K", "192K", "256K", "320K"):
             self.audio_bit_rate.addItem(value, value)
         self._set_combo_value(self.audio_bit_rate, self.cfg.get("scrcpy_audio_bit_rate", "128K"))
@@ -383,13 +384,19 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _set_combo_value(combo: QComboBox, value) -> None:
-        """Select a data value while preserving custom editable values."""
+        """Select the entry whose data is *value*.
+
+        A value the list doesn't offer (an older setting, or one written into
+        settings.json by hand) is added as its own entry, so it is still shown
+        and saved unchanged now that these dropdowns are pickers only."""
         text = str(value or "")
+        if not text:
+            return
         index = combo.findData(text)
-        if index >= 0:
-            combo.setCurrentIndex(index)
-        else:
-            combo.setEditText(text)
+        if index < 0:
+            combo.addItem(text, text)
+            index = combo.findData(text)
+        combo.setCurrentIndex(index)
 
     @staticmethod
     def _combo_value(combo: QComboBox) -> str:
@@ -437,9 +444,19 @@ class SettingsDialog(QDialog):
             "remote by server and serial) unless a saved target already points at it."
         )
         self.auto_save_targets.setChecked(bool(self.cfg.get("auto_save_targets", True)))
+        self.stop_adb_on_exit = QCheckBox(
+            "Close ADB and scrcpy when TurboADB closes"
+        )
+        self.stop_adb_on_exit.setToolTip(
+            "On exit, close any scrcpy window TurboADB opened and stop the adb server, so "
+            "no adb daemon keeps running. A server shared with other machines "
+            "(turboadb serve) is left alone."
+        )
+        self.stop_adb_on_exit.setChecked(bool(self.cfg.get("stop_adb_on_exit", True)))
         v.addWidget(self.shortcut)
         v.addWidget(self.autoupd)
         v.addWidget(self.auto_save_targets)
+        v.addWidget(self.stop_adb_on_exit)
         v.addSpacing(8)
         v.addWidget(QLabel("When the same device is opened again"))
         v.addWidget(self.duplicate_device_action)
@@ -535,6 +552,7 @@ class SettingsDialog(QDialog):
                 "auto_update": self.autoupd.isChecked(),
                 "duplicate_device_action": self.duplicate_device_action.currentData(),
                 "auto_save_targets": self.auto_save_targets.isChecked(),
+                "stop_adb_on_exit": self.stop_adb_on_exit.isChecked(),
             }
         )
 

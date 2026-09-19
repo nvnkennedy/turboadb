@@ -3,6 +3,83 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 2.3.0
+
+### New
+
+- **Make device files writable.** When the device refuses a change (permission
+  denied, a read-only file system), TurboADB asks which of **adb root**, **adb
+  disable-verity** and **adb remount** to run, runs them with any reboot they
+  need, and then tries your change again. A terminal that is refused offers the
+  same in a toast, and **More ▾ → Root and mount → Make files writable…**
+  opens it at any time. Also on the command line (`turboadb make-writable`,
+  `turboadb access`) and in Python (`make_writable()`, `access_status()`).
+- **Every terminal follows adb root.** After `adb root` or `adb unroot` — from
+  the menu or typed in PowerShell or Command Prompt — the Android shell
+  reconnects and shows the new prompt (`#` as root), and a PowerShell or CMD tab
+  that was inside `adb shell` opens it again in the same device folder. Device
+  reboots restore those adb shells too.
+- **Rapid tap bursts, on the command line and in Python.** `turboadb tap-burst
+  540 1200 --count 5000` taps a point thousands of times for a soak or stress
+  test. The whole burst runs as one loop **on the device**, so no tap waits for
+  the PC, and where the adb shell may write to the touchscreen the taps go
+  straight to it with `sendevent` instead of starting a JVM per tap. `--rate`
+  caps taps per second and `--duration` taps for a while instead of counting;
+  `turboadb touch-device` shows the touchscreen and whether it is writable.
+- **Closing TurboADB closes ADB and scrcpy.** Any scrcpy window it opened is
+  closed and the adb server is stopped, so nothing of TurboADB's keeps running
+  (and keeps the device busy) after the window is gone. A server shared with
+  other machines (`turboadb serve`) is left alone, and **Settings → Startup**
+  turns the whole thing off. `turboadb stop-server` does the same by hand.
+- **Files works like a file manager.** Drag beside the names to select a block
+  of files, **Ctrl+A** selects all, **Enter** opens, **Backspace** goes up,
+  **Ctrl+Shift+N** makes a folder and **Esc** clears the selection. On Windows
+  **Delete** now moves to the Recycle Bin and **Shift+Delete** deletes for good;
+  on the device both delete. Each pane says what it holds ("3 folders, 12 files
+  · 2 selected (14.3 MB)") and an empty folder says so.
+
+### Changed
+
+- **Clearer warm colours.** Folder icons (now softly filled), warnings, the
+  terminal's yellow, Logcat's W lines and search highlights were a dull tan;
+  they are a clear amber now, still checked for contrast in every theme.
+- Dates, sizes and permissions in Files no longer end in "…": the columns are
+  measured from the font, and on a narrow window Type and then Owner step aside
+  so the names keep the room.
+
+### Fixed
+
+- **The GitHub release build could hang.** The bundled exe has no console, so
+  writing its self-test result to stderr raised and PyInstaller showed an error
+  dialog no one could click; the job waited 6 hours. The exe no longer writes to
+  a missing stream, and the workflow gives the step and the job time limits.
+- Clicking **Up**, **Refresh** or a pane button in Files no longer takes the
+  keyboard away, so Ctrl+A, Delete and F2 keep working afterwards.
+- A right-click menu in a file list opens where you clicked (it was one header
+  height too low).
+- **A rare crash while device work was being cleaned up.** A finished
+  background worker could be deleted twice — once by Python, once by the delete
+  Qt still had queued — and the second one landed on freed memory, taking the
+  app down with no error. Workers are now held until Qt has really deleted
+  them, and the Files page no longer keeps a reference cycle with its tables.
+- **Settings says what you changed.** Pressing OK always logged "Settings
+  saved — theme: Graphite", whatever you had come to change, as if TurboADB had
+  swapped your theme; it now names the settings you actually changed ("terminal
+  font size", "screen renderer: screencap"), and says so when nothing changed.
+- **Settings dropdowns are pickers again.** Terminal font, video quality and
+  audio bit rate took a text caret, so a click landed inside the box and a
+  half-typed value could stand as the setting. They choose from their list now;
+  a value the list doesn't offer (an older or hand-edited setting) is still
+  shown and kept. The Connect and target dialogs still take typed hosts and
+  serials, as they must.
+- **No more "Unable to set geometry" warnings** from the small activity toast.
+  A longer message was measured while the toast was still fixed at the previous
+  message's size, so Windows was asked for a window shorter than its own text
+  and refused it.
+- **The desktop tests now pass on Linux CI.** Three of them drove a real
+  PowerShell or cmd.exe, which an Ubuntu runner has not got; they skip there or
+  use a stand-in shell, so the Linux desktop-test job is green again.
+
 ## 2.2.2
 
 ### New

@@ -8,6 +8,19 @@ import sys
 import traceback
 
 
+def _stderr(message: str) -> None:
+    """Write to stderr when there is one: a windowed (no console) exe has
+    ``sys.stderr = None``, and the AttributeError from writing to it used to
+    end the self-test with an error dialog nobody could close on CI."""
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        stream.write(message + "\n")
+    except Exception:
+        pass
+
+
 def _fatal(message: str):
     try:
         d = os.path.join(os.path.expanduser("~"), ".turboadb")
@@ -21,7 +34,7 @@ def _fatal(message: str):
 
         ctypes.windll.user32.MessageBoxW(0, message[:1800], "TurboADB GUI failed to start", 0x10)
     except Exception:
-        sys.stderr.write(message + "\n")
+        _stderr(message)
 
 
 def _selftest_winrm():
@@ -54,7 +67,7 @@ def _selftest_winrm():
             fh.write(out + "\n")
     except Exception:
         pass
-    sys.stderr.write(out + "\n")
+    _stderr(out)
     return 0 if not bad else 2
 
 

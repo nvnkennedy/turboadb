@@ -83,6 +83,9 @@ DEFAULTS = {
     # Add a device to Saved targets once its tab connects (USB by serial,
     # network by host:port, remote by server + serial), unless already saved.
     "auto_save_targets": True,
+    # Closing TurboADB closes what it started: any scrcpy window, and the adb
+    # server (unless this PC is sharing its devices with `turboadb serve`).
+    "stop_adb_on_exit": True,
     "recent_network_hosts": [],
     "recent_remote_hosts": [],
     # remembered Remote-webcam connection (host/user/domain only — never the password)

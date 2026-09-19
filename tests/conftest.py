@@ -1,6 +1,7 @@
 """Shared pytest fixtures: a fake adb that records argv and returns canned
 output, so the real ADBHandler code paths (arg building, parsing, safe-mode) run
 without a device or a real adb binary — portable across Linux/Windows CI."""
+import gc
 import os
 import sys
 import tempfile
@@ -136,6 +137,38 @@ def _no_ffmpeg_download(monkeypatch):
         return
     monkeypatch.setattr(ffmpeg_tools, "_auto_download_supported", lambda: False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _settle_qt():
+    """Let Qt finish with a test's widgets before the next test starts.
+
+    Tests call ``close()`` and ``deleteLater()``, but with no event loop running
+    those deletions only queue up: they are carried out by whichever later test
+    happens to spin the event loop. By then Python may have dropped the last
+    reference and freed the C++ object with it, so the queued delete lands on
+    freed memory — a native access violation in the middle of an unrelated test
+    (seen in the console tests, and only in a full run). Draining the queue here
+    keeps every test's cleanup inside that test."""
+    yield
+    try:
+        from PyQt5.QtCore import QEvent
+        from PyQt5.QtWidgets import QApplication
+    except Exception:  # PyQt5 is not installed (CI installs only [test])
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    # Collect first: a widget the test dropped is deleted here, and Qt drops
+    # its posted events with it. Collected *during* the dispatch below, the
+    # same deletion leaves Qt holding a pointer to freed memory.
+    gc.collect()
+    try:
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        app.processEvents()
+    except RuntimeError:
+        pass
 
 
 @pytest.fixture(scope="session")

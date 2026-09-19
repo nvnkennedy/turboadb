@@ -30,6 +30,7 @@ from typing import Callable, Optional, Sequence, Union
 
 from .config import ADBConfig, ScrcpyOptions, format_host_port, validate_port
 from .devices import list_devices
+from . import touch
 from .results import CommandResult, TransferResult, StreamResult, OperationResult, strip_ansi
 from .tools import DEFAULT_ADB_SERVER_PORT, NO_WINDOW, find_adb, is_adb_server_alive
 from .exceptions import (
@@ -252,6 +253,7 @@ class ADBHandler:
         self._connected = False
         self._owned_target: Optional[str] = None  # a TCP target THIS handler connected
         self._cap_method: Optional[int] = None  # cached screencap method idx
+        self._touch: Optional[tuple] = None  # cached (TouchDevice|None, writable)
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -699,13 +701,7 @@ class ADBHandler:
 
         def _do():
             self._emit(logging.INFO, "Restarting the adb server…")
-            stopped = self._run_global(["kill-server"], timeout=15)
-            if not self.config.adb_server_host:
-                # let the old daemon release the port before starting a new one
-                port = self.config.adb_server_port
-                deadline = time.monotonic() + 5.0
-                while is_adb_server_alive(port=port, timeout=0.1) and time.monotonic() < deadline:
-                    time.sleep(0.1)
+            stopped = self._kill_server()
             started = self._run_global(["start-server"], timeout=30)
             if not started.ok:
                 raise self._command_error("start-server", started)
@@ -719,6 +715,36 @@ class ADBHandler:
             return started
 
         return self._guard("restart_server", _do, safe=safe)
+
+    def _kill_server(self):
+        """``adb kill-server``, then wait for a local daemon to release its port."""
+        stopped = self._run_global(["kill-server"], timeout=15)
+        if not self.config.adb_server_host:
+            port = self.config.adb_server_port
+            deadline = time.monotonic() + 5.0
+            while is_adb_server_alive(port=port, timeout=0.1) and time.monotonic() < deadline:
+                time.sleep(0.1)
+        return stopped
+
+    def stop_server(self, *, safe: Optional[bool] = None):
+        """Stop the adb server this handler talks to (``adb kill-server``).
+
+        True once it is gone — including when none was running. Every shell and
+        stream on that server ends with it, so this is for leaving: the GUI
+        calls it on exit (Settings → Startup) so no adb daemon is left behind."""
+
+        def _do():
+            self._kill_server()
+            if self.config.adb_server_host:
+                return True  # a remote server answers only its own machine
+            alive = is_adb_server_alive(port=self.config.adb_server_port, timeout=0.2)
+            if alive:
+                self._emit(logging.WARNING, "the adb server is still running after kill-server")
+            else:
+                self._emit(logging.INFO, "ADB server stopped.")
+            return not alive
+
+        return self._guard("stop_server", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # TCP/IP + pairing (Android 11+ wireless debugging)
@@ -890,18 +916,156 @@ class ADBHandler:
             "unroot", lambda: self._adbd_restart("unroot", "not running as root"), safe=safe
         )
 
+    _REMOUNT_REFUSALS = ("remount failed", "not running as root", "permission denied", "error:")
+
     def remount(self, *, safe: Optional[bool] = None):
         """Remount /system (and friends) read-write (needs root)."""
         return self._guard(
             "remount",
             lambda: self._checked_adb(
                 ["remount"],
-                ("remount failed", "not running as root", "permission denied", "error:"),
+                self._REMOUNT_REFUSALS,
                 timeout=60,
                 success_marker="remount succeeded",
             ),
             safe=safe,
         )
+
+    # "Now reboot your device for settings to take effect", "Reboot the device
+    # for changes to take effect": adbd changed verity/overlayfs and needs a boot.
+    _REBOOT_REQUEST_RE = re.compile(
+        r"\breboot (?:your|the) device\b|\bnow reboot\b|\breboot to take effect\b", re.I
+    )
+
+    def access_status(self, *, safe: Optional[bool] = None):
+        """What decides whether protected files can be changed, from one shell call.
+
+        Returns a dict: ``root`` (adbd runs as uid 0), ``uid`` (int or None),
+        ``debuggable`` (``ro.debuggable=1``: ``adb root`` is allowed),
+        ``build_type`` (``user``, ``userdebug`` or ``eng``), ``verity``
+        (``ro.boot.veritymode``: ``enforcing``, ``disabled``, ``logging`` or
+        ``""``) and ``bootloader`` (``locked``, ``unlocked`` or ``""``)."""
+
+        def _do():
+            script = (
+                'echo "@@$(id -u)|$(getprop ro.debuggable)|$(getprop ro.build.type)'
+                '|$(getprop ro.boot.veritymode)|$(getprop ro.boot.vbmeta.device_state)'
+                '|$(getprop ro.boot.flash.locked)"'
+            )
+            res = self._run(["shell", script], timeout=15, check=False)
+            line = next(
+                (ln[2:] for ln in reversed(res.text.splitlines()) if ln.startswith("@@")), None
+            )
+            if not res.ok or line is None:
+                raise self._command_error("shell id -u; getprop", res)
+            parts = (line.split("|") + [""] * 6)[:6]
+            uid_text, debuggable, build_type, verity, device_state, flash_locked = (
+                part.strip() for part in parts
+            )
+            bootloader = device_state.lower()
+            if not bootloader and flash_locked in ("0", "1"):
+                bootloader = "locked" if flash_locked == "1" else "unlocked"
+            uid = int(uid_text) if uid_text.isdigit() else None
+            return {
+                "root": uid == 0,
+                "uid": uid,
+                "debuggable": debuggable == "1",
+                "build_type": build_type,
+                "verity": verity.lower(),
+                "bootloader": bootloader if bootloader in ("locked", "unlocked") else "",
+            }
+
+        return self._guard("access_status", _do, safe=safe)
+
+    def _remount_once(self):
+        """``adb remount`` -> ``(output, reboot_needed)``; raises when refused."""
+        res = self._run(["remount"], timeout=60, check=False)
+        text = self._combined_output(res)
+        low = text.lower()
+        succeeded = "remount succeeded" in low
+        reboot_needed = not succeeded and bool(self._REBOOT_REQUEST_RE.search(text))
+        refused = not res.ok or any(marker in low for marker in self._REMOUNT_REFUSALS)
+        if refused and not (succeeded or reboot_needed):
+            raise self._command_error("remount", res)
+        return text or "ok", reboot_needed
+
+    def make_writable(
+        self,
+        *,
+        root: bool = True,
+        disable_verity: bool = False,
+        remount: bool = True,
+        reboot: bool = True,
+        boot_timeout: float = 180.0,
+        on_step=None,
+        safe: Optional[bool] = None,
+    ):
+        """Prepare the device so protected files can be changed.
+
+        In order: ``adb root``; ``adb disable-verity`` (then a reboot, since it
+        only applies after one); ``adb remount`` — and when remount itself asks
+        for a reboot (Android 10+ sets up overlayfs first), reboot, root and
+        remount again. After every reboot adbd starts without root, so root
+        is requested again when *root* is set. With *reboot=False* nothing
+        reboots and ``reboot_needed`` says a reboot is still due.
+
+        *on_step(text)* is called before each step (from the calling thread).
+        Returns ``{"steps": [(step, output), …], "rebooted": bool,
+        "reboot_needed": bool}``. Raises an ADBError when a step is refused
+        (ADBCommandError for "adbd cannot run as root in production builds").
+        """
+
+        def _do():
+            steps = []
+            state = {"rebooted": False, "reboot_needed": False}
+
+            def note(text):
+                if on_step is not None:
+                    on_step(text)
+
+            def do_root():
+                note("adb root")
+                steps.append(("root", self.root(safe=False)))
+
+            def reboot_and_wait(reason):
+                if not reboot:
+                    state["reboot_needed"] = True
+                    return False
+                note(f"reboot ({reason})")
+                self.shell("sync", timeout=30, safe=False)
+                if not self.reboot(safe=False):
+                    raise ADBError(f"reboot after {reason} was refused")
+                note("waiting for the device to boot")
+                self.wait_for_boot(boot_timeout, safe=False)
+                steps.append(("reboot", f"rebooted after {reason}"))
+                state["rebooted"] = True
+                if root:
+                    do_root()
+                return True
+
+            if root:
+                do_root()
+            if disable_verity:
+                note("adb disable-verity")
+                out = self.disable_verity(safe=False)
+                steps.append(("disable-verity", out))
+                if "already disabled" not in out.lower():
+                    reboot_and_wait("disable-verity")
+            if remount:
+                note("adb remount")
+                out, reboot_needed = self._remount_once()
+                steps.append(("remount", out))
+                if reboot_needed and reboot_and_wait("remount"):
+                    note("adb remount")
+                    out, reboot_needed = self._remount_once()
+                    steps.append(("remount", out))
+                    if reboot_needed:
+                        raise ADBError(
+                            "adb remount still asks for a reboot after rebooting: " + out
+                        )
+            return {"steps": steps, **state}
+
+        return self._guard("make_writable", _do, safe=safe)
 
     _VERITY_REFUSALS = (
         "only works for",
@@ -1081,6 +1245,156 @@ class ADBHandler:
             ).ok,
             safe=safe,
         )
+
+    # A tap costs about this long, without any rate limit: one `input` call
+    # starts a JVM on the device, while `sendevent` is a small native tool.
+    _BURST_TAP_SECONDS = {"input": 0.25, "events": 0.05}
+    _BURST_MAX_TAPS = 1_000_000
+
+    def touch_device(self, *, refresh: bool = False, safe: Optional[bool] = None):
+        """The device's touchscreen, from ``getevent -pl``, or None when it has
+        none TurboADB can drive.
+
+        ``{"path", "name", "max_x", "max_y", "protocol", "direct", "writable"}``.
+        ``writable`` says whether the adb shell user may send events to it
+        (often only after ``adb root``). Cached per handler; *refresh* re-reads."""
+
+        def _do():
+            device, writable = self._touch_screen(refresh=refresh)
+            if device is None:
+                return None
+            return dict(device.as_dict(), writable=writable)
+
+        return self._guard("touch_device", _do, safe=safe)
+
+    def _touch_screen(self, *, refresh: bool = False):
+        """``(TouchDevice|None, writable)``, read once per handler."""
+        if self._touch is not None and not refresh:
+            return self._touch
+        text = self._run(["shell", "getevent", "-pl"], timeout=20, check=False).text
+        device = touch.pick_touch_device(touch.parse_touch_devices(text))
+        writable = False
+        if device is not None:
+            writable = self._run(self._shell_args("test", "-w", device.path),
+                                 timeout=15, check=False).ok
+        self._touch = (device, writable)
+        return self._touch
+
+    def _burst_taps(self, count, rate, duration) -> int:
+        """How many taps a burst makes, from *count* or *rate*+*duration*."""
+        if duration is not None:
+            if not rate:
+                raise ValueError("a burst measured in seconds needs a rate (taps per second)")
+            if float(duration) <= 0:
+                raise ValueError("duration must be greater than 0")
+            count = int(float(rate) * float(duration))
+        taps = int(count)
+        if taps < 1:
+            raise ValueError("a burst needs at least one tap")
+        if taps > self._BURST_MAX_TAPS:
+            raise ValueError(f"at most {self._BURST_MAX_TAPS} taps in one burst")
+        return taps
+
+    def _burst_command(self, x, y, *, method: str, display_id):
+        """``(method, tap command, device)`` for the burst loop.
+
+        ``"events"`` needs a touchscreen the shell may write to, and sends to
+        whichever display that screen belongs to — so a burst aimed at another
+        display always goes through ``input``."""
+        wanted = (method or "auto").lower()
+        if wanted not in ("auto", "input", "events"):
+            raise ValueError('method must be "auto", "input" or "events"')
+        device = writable = None
+        if wanted != "input":
+            device, writable = self._touch_screen()
+        if wanted == "events":
+            if device is None:
+                raise ADBError(
+                    "no touchscreen was found in 'getevent -pl' — use method='input'")
+            if not writable:
+                raise ADBError(
+                    f"the adb shell may not write to {device.path} (try adb root) "
+                    "— use method='input'")
+            if display_id is not None:
+                raise ADBError(
+                    "a touchscreen belongs to its own display — send a burst to another "
+                    "display with method='input'")
+        if wanted == "auto" and (device is None or not writable or display_id is not None):
+            device = None
+        if device is None:
+            flag = self._display_flag(display_id)
+            return "input", touch.input_tap(int(x), int(y), flag), None
+        screen = self._gesture_size(display_id=None)
+        ev_x, ev_y = touch.scale_point(int(x), int(y), screen, device)
+        return "events", touch.sendevent_tap(device, ev_x, ev_y), device
+
+    def tap_burst(
+        self,
+        x,
+        y,
+        *,
+        count: int = 100,
+        rate: Optional[float] = None,
+        duration: Optional[float] = None,
+        display_id: Optional[int] = None,
+        method: str = "auto",
+        on_progress=None,
+        timeout: Optional[float] = None,
+        safe: Optional[bool] = None,
+    ):
+        """Tap one point many times — thousands of taps for a soak or stress test.
+
+        The whole burst runs as ONE loop on the device, so no tap waits for the
+        PC. *method* ``"events"`` sends touch events with ``sendevent`` (several
+        times faster, and what ``"auto"`` picks when the shell may write to the
+        touchscreen); ``"input"`` uses ``input tap`` and works on any device.
+        *rate* caps taps per second (a delay between taps, so it is an upper
+        bound); *duration* with *rate* says how long to keep tapping instead of
+        how many taps. *on_progress(done, total)* is called as the device
+        reports its progress.
+
+        Returns ``{"method", "taps", "seconds", "rate", "device"}``. Raises
+        ADBError when the device stopped tapping early (for example when it
+        refused the events)."""
+
+        def _do():
+            if rate is not None and float(rate) <= 0:
+                raise ValueError("rate must be greater than 0")
+            taps = self._burst_taps(count, rate, duration)
+            chosen, command, device = self._burst_command(x, y, method=method,
+                                                          display_id=display_id)
+            sleep_s = 1.0 / float(rate) if rate else 0.0
+            every = max(1, min(100, taps // 20)) if taps > 20 else 0
+            script = touch.burst_script(command, taps, sleep_s=sleep_s, progress_every=every)
+            per_tap = sleep_s + self._BURST_TAP_SECONDS[chosen]
+            limit = float(timeout) if timeout else max(60.0, taps * per_tap + 30.0)
+            self._emit(logging.INFO,
+                       f"tapping {x},{y} {taps} times ({chosen})"
+                       + (f" at up to {rate:g}/s" if rate else ""))
+            done, problems = 0, []
+            started = time.monotonic()
+            for line in self.iter_lines(["shell", script], timeout=limit):
+                value = touch.parse_progress(line)
+                if value is None:
+                    if line.strip():
+                        problems.append(line.strip())
+                    continue
+                done = value
+                if on_progress is not None:
+                    on_progress(done, taps)
+            elapsed = max(time.monotonic() - started, 1e-6)
+            if done < taps:
+                detail = "; ".join(problems[:3]) or f"it stopped after {done} of {taps} taps"
+                raise ADBError(f"the tap burst did not finish: {detail}")
+            return {
+                "method": chosen,
+                "taps": done,
+                "seconds": round(elapsed, 3),
+                "rate": round(done / elapsed, 1),
+                "device": device.path if device is not None else None,
+            }
+
+        return self._guard("tap_burst", _do, safe=safe)
 
     def swipe(
         self,

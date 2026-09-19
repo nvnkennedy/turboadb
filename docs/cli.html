@@ -146,6 +146,7 @@ turboadb self-update --check</code></pre></div>
             <tr data-cmd="tcpip"><td><code>tcpip</code></td><td>Restart adbd on a USB device in TCP mode.</td><td><code>[PORT=5555]</code></td></tr>
             <tr data-cmd="wireless"><td><code>wireless</code></td><td>USB → Wi-Fi in one step: read the IP, <code>tcpip</code>, connect.</td><td><code>[PORT=5555]</code></td></tr>
             <tr data-cmd="discover"><td><code>discover</code></td><td>Find Wireless-debugging devices on the network (mDNS).</td><td><code>--connect</code> <code>--json</code></td></tr>
+            <tr data-cmd="stop-server"><td><code>stop-server</code></td><td>Stop the adb server, leaving no adb daemon running.</td><td><code>--json</code></td></tr>
             <tr data-cmd="restart-server"><td><code>restart-server</code></td><td>Kill and start the adb server (devices not showing up).</td><td><code>--json</code></td></tr>
             <tr data-cmd="wait"><td><code>wait</code></td><td>Wait until the device is online.</td><td><code>[SECONDS]</code></td></tr>
             <tr data-cmd="state"><td><code>state</code></td><td>The adb state: device, offline, unauthorized, recovery, bootloader… (works while rebooting).</td><td></td></tr>
@@ -261,6 +262,8 @@ turboadb -s SERIAL scrcpy --no-playback --record drive.mkv --record-format mkv</
             <tr data-cmd="key"><td><code>key</code></td><td>Send keys in order, by name or keycode: <code>home</code>, <code>back</code>, <code>recents</code>, <code>menu</code>, <code>search</code>, <code>power</code>, <code>sleep</code>, <code>wake</code>, <code>notifications</code>, <code>call</code>, <code>enter</code>, <code>del</code>, <code>tab</code>, <code>space</code>, <code>esc</code>, <code>up</code>, <code>down</code>, <code>left</code>, <code>right</code>, <code>center</code>, <code>vol_up</code>, <code>vol_down</code>, <code>vol_mute</code>, <code>play_pause</code>, <code>media_play</code>, <code>media_pause</code>, <code>stop</code>, <code>next</code>, <code>prev</code>, <code>rewind</code>, <code>fast_forward</code>, <code>brightness_up</code>, <code>brightness_down</code>.</td><td><code>KEY…</code> <code>--longpress</code> <code>--display N</code></td></tr>
             <tr data-cmd="text"><td><code>text</code></td><td>Type text into the focused field.</td><td><code>TEXT…</code> <code>--display N</code></td></tr>
             <tr data-cmd="tap"><td><code>tap</code></td><td>Tap a point, or the centre of the screen.</td><td><code>[X Y]</code> <code>--display N</code></td></tr>
+            <tr data-cmd="tap-burst"><td><code>tap-burst</code></td><td>Tap one point many times from a single device-side loop (soak and stress testing).</td><td><code>X Y</code> <code>--count 100</code> <code>--rate</code> <code>--duration</code> <code>--display</code> <code>--method auto|input|events</code> <code>--json</code></td></tr>
+            <tr data-cmd="touch-device"><td><code>touch-device</code></td><td>The touchscreen a tap burst can write to, and whether the shell may.</td><td><code>--json</code></td></tr>
             <tr data-cmd="swipe"><td><code>swipe</code></td><td>Swipe from one point to another.</td><td><code>X1 Y1 X2 Y2</code> <code>--ms 200</code> <code>--display N</code></td></tr>
             <tr data-cmd="scroll"><td><code>scroll</code></td><td>Scroll with a swipe.</td><td><code>up|down|left|right</code> <code>--display N</code></td></tr>
             <tr data-cmd="media"><td><code>media</code></td><td>Media control through the active session.</td><td><code>play-pause|play|pause|next|previous|stop|fast-forward|rewind|mute</code></td></tr>
@@ -354,6 +357,8 @@ turboadb -s SERIAL send-sms 1800123456 "on my way"</code></pre></div>
             <tr data-cmd="root"><td><code>root</code></td><td>Restart adbd as root.</td><td></td></tr>
             <tr data-cmd="unroot"><td><code>unroot</code></td><td>Restart adbd without root.</td><td></td></tr>
             <tr data-cmd="remount"><td><code>remount</code></td><td><code>adb remount</code> read-write.</td><td></td></tr>
+            <tr data-cmd="access"><td><code>access</code></td><td>Root, build type, verity and bootloader state.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="make-writable"><td><code>make-writable</code></td><td><code>adb root</code>, optional <code>disable-verity</code> and <code>remount</code>, with the reboots they need.</td><td><code>--no-root</code> <code>--disable-verity</code> <code>--no-remount</code> <code>--no-reboot</code> <code>--boot-timeout 180</code></td></tr>
             <tr data-cmd="mount-rw"><td><code>mount-rw</code></td><td>Remount a partition read-write.</td><td><code>[PATH=/]</code></td></tr>
             <tr data-cmd="disable-verity"><td><code>disable-verity</code></td><td><code>adb disable-verity</code> (reboot to apply).</td><td><code>--reboot</code> <code>--json</code></td></tr>
             <tr data-cmd="enable-verity"><td><code>enable-verity</code></td><td><code>adb enable-verity</code> (reboot to apply).</td><td><code>--reboot</code></td></tr>

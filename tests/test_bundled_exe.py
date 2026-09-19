@@ -87,3 +87,39 @@ def test_release_detects_a_wheel_without_the_exe(tmp_path):
         zf.writestr("turboadb/__init__.py", "")
     assert release.wheel_has_exe(good)
     assert not release.wheel_has_exe(bad)
+
+
+def _gui_entry_module():
+    spec = importlib.util.spec_from_file_location(
+        "turboadb_gui_entry_script", os.path.join(ROOT, "scripts", "gui_entry.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_exe_self_test_finishes_without_a_stderr(tmp_path, monkeypatch):
+    """A windowed exe has sys.stderr = None: writing the verdict there raised,
+    and the frozen exe then waited on an error dialog until CI cancelled it."""
+    import types
+
+    entry = _gui_entry_module()
+    fake_winrm = types.ModuleType("winrm")
+    fake_winrm.Session = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "winrm", fake_winrm)
+    monkeypatch.setattr(importlib, "import_module", lambda name: types.ModuleType(name))
+    monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setenv("TURBOADB_SELFTEST", "winrm")
+    assert entry.run() == 0
+    report = (tmp_path / ".turboadb" / "winrm-selftest.txt").read_text(encoding="utf-8")
+    assert report.startswith("WINRM-SELFTEST: ALL OK")
+
+
+def test_exe_startup_failure_is_reported_without_a_stderr(tmp_path, monkeypatch):
+    entry = _gui_entry_module()
+    monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setitem(sys.modules, "ctypes", None)  # no message box either
+    entry._fatal("boom")  # must not raise
+    assert "boom" in (tmp_path / ".turboadb" / "crash.log").read_text(encoding="utf-8")

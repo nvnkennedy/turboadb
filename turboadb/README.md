@@ -127,7 +127,9 @@ A tabbed, multi-device workspace:
     highlight, a Crashes preset, pause, clear, save, and **instant stop**.
   - **Files** — **This PC** and **Device** panes with **Push** / **Pull**, drag
     and drop, new folder / file, a built-in editor, copy / paste, rename, delete
-    and a progress bar with Cancel.
+    (Recycle Bin locally, Shift+Delete for good) and a progress bar with Cancel.
+    Select with a drag beside the names or Ctrl+A; a refused change offers
+    **adb root**, **disable-verity** and **remount**, then retries.
   - **Apps** — install (incl. split APKs), list, uninstall, clear, start, stop.
   - **Device Control** — the device screen (Start screen, or open it in a
     separate window) beside a control centre: Back / Home / Recents, power,
@@ -146,7 +148,9 @@ A tabbed, multi-device workspace:
   - **IVI Displays** (cars and multi-display devices) — every display live and
     controllable, side by side, started one after another, with Start all /
     Stop all / Rescan, and Maximize / Restore on each display.
-  - **More ▾ → Root and mount** — `adb root`, `remount`, `mount -o remount,rw /`,
+  - **More ▾ → Root and mount** — `adb root`, `remount`, **Make files
+    writable…** (root, disable-verity and remount with the reboots they need),
+    `mount -o remount,rw /`,
     `disable-verity` (auto sync + reboot prompt).
   - **Screen** — scrcpy with a named display picker and compatibility mode, shown
     inside Device Control (Windows) or in a separate window from the **Screen ▾**
@@ -548,6 +552,8 @@ turboadb settings | camera | gallery | calculator | close-apps   [-s S]
 turboadb battery | health [--full -o F] | build-info [--full -o F] | getprop [NAME]   [-s S]
 turboadb bugreport   [-s S] [PATH]
 turboadb remount | disable-verity [--reboot] | enable-verity [--reboot]   [-s S]
+turboadb tap-burst X Y [--count N] [--rate R] [--duration S] [--method auto|input|events]
+turboadb touch-device | access | make-writable | stop-server                  [-s S]
 # phone:
 turboadb dial NUMBER | call NUMBER | answer | end-call | call-state   [-s S]
 turboadb call-log [--limit N] | sms [--limit N] | send-sms NUMBER message…  [-s S]

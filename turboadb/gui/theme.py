@@ -44,7 +44,7 @@ _DARK = dict(  # Graphite
     text="#e3e4e8", dim="#a7a9b0", placeholder="#83858d", sel="#2c3e57", sel_text="#f1f3f6",
     accent="#6ea4e7", accent_hover="#89b6ee", accent_text="#8cb8ef", on_accent="#10131a",
     section_text="#c9cbd1", danger="#b8454c", danger_text="#f28b90", on_danger="#fff6f6",
-    warn_text="#e2b35e", ok_text="#8fc77c",
+    warn_text="#ecbb4c", ok_text="#8fc77c",
 )
 # Light palettes are deliberately dimmed (page luminance about 0.6 instead of
 # 0.85): full-brightness light surfaces were reported as painful to look at.
@@ -68,7 +68,7 @@ _BLACK = dict(
     text="#cbcbce", dim="#949498", placeholder="#7a7a7e", sel="#2f343c", sel_text="#ececee",
     accent="#3b424d", accent_hover="#474f5c", accent_text="#b1bac6", on_accent="#eef0f3",
     section_text="#b4b4b8", danger="#a3403b", danger_text="#e98c86", on_danger="#fff4f3",
-    warn_text="#d6ab62", ok_text="#8dbd7c",
+    warn_text="#e6b54e", ok_text="#8dbd7c",
 )
 # Cards sit a shade below the paper page and fields a shade above it, so a
 # page full of cards never reads as one white sheet.
@@ -89,7 +89,7 @@ _SLATE = dict(
     text="#e1e6ee", dim="#aab4c2", placeholder="#838ea0", sel="#3a4c64", sel_text="#eef2f7",
     accent="#466782", accent_hover="#51728f", accent_text="#8fbad2", on_accent="#f1f5f9",
     section_text="#b9c5d5", danger="#a54f58", danger_text="#e6979e", on_danger="#fdf4f5",
-    warn_text="#e0bf84", ok_text="#a6c48d",
+    warn_text="#ecc462", ok_text="#a6c48d",
 )
 _MIST = dict(
     chrome="#cdd4dd", win="#d6dce4", panel="#dde2e9", raised="#e2e6ec",
@@ -110,7 +110,7 @@ _NIGHT = dict(
     text="#ddd5c7", dim="#a99f90", placeholder="#8b8375", sel="#473c2c", sel_text="#f5eee2",
     accent="#7a5b2c", accent_hover="#876633", accent_text="#d8b06d", on_accent="#fcf6eb",
     section_text="#cdbfa8", danger="#a34a3f", danger_text="#e99585", on_danger="#fff6f0",
-    warn_text="#dfb566", ok_text="#a4c184",
+    warn_text="#eab853", ok_text="#a4c184",
 )
 _PAPER = dict(
     chrome="#dfd7c7", win="#e8e1d3", panel="#ede7dc", raised="#f1ece3",
@@ -128,7 +128,7 @@ _MOCHA = dict(
     text="#e4dacd", dim="#bfae9c", placeholder="#9a8a7b", sel="#4a3a2e", sel_text="#fff5ea",
     accent="#d9a066", accent_hover="#e5b27f", accent_text="#e8b884", on_accent="#1c1714",
     section_text="#e6cdb0", danger="#b84a3e", danger_text="#f08a7c", on_danger="#fff5ea",
-    warn_text="#e3b25a", ok_text="#9cc27a",
+    warn_text="#eeb84f", ok_text="#9cc27a",
 )
 _LATTE = dict(
     chrome="#c9bcaa", win="#d4c9ba", panel="#cabdab", raised="#d7cfc2",
@@ -177,9 +177,9 @@ TERM_BORDER = "#2e3034"
 
 # ANSI SGR colours, muted to sit comfortably on TERM_BG.
 ANSI_FG = {
-    30: "#5c6370", 31: "#e06c75", 32: "#98c379", 33: "#d19a66",
+    30: "#5c6370", 31: "#e06c75", 32: "#98c379", 33: "#e5c07b",
     34: "#61afef", 35: "#c678dd", 36: "#56b6c2", 37: "#abb2bf",
-    90: "#7f848e", 91: "#ef7a82", 92: "#a9d18e", 93: "#e5c07b",
+    90: "#7f848e", 91: "#ef7a82", 92: "#a9d18e", 93: "#f2d38c",
     94: "#7ab8f0", 95: "#d292e6", 96: "#6cc4cf", 97: "#d6d8dc",
 }
 ANSI_BG = {
@@ -191,14 +191,14 @@ ANSI_BG = {
 
 # Messages TurboADB itself echoes into a terminal.
 ECHO_ERROR = "#e06c75"
-ECHO_WARN = "#d7a65f"
+ECHO_WARN = "#e9b44c"
 
 # Log dock: level -> (badge colour, message colour).
 LOG_LEVEL_STYLE = {
     "DEBUG": ("#8b9099", "#9ba0a8"),
     "INFO": ("#8fb3d9", "#c3cfdd"),
     "OK": ("#8fbf73", "#b7d3a6"),
-    "WARNING": ("#d7a65f", "#e2c797"),
+    "WARNING": ("#e9b44c", "#eed293"),
     "ERROR": ("#e06c75", "#e8a3a8"),
 }
 LOG_TIMESTAMP = "#7c8189"
@@ -208,13 +208,13 @@ LOG_TEXT = "#c3c7cd"
 LOGCAT_LEVELS = {
     "E": "#e06c75",
     "F": "#d292e6",
-    "W": "#d7a65f",
+    "W": "#e9b44c",
     "I": "#8fbf73",
     "D": "#8fb3d9",
     "V": "#8b9099",
 }
 LOGCAT_DEFAULT = LOG_TEXT
-HIGHLIGHT_BG = "#d7b35a"
+HIGHLIGHT_BG = "#f0c948"
 HIGHLIGHT_FG = "#1a1a1a"
 
 # Backwards-compatible names used across the GUI.
@@ -226,7 +226,7 @@ WARN = ECHO_WARN
 LOG_COLORS = {
     "ERROR": LOG_LEVEL_STYLE["ERROR"][0],
     "WARNING": LOG_LEVEL_STYLE["WARNING"][0],
-    "stderr": "#d7875f",
+    "stderr": "#ef9b5f",
     "OK": LOG_LEVEL_STYLE["OK"][0],
     "INFO": LOG_LEVEL_STYLE["INFO"][0],
     **{f" {level} ": colour for level, colour in LOGCAT_LEVELS.items()},
@@ -286,11 +286,11 @@ def palette(name: str | None = None) -> dict:
 _HUES = {
     "blue": ("#7ab0f0", "#2a62a8"),
     "green": ("#7fcf8e", "#297539"),
-    "amber": ("#e9b862", "#875800"),
+    "amber": ("#ecbb4c", "#8f5d00"),
     "red": ("#f08c8c", "#b3342c"),
     "purple": ("#b9a2f3", "#6b46ba"),
     "teal": ("#62cfc5", "#1c736c"),
-    "orange": ("#f2a46e", "#a0501a"),
+    "orange": ("#ff9f5c", "#a84e0e"),
     "pink": ("#ef93c3", "#a8386f"),
 }
 TONES = tuple(_HUES)
@@ -498,7 +498,7 @@ def status_colors(name: str | None = None) -> dict:
         "info": (c["on_accent"], c["accent"]),
         "ok": (c["on_danger"], "#3f6b35"),
         "rec": (c["on_danger"], c["danger"]),
-        "warn": ("#1e1f22", "#c9a14f"),
+        "warn": ("#1e1f22", "#e2ab3c"),
         "error": (c["on_danger"], c["danger"]),
     }
 
@@ -1196,6 +1196,7 @@ def stylesheet(name: str = "dark") -> str:
     QStackedWidget#phoneStack {{ background: transparent; }}
     QLineEdit#phoneNumber {{ font-size: 16pt; font-weight: 600; padding: 6px 10px; }}
     QToolButton#paneTitle {{ padding: 2px 4px 2px 0px; font-weight: 700; }}
+    QPushButton#paneOp {{ padding: 4px 6px; }}
     QLabel#cameraView {{ background: {TERM_BG}; color: {LOG_TIMESTAMP}; border-radius: 6px; }}
     {_camera_status_rules(name)}
     QPlainTextEdit#logcatView {{ background: {TERM_BG}; border: none; }}

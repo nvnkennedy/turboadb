@@ -1244,3 +1244,91 @@ def test_a_stack_trace_keeps_the_error_toast_and_its_buttons_on_screen(qapp, hos
     assert work.contains(toast.geometry())
     assert "shortened" in toast.text.text() and toast.message == "logcat: " + dump
     _assert_nothing_clipped(toast.text)
+
+
+# --------------------------------------------------------------------------- #
+# the toast is never sized to something the window system refuses
+# --------------------------------------------------------------------------- #
+def _resize_spy(toast):
+    """Record every size the toast is actually resized to."""
+    from PyQt5.QtCore import QEvent, QObject
+
+    sizes = []
+
+    class _Spy(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Resize:
+                sizes.append(event.size())
+            return False
+
+    spy = _Spy(toast)
+    toast.installEventFilter(spy)
+    return sizes
+
+
+def test_a_longer_message_never_resizes_the_toast_to_a_height_that_cuts_it(qapp, host):
+    """Activating the layout resized the shown toast to the layout minimum
+    first — a height that ignores the wrapped lines. Windows refused it and Qt
+    logged "QWindowsWindow::setGeometry: Unable to set geometry" every time."""
+    from turboadb.gui import fileutil
+
+    toast = fileutil.activity_toast(host, "Wi-Fi on")
+    qapp.processEvents()
+    sizes = _resize_spy(toast)
+    long_message = ("Settings saved — terminal font size, screen renderer: screencap, "
+                    "adb path, scrcpy options and audio options for this device")
+    toast = fileutil.activity_toast(host, long_message)
+    qapp.processEvents()
+    layout = toast.layout()
+    assert sizes, "the toast never resized for the longer message"
+    for size in sizes:
+        needed = layout.totalHeightForWidth(size.width()) if layout.hasHeightForWidth() \
+            else layout.totalSizeHint().height()
+        assert size.height() >= needed, (size, needed)
+    assert toast.minimumSize() == toast.maximumSize() == toast.size()
+
+
+def test_every_toast_size_is_one_the_toast_itself_asks_for(qapp, host, themed):
+    """Whatever the message, the fixed size matches the content: no window is
+    asked for a size its own layout contradicts."""
+    from turboadb.gui import fileutil
+
+    messages = ("Saved", "Copied 3 device item(s) to clipboard.",
+                "make writable: " + "adb remount on every partition, " * 5,
+                "Wi-Fi on")
+    for message in messages:
+        toast = fileutil.activity_toast(host, message)
+        qapp.processEvents()
+        layout = toast.layout()
+        assert toast.minimumSize() == toast.maximumSize() == toast.size(), message
+        assert toast.width() >= layout.totalMinimumSize().width(), message
+        assert toast.height() >= layout.totalHeightForWidth(toast.width()), message
+
+
+# --------------------------------------------------------------------------- #
+# Settings reports what the user changed
+# --------------------------------------------------------------------------- #
+def test_the_settings_line_names_what_changed_not_always_the_theme():
+    from turboadb.gui.main_window import _describe_settings
+
+    assert _describe_settings({"term_font_size": 12}) == "terminal font size"
+    assert _describe_settings({"screen_backend": "screencap"}) == "screen renderer: screencap"
+    assert _describe_settings({"adb_path": "C:/adb.exe", "auto_update": False}) == \
+        "adb path, automatic updates"
+    # scrcpy's many options are named as the two groups the dialog shows
+    assert _describe_settings({"scrcpy_bit_rate": "8M", "scrcpy_max_size": 1080}) == \
+        "screen options"
+    assert _describe_settings({"scrcpy_audio": True, "scrcpy_audio_codec": "opus"}) == \
+        "audio options"
+    assert _describe_settings({"scrcpy_max_size": 1080, "scrcpy_audio": True}) == \
+        "screen options, audio options"
+    # the theme is named only when it changed, and its bookkeeping keys never are
+    assert _describe_settings({"theme": "mono-light", "theme_last_light": "mono-light",
+                               "settings_version": 4}) == "theme: White"
+    assert _describe_settings({}) == ""
+    long_change = {"term_font": "Cascadia", "term_font_size": 12, "adb_path": "a",
+                   "scrcpy_path": "s", "logcat_format": "brief"}
+    assert _describe_settings(long_change) == \
+        "terminal font, terminal font size, adb path and 2 more"
+    # a key with no friendly name still reads as words
+    assert _describe_settings({"some_new_option": 1}) == "some new option"

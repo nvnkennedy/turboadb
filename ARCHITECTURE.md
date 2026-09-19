@@ -145,6 +145,35 @@ Two patterns recur and are worth preserving:
   a second Stop before the device prompt returns (or no answer within 3 s)
   reopens the local shell, re-enters the same adb shell and `cd`s back.
 
+### Rapid tap bursts
+
+`touch.py` holds the pure parts: parsing ``getevent -pl``, choosing the
+touchscreen, scaling a display point into the panel's own units and building the
+device-side loop. `ADBHandler.tap_burst` runs that loop in ONE ``adb shell`` so
+no tap waits for the PC, prefers ``sendevent`` (the device's own tool, so the
+events are packed for its kernel) when the shell may write to the input node,
+and falls back to ``input tap`` otherwise — as it always does for a burst aimed
+at another display, since an input node belongs to one screen. The loop stops at
+the first refused tap, and prints its progress so the caller can follow it.
+
+### Shutdown
+
+`gui/app.py::_stop_started_tools` runs when the app exits: `scrcpy.stop_all()`
+closes any mirror this process started (every `ScrcpySession` registers itself),
+and `ADBHandler.stop_server` stops the adb server unless the user turned that
+off (`stop_adb_on_exit`) or this PC is sharing its devices.
+
+### Write access to protected files
+
+`ADBHandler.access_status()` reports root, `ro.debuggable`, the build type, the
+dm-verity mode and the bootloader state from one shell call. `make_writable()`
+runs `adb root`, optionally `adb disable-verity`, then `adb remount`, and
+handles the reboots those need (after a reboot adbd is not root, so root runs
+again). The GUI shows `gui/device_access.WriteAccessDialog` when a change is
+refused (`is_permission_problem`), runs the choice through `DeviceTab`, and
+holds every terminal meanwhile: the Android shell pauses and reconnects, and
+PowerShell/CMD reopen the `adb shell` they were in, in the same device folder.
+
 ## Packaging
 
 - `pyproject.toml` — package metadata, the console-script/gui-script entry

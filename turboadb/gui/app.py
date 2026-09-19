@@ -4,6 +4,7 @@ the app level, and shows the main window."""
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import traceback
@@ -288,6 +289,59 @@ def _acquire_instance_lock() -> bool:
     return False
 
 
+def _stop_started_tools() -> None:
+    """On the way out, close what TurboADB started: any scrcpy window it opened
+    and the adb server it uses.
+
+    A mirror window or an adb daemon left running keeps the device busy after
+    the app is gone. Settings → Startup turns this off, and a server shared
+    with other machines (``turboadb serve``) is never stopped: it exists for
+    them, not for this app.
+    """
+    log = logging.getLogger("turboadb.gui")
+    try:
+        from .. import scrcpy
+
+        closed = scrcpy.stop_all()
+        if closed:
+            log.info("closed %d scrcpy window(s) on exit", closed)
+    except Exception as exc:
+        log.warning("could not close scrcpy on exit: %s", exc)
+    try:
+        from . import settings as settings_mod
+
+        if not settings_mod.get("stop_adb_on_exit", True):
+            return
+        _stop_adb_server(log)
+    except Exception as exc:
+        log.warning("could not stop the adb server on exit: %s", exc)
+
+
+def _stop_adb_server(log) -> None:
+    from ..config import ADBConfig
+    from ..core import ADBHandler
+    from ..devices import server_is_shared
+    from ..tools import find_adb, is_adb_server_alive
+    from .adb_path import gui_adb_path
+
+    if not is_adb_server_alive():
+        return
+    if server_is_shared():
+        log.info("the adb server is shared with other machines — left running")
+        return
+    adb = gui_adb_path()
+    if not adb or not os.path.exists(adb):
+        # Never let a missing adb start the managed-tools download on the way
+        # out; without a binary there is nothing of ours to stop anyway.
+        try:
+            adb = find_adb()
+        except Exception:
+            return
+    result = ADBHandler(ADBConfig(adb_path=adb), quiet=True).stop_server(safe=True)
+    if not result.success or result.value is not True:
+        log.warning("the adb server was still running after kill-server")
+
+
 def _release_instance_lock() -> None:
     global _instance_lock, _instance_mutex
     if _instance_lock is not None:
@@ -341,6 +395,7 @@ def main():
     try:
         return app.exec_()
     finally:
+        _stop_started_tools()
         _release_instance_lock()
 
 

@@ -546,6 +546,34 @@ def test_settings_dialog_saves_only_changed_keys(qapp, settings_file):
         dlg.deleteLater()
 
 
+def test_settings_dropdowns_are_pickers_not_text_fields(qapp, settings_file):
+    """Every Settings dropdown chooses from its list. They used to take a text
+    caret, so a click landed in the box and a half-typed value could stand as
+    the setting (the font one accepted any text at all)."""
+    from PyQt5.QtWidgets import QComboBox
+
+    from turboadb.gui import settings
+    from turboadb.gui.settings_dialog import SettingsDialog
+
+    # values the lists do not offer, as an older or hand-edited file may hold
+    settings.save({"scrcpy_bit_rate": "12M", "scrcpy_audio_bit_rate": "96K"})
+    dlg = SettingsDialog()
+    try:
+        combos = dlg.findChildren(QComboBox)
+        assert len(combos) >= 6
+        for combo in combos:
+            assert not combo.isEditable() and combo.lineEdit() is None
+        # the saved values are still shown, and unchanged by opening the dialog
+        assert dlg._combo_value(dlg.bit_rate) == "12M"
+        assert dlg._combo_value(dlg.audio_bit_rate) == "96K"
+        assert dlg.changed_settings() == {}
+        # and choosing from the list still saves the list's value, not its label
+        dlg._set_combo_value(dlg.bit_rate, "16M")
+        assert dlg.changed_settings() == {"scrcpy_bit_rate": "16M"}
+    finally:
+        dlg.deleteLater()
+
+
 def test_scrollback_writer_failure_keeps_history_saveable(qapp, tmp_path, monkeypatch):
     from PyQt5.QtWidgets import QPlainTextEdit
     from turboadb.gui import scrollback as sb_mod

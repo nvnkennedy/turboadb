@@ -461,6 +461,55 @@ class _AppUpgradeThread(QThread):
         self.done.emit(res or {})
 
 
+# What the Settings dialog calls each setting, for the line it logs on OK.
+_SETTING_LABELS = {
+    "theme": "theme",
+    "term_font": "terminal font",
+    "term_font_size": "terminal font size",
+    "adb_path": "adb path",
+    "scrcpy_path": "scrcpy path",
+    "ffmpeg_path": "ffmpeg path",
+    "screen_backend": "screen renderer",
+    "logcat_format": "logcat format",
+    "auto_update": "automatic updates",
+    "auto_save_targets": "saving connected targets",
+    "stop_adb_on_exit": "closing ADB and scrcpy on exit",
+    "duplicate_device_action": "duplicate device action",
+    "make_shortcut_first_run": "desktop shortcut",
+    "mute_popups_with_log": "muting popups with the log open",
+}
+# Written alongside a choice, never chosen: never named back to the user.
+_SETTING_BOOKKEEPING = ("settings_version", "theme_last_dark", "theme_last_light")
+
+
+def _describe_settings(changes: dict) -> str:
+    """Name what the user actually changed ("" for nothing).
+
+    Saying "theme: Graphite" after every OK looked like TurboADB had
+    changed the theme by itself, whatever the user had come to change."""
+    named = []
+    groups = []
+    for key, value in changes.items():
+        if key in _SETTING_BOOKKEEPING:
+            continue
+        if key == "theme":
+            named.append(f"theme: {theme.theme_label(value)}")
+        elif key == "screen_backend":
+            named.append(f"screen renderer: {value}")
+        elif key.startswith("scrcpy_audio"):
+            if "audio options" not in groups:
+                groups.append("audio options")
+        elif key.startswith("scrcpy_"):
+            if "screen options" not in groups:
+                groups.append("screen options")
+        else:
+            named.append(_SETTING_LABELS.get(key, key.replace("_", " ")))
+    named += groups
+    if len(named) > 3:
+        return ", ".join(named[:3]) + f" and {len(named) - 3} more"
+    return ", ".join(named)
+
+
 class MainWindow(QMainWindow):
     # Socket tracking is the primary, immediate notification channel.  This is
     # deliberately only a reconciliation fallback, never a second fast poller.
@@ -2435,7 +2484,9 @@ class MainWindow(QMainWindow):
         # kind); apply exactly the one chosen there, not a re-derived one.
         name = changes.get("theme") or settings_mod.get("theme")
         self._apply_theme(name, persist=False, announce=False)
-        self._log(f"[OK] Settings saved — theme: {theme.theme_label(name)}")
+        described = _describe_settings(changes)
+        self._log(f"[OK] Settings saved — {described}" if described
+                  else "[INFO] Settings closed — nothing changed")
         if "screen_backend" in changes:
             from .mirror_panel import MirrorPanel
 

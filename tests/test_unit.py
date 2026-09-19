@@ -1185,9 +1185,27 @@ def test_console_osc_filtering_and_csi_clear(qapp):
     assert con.toPlainText() == ""
 
 
-def test_local_shell_widget_lazy_start(qapp):
+def test_local_shell_widget_lazy_start(qapp, monkeypatch):
+    from turboadb.gui import local_terminal
     from turboadb.gui.device_tab import _LocalShellWidget
 
+    class _Session:
+        """A stub shell: the real one is powershell.exe, which only Windows has."""
+        running = True
+
+        def __init__(self, *args, **kwargs):
+            self.args = (args, kwargs)
+
+        def read(self, size=4096):
+            return b""
+
+        def send(self, data):
+            return True
+
+        def close(self):
+            self.running = False
+
+    monkeypatch.setattr(local_terminal, "LocalShellSession", _Session)
     widget = _LocalShellWidget("powershell", serial="test123")
     try:
         # Before focus or ensure_started, session is None (lazy)
@@ -1267,9 +1285,27 @@ def test_file_table_subfolder_drop_targeting(qapp):
     assert data[1] is True
 
 
-def test_local_shell_completion_and_cwd_tracking(qapp, tmp_path):
+def test_local_shell_completion_and_cwd_tracking(qapp, tmp_path, monkeypatch):
+    from turboadb.gui import local_terminal
     from turboadb.gui.device_tab import _LocalShellWidget
 
+    class _Session:
+        """A stub shell: the real one is cmd.exe, which only Windows has."""
+        running = True
+
+        def __init__(self, *args, **kwargs):
+            self.sent = []
+
+        def read(self, size=4096):
+            return b""
+
+        def send(self, data):
+            self.sent.append(data)
+
+        def close(self):
+            self.running = False
+
+    monkeypatch.setattr(local_terminal, "LocalShellSession", _Session)
     widget = _LocalShellWidget("cmd", serial="test123")
     widget._shell_cwd = str(tmp_path)
 

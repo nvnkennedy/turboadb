@@ -29,14 +29,17 @@ import threading
 import time
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QUrl, QMimeData
+from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect,
+                          QSize, QThread, QTimer, QUrl, Qt, pyqtSignal)
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
                              QInputDialog, QMessageBox, QLabel, QProgressBar,
                              QSplitter, QFrame, QMenu, QShortcut, QComboBox,
-                             QAbstractItemView, QDialog, QPlainTextEdit, QToolButton)
-from PyQt5.QtGui import QKeySequence, QFont, QTextCursor, QDrag
+                             QAbstractItemView, QApplication, QDialog, QPlainTextEdit,
+                             QRubberBand, QStyledItemDelegate, QToolButton)
+from PyQt5.QtGui import QColor, QCursor, QKeySequence, QFont, QPainter, QTextCursor, QDrag
 from ..results import strip_ansi
+from . import theme
 from .fileutil import _alive, write_text_file
 from .icons import icon
 from .qtutil import (cached_icon, close_jobs, disconnect_signals, page_toolbar, park_thread,
@@ -88,6 +91,8 @@ _PANE_OP_ICONS = {
     "Paste": ("paste", "blue"),
     "Rename": ("rename", "teal"),
     "Delete": ("trash", "red"),
+    "Delete permanently": ("trash", "red"),
+    "Select all": ("check", "accent"),
     "Push to device": ("arrow-right", "blue"),
     "Pull to this PC": ("arrow-left", "green"),
 }
@@ -347,13 +352,15 @@ class _FileEditorDialog(QDialog):
         if saving:
             self.status.setText("Saving…")
 
-    def complete_async_save(self, ok: bool, error: str = ""):
-        """Finish a background save requested by ``on_save``."""
+    def complete_async_save(self, ok: bool, error: str = "", *, report: bool = True):
+        """Finish a background save requested by ``on_save``. *report=False*:
+        the failure is shown elsewhere (the device tab offers write access)."""
         self._saving = False
         self._set_saving(False)
         if not ok:
             self._close_after_save = False
-            QMessageBox.critical(self, "Save File", error or "Could not save the file.")
+            if report:
+                QMessageBox.critical(self, "Save File", error or "Could not save the file.")
             self._update_status()
             return
         self._dirty = False
@@ -378,11 +385,38 @@ class _FileEditorDialog(QDialog):
         super().reject()
 
 
+class _NameDelegate(QStyledItemDelegate):
+    """Name cells shorten in the middle, so the extension stays visible."""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.ElideMiddle
+
+
+class _PathEdit(QLineEdit):
+    """The folder path field: it takes the spare width of its header row but
+    asks for little, so Up and Refresh stay beside it on a laptop screen."""
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        return QSize(min(hint.width(), 140), hint.height())
+
+
 class _FileTableWidget(QTableWidget):
-    """Table widget with native bidirectional drag-and-drop and fixed '..' row 0."""
+    """Table widget with native bidirectional drag-and-drop and fixed '..' row 0.
+
+    Like Explorer, a drag that starts on a name moves files, and a drag that
+    starts anywhere else (another column, or below the rows) selects with a
+    rectangle, scrolling while the pointer is above or below the rows.
+    """
     # (paths, paths_are_local, target_dir): paths_are_local is True for local
     # filesystem paths (Explorer or a local pane), False for device paths.
     dropped = pyqtSignal(list, bool, str)
+
+    BAND_SCROLL_MS = 40
+    # (column, table width below which it hides): on a narrow pane Type (the
+    # icon already says it) and then Owner give their room to the names.
+    NARROW_HIDDEN_COLUMNS = ((2, 760), (5, 640))
 
     def __init__(self, is_remote: bool = False, parent=None):
         super().__init__(0, 6, parent)
@@ -391,6 +425,8 @@ class _FileTableWidget(QTableWidget):
         self.browser = None  # owning FileBrowser (identifies the device of remote drags)
         # Listed names that could not be identified exactly (never acted on).
         self.unsafe_names = frozenset()
+        # Shown in the middle of a folder with nothing to list ("" while loading).
+        self.empty_text = ""
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
@@ -400,7 +436,170 @@ class _FileTableWidget(QTableWidget):
         header = self.horizontalHeader()
         header.setSortIndicatorShown(True)
         header.setSortIndicator(0, Qt.AscendingOrder)
+        # a select-all must not paint every header section as pressed
+        header.setHighlightSections(False)
         header.sectionClicked.connect(self._on_header_clicked)
+        self._band = None          # the QRubberBand, created on the first drag
+        self._band_origin = None   # press point in content coordinates
+        self._band_base = QItemSelection()  # kept under the band (Ctrl / Shift)
+        self._band_active = False
+        self._band_pos = QPoint()
+        self._band_timer = QTimer(self)
+        self._band_timer.setInterval(self.BAND_SCROLL_MS)
+        self._band_timer.timeout.connect(self._band_autoscroll)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = self.width()
+        for column, below in self.NARROW_HIDDEN_COLUMNS:
+            if column < self.columnCount() and self.isColumnHidden(column) != (width < below):
+                self.setColumnHidden(column, width < below)
+
+    # ---- selection ----
+    def is_parent_row(self, row: int) -> bool:
+        it = self.item(row, 0)
+        data = it.data(Qt.UserRole) if it is not None else None
+        return isinstance(data, (tuple, list)) and len(data) > 1 and data[0] == ".."
+
+    def _entry_rows(self):
+        """``(first, last)`` rows holding files or folders ('..' excluded)."""
+        first = 1 if self.rowCount() and self.is_parent_row(0) else 0
+        return first, self.rowCount() - 1
+
+    def select_all_entries(self) -> None:
+        """Ctrl+A: every file and folder, never the '..' row."""
+        first, last = self._entry_rows()
+        model = self.selectionModel()
+        head = self.item(first, 0) if first <= last else None
+        if head is None or not head.flags() & Qt.ItemIsSelectable:
+            model.clearSelection()  # nothing listed, or only "Loading…"
+            return
+        whole = QItemSelection(self.model().index(first, 0),
+                               self.model().index(last, self.columnCount() - 1))
+        model.select(whole, QItemSelectionModel.ClearAndSelect)
+
+    def _offset(self) -> QPoint:
+        return QPoint(self.horizontalOffset(), self.verticalOffset())
+
+    def mousePressEvent(self, event):
+        self._end_band()
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(event.pos())
+            if item is None or item.column() != 0:
+                keep = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+                self._band_base = (QItemSelection(self.selectionModel().selection())
+                                   if keep else QItemSelection())
+                self._band_origin = event.pos() + self._offset()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._band_origin is None or not event.buttons() & Qt.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+        # Never a file drag from here: the press was not on a name.
+        if not self._band_active:
+            start = self._band_origin - self._offset()
+            if (event.pos() - start).manhattanLength() < QApplication.startDragDistance():
+                return
+            self._band_active = True
+            if self._band is None:
+                self._band = QRubberBand(QRubberBand.Rectangle, self.viewport())
+        self._band_pos = event.pos()
+        self._update_band()
+        inside = 0 <= event.pos().y() < self.viewport().height()
+        if inside:
+            self._band_timer.stop()
+        elif not self._band_timer.isActive():
+            self._band_timer.start()
+
+    def mouseReleaseEvent(self, event):
+        used = self._band_active and event.button() == Qt.LeftButton
+        self._end_band()
+        if used:
+            event.accept()  # keep the rectangle's selection (a click would replace it)
+            return
+        super().mouseReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        if not (event.reason() == Qt.PopupFocusReason):
+            self._end_band()
+        super().focusOutEvent(event)
+
+    def _end_band(self) -> None:
+        self._band_timer.stop()
+        self._band_origin = None
+        self._band_active = False
+        if self._band is not None:
+            self._band.hide()
+
+    def _band_autoscroll(self) -> None:
+        if not self._band_active:
+            self._band_timer.stop()
+            return
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        bar = self.verticalScrollBar()
+        if pos.y() < 0:
+            bar.setValue(bar.value() - 1)
+        elif pos.y() >= self.viewport().height():
+            bar.setValue(bar.value() + 1)
+        else:
+            self._band_timer.stop()
+        self._band_pos = pos
+        self._update_band()
+
+    def band_rows(self, top: int, bottom: int):
+        """``(first, last)`` rows touched by content y range *top*..*bottom*."""
+        first_entry, last_row = self._entry_rows()
+        if last_row < 0:
+            return 0, -1
+        header = self.verticalHeader()
+
+        def row_at(y):
+            lo, hi = 0, last_row
+            while lo < hi:  # rows are sorted by position; find the last one starting <= y
+                mid = (lo + hi + 1) // 2
+                if header.sectionPosition(mid) <= y:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+
+        end = header.sectionPosition(last_row) + header.sectionSize(last_row)
+        if top >= end:
+            return 0, -1  # the rectangle is below the last row
+        return max(first_entry, row_at(max(0, top))), row_at(max(0, bottom))
+
+    def _update_band(self) -> None:
+        if self._band_origin is None or self._band is None:
+            return
+        offset = self._offset()
+        start = self._band_origin - offset
+        rect = QRect(start, self._band_pos).normalized()
+        self._band.setGeometry(rect.intersected(self.viewport().rect()))
+        self._band.show()
+        top = min(self._band_origin.y(), self._band_pos.y() + offset.y())
+        bottom = max(self._band_origin.y(), self._band_pos.y() + offset.y())
+        first, last = self.band_rows(top, bottom)
+        selection = QItemSelection(self._band_base)
+        if first <= last:
+            selection.merge(
+                QItemSelection(self.model().index(first, 0),
+                               self.model().index(last, self.columnCount() - 1)),
+                QItemSelectionModel.Select)
+        self.selectionModel().select(selection, QItemSelectionModel.ClearAndSelect)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        rows = self.rowCount()
+        if not self.empty_text or rows > 1 or (rows == 1 and not self.is_parent_row(0)):
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QColor(theme.palette()["dim"]))
+        area = self.viewport().rect()
+        if rows == 1:
+            area.setTop(self.rowViewportPosition(0) + self.rowHeight(0))
+        painter.drawText(area, Qt.AlignCenter, self.empty_text)
+        painter.end()
 
     def startDrag(self, supportedActions):
         indexes = self.selectedIndexes()
@@ -751,6 +950,60 @@ def _delete_local_items(paths) -> List[str]:
     return errors
 
 
+def recycle_bin_available() -> bool:
+    """Local Delete moves items to the Recycle Bin on Windows (Shift+Delete, and
+    other systems, delete permanently)."""
+    return os.name == "nt"
+
+
+def _recycle_list(paths) -> str:
+    """The ``pFrom`` value SHFileOperationW wants: every absolute path
+    NUL-terminated, with one more NUL at the end ("" for no paths)."""
+    paths = [os.path.abspath(p) for p in paths if p]
+    return "\0".join(paths) + "\0\0" if paths else ""
+
+
+def _recycle_local_items(paths) -> List[str]:
+    """Move *paths* to the Windows Recycle Bin in one shell call; returns errors.
+
+    Items on a drive without a Recycle Bin get Windows' own "delete
+    permanently?" warning instead of silently disappearing."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        # shellapi.h packs this structure to 1 byte only on 32-bit Windows
+        _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    text = _recycle_list(paths)
+    if not text:
+        return []
+    fo_delete = 3
+    flags = 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x4000  # SILENT NOCONFIRMATION ALLOWUNDO NOERRORUI WANTNUKEWARNING
+    names = (ctypes.c_wchar * len(text))(*text)
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = fo_delete
+    op.pFrom = ctypes.cast(names, ctypes.c_wchar_p)
+    op.fFlags = flags
+    code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if op.fAnyOperationsAborted:
+        return ["cancelled: nothing more was moved to the Recycle Bin"]
+    if code:
+        return [f"the Recycle Bin refused the items (error 0x{code:x}); "
+                "Shift+Delete deletes them permanently"]
+    return []
+
+
 def _create_empty_file(path: str) -> None:
     with open(path, "a"):
         pass
@@ -946,6 +1199,10 @@ class _TransferThread(QThread):
 
 class FileBrowser(QWidget):
     log = pyqtSignal(str)
+    # {"path": device folder, "error": text, "action": "deleting 2 items",
+    # "retry": callable}: the device refused a change; the device tab offers
+    # adb root / disable-verity / remount and then calls retry.
+    write_access_needed = pyqtSignal(object)
 
     COLUMNS = ["Name", "Size", "Type", "Date Modified", "Permissions", "Owner"]
 
@@ -977,6 +1234,7 @@ class FileBrowser(QWidget):
         self._remote_shown = None         # device folder the table last listed successfully
         self._remote_failed = False       # the current device folder could not be listed
         self._cancelled_transfer = None
+        self._refused_transfers = []  # (src, dst, direction, error) the device refused
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -995,7 +1253,7 @@ class FileBrowser(QWidget):
         for lbl, glyph, p in (("Home", "house", home),
                               ("Desktop", "monitor", os.path.join(home, "Desktop")),
                               ("Downloads", "download", os.path.join(home, "Downloads"))):
-            b = QPushButton(lbl); b.setProperty("role", "ghost")
+            b = self._flat_button(lbl)
             b.setIcon(icon(glyph, "blue"))
             b.setToolTip(f"Open {p}")
             b.clicked.connect(lambda _=False, path=p: self._jump_local(path))
@@ -1007,7 +1265,7 @@ class FileBrowser(QWidget):
         for lbl, glyph, p in (("/sdcard", "smartphone", "/sdcard"),
                               ("/data/local/tmp", "folder", "/data/local/tmp"),
                               ("/", "folder", "/")):
-            b = QPushButton(lbl); b.setProperty("role", "ghost")
+            b = self._flat_button(lbl)
             b.setIcon(icon(glyph, "green"))
             b.setToolTip(f"Open {p} on the device")
             b.clicked.connect(lambda _=False, path=p: self._jump_remote(path))
@@ -1035,14 +1293,13 @@ class FileBrowser(QWidget):
         self.cmb_drives.addItem(_drive_of(self.local_cwd))
         self.cmb_drives.setToolTip("Drive")
         self.cmb_drives.currentTextChanged.connect(self._on_drive_changed)
-        self.local_path = QLineEdit(self.local_cwd)
+        self.local_path = _PathEdit(self.local_cwd)
         self.local_path.returnPressed.connect(self._go_local)
-        lup = QPushButton("Up"); lup.setProperty("role", "ghost")
+        lup = self._flat_button("Up")
         lup.setIcon(icon("arrow-up", "accent"))
-        lup.setToolTip("Parent folder")
+        lup.setToolTip("Parent folder (Backspace)")
         lup.clicked.connect(self._up_local)
-        lref = QPushButton("Refresh")
-        lref.setProperty("role", "ghost")
+        lref = self._flat_button("Refresh")
         lref.setIcon(icon("refresh", "green"))
         lref.setToolTip("Refresh local listing (F5)")
         lref.clicked.connect(self.refresh_local)
@@ -1060,6 +1317,8 @@ class FileBrowser(QWidget):
         self.local_table.customContextMenuRequested.connect(self._context_local)
         self.local_table.dropped.connect(self._on_local_dropped)
         left_lay.addWidget(self.local_table, 1)
+        self.local_status = self._pane_status()
+        left_lay.addWidget(self.local_status)
 
         left_lay.addLayout(self._pane_ops((
             ("New folder", self._local_mkdir),
@@ -1085,6 +1344,7 @@ class FileBrowser(QWidget):
         self.btn_push.setToolTip("Push selected local files to the Android device folder")
         self.btn_push.setFixedWidth(84)
         self.btn_push.setFixedHeight(32)
+        self.btn_push.setFocusPolicy(Qt.TabFocus)  # a click keeps the pane's focus
         self.btn_push.clicked.connect(self.push_selected)
         center_lay.addWidget(self.btn_push)
 
@@ -1094,6 +1354,7 @@ class FileBrowser(QWidget):
         self.btn_pull.setToolTip("Pull selected Android files to the local PC folder")
         self.btn_pull.setFixedWidth(84)
         self.btn_pull.setFixedHeight(32)
+        self.btn_pull.setFocusPolicy(Qt.TabFocus)
         self.btn_pull.clicked.connect(self.pull_selected)
         center_lay.addWidget(self.btn_pull)
 
@@ -1106,14 +1367,13 @@ class FileBrowser(QWidget):
 
         rtop = ToolbarFlowLayout(hspacing=8, vspacing=6)
         rtitle = self._pane_title("Device", "smartphone", "green")
-        self.remote_path = QLineEdit(self.remote_cwd)
+        self.remote_path = _PathEdit(self.remote_cwd)
         self.remote_path.returnPressed.connect(self._go_remote)
-        rup = QPushButton("Up"); rup.setProperty("role", "ghost")
+        rup = self._flat_button("Up")
         rup.setIcon(icon("arrow-up", "accent"))
-        rup.setToolTip("Parent folder")
+        rup.setToolTip("Parent folder (Backspace)")
         rup.clicked.connect(self._up_remote)
-        rref = QPushButton("Refresh")
-        rref.setProperty("role", "ghost")
+        rref = self._flat_button("Refresh")
         rref.setIcon(icon("refresh", "green"))
         rref.setToolTip("Refresh device listing (F5)")
         rref.clicked.connect(self.refresh_remote)
@@ -1129,6 +1389,8 @@ class FileBrowser(QWidget):
         self.remote_table.customContextMenuRequested.connect(self._context_remote)
         self.remote_table.dropped.connect(self._on_remote_dropped)
         right_lay.addWidget(self.remote_table, 1)
+        self.remote_status = self._pane_status()
+        right_lay.addWidget(self.remote_status)
 
         right_lay.addLayout(self._pane_ops((
             ("New folder", self._remote_mkdir),
@@ -1156,6 +1418,7 @@ class FileBrowser(QWidget):
         self.btn_cancel_transfer.setIcon(icon("x", "on-danger"))
         self.btn_cancel_transfer.setToolTip("Stop the running transfer and clear the queue")
         self.btn_cancel_transfer.setVisible(False)
+        self.btn_cancel_transfer.setFocusPolicy(Qt.TabFocus)
         self.btn_cancel_transfer.clicked.connect(self.cancel_transfers)
         bar_row = QHBoxLayout()
         bar_row.setSpacing(8)
@@ -1163,26 +1426,54 @@ class FileBrowser(QWidget):
         bar_row.addWidget(self.btn_cancel_transfer)
         body.addLayout(bar_row)
 
-        self.hint = QLabel("Drag and drop between panes or from Explorer   ·   F4 Edit   ·   "
-                           "F5 Refresh   ·   F2 Rename   ·   Del Delete")
+        delete_hint = "Del Recycle Bin   ·   Shift+Del Delete permanently" if recycle_bin_available() else \
+            "Del Delete"
+        self.hint = QLabel("Drag files between panes or from Explorer   ·   drag beside the names "
+                           "to select   ·   Ctrl+A Select all   ·   Enter Open   ·   F2 Rename   ·   "
+                           f"F4 Edit   ·   F5 Refresh   ·   {delete_hint}")
         self.hint.setObjectName("mutedHint")
+        self.hint.setWordWrap(True)
         body.addWidget(self.hint)
 
-        # Shortcuts.  The table shortcuts exist once per table, so each is scoped
-        # to its table: two window-wide shortcuts on the same key are ambiguous
-        # to Qt, and then neither fires.
+        # Shortcuts.  Each pane has its own set, scoped to the pane, so they
+        # work after clicking Up, Refresh or a pane button too (and two
+        # window-wide shortcuts on one key would be ambiguous: neither fires).
+        # A focused path field keeps its own Ctrl+A / Delete / Backspace.
         QShortcut(QKeySequence("F5"), self, activated=self._on_f5)
-        for table, edit, delete, rename, copy, paste in (
-                (self.local_table, self._local_edit, self._local_delete, self._local_rename,
-                 self._local_copy, self._local_paste),
-                (self.remote_table, self._remote_edit, self._remote_delete, self._remote_rename,
-                 self._remote_copy, self._remote_paste)):
-            for key, slot in ((QKeySequence("F4"), edit),
-                              (QKeySequence(QKeySequence.Delete), delete),
-                              (QKeySequence("F2"), rename),
-                              (QKeySequence(QKeySequence.Copy), copy),
-                              (QKeySequence(QKeySequence.Paste), paste)):
-                QShortcut(key, table, activated=slot, context=Qt.WidgetWithChildrenShortcut)
+        for pane, table, actions in (
+                (left_w, self.local_table, (
+                    (QKeySequence("F4"), self._local_edit),
+                    (QKeySequence(QKeySequence.Delete), self._local_delete),
+                    (QKeySequence("Shift+Del"), self._local_delete_permanently),
+                    (QKeySequence("F2"), self._local_rename),
+                    (QKeySequence(QKeySequence.Copy), self._local_copy),
+                    (QKeySequence(QKeySequence.Paste), self._local_paste),
+                    (QKeySequence("Ctrl+Shift+N"), self._local_mkdir),
+                    (QKeySequence("Backspace"), self._up_local),
+                    (QKeySequence("Alt+Up"), self._up_local),
+                )),
+                (right_w, self.remote_table, (
+                    (QKeySequence("F4"), self._remote_edit),
+                    (QKeySequence(QKeySequence.Delete), self._remote_delete),
+                    (QKeySequence("Shift+Del"), self._remote_delete),
+                    (QKeySequence("F2"), self._remote_rename),
+                    (QKeySequence(QKeySequence.Copy), self._remote_copy),
+                    (QKeySequence(QKeySequence.Paste), self._remote_paste),
+                    (QKeySequence("Ctrl+Shift+N"), self._remote_mkdir),
+                    (QKeySequence("Backspace"), self._up_remote),
+                    (QKeySequence("Alt+Up"), self._up_remote),
+                ))):
+            for key, slot in actions:
+                QShortcut(key, pane, activated=slot, context=Qt.WidgetWithChildrenShortcut)
+            QShortcut(QKeySequence(QKeySequence.SelectAll), pane,
+                      activated=lambda t=table: self._select_all(t),
+                      context=Qt.WidgetWithChildrenShortcut)
+            # Enter and Esc only on the table: the path field needs its own Enter.
+            for key in ("Return", "Enter"):
+                QShortcut(QKeySequence(key), table, activated=lambda t=table: self._open_current(t),
+                          context=Qt.WidgetShortcut)
+            QShortcut(QKeySequence("Esc"), table, activated=table.clearSelection,
+                      context=Qt.WidgetShortcut)
 
         # The device listing starts lazily on first show (one listing, not two).
         self._loaded_remote = False
@@ -1194,6 +1485,22 @@ class FileBrowser(QWidget):
         super().showEvent(event)
         if not self._loaded_remote:
             self.refresh_remote()
+
+    @staticmethod
+    def _flat_button(text: str) -> QPushButton:
+        """A compact ghost button that a mouse click never takes the keyboard to,
+        so the file shortcuts keep working after it is clicked."""
+        button = QPushButton(text)
+        button.setProperty("role", "ghost")
+        button.setObjectName("paneOp")
+        button.setFocusPolicy(Qt.TabFocus)
+        return button
+
+    @staticmethod
+    def _pane_status() -> QLabel:
+        label = QLabel("")
+        label.setObjectName("mutedHint")
+        return label
 
     @staticmethod
     def _pane_title(text: str, glyph: str, tone: str) -> QToolButton:
@@ -1214,10 +1521,9 @@ class FileBrowser(QWidget):
         """A pane's file-operation row: plain actions left, Delete on the right."""
         from .flowlayout import ToolbarFlowLayout
 
-        row = ToolbarFlowLayout(hspacing=6, vspacing=6)
+        row = ToolbarFlowLayout(hspacing=2, vspacing=6)
         for text, fn in actions:
-            b = QPushButton(text)
-            b.setProperty("role", "ghost")
+            b = FileBrowser._flat_button(text)
             glyph, tone = _PANE_OP_ICONS.get(text, ("file", "dim"))
             b.setIcon(icon(glyph, tone))
             b.clicked.connect(fn)
@@ -1225,6 +1531,8 @@ class FileBrowser(QWidget):
         row.addStretch(1)
         delete = QPushButton("Delete")
         delete.setProperty("role", "danger")
+        delete.setObjectName("paneOp")
+        delete.setFocusPolicy(Qt.TabFocus)
         delete.setIcon(icon("trash", "on-danger"))
         delete.clicked.connect(delete_slot)
         row.addWidget(delete)
@@ -1238,17 +1546,34 @@ class FileBrowser(QWidget):
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.setShowGrid(False)
+        table.setWordWrap(False)
+        # long names keep their extension ("app-rel…v2.apk"); other columns cut at the end
+        table.setItemDelegateForColumn(0, _NameDelegate(table))
+        table.setIconSize(QSize(18, 18))
         table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(22)
-        table.horizontalHeader().setStretchLastSection(False)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.setColumnWidth(1, 80)
-        table.setColumnWidth(2, 85)
-        table.setColumnWidth(3, 120)
-        table.setColumnWidth(4, 90)
-        table.setColumnWidth(5, 90)
+        table.verticalHeader().setDefaultSectionSize(26)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setMinimumSectionSize(48)
+        size_header = table.horizontalHeaderItem(1)
+        if size_header is not None:
+            size_header.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # Wide enough for a full date, size and permission string in the
+        # table's own (style sheet) font, so none of them ends in "…".
+        table.ensurePolished()
+        metrics = table.fontMetrics()
+        for column, sample in ((1, "999.9 MB"), (2, "Folder"), (3, "2026-09-01 10:00"),
+                               (4, "drwxrwxrwx"), (5, "u0_a1234")):
+            table.setColumnWidth(column, metrics.horizontalAdvance(sample) + 24)
         table.setSortingEnabled(False)
         table.setDragEnabled(True)
+        # A bound method, not a lambda: PyQt holds the receiver weakly, so the
+        # table does not keep a strong reference back to this page (a cycle
+        # Python could collect mid-event, deleting a widget Qt still had posted
+        # events for).
+        table.itemSelectionChanged.connect(self._on_selection_changed)
         return table
 
     @property
@@ -1305,6 +1630,8 @@ class FileBrowser(QWidget):
 
     @staticmethod
     def _set_loading(table: QTableWidget):
+        if isinstance(table, _FileTableWidget):
+            table.empty_text = ""
         table.setRowCount(0)
         table.insertRow(0)
         it = QTableWidgetItem(cached_icon("refresh", "dim"), "Loading…")
@@ -1328,8 +1655,50 @@ class FileBrowser(QWidget):
                 self._add_row(table, *row)
             if isinstance(table, _FileTableWidget):
                 table.apply_sort()
+                table.empty_text = "This folder is empty"
         finally:
             table.setUpdatesEnabled(True)
+        self._update_pane_status(table)
+
+    def _on_selection_changed(self) -> None:
+        """The table that changed is the sender; see :meth:`_create_table`."""
+        table = self.sender()
+        if table is not None:
+            self._update_pane_status(table)
+
+    def _update_pane_status(self, table) -> None:
+        """"3 folders, 12 files" and, with a selection, "2 selected · 1.4 MB"."""
+        local = table is getattr(self, "local_table", None)
+        label = getattr(self, "local_status" if local else "remote_status", None)
+        if label is None or self._closing:
+            return
+        folders = files = 0
+        for row in range(table.rowCount()):
+            entry = self._row_entry(table, row)
+            if entry is not None:
+                if entry[1]:
+                    folders += 1
+                else:
+                    files += 1
+        parts = []
+        if folders:
+            parts.append(f"{folders} folder{'s' if folders != 1 else ''}")
+        if files:
+            parts.append(f"{files} file{'s' if files != 1 else ''}")
+        text = ", ".join(parts)
+        selected = self._selected_rows(table)
+        if selected:
+            size = 0
+            for row in selected:
+                entry = self._row_entry(table, row)
+                it = table.item(row, 1)
+                raw = it.data(Qt.UserRole) if it is not None else None
+                if entry and not entry[1] and isinstance(raw, int):
+                    size += raw
+            text += f"   ·   {len(selected)} selected"
+            if size:
+                text += f" ({_human_size(size)})"
+        label.setText(text)
 
     # ---- Navigation: Local PC ----
     def _on_drives(self, drives):
@@ -1349,6 +1718,7 @@ class FileBrowser(QWidget):
 
     def _jump_local(self, path: str):
         self._navigate_local(path)
+        self.local_table.setFocus(Qt.OtherFocusReason)
 
     def _sync_drive_combo(self):
         drive = _drive_of(self.local_cwd)
@@ -1361,6 +1731,7 @@ class FileBrowser(QWidget):
 
     def _go_local(self):
         self._navigate_local(self.local_path.text().strip() or self.local_cwd)
+        self.local_table.setFocus(Qt.OtherFocusReason)
 
     def _up_local(self):
         parent = os.path.dirname(self.local_cwd)
@@ -1428,12 +1799,14 @@ class FileBrowser(QWidget):
     def _jump_remote(self, path: str):
         self.remote_cwd = _normalize_remote_path(path)
         self.refresh_remote()
+        self.remote_table.setFocus(Qt.OtherFocusReason)
 
     def _go_remote(self):
         p = self.remote_path.text().strip()
         if p:
             self.remote_cwd = _normalize_remote_path(p)
         self.refresh_remote()
+        self.remote_table.setFocus(Qt.OtherFocusReason)
 
     def _up_remote(self):
         if self.remote_cwd in ("/", ""):
@@ -1508,10 +1881,13 @@ class FileBrowser(QWidget):
         if shown is not None and shown != path:
             self.remote_cwd = shown
             self.refresh_remote()
+            self._offer_write_access(path, msg, "opening the folder",
+                                     lambda: self._jump_remote(path))
             return
         self._remote_failed = True
         self.remote_table.base_dir = self.remote_cwd
         self._populate(self.remote_table, [], parent_row=True)
+        self.remote_table.empty_text = "This folder could not be listed"
 
     def _on_remote_double_click(self, row: int, _col: int):
         it = self.remote_table.item(row, 0)
@@ -1548,6 +1924,7 @@ class FileBrowser(QWidget):
         it_name.setData(ICON_ROLE, glyph)
         it_size = _FileItem(sz_str)
         it_size.setData(Qt.UserRole, raw_size)
+        it_size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         it_type = _FileItem(ftype)
         it_date = _FileItem(mtime)
         if raw_mtime is not None:
@@ -1566,6 +1943,20 @@ class FileBrowser(QWidget):
             table.setItem(row, col, it)
 
     # ---- Selection helpers ----
+    def _select_all(self, table) -> None:
+        table.select_all_entries()
+        table.setFocus(Qt.OtherFocusReason)
+
+    def _open_current(self, table) -> None:
+        """Enter: open the current folder, or edit the current file."""
+        row = table.currentRow()
+        if row < 0 or table.item(row, 0) is None:
+            return
+        if table is self.local_table:
+            self._on_local_double_click(row, 0)
+        else:
+            self._on_remote_double_click(row, 0)
+
     @staticmethod
     def _row_entry(table, row: int):
         """``(name, is_dir)`` of a real file row (not '..' or 'Loading…'), else None."""
@@ -1697,6 +2088,19 @@ class FileBrowser(QWidget):
             return
         self._enqueue_transfers(jobs, f"{verb} {len(jobs)} item(s) to {dst_dir}…")
 
+    def _offer_write_access(self, folder: str, error, action: str, retry=None) -> bool:
+        """When the device refused a change, ask the device tab to offer write
+        access (and retry). False when this is no refusal or nobody listens."""
+        from .device_access import is_permission_problem
+
+        if self._closing or not is_permission_problem(error):
+            return False
+        if not self.receivers(self.write_access_needed):
+            return False
+        self.write_access_needed.emit(
+            {"path": folder, "error": str(error), "action": action, "retry": retry})
+        return True
+
     def _report_errors(self, title: str, errors):
         for err in errors:
             self.log.emit(f"[ERROR] {title}: {err}")
@@ -1731,6 +2135,15 @@ class FileBrowser(QWidget):
             self.btn_cancel_transfer.setVisible(False)
             self.refresh_local()
             self.refresh_remote()
+            refused, self._refused_transfers = self._refused_transfers, []
+            if refused:
+                jobs = [(src, dst, direction) for src, dst, direction, _error in refused]
+                src, dst, direction, error = refused[0]
+                device_path = dst if direction == "push" else src
+                self._offer_write_access(
+                    posixpath.dirname(device_path.rstrip("/")) or "/", error,
+                    f"the {direction} of {len(jobs)} item(s)",
+                    lambda: self._enqueue_transfers(jobs, f"Retrying {len(jobs)} transfer(s)…"))
             return
 
         src, dst, direction = self._queue.pop(0)
@@ -1766,12 +2179,17 @@ class FileBrowser(QWidget):
             self.log.emit(f"[OK] {t.direction}: {_transfer_name(t.a)}")
         else:
             self.log.emit(f"[ERROR] {t.direction} {t.a}: {message}")
+            from .device_access import is_permission_problem
+
+            if is_permission_problem(message):
+                self._refused_transfers.append((t.a, t.b, t.direction, message))
         self._process_queue()
 
     def cancel_transfers(self):
         """Stop the running transfer and drop everything still queued."""
         dropped = len(self._queue)
         self._queue.clear()
+        self._refused_transfers = []
         t = self._transfer
         if t is None:
             if dropped:
@@ -1860,11 +2278,28 @@ class FileBrowser(QWidget):
             self._local_job(f"rename {old_name}", lambda: os.rename(old_path, new_path), "Error")
 
     def _local_delete(self):
+        """Delete: to the Recycle Bin on Windows (Shift+Delete skips it)."""
+        if not recycle_bin_available():
+            self._local_delete_permanently()
+            return
         items = self._selected_local()
         if not items:
             return
         if QMessageBox.question(self, "Delete Local",
-                                f"Permanently delete {len(items)} item(s) from Local PC?",
+                                f"Move {len(items)} item(s) to the Recycle Bin?",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        paths = [p for p, _ in items]
+        self._local_job(f"move {len(paths)} local item(s) to the Recycle Bin",
+                        lambda: _recycle_local_items(paths))
+
+    def _local_delete_permanently(self):
+        items = self._selected_local()
+        if not items:
+            return
+        if QMessageBox.question(self, "Delete Local",
+                                f"Permanently delete {len(items)} item(s) from Local PC?\n\n"
+                                "They will not go to the Recycle Bin.",
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
         paths = [p for p, _ in items]
@@ -1984,9 +2419,12 @@ class FileBrowser(QWidget):
                                 f"Permanently delete {len(items)} item(s) from Device?",
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        targets = [posixpath.join(self.remote_cwd, n) for n, _ in items]
+        self._delete_remote_targets([posixpath.join(self.remote_cwd, n) for n, _ in items])
+
+    def _delete_remote_targets(self, targets):
         label = f"delete {len(targets)} device item(s)"
         handler = self.handler
+        folder = self.remote_cwd
 
         def done(_removed):
             self.log.emit(f"[OK] {label}")
@@ -1995,6 +2433,8 @@ class FileBrowser(QWidget):
         def fail(msg):
             self.log.emit(f"[ERROR] {label}: {msg}")
             self.refresh_remote()
+            self._offer_write_access(folder, msg, f"deleting {len(targets)} item(s)",
+                                     lambda: self._delete_remote_targets(targets))
 
         # Deletion belongs to the engine: it refuses '/', refuses a folder
         # without recursive, and splits the paths into shell-sized `rm` calls.
@@ -2021,10 +2461,20 @@ class FileBrowser(QWidget):
                 out.append((label, bool(res.ok), "" if res.ok else _result_error(res)))
             return out
 
+        folder = self.remote_cwd
+
         def done(results):
             for label, ok, err in results:
                 self.log.emit(f"[OK] {label}" if ok else f"[ERROR] {label}: {err}")
             self.refresh_remote()
+            from .device_access import is_permission_problem
+
+            refused = [(command, err) for command, (_label, ok, err) in zip(commands, results)
+                       if not ok and is_permission_problem(err)]
+            if refused:
+                retry = [command for command, _err in refused]
+                self._offer_write_access(folder, refused[0][1], refused[0][0][0],
+                                         lambda: self._run_shell_batch(retry, timeout))
 
         def fail(msg):
             self.log.emit(f"[ERROR] {commands[0][0] if commands else 'device command'}: {msg}")
@@ -2044,8 +2494,14 @@ class FileBrowser(QWidget):
         self._menu_action(menu, "Copy\tCtrl+C", self._local_copy)
         self._menu_action(menu, "Paste\tCtrl+V", self._local_paste)
         self._menu_action(menu, "Rename\tF2", self._local_rename)
-        self._menu_action(menu, "Delete\tDel", self._local_delete)
-        menu.exec_(self.local_table.mapToGlobal(pos))
+        menu.addSeparator()
+        self._menu_action(menu, "Select all\tCtrl+A", lambda: self._select_all(self.local_table))
+        if recycle_bin_available():
+            self._menu_action(menu, "Delete\tDel", self._local_delete)
+            self._menu_action(menu, "Delete permanently\tShift+Del", self._local_delete_permanently)
+        else:
+            self._menu_action(menu, "Delete\tDel", self._local_delete)
+        menu.exec_(self.local_table.viewport().mapToGlobal(pos))
 
     def _context_remote(self, pos):
         menu = QMenu(self)
@@ -2057,8 +2513,10 @@ class FileBrowser(QWidget):
         self._menu_action(menu, "Copy\tCtrl+C", self._remote_copy)
         self._menu_action(menu, "Paste\tCtrl+V", self._remote_paste)
         self._menu_action(menu, "Rename\tF2", self._remote_rename)
+        menu.addSeparator()
+        self._menu_action(menu, "Select all\tCtrl+A", lambda: self._select_all(self.remote_table))
         self._menu_action(menu, "Delete\tDel", self._remote_delete)
-        menu.exec_(self.remote_table.mapToGlobal(pos))
+        menu.exec_(self.remote_table.viewport().mapToGlobal(pos))
 
     @staticmethod
     def _menu_action(menu, text: str, slot):
@@ -2087,8 +2545,14 @@ class FileBrowser(QWidget):
                     dlg.complete_async_save(True)
 
             def fail(msg):
-                if _alive(dlg):
-                    dlg.complete_async_save(False, f"Could not save {name}:\n{msg}")
+                if not _alive(dlg):
+                    return
+                offered = refresh == self.refresh_remote and _alive(self) and \
+                    self._offer_write_access(posixpath.dirname(path) or "/", msg,
+                                             f"saving {name}",
+                                             lambda: _alive(dlg) and dlg._save())
+                dlg.complete_async_save(False, f"Could not save {name}:\n{msg}",
+                                        report=not offered)
 
             # Not in self._jobs: close_panel must not cut an open editor's save path.
             run_job(self._save_jobs, lambda: write(payload), done, fail)

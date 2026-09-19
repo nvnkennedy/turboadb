@@ -451,6 +451,7 @@ def test_settings_set_and_mute_popups(qapp):
         settings_mod.set("mute_popups_with_log", orig)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="starts a real powershell.exe / cmd.exe")
 def test_local_terminal_startup_banners(qapp):
     import time
     from turboadb.gui.local_terminal import LocalShellSession

@@ -864,3 +864,258 @@ def test_engine_diagnostics_reach_the_tabs_trace_not_its_notifications(qapp):
         assert logged == []
     finally:
         _close(qapp, tab)
+
+
+# --------------------------------------------------------------------------- #
+# (f) adb root / unroot and making files writable: every terminal follows
+# --------------------------------------------------------------------------- #
+class _RootDevice(_Device):
+    """Adds the root and write-access calls of the engine."""
+
+    def __init__(self, status=None, report=None, error=""):
+        super().__init__()
+        self.status = status or {"root": False, "uid": 2000, "debuggable": True,
+                                 "build_type": "userdebug", "verity": "enforcing",
+                                 "bootloader": "unlocked"}
+        self.report = report or {"steps": [("root", "ok")], "rebooted": False,
+                                 "reboot_needed": False}
+        self.error = error
+        self.writable_kwargs = None
+
+    def root(self, safe=None):
+        self._one_shot("root")
+        return OperationResult(True, "root", value="restarting adbd as root")
+
+    def unroot(self, safe=None):
+        self._one_shot("unroot")
+        return OperationResult(True, "unroot", value="restarting adbd as non root")
+
+    def wait_for_device(self, timeout=None, safe=None):
+        return self._one_shot("wait_for_device", OperationResult(True, "wait", value=True))
+
+    def access_status(self, safe=None):
+        return self._one_shot("access_status",
+                              OperationResult(True, "access_status", value=dict(self.status)))
+
+    def make_writable(self, *, on_step=None, safe=None, **kwargs):
+        self.writable_kwargs = kwargs
+        if on_step is not None:
+            on_step("adb root")
+        if self.error:
+            return OperationResult(False, "make_writable", error=RuntimeError(self.error))
+        return self._one_shot("make_writable",
+                              OperationResult(True, "make_writable", value=dict(self.report)))
+
+
+class _LocalSession:
+    running = True
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        self.running = False
+
+
+def _nested_adb_shell(widget, pc_folder, cwd="/sdcard"):
+    """Put a PowerShell/CMD terminal inside an interactive adb shell.
+
+    *pc_folder* must exist: a terminal recognises its own prompt (and so
+    the end of the adb shell) only for a folder that is really there."""
+    widget._started = True
+    widget.session = _LocalSession()
+    widget._shell_cwd = str(pc_folder)
+    widget._send(b"adb shell\r\n")
+    widget._feed_from(widget.reader, b"PD2318:/ $ ")
+    widget._send(f"cd {cwd}\r\n".encode())
+    widget._feed_from(widget.reader, f"PD2318:{cwd} $ ".encode())
+    return widget.session
+
+
+def test_adb_root_reconnects_the_android_shell_and_reopens_nested_adb_shells(
+        qapp, monkeypatch, tmp_path):
+    device = _RootDevice()
+    tab = _tab(qapp)
+    try:
+        _connect(tab, device)
+        tab.show()
+        tab.show_subtab("shell")
+        assert _pump(qapp, lambda: len(device.sessions()) == 1)
+        first = device.sessions()[0]
+        powershell = tab.shell.ps_widget
+        monkeypatch.setattr(powershell, "_stop_session", lambda **_kw: None)
+        session = _nested_adb_shell(powershell, tmp_path)
+
+        prompt_queries = device.commands.count("shell")
+        tab._adbd_action("root", lambda handler: handler.root(safe=True))
+        # the Android stream pauses instead of reporting a lost device
+        assert first.closed.is_set() and powershell._adb_resume == ("adb shell -t -t", "/sdcard")
+        assert _pump(qapp, lambda: not tab._adbd_busy)
+        assert "root" in device.commands
+        # the Android shell is open again and asks the device for its prompt
+        # (root shows as "#", so the old answer must not be reused)
+        assert _pump(qapp, lambda: len(device.sessions()) == 2)
+        assert _pump(qapp, lambda: device.commands.count("shell") > prompt_queries)
+
+        # PowerShell reopens its adb shell as soon as the PC prompt is back
+        powershell._feed_from(powershell.reader, f"\r\nPS {tmp_path}> ".encode())
+        assert session.sent[-1] == b"adb shell -t -t\r\n"
+        powershell._feed_from(powershell.reader, b"PD2318:/ # ")  # a root prompt now
+        assert session.sent[-1] == b"cd /sdcard\r\n"
+    finally:
+        tab.hide()
+        _close(qapp, tab)
+
+
+def test_adb_root_typed_in_a_terminal_brings_the_other_terminals_along(
+        qapp, monkeypatch, tmp_path):
+    device = _RootDevice()
+    tab = _tab(qapp)
+    monkeypatch.setattr(type(tab), "ADBD_RESTART_SETTLE_S", 0.0)
+    try:
+        _connect(tab, device)
+        tab.show()
+        tab.show_subtab("shell")
+        assert _pump(qapp, lambda: len(device.sessions()) == 1)
+        command_prompt = tab.shell.cmd_widget
+        monkeypatch.setattr(command_prompt, "_stop_session", lambda **_kw: None)
+        session = _nested_adb_shell(command_prompt, tmp_path)
+
+        powershell = tab.shell.ps_widget
+        powershell._started = True
+        powershell.session = _LocalSession()
+        powershell._send(b"adb root\r\n")  # typed on the PC, not chosen from the menu
+
+        assert tab._adbd_busy and command_prompt._adb_resume is not None
+        assert _pump(qapp, lambda: not tab._adbd_busy)
+        assert "wait_for_device" in device.commands
+        command_prompt._feed_from(command_prompt.reader, f"\r\n{tmp_path}>".encode())
+        assert session.sent[-1] == b"adb shell -t -t\r\n"
+    finally:
+        tab.hide()
+        _close(qapp, tab)
+
+
+class _AcceptDialog:
+    """Stands in for WriteAccessDialog: records what it was asked, accepts."""
+
+    seen = {}
+    answer = True
+
+    def __init__(self, status, *, path="", error="", action="", can_retry=False, parent=None):
+        type(self).seen = dict(status=status, path=path, error=error, action=action,
+                               can_retry=can_retry)
+
+    def exec_(self):
+        from PyQt5.QtWidgets import QDialog
+
+        return QDialog.Accepted if type(self).answer else QDialog.Rejected
+
+    def choices(self):
+        return {"root": True, "disable_verity": True, "remount": True, "reboot": True,
+                "retry": True}
+
+    def deleteLater(self):
+        pass
+
+
+def test_make_files_writable_runs_the_chosen_steps_and_retries(qapp, monkeypatch):
+    import turboadb.gui.device_access as access_mod
+
+    device = _RootDevice()
+    tab = _tab(qapp)
+    retried = []
+    _AcceptDialog.answer = True
+    monkeypatch.setattr(access_mod, "WriteAccessDialog", _AcceptDialog)
+    try:
+        _connect(tab, device)
+        tab.show()
+        tab.make_files_writable(path="/system/app", error="Read-only file system",
+                                action="deleting 1 item(s)", retry=lambda: retried.append(True))
+        assert _pump(qapp, lambda: device.writable_kwargs is not None)
+        assert _AcceptDialog.seen["status"]["build_type"] == "userdebug"
+        assert _AcceptDialog.seen["can_retry"] is True
+        assert device.writable_kwargs == {"root": True, "disable_verity": True, "remount": True,
+                                          "reboot": True}
+        assert _pump(qapp, lambda: retried == [True])
+        assert _pump(qapp, lambda: not tab._adbd_busy)
+    finally:
+        tab.hide()
+        _close(qapp, tab)
+
+
+def test_a_declined_offer_is_not_repeated_for_the_same_folder(qapp, monkeypatch):
+    import turboadb.gui.device_access as access_mod
+
+    device = _RootDevice()
+    tab = _tab(qapp)
+    shown = []
+
+    class _Decline(_AcceptDialog):
+        answer = False
+
+        def __init__(self, status, **kwargs):
+            super().__init__(status, **kwargs)
+            shown.append(kwargs.get("path"))
+
+    monkeypatch.setattr(access_mod, "WriteAccessDialog", _Decline)
+    try:
+        _connect(tab, device)
+        tab.show()
+        tab.make_files_writable(path="/system/app", error="Read-only file system")
+        assert _pump(qapp, lambda: shown == ["/system/app"])
+        tab.make_files_writable(path="/system/app", error="Read-only file system")
+        _pump(qapp, lambda: False, timeout=0.2)
+        assert shown == ["/system/app"]  # declined a moment ago
+        tab.make_files_writable(path="/vendor", error="Read-only file system")
+        assert _pump(qapp, lambda: shown == ["/system/app", "/vendor"])
+        tab.make_files_writable()  # asked for from the menu: always offered
+        assert _pump(qapp, lambda: len(shown) == 3)
+    finally:
+        tab.hide()
+        _close(qapp, tab)
+
+
+def test_a_refusal_in_a_terminal_offers_write_access_in_a_toast(qapp, monkeypatch):
+    from turboadb.gui import fileutil
+
+    device = _RootDevice()
+    tab = _tab(qapp)
+    toasts = []
+    monkeypatch.setattr(fileutil, "activity_toast",
+                        lambda parent, message, **kwargs: toasts.append((message, kwargs)))
+    asked = []
+    try:
+        _connect(tab, device)
+        tab.show()
+        monkeypatch.setattr(tab, "make_files_writable", lambda **kwargs: asked.append(kwargs))
+        tab.shell.access_refused.emit("rm: /system/x: Read-only file system")
+        assert len(toasts) == 1
+        message, kwargs = toasts[0]
+        assert "Read-only file system" in message and kwargs["level"] == "warning"
+        kwargs["action"]()
+        assert asked == [{"error": "rm: /system/x: Read-only file system"}]
+    finally:
+        tab.hide()
+        _close(qapp, tab)
+
+
+def test_the_files_page_asks_the_tab_for_write_access(qapp, monkeypatch):
+    device = _RootDevice()
+    tab = _tab(qapp)
+    asked = []
+    try:
+        _connect(tab, device)
+        tab.show()
+        monkeypatch.setattr(tab, "make_files_writable", lambda **kwargs: asked.append(kwargs))
+        files = tab.files  # builds the page
+        files.write_access_needed.emit({"path": "/system", "error": "Read-only file system",
+                                        "action": "deleting 1 item(s)", "retry": None})
+        assert asked == [{"path": "/system", "error": "Read-only file system",
+                          "action": "deleting 1 item(s)", "retry": None}]
+    finally:
+        tab.hide()
+        _close(qapp, tab)

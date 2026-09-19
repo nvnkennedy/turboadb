@@ -15,6 +15,9 @@ permissions:
 jobs:
   windows-exe:
     runs-on: windows-latest
+    # A stuck step (an error dialog in the windowed exe) used to hold the
+    # runner for GitHub's 6-hour limit.
+    timeout-minutes: 60
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -47,13 +50,20 @@ jobs:
         # scripts/gui_entry.py runs the pywinrm/NTLM self-test under this flag
         # and writes the verdict to ~/.turboadb/winrm-selftest.txt.
         shell: pwsh
+        timeout-minutes: 10
         env:
           TURBOADB_SELFTEST: winrm
         run: |
           $exe = Get-ChildItem dist/TurboADB-*-win64.exe | Select-Object -First 1
           if (-not $exe) { throw "PyInstaller produced no dist/TurboADB-*-win64.exe" }
-          # It is a windowed exe, so wait for it explicitly and read its report.
-          $p = Start-Process -FilePath $exe.FullName -Wait -PassThru
+          # It is a windowed exe, so wait for it explicitly (never forever: an
+          # error dialog would wait for a click) and read its report.
+          $p = Start-Process -FilePath $exe.FullName -PassThru
+          $null = $p.Handle  # keeps ExitCode available after the process ends
+          if (-not $p.WaitForExit(300000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "the built exe did not finish its self-test within 5 minutes"
+          }
           $report = Join-Path $env:USERPROFILE ".turboadb\winrm-selftest.txt"
           if (-not (Test-Path $report)) { throw "the exe wrote no self-test report" }
           Get-Content $report

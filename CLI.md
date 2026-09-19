@@ -265,6 +265,14 @@ turboadb discover
 turboadb discover --connect
 ```
 
+### `turboadb stop-server`
+Stop the adb server, leaving no adb daemon running (every shell and stream on it
+ends). The GUI does the same when it closes, unless you turn that off in
+**Settings → Startup**.
+```bash
+turboadb stop-server
+```
+
 ### `turboadb restart-server`
 Kill and start the adb server. Fixes devices that don't show up after an adb
 version mismatch.
@@ -773,6 +781,42 @@ turboadb -s SERIAL tap 540 1200
 turboadb -s SERIAL tap
 ```
 
+### `turboadb tap-burst`
+Tap one point over and over — a soak or stress test. The whole burst runs as one
+loop **on the device**, so no tap waits for the PC.
+
+| Argument | Meaning |
+|---|---|
+| `X Y` | Where to tap, in display pixels. |
+
+| Option | Meaning |
+|---|---|
+| `--count` | How many taps (default 100). |
+| `--rate` | Taps per second, at most. Without it the device goes as fast as it can. |
+| `--duration` | With `--rate`: keep tapping for this many seconds instead of counting. |
+| `--display` | Display id (a burst to another display always uses `--method input`). |
+| `--method` | `auto` (default), `input` (any device) or `events` (`sendevent`, several times faster). |
+
+`events` writes touch events straight to the touchscreen, which is what `auto`
+picks when the adb shell may write to it (`turboadb touch-device` says whether
+it may; `adb root` usually makes it writable). Otherwise the burst uses the
+device's `input` tool, which works everywhere but starts a JVM per tap — about
+ten taps a second.
+
+```bash
+turboadb -s SERIAL tap-burst 540 1200 --count 5000
+turboadb -s SERIAL tap-burst 540 1200 --rate 20 --duration 60
+turboadb -s SERIAL tap-burst 960 360 --count 2000 --display 2 --json
+```
+
+### `turboadb touch-device`
+The touchscreen `tap-burst` can write to: its input node, size in event units,
+protocol, and whether the adb shell may send events to it.
+```bash
+turboadb -s SERIAL touch-device
+turboadb -s SERIAL touch-device --json
+```
+
 ### `turboadb swipe`
 Swipe from one point to another.
 
@@ -1048,6 +1092,35 @@ turboadb -s SERIAL unroot
 `adb remount` the system partitions read-write.
 ```bash
 turboadb -s SERIAL remount
+```
+
+### `turboadb access`
+Show what decides whether protected files can be changed: whether adbd runs as
+root, whether the build allows `adb root` (debuggable, build type), the
+dm-verity mode and the bootloader lock state.
+```bash
+turboadb -s SERIAL access
+turboadb -s SERIAL access --json
+```
+
+### `turboadb make-writable`
+Prepare the device so files under `/system`, `/vendor` and the other system
+partitions can be changed: `adb root`, optionally `adb disable-verity`, then
+`adb remount`. It reboots when a step needs it (disable-verity always does;
+remount does on Android 10 and later when it first sets up overlayfs), waits for
+the boot and runs root and remount again.
+
+| Option | Meaning |
+|---|---|
+| `--no-root` | Skip `adb root`. |
+| `--disable-verity` | Also run `adb disable-verity` (reboots the device). |
+| `--no-remount` | Skip `adb remount`. |
+| `--no-reboot` | Never reboot; say when a reboot is still needed. |
+| `--boot-timeout` | Seconds to wait for each reboot (default 180). |
+
+```bash
+turboadb -s SERIAL make-writable
+turboadb -s SERIAL make-writable --disable-verity
 ```
 
 ### `turboadb mount-rw`

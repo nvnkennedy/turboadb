@@ -29,9 +29,11 @@ _HANDSET = (
     'a2 2 0 0 1-.5 2.1L8.2 10.2a15 15 0 0 0 5.6 5.6l1.2-1.2a2 2 0 0 1 2.1-.5'
     'c.8.3 1.7.6 2.6.7a2 2 0 0 1 1.3 1.6z"/>'
 )
+# Folders get a soft wash of their own colour, so a listing tells folders from
+# files at a glance (an outline alone read as a dull line in amber).
 _FOLDER = (
     '<path d="M3 7.5A2 2 0 0 1 5 5.5h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5'
-    'a2 2 0 0 1-2-2z"/>'
+    'a2 2 0 0 1-2-2z" fill="currentColor" fill-opacity="0.28"/>'
 )
 _FILE = '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
 _SPEAKER = '<path d="M11 5 6.5 9H3v6h3.5L11 19z"/>'

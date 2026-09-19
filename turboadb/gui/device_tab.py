@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
 from ..config import ADBConfig
 from ..core import ADBHandler
 from ..results import OperationResult
+from . import device_access
+from . import fileutil
 from . import settings as settings_mod
 from . import theme
 from .terminal import ReaderThread
@@ -33,6 +35,7 @@ from .mirror_panel import MirrorPanel
 from .camera_widget import CameraPanel
 from .phone_panel import PhonePanel
 from .adb_path import gui_adb_path
+from .device_access import refusal_line
 from . import icons
 from .qtutil import AnimatedTabWidget, FunctionThread, close_jobs, run_job
 from .sessions import normalize_session
@@ -829,6 +832,9 @@ class _TerminalWidgetBase(QWidget):
     the Android shell and the local PowerShell / Command Prompt terminals."""
 
     log = pyqtSignal(str)
+    # an output line where the device refused a change (at most once a minute)
+    access_refused = pyqtSignal(str)
+    ACCESS_NOTICE_S = 60.0
 
     _BIN_DIRS = (
         "/system/bin",
@@ -845,6 +851,16 @@ class _TerminalWidgetBase(QWidget):
         self.reader = None
         self._closing = False
         self._completion_thread = None
+        self._access_notice_at = 0.0
+
+    def _notice_refusal(self, data) -> None:
+        """Emit :attr:`access_refused` for a line where the device refused access."""
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        line = refusal_line(text)
+        now = time.monotonic()
+        if line and now - self._access_notice_at >= self.ACCESS_NOTICE_S:
+            self._access_notice_at = now
+            self.access_refused.emit(line)
 
     def _build_toolbar(self, layout, *, restart_tip, restart_slot, info_text):
         """Add the action row. Call :meth:`_attach_terminal` once ``term`` exists."""
@@ -1060,6 +1076,11 @@ class _TerminalWidgetBase(QWidget):
 class _LocalShellWidget(_TerminalWidgetBase):
     """Dedicated interactive terminal tab for local PowerShell or CMD."""
     adb_reboot_requested = pyqtSignal(object)
+    # "root" / "unroot" typed here for this device: adbd restarts
+    adbd_restart_requested = pyqtSignal(str)
+
+    # how long after the device is back an adb shell may still be ending
+    ADB_RESUME_WAIT_S = 30.0
 
     def __init__(self, shell_type: str = "powershell", serial: str = None, handler=None, parent=None):
         # The same handler backs the device tab, so completion requests use the
@@ -1102,6 +1123,9 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._adb_interrupt_timer = QTimer(self)
         self._adb_interrupt_timer.setSingleShot(True)
         self._adb_interrupt_timer.timeout.connect(self._on_adb_interrupt_timeout)
+        # (command, device folder) of an adb shell to reopen once adbd is back
+        self._adb_resume = None
+        self._adb_resume_until = 0.0  # set when the device is back; monotonic
         self._strip_startup_banner = False  # set for each new CMD session
         self._prompt_tail = ""
 
@@ -1435,8 +1459,9 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self.term.set_completion_fn(self._adb_shell_complete)
         return (command + "\r\n").encode("utf-8")
 
-    def _local_adb_reboot_mode(self, tokens: list[str]):
-        """Return the requested reboot mode for this terminal's device, if any."""
+    def _local_adb_command(self, tokens: list[str]):
+        """``(subcommand, arguments)`` of an adb command line aimed at this
+        terminal's device (``adb -s OTHER …`` is not), else None."""
         if not tokens or os.path.basename(tokens[0]).lower() not in ("adb", "adb.exe"):
             return None
         index = 1
@@ -1451,11 +1476,25 @@ class _LocalShellWidget(_TerminalWidgetBase):
                 index += 2
             else:
                 index += 1
-        if index >= len(tokens) or tokens[index].lower() != "reboot":
+        if index >= len(tokens):
             return None
         if selected_serial and self.serial and selected_serial != self.serial:
             return None
-        return tokens[index + 1].lower() if index + 1 < len(tokens) else ""
+        return tokens[index].lower(), tokens[index + 1:]
+
+    def _local_adb_reboot_mode(self, tokens: list[str]):
+        """Return the requested reboot mode for this terminal's device, if any."""
+        command = self._local_adb_command(tokens)
+        if command is None or command[0] != "reboot":
+            return None
+        return command[1][0].lower() if command[1] else ""
+
+    def _local_adbd_restart_verb(self, tokens: list[str]):
+        """``"root"`` / ``"unroot"`` when the line restarts this device's adbd."""
+        command = self._local_adb_command(tokens)
+        if command is None or command[0] not in ("root", "unroot") or command[1]:
+            return None
+        return command[0]
 
     def ensure_started(self):
         if not self._started:
@@ -1523,6 +1562,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     pass
             if self._adb_interrupt_pending:
                 self._adb_interrupt_heard = True
+            if self._in_adb_shell:
+                self._notice_refusal(data)
             self._track_prompt_cwd(data)
             self.term.feed(data)
 
@@ -1579,6 +1620,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
             self.reset_adb_shell_context()
             self._shell_cwd = match.group(1)
             self.term._cwd = self._shell_cwd
+            if self._adb_resume is not None and time.monotonic() < self._adb_resume_until:
+                self._resume_adb_shell_now()  # adbd restarted and the device is back
 
     def _on_closed(self):
         if not self._closing:
@@ -1594,6 +1637,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
         try:
             line = data.decode("utf-8", "replace").strip()
             parts = line.split(maxsplit=1)
+            # typing takes over: an adb shell waiting to reopen stays closed
+            self._adb_resume = None
             # Once `adb shell` is interactive, its commands and paths belong
             # to Android. Never apply Windows path completion to them.
             was_in_adb_shell = self._in_adb_shell
@@ -1628,6 +1673,9 @@ class _LocalShellWidget(_TerminalWidgetBase):
             tokens = line.split()
             local_reboot_mode = (
                 self._local_adb_reboot_mode(tokens) if not was_in_adb_shell else None
+            )
+            adbd_restart = (
+                self._local_adbd_restart_verb(tokens) if not was_in_adb_shell else None
             )
             adb_shell = None
             if len(tokens) == 2 and tokens[0].lower() == "adb" and tokens[1].lower() == "shell":
@@ -1672,9 +1720,13 @@ class _LocalShellWidget(_TerminalWidgetBase):
                 # Android stream after an explicit local `adb reboot`.
                 self.adb_reboot_requested.emit(local_reboot_mode or None)
         except Exception:
-            pass
+            adbd_restart = None
 
         self.session.send(data)
+        if adbd_restart:
+            # After the command is on its way: the device tab holds the other
+            # terminals and brings them back once adbd has restarted.
+            self.adbd_restart_requested.emit(adbd_restart)
 
     # Interpreters that show their prompt only on a real console. Their input
     # here is a pipe, so a bare `python` or `node` waited silently and looked
@@ -1805,17 +1857,54 @@ class _LocalShellWidget(_TerminalWidgetBase):
             self.reset_adb_shell_context()  # _start_session has shown why
             return
         if command:
-            line = self._enter_adb_shell(command)
-            self._adb_shell_cwd = self.term._cwd = cwd
-            self._adb_reentry_cwd = cwd if cwd != "/" else None
-            self.session.send(line)
+            self._send_adb_shell(command, cwd)
         self.term.set_alive(True)
         self.term.setFocus(Qt.OtherFocusReason)
+
+    def _send_adb_shell(self, command: str, cwd: str) -> None:
+        """Start *command* (an adb shell) in this session and go back to *cwd*
+        on the device once its prompt shows."""
+        line = self._enter_adb_shell(command)
+        self._adb_shell_cwd = self.term._cwd = cwd
+        self._adb_reentry_cwd = cwd if cwd != "/" else None
+        self.session.send(line)
+
+    def hold_adb_shell(self) -> None:
+        """adbd is about to restart (adb root / unroot, a reboot): remember an
+        adb shell started here, so :meth:`resume_adb_shell` can reopen it."""
+        if self._in_adb_shell and self._adb_shell_command:
+            self._adb_resume = (self._adb_shell_command, self._adb_shell_cwd)
+            self._adb_resume_until = 0.0
+
+    def resume_adb_shell(self) -> None:
+        """The device is back: reopen the remembered adb shell in its folder.
+
+        At once when this terminal is at its own prompt already; otherwise as
+        soon as that prompt shows (the adb shell may still be ending), for a
+        short while only. If adbd did not actually restart, the adb shell is
+        still running and nothing is typed into it."""
+        if self._adb_resume is None or self._closing:
+            return
+        if not (self.session and self.session.running):
+            self._adb_resume = None
+            return
+        if self._in_adb_shell:
+            self._adb_resume_until = time.monotonic() + self.ADB_RESUME_WAIT_S
+            return
+        self._resume_adb_shell_now()
+
+    def _resume_adb_shell_now(self) -> None:
+        (command, cwd), self._adb_resume = self._adb_resume, None
+        if not (self.session and self.session.running):
+            return
+        self.term._echo(f"\n↻  device back — reopening adb shell in {cwd}\n", theme.ECHO_WARN)
+        self._send_adb_shell(command, cwd)
 
     def reopen(self):
         self._stop_session()
         self.term.clear()
         self._closing = False
+        self._adb_resume = None
         self.reset_adb_shell_context()
         self._started = False
         self.ensure_started()
@@ -2030,6 +2119,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
 
     def _feed_from(self, reader, data):
         if reader is self.reader:
+            self._notice_refusal(data)
             self.term.feed(data)
 
     def _on_reader_closed(self):
@@ -2184,6 +2274,8 @@ class _AndroidShellWidget(_TerminalWidgetBase):
 class ShellPanel(QWidget):
     """Container holding persistent sub-tabs for Android Shell, PowerShell, and CMD."""
     log = pyqtSignal(str)
+    adbd_restart_requested = pyqtSignal(str)
+    access_refused = pyqtSignal(str)
     disconnected = pyqtSignal()
     adb_reboot_requested = pyqtSignal(object)
 
@@ -2208,18 +2300,19 @@ class ShellPanel(QWidget):
         )
         self.android_widget.log.connect(self.log)
         self.android_widget.disconnected.connect(self.disconnected)
+        self.android_widget.access_refused.connect(self.access_refused)
         self.subtabs.addTab(self.android_widget, "Android shell")
 
         serial = getattr(handler, "serial", None)
         self.ps_widget = _LocalShellWidget("powershell", serial=serial, handler=handler)
-        self.ps_widget.log.connect(self.log)
-        self.ps_widget.adb_reboot_requested.connect(self.adb_reboot_requested)
         self.subtabs.addTab(self.ps_widget, "PowerShell")
-
         self.cmd_widget = _LocalShellWidget("cmd", serial=serial, handler=handler)
-        self.cmd_widget.log.connect(self.log)
-        self.cmd_widget.adb_reboot_requested.connect(self.adb_reboot_requested)
         self.subtabs.addTab(self.cmd_widget, "Command Prompt")
+        for local in (self.ps_widget, self.cmd_widget):
+            local.log.connect(self.log)
+            local.adb_reboot_requested.connect(self.adb_reboot_requested)
+            local.adbd_restart_requested.connect(self.adbd_restart_requested)
+            local.access_refused.connect(self.access_refused)
         self.subtabs.currentChanged.connect(self._on_terminal_changed)
         self._install_switchers()
 
@@ -2307,8 +2400,21 @@ class ShellPanel(QWidget):
 
     def pause_for_device_reboot(self):
         self.android_widget.pause_for_device_reboot()
-        self.ps_widget.reset_adb_shell_context()
-        self.cmd_widget.reset_adb_shell_context()
+        for local in (self.ps_widget, self.cmd_widget):
+            local.hold_adb_shell()  # reopened by resume_adb_shells once it is back
+            local.reset_adb_shell_context()
+
+    def hold_for_adbd_restart(self, reason: str) -> None:
+        """adbd restarts (adb root / unroot, making files writable): the Android
+        shell pauses quietly and adb shells in PowerShell/CMD are remembered."""
+        self.android_widget._pause_stream(reason)
+        for local in (self.ps_widget, self.cmd_widget):
+            local.hold_adb_shell()
+
+    def resume_adb_shells(self) -> None:
+        """The device is back: PowerShell/CMD reopen the adb shells they had."""
+        for local in (self.ps_widget, self.cmd_widget):
+            local.resume_adb_shell()
 
     def interrupt(self):
         curr = self.subtabs.currentWidget()
@@ -2642,6 +2748,8 @@ class DeviceTab(QWidget):
     # Once per tab, after its first successful connect has named the tab
     # (a later reconnect is not a new connection).
     connected = pyqtSignal()
+    # progress of make_files_writable, from its worker thread
+    access_step = pyqtSignal(str)
 
     # Built on first show (see _LazyPage); Terminal and Device Control are not.
     logcat = _lazy_page("logcat")
@@ -2663,6 +2771,10 @@ class DeviceTab(QWidget):
         self._reconnecting = False
         self._reboot_in_progress = False
         self._adb_restart_in_progress = False
+        # adb root / unroot / make writable running: terminals are held
+        self._adbd_busy = False
+        self._access_declined = {}  # device folder -> when its write-access offer was declined
+        self.access_step.connect(self._on_access_step)
         self._info_thread = None
         self._probe_thread = None
         self._lazy_pages = {}
@@ -2777,8 +2889,11 @@ class DeviceTab(QWidget):
         build.setToolTip("Build identity, software version, kernel, and Android properties")
         more_menu.addSeparator()
         amenu = more_menu.addMenu(icons.icon("shield", "amber"), "Root and mount")
-        amenu.addAction("adb root", lambda: self._op("root", lambda h: h.root(safe=True)))
-        amenu.addAction("adb unroot", lambda: self._op("unroot", lambda h: h.unroot(safe=True)))
+        amenu.addAction("adb root", lambda: self._adbd_action("root", lambda h: h.root(safe=True)))
+        amenu.addAction(
+            "adb unroot", lambda: self._adbd_action("unroot", lambda h: h.unroot(safe=True)))
+        writable = amenu.addAction("Make files writable…", lambda: self.make_files_writable())
+        writable.setToolTip("Choose adb root, disable-verity and remount; reboots when needed")
         amenu.addSeparator()
         amenu.addAction("adb remount (rw)", lambda: self._op("remount", lambda h: h.remount(safe=True)))
         amenu.addAction("mount -o remount,rw /", lambda: self._op("mount rw", lambda h: h.mount_rw(safe=True)))
@@ -3075,6 +3190,7 @@ class DeviceTab(QWidget):
             self.log.emit("[OK] device back online — reconnected")
             try:
                 self.shell.reconnect()
+                self.shell.resume_adb_shells()
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
         else:
@@ -3121,6 +3237,179 @@ class DeviceTab(QWidget):
             lambda: fn(handler),
             lambda value: self.log.emit(f"[OK] {label}: {value}"),
         )
+
+    # ---- adbd restarts (root / unroot) and write access ----
+    # the typed adb root/unroot gets this long to take adbd down before waiting
+    ADBD_RESTART_SETTLE_S = 2.0
+    # a declined write-access offer for a folder is not repeated for this long
+    ACCESS_DECLINE_S = 60.0
+
+    def _adbd_can_restart(self) -> bool:
+        if not self.handler or self._session_closed:
+            return False
+        if self._adbd_busy or self._reboot_in_progress or self._adb_restart_in_progress:
+            self.log.emit("[INFO] Wait for the running device restart to finish first.")
+            return False
+        return True
+
+    def _hold_terminals(self, reason: str) -> None:
+        """adbd is about to restart: every terminal waits for it instead of
+        reporting a lost device, and follows it afterwards."""
+        self._adbd_busy = True
+        self._enable_actions(False)
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            shell.hold_for_adbd_restart(reason)
+
+    def _release_terminals(self) -> None:
+        """adbd is back (as root or not): the Android shell reconnects and asks
+        for its prompt again (``#`` as root), PowerShell/CMD reopen their adb
+        shells, and a built Files page lists its folder again."""
+        self._adbd_busy = False
+        if self._session_closed:
+            return
+        self._enable_actions(True)
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            try:
+                shell.reconnect()
+                shell.resume_adb_shells()
+            except Exception as exc:
+                self.log.emit(f"[ERROR] shell reconnect: {exc}")
+        holder = self._lazy_pages.get("files")
+        page = holder.page if holder is not None else None
+        if page is not None:
+            page.refresh_remote()
+
+    def _adbd_action(self, verb: str, fn) -> None:
+        """More → Root and mount → adb root / adb unroot."""
+        if not self._adbd_can_restart():
+            return
+        handler = self.handler
+        label = f"adb {verb}"
+        self.log.emit(f"[INFO] {label}…")
+        self._hold_terminals(f"{label} — adbd restarting")
+
+        def done(value):
+            self.log.emit(f"[OK] {label}: {value}")
+            self._release_terminals()
+
+        def failed(message):
+            self.log.emit(f"[ERROR] {label}: {message}")
+            self._release_terminals()
+
+        self._run_action(label, lambda: fn(handler), done, on_error=failed, gated=False)
+
+    def _on_local_adbd_restart(self, verb: str) -> None:
+        """``adb root`` / ``adb unroot`` was typed in PowerShell or CMD: hold the
+        other terminals, wait for adbd to come back, then bring them along."""
+        if not self._adbd_can_restart():
+            return
+        handler = self.handler
+        self.log.emit(f"[INFO] adb {verb} typed in a terminal — the other terminals follow")
+        self._hold_terminals(f"adb {verb} — adbd restarting")
+        settle = self.ADBD_RESTART_SETTLE_S
+
+        def wait():
+            time.sleep(settle)  # let the typed command take adbd down first
+            return handler.wait_for_device(20, safe=True)
+
+        self._run_action(f"adb {verb}", wait, lambda _value: self._release_terminals(),
+                         on_error=lambda _message: self._release_terminals(), gated=False)
+
+    def _on_access_refused(self, line: str) -> None:
+        """A terminal printed a refusal: offer write access in a toast, never a dialog."""
+        if self._session_closed or self._adbd_busy or not self.handler:
+            return
+        fileutil.activity_toast(
+            self.window(),
+            f"The device refused: {line}",
+            level="warning",
+            action_text="Make writable…",
+            action=lambda: self.make_files_writable(error=line),
+        )
+
+    def make_files_writable(self, *, path: str = "", error: str = "", action: str = "",
+                            retry=None) -> None:
+        """Ask which of adb root / disable-verity / remount to run, run them
+        (rebooting when a step needs it), then call *retry*.
+
+        Used by the Files page after a refused change, by a terminal's toast
+        and by More → Root and mount → Make files writable."""
+        if not self._adbd_can_restart():
+            return
+        declined = self._access_declined.get(path)
+        if error and declined is not None and time.monotonic() - declined < self.ACCESS_DECLINE_S:
+            return  # declined moments ago for this folder; the error is in the log
+        handler = self.handler
+        self._run_action(
+            "device access state",
+            lambda: handler.access_status(safe=True),
+            lambda status: self._ask_write_access(status, path, error, action, retry),
+            on_error=lambda _message: self._ask_write_access(None, path, error, action, retry),
+        )
+
+    def _ask_write_access(self, status, path, error, action, retry) -> None:
+        if self._session_closed or not self.handler or self._adbd_busy:
+            return
+        dialog = device_access.WriteAccessDialog(status, path=path, error=error, action=action,
+                                                 can_retry=retry is not None, parent=self)
+        try:
+            accepted = dialog.exec_() == QDialog.Accepted
+            choices = dialog.choices()
+        finally:
+            dialog.deleteLater()
+        if not accepted:
+            self._access_declined[path] = time.monotonic()
+            return
+        wants_retry = choices.pop("retry")
+        self._run_make_writable(choices, retry if wants_retry else None)
+
+    def _run_make_writable(self, choices: dict, retry) -> None:
+        if not self._adbd_can_restart():
+            return
+        handler = self.handler
+        steps = [name for name, key in (("root", "root"), ("disable-verity", "disable_verity"),
+                                        ("remount", "remount")) if choices.get(key)]
+        self.log.emit(f"[INFO] making device files writable: {', '.join(steps)}…")
+        self.status.setText("Making device files writable…")
+        self._hold_terminals("Making device files writable — the device may reboot")
+        step_signal = self.access_step
+
+        def work():
+            return handler.make_writable(on_step=step_signal.emit, safe=True, **choices)
+
+        def connected_text():
+            return f"Connected — {handler.serial or self.session.get('name')}"
+
+        def done(report):
+            self._release_terminals()
+            if self._session_closed:
+                return
+            self.status.setText(connected_text())
+            if report.get("reboot_needed"):
+                self.log.emit("[WARNING] make writable: reboot the device for the changes "
+                              "to take effect")
+                return
+            self.log.emit("[OK] device files are writable"
+                          + (" (the device rebooted)" if report.get("rebooted") else ""))
+            if retry is not None:
+                retry()
+
+        def failed(message):
+            self._release_terminals()
+            if self._session_closed:
+                return
+            self.status.setText(connected_text())
+            self.log.emit(f"[ERROR] make writable: {message}")
+
+        self._run_action("make writable", work, done, on_error=failed, gated=False)
+
+    def _on_access_step(self, text: str) -> None:
+        if self._session_closed or not self._adbd_busy:
+            return
+        self.status.setText(f"Making device files writable: {text}…")
+        self.log.emit(f"[INFO] make writable: {text}")
 
     def _verity(self, enable):
         if not self.handler:
@@ -3188,6 +3477,8 @@ class DeviceTab(QWidget):
         self.shell.log.connect(self.log)
         self.shell.disconnected.connect(self._on_shell_lost)
         self.shell.adb_reboot_requested.connect(self._on_local_adb_reboot)
+        self.shell.adbd_restart_requested.connect(self._on_local_adbd_restart)
+        self.shell.access_refused.connect(self._on_access_refused)
         for terminal in (
             self.shell.android_widget.term,
             self.shell.ps_widget.term,
@@ -3280,6 +3571,7 @@ class DeviceTab(QWidget):
     def _build_files(self):
         page = FileBrowser(self.handler, start="/sdcard", adb_gate=self._adb_gate)
         page.log.connect(self.log)
+        page.write_access_needed.connect(lambda request: self.make_files_writable(**request))
         return page
 
     def _build_apps(self):

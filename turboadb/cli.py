@@ -522,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_discover.add_argument(
         "--connect", action="store_true", help="also adb connect every device that is ready"
     )
+    device_cmd("stop-server", "stop the adb server (leave no adb daemon running)")
     device_cmd(
         "restart-server",
         "kill + start the adb server (fixes 'device not visible' from adb version mismatches)",
@@ -798,6 +799,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_tap = device_cmd("tap", "tap at X Y, or the centre of the screen")
     p_tap.add_argument("coords", nargs="*", type=int, metavar="XY", help="X and Y in screen pixels")
     display_opt(p_tap)
+    p_burst = device_cmd(
+        "tap-burst", "tap one point many times (soak and stress testing)")
+    p_burst.add_argument("x", type=int)
+    p_burst.add_argument("y", type=int)
+    p_burst.add_argument("--count", type=int, default=100, help="how many taps (default 100)")
+    p_burst.add_argument("--rate", type=float,
+                         help="taps per second, at most (default: as fast as the device goes)")
+    p_burst.add_argument("--duration", type=float,
+                         help="seconds to keep tapping, with --rate, instead of --count")
+    p_burst.add_argument("--display", type=int, help="display id (uses --method input)")
+    p_burst.add_argument("--method", choices=["auto", "input", "events"], default="auto",
+                         help="auto (default), input (any device) or events (sendevent, faster)")
+    device_cmd("touch-device", "the touchscreen input device a tap burst can write to")
     p_swipe = device_cmd("swipe", "swipe from X1 Y1 to X2 Y2")
     for coord in ("x1", "y1", "x2", "y2"):
         p_swipe.add_argument(coord, type=int)
@@ -864,6 +878,18 @@ def build_parser() -> argparse.ArgumentParser:
     device_cmd("root", "restart adbd as root")
     device_cmd("unroot", "restart adbd WITHOUT root")
     device_cmd("remount", "adb remount read-write")
+    device_cmd("access", "root, build type, verity and bootloader state")
+    p_mw = device_cmd(
+        "make-writable", "adb root, optional disable-verity, and remount (with the reboots they need)"
+    )
+    p_mw.add_argument("--no-root", action="store_true", help="skip adb root")
+    p_mw.add_argument("--disable-verity", action="store_true",
+                      help="also run adb disable-verity (reboots the device)")
+    p_mw.add_argument("--no-remount", action="store_true", help="skip adb remount")
+    p_mw.add_argument("--no-reboot", action="store_true",
+                      help="never reboot; report when a reboot is still needed")
+    p_mw.add_argument("--boot-timeout", type=float, default=180.0,
+                      help="seconds to wait for each reboot (default 180)")
     p_mrw = device_cmd("mount-rw", "remount a partition read-write (default /)")
     p_mrw.add_argument("path", nargs="?", default="/")
     for verity in ("disable-verity", "enable-verity"):
@@ -1599,6 +1625,9 @@ def main(argv=None) -> int:
                 return rc
             return 0
 
+        if cmd == "stop-server":
+            stopped = _handler(args, serial=None).stop_server()
+            return _report(stopped, "adb server stopped", "the adb server is still running")
         if cmd == "restart-server":
             r = _handler(args, serial=None).restart_server()
             _result(r.text or r.stderr.strip() or "ADB server restarted.")
@@ -2015,6 +2044,39 @@ def main(argv=None) -> int:
             else:
                 print("tap takes X Y, or nothing for the centre of the screen", file=sys.stderr)
                 return 2
+        elif cmd == "tap-burst":
+            last = [0]
+
+            def show(done, total):
+                if not _JSON["on"] and done != last[0]:
+                    last[0] = done
+                    print(f"\r{done}/{total} taps", end="", file=sys.stderr, flush=True)
+
+            report = dev.tap_burst(
+                args.x, args.y, count=args.count, rate=args.rate, duration=args.duration,
+                display_id=args.display, method=args.method, on_progress=show,
+            )
+            if not _JSON["on"] and last[0]:
+                print("", file=sys.stderr)
+            if _JSON["on"]:
+                print(json.dumps({"ok": True, "result": report}, default=str, indent=2))
+            else:
+                where = f" through {report['device']}" if report["device"] else ""
+                print(f"{report['taps']} taps in {report['seconds']:g}s "
+                      f"({report['rate']:g}/s, {report['method']}{where})")
+        elif cmd == "touch-device":
+            info = dev.touch_device()
+            if _JSON["on"]:
+                print(json.dumps(info, indent=2))
+            elif not info:
+                print("no touchscreen found in 'getevent -pl'", file=sys.stderr)
+                return 1
+            else:
+                print(f"{info['path']}  {info['name']}")
+                print(f"  size:     {info['max_x'] + 1}x{info['max_y'] + 1} event units")
+                print(f"  protocol: {info['protocol']}"
+                      f"  ·  {'screen' if info['direct'] else 'touchpad'}")
+                print(f"  writable: {'yes' if info['writable'] else 'no (try adb root)'}")
         elif cmd == "swipe":
             rc = _report(
                 dev.swipe(args.x1, args.y1, args.x2, args.y2, args.ms, display_id=args.display),
@@ -2094,6 +2156,33 @@ def main(argv=None) -> int:
                     print(f"[{key}]: [{value[key]}]")
         elif cmd == "remount":
             _result(dev.remount())
+        elif cmd == "access":
+            status = dev.access_status()
+            if _JSON["on"]:
+                print(json.dumps(status, indent=2))
+            else:
+                print(f"adbd root:   {'yes' if status['root'] else 'no'} (uid {status['uid']})")
+                print(f"debuggable:  {'yes' if status['debuggable'] else 'no'}"
+                      f"  (build type {status['build_type'] or 'unknown'})")
+                print(f"verity:      {status['verity'] or 'unknown'}")
+                print(f"bootloader:  {status['bootloader'] or 'unknown'}")
+        elif cmd == "make-writable":
+            report = dev.make_writable(
+                root=not args.no_root,
+                disable_verity=args.disable_verity,
+                remount=not args.no_remount,
+                reboot=not args.no_reboot,
+                boot_timeout=args.boot_timeout,
+                on_step=None if _JSON["on"] else (lambda text: print(f"-> {text}", file=sys.stderr)),
+            )
+            if _JSON["on"]:
+                print(json.dumps({"ok": True, "result": report}, default=str, indent=2))
+            else:
+                for step, output in report["steps"]:
+                    print(f"{step}: {str(output).strip()}")
+                if report["reboot_needed"]:
+                    print("A reboot is still needed; run it again without --no-reboot.",
+                          file=sys.stderr)
         elif cmd in ("disable-verity", "enable-verity"):
             out = dev.disable_verity() if cmd == "disable-verity" else dev.enable_verity()
             if not args.reboot:

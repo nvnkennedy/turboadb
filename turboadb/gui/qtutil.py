@@ -156,10 +156,16 @@ def _unpark(t) -> None:
 
 
 def park_thread(t) -> None:
-    """Keep *t* (a QThread) alive until it finishes even after the widget that
-    owns it is closed — e.g. a device tab closed while its connect thread is
-    still waiting on a slow remote adb server. Safe to call before start():
-    the reference is simply dropped once the thread finishes."""
+    """Keep *t* (a QThread) alive until Qt has deleted it, even after the widget
+    that owns it is closed — e.g. a device tab closed while its connect thread
+    is still waiting on a slow remote adb server. Safe to call before start().
+
+    The reference is held until ``destroyed``, not ``finished``: a QThread that
+    Python still owns when it asks for ``deleteLater`` can be garbage-collected
+    (which deletes the C++ object) while that delete is still queued, and Qt
+    then carries the queued delete out on freed memory — a native crash with no
+    Python traceback, in whatever ran next.
+    """
     if t is None or t in _parked:
         return
     try:
@@ -170,7 +176,7 @@ def park_thread(t) -> None:
         return
     _parked.add(t)
     t.finished.connect(t.deleteLater)
-    t.finished.connect(lambda: _unpark(t))
+    t.destroyed.connect(lambda *_args: _unpark(t))
 
 
 def thread_running(t) -> bool:

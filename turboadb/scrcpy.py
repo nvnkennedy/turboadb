@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 from typing import Optional
 
 from .config import ScrcpyOptions, parse_host_port
@@ -282,6 +283,40 @@ def _send_ctrl_break(pid: int) -> bool:
         return False
 
 
+# Every scrcpy this process started and has not stopped yet. A mirror window
+# outliving TurboADB keeps a device busy (and its adb connection open), so the
+# app stops the survivors on the way out — see live_sessions()/stop_all().
+_LIVE_SESSIONS: "list" = []
+_LIVE_LOCK = threading.Lock()
+
+
+def live_sessions() -> list:
+    """The scrcpy sessions this process started that are still running."""
+    with _LIVE_LOCK:
+        sessions = list(_LIVE_SESSIONS)
+    alive = [s for s in sessions if s.running]
+    if len(alive) != len(sessions):
+        with _LIVE_LOCK:
+            _LIVE_SESSIONS[:] = [s for s in _LIVE_SESSIONS if s.running]
+    return alive
+
+
+def stop_all(timeout: float = 5.0) -> int:
+    """Stop every scrcpy still running from this process; returns how many.
+
+    Called when TurboADB closes, so no mirror window (and no adb connection
+    behind it) is left behind — a scrcpy that was never stopped keeps running
+    after the app exits."""
+    stopped = 0
+    for session in live_sessions():
+        try:
+            session.stop(timeout=timeout)
+            stopped += 1
+        except Exception:
+            pass
+    return stopped
+
+
 class ScrcpySession:
     """A running scrcpy process. Call :meth:`stop` to close the mirror window."""
 
@@ -296,6 +331,11 @@ class ScrcpySession:
         self.serial = serial
         self.log_path = log_path
         self._logfh = logfh
+        with _LIVE_LOCK:
+            # drop the ones that have since exited, so a long session that
+            # starts many screens does not hold on to every finished process
+            _LIVE_SESSIONS[:] = [s for s in _LIVE_SESSIONS if s.running]
+            _LIVE_SESSIONS.append(self)
 
     def read_log(self) -> str:
         """Return scrcpy's captured stdout/stderr (for diagnosing a failed start)."""
@@ -356,6 +396,9 @@ class ScrcpySession:
                 self._logfh.close()
         except Exception:
             pass
+        with _LIVE_LOCK:
+            if self in _LIVE_SESSIONS:
+                _LIVE_SESSIONS.remove(self)
 
     def __enter__(self) -> "ScrcpySession":
         return self
