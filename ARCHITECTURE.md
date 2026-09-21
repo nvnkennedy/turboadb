@@ -118,7 +118,10 @@ device_tab.py     per-device tab; connects in the background; hosts the sub-pane
   console.py        AnsiConsole — the interactive shell terminal
   terminal.py       reader thread that pumps shell bytes into the console
   logcat_view.py    live logcat with filtering + complete-save
-  file_browser.py   device filesystem tree + push/pull
+  file_browser.py   device filesystem tree + push/pull; one per Files tab
+    transfer_log.py   transfer history model + size measuring (no Qt)
+    transfer_panel.py the Transfers panel: summary, table, retry, report
+    file_icons.py     native file-type icons, with the glyphs as fallback
   apps_panel.py     package list / install / uninstall / start / stop
   controls_panel.py the responsive grid of device controls
   phone_panel.py    dialer / calls / SMS

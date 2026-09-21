@@ -40,6 +40,19 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Uni
 
 from ..tools import find_adb, NO_WINDOW
 
+# Hoisted out of the per-poll read path: ShellSession.read() runs many times
+# a second per open terminal, and re-importing these each time is wasted work.
+if os.name == "nt":
+    import ctypes as _ctypes
+    import msvcrt as _msvcrt
+    from ctypes import wintypes as _wintypes
+
+    _PEEK_NAMED_PIPE = _ctypes.windll.kernel32.PeekNamedPipe
+else:  # pragma: no cover - POSIX has no named-pipe peek
+    _ctypes = _msvcrt = _wintypes = None
+    _PEEK_NAMED_PIPE = None
+
+
 # (name, raw value, registry type) as returned by winreg.EnumValue.
 RegValue = Tuple[str, str, int]
 
@@ -557,12 +570,9 @@ class LocalShellSession:
             if not self._proc or not self._proc.stdout:
                 return b""
             if os.name == "nt":
-                import ctypes
-                import msvcrt
-                from ctypes import wintypes
-                h = msvcrt.get_osfhandle(self._proc.stdout.fileno())
-                avail = wintypes.DWORD()
-                if not ctypes.windll.kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+                h = _msvcrt.get_osfhandle(self._proc.stdout.fileno())
+                avail = _wintypes.DWORD()
+                if not _PEEK_NAMED_PIPE(h, None, 0, None, _ctypes.byref(avail), None):
                     return b""
                 if avail.value == 0:
                     return b""

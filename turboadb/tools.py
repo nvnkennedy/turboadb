@@ -161,6 +161,9 @@ def _sdk_candidates(name: str) -> list:
 
 
 _CACHE: dict = {}
+# Keyed on (name, explicit, env, setting): a process that builds many
+# handlers with different adb paths would otherwise grow it forever.
+_CACHE_MAX = 64
 
 
 def clear_tools_cache() -> None:
@@ -221,6 +224,8 @@ def _resolve(name: str, explicit, env_var: str) -> str | None:
         return cached
     found = _search(name, explicit, env, setting)
     if found:
+        if len(_CACHE) >= _CACHE_MAX:
+            _CACHE.clear()
         _CACHE[cache_key] = found
     return found
 
@@ -434,7 +439,7 @@ def diagnose() -> dict:
     info = {"adb": None, "adb_path": None, "scrcpy": None, "scrcpy_path": None}
     try:
         info["adb_path"] = find_adb()
-        info["adb"] = adb_version()
+        info["adb"] = adb_version(info["adb_path"])
     except ADBNotFoundError:
         pass
     try:

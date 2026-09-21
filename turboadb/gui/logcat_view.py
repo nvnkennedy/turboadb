@@ -14,7 +14,6 @@ from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QPushButton,
     QLineEdit,
     QComboBox,

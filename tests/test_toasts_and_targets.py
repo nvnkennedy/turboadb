@@ -419,7 +419,8 @@ def test_saved_notification_error_and_activity_toasts_never_cover_each_other(qap
     from turboadb.gui import fileutil
 
     themed("dark")
-    path = "C:\\Users\\someone\\Downloads\\logcat-20260916-101010.log"
+    path = os.sep.join(["C:", "Users", "someone", "Downloads",
+                        "logcat-20260916-101010.log"])
     error = fileutil.error_toast(host, "adb: device offline", action=lambda: None)
     activity = _show_activity(qapp, host, f"logcat saved to {path}", level="ok")
     fileutil.saved_toast(host, path, "logcat")
@@ -805,7 +806,7 @@ def test_a_short_saved_path_is_not_squeezed(qapp, host, themed):
     from turboadb.gui import fileutil
 
     themed("dark")
-    path = "C:" + chr(92) + "Temp" + chr(92) + "shot.png"
+    path = os.sep.join(["C:", "Temp", "shot.png"])
     fileutil.saved_toast(host, path, "screenshot")
     qapp.processEvents()
     note = host._turboadb_toasts[-1]
@@ -1012,7 +1013,7 @@ def test_copying_toast_text_never_includes_the_break_points(qapp, host, themed):
     from turboadb.gui import fileutil
 
     themed("dark")
-    sep = chr(92)
+    sep = os.sep
     path = sep.join(["C:", "Users", "someone", "Downloads",
                      "turboadb_INSTALL_FAILED_VERSION_DOWNGRADE_com.example.application_"
                      "20260916_101010_screenshot_with_a_long_name_and_more.png"])
@@ -1049,7 +1050,7 @@ def test_break_points_never_split_a_character(qapp):
     vietnamese = unicodedata.normalize("NFD", "Ảnhchụpmànhìnhđiệnthoạiđượclưuvàothưmục" * 2)
     family = zwj.join([chr(0x1F468), chr(0x1F469), chr(0x1F467), chr(0x1F466)]) * 6
     flags = (chr(0x1F1EE) + chr(0x1F1F3)) * 12
-    path = "C:" + chr(92) + "a_b" * 40
+    path = "C:" + os.sep + "a_b" * 40
     for word in (hindi, vietnamese, family, flags, path):
         broken = fileutil._breakable(word, metrics, 40)
         assert broken.replace(ZWSP, "") == word
@@ -1170,7 +1171,7 @@ def test_a_burst_of_updates_does_not_resize_the_toast_each_time(qapp, host):
 
     counter = Counter()
     toast.installEventFilter(counter)
-    sep = chr(92)
+    sep = os.sep
     try:
         for index in range(150):
             name = "IMG_20260916_%06d%s.jpg" % (index, "_burst" * (index % 4))
@@ -1196,7 +1197,7 @@ def test_a_long_saved_path_wraps_and_stays_valid_markup(qapp, host, themed):
     from turboadb.gui import fileutil
 
     themed("dark")
-    sep = chr(92)
+    sep = os.sep
     name = ("turboadb_INSTALL_FAILED_VERSION_DOWNGRADE_com.example.application_20260916_101010_"
             "screenshot_with_a_long_name_and_more_more_more.png")
     path = sep.join(["C:", "Users", "a&b <team>", "Downloads", name])
@@ -1332,3 +1333,190 @@ def test_the_settings_line_names_what_changed_not_always_the_theme():
         "terminal font, terminal font size, adb path and 2 more"
     # a key with no friendly name still reads as words
     assert _describe_settings({"some_new_option": 1}) == "some new option"
+
+
+# --------------------------------------------------------------------------- #
+# an action's result must survive the refresh it triggers
+# --------------------------------------------------------------------------- #
+def _toast_host(qapp, window):
+    """Give a plain window the few attributes MainWindow._log needs."""
+    from turboadb.gui.main_window import MainWindow
+
+    window._LOG_LEVEL_RE = MainWindow._LOG_LEVEL_RE
+    window._LEVEL_ALIASES = MainWindow._LEVEL_ALIASES
+    window.log_panel = types.SimpleNamespace(append=lambda *_a: None, chk_silent=None)
+    window._log_dock = None
+    window._show_log_dock = lambda *_a: None
+    window.statusBar = lambda: types.SimpleNamespace(showMessage=lambda *a, **k: None)
+    return lambda text: MainWindow._log(window, text)
+
+
+def test_installing_an_apk_reports_the_install_not_the_package_count(qapp, host, themed):
+    """The window shows ONE activity toast, replaced in place.
+
+    AppsPanel logged the install result and then immediately re-listed, and the
+    listing count overwrote it within milliseconds — so installing an APK ended
+    with a toast reading "1 packages" and no confirmation was ever visible."""
+    from turboadb.gui import apps_panel as ap
+    from turboadb.results import OperationResult
+
+    themed("dark")
+
+    class Handler:
+        def list_packages(self, *a, **k):
+            return OperationResult(True, "list_packages", value=["com.example.app"])
+
+        def install(self, path, **k):
+            return OperationResult(True, "install", value="Success")
+
+    panel = ap.AppsPanel(Handler(), parent=host)
+    panel.log.connect(_toast_host(qapp, host))
+    traced = []
+    panel.trace.connect(traced.append)
+    ap.QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: (["/tmp/demo.apk"], ""))
+    try:
+        panel._install()
+        for _ in range(80):
+            qapp.processEvents()
+        toast = host._turboadb_activity_toast
+        assert "demo.apk" in toast.text.text()      # the install is what shows
+        assert "packages" not in toast.text.text()  # not the refresh that followed
+        assert traced == ["[OK] 1 packages"]        # the count is log-only
+    finally:
+        panel.close_panel()
+
+
+# --------------------------------------------------------------------------- #
+# copying to the clipboard has to say it happened
+# --------------------------------------------------------------------------- #
+def test_copying_to_the_clipboard_confirms_it(qapp, host, themed):
+    """Every clipboard write in the GUI was silent, so a copy that worked
+    looked exactly like one that did nothing."""
+    from PyQt5.QtWidgets import QApplication
+
+    from turboadb.gui import fileutil
+
+    themed("dark")
+    fileutil.copy_to_clipboard(host, "one\ntwo\nthree")
+    qapp.processEvents()
+    assert QApplication.clipboard().text() == "one\ntwo\nthree"
+    assert host._turboadb_activity_toast.text.text() == "Copied 3 lines"
+
+    fileutil.copy_to_clipboard(host, "+441234", "the phone number")
+    qapp.processEvents()
+    assert host._turboadb_activity_toast.text.text() == "Copied the phone number"
+
+    fileutil.copy_to_clipboard(host, "one line")
+    qapp.processEvents()
+    assert host._turboadb_activity_toast.text.text() == "Copied 1 line"
+
+    fileutil.copy_to_clipboard(host, "")
+    qapp.processEvents()
+    assert host._turboadb_activity_toast.text.text() == "Nothing to copy"
+
+
+# --------------------------------------------------------------------------- #
+# a bulk file operation reports once, not once per file
+# --------------------------------------------------------------------------- #
+def _files_panel(qapp, host, monkeypatch):
+    """A FileBrowser wired to *host*'s toasts, with no real device behind it."""
+    from PyQt5.QtCore import QObject, pyqtSignal
+
+    from turboadb.gui import file_browser as fbmod
+
+    class FakeThread(QObject):
+        progress = pyqtSignal(int)
+        done = pyqtSignal(object)
+        failed = pyqtSignal(str)
+        finished = pyqtSignal()
+
+        def __init__(self, handler, direction, a, b):
+            super().__init__()
+            self.direction, self.a, self.b = direction, a, b
+
+        def start(self):
+            pass
+
+        def isFinished(self):
+            return False
+
+        def isRunning(self):
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(fbmod, "_TransferThread", FakeThread)
+    monkeypatch.setattr(fbmod, "park_thread", lambda t: None)
+
+    class Handler:
+        adb_path = "adb"
+
+        def shell(self, *a, **k):
+            raise RuntimeError("no device")
+
+    browser = fbmod.FileBrowser(Handler(), start="/sdcard", parent=host)
+    monkeypatch.setattr(browser, "refresh_local", lambda *a, **k: None)
+    monkeypatch.setattr(browser, "refresh_remote", lambda *a, **k: None)
+    return browser
+
+
+def test_copying_many_files_reports_once_not_once_per_file(qapp, host, themed, monkeypatch):
+    """Each finished transfer logged its own line. The window shows ONE
+    activity toast, so 200 files left the LAST file name on screen and no
+    result — which read as "nothing happened"."""
+    themed("dark")
+    browser = _files_panel(qapp, host, monkeypatch)
+    toasted, traced = [], []
+    browser.log.connect(toasted.append)
+    browser.trace.connect(traced.append)
+    jobs = [(f"/local/f{i}.txt", "/sdcard", "push") for i in range(5)]
+    try:
+        browser._enqueue_transfers(jobs, "Pushing 5 item(s)")
+        for _ in range(len(jobs)):
+            transfer = browser._transfer
+            if transfer is None:
+                break
+            browser._on_transfer_finished(transfer, True, "")
+            qapp.processEvents()
+        assert toasted[-1] == "[OK] Pushed 5 items"   # one result, not five
+        assert len(traced) == 5                        # every file still logged
+    finally:
+        browser._closing = True
+
+
+def test_a_failed_file_still_surfaces_and_the_summary_counts_it(qapp, host, themed, monkeypatch):
+    themed("dark")
+    browser = _files_panel(qapp, host, monkeypatch)
+    toasted = []
+    browser.log.connect(toasted.append)
+    jobs = [(f"/local/f{i}.txt", "/sdcard", "push") for i in range(3)]
+    try:
+        browser._enqueue_transfers(jobs, "Pushing 3 item(s)")
+        for index in range(len(jobs)):
+            transfer = browser._transfer
+            if transfer is None:
+                break
+            browser._on_transfer_finished(transfer, index != 1, "" if index != 1 else "denied")
+            qapp.processEvents()
+        assert any("denied" in line for line in toasted)          # the failure shows
+        assert toasted[-1] == ("[WARNING] Pushed 2 of 3 items - 1 failed (see the log)")
+    finally:
+        browser._closing = True
+
+
+def test_a_single_transfer_still_names_the_file(qapp, host, themed, monkeypatch):
+    """One file needs no summary — its own line already is one."""
+    themed("dark")
+    browser = _files_panel(qapp, host, monkeypatch)
+    toasted, traced = [], []
+    browser.log.connect(toasted.append)
+    browser.trace.connect(traced.append)
+    try:
+        browser._enqueue_transfers([("/local/only.txt", "/sdcard", "push")], "Pushing 1 item(s)")
+        browser._on_transfer_finished(browser._transfer, True, "")
+        qapp.processEvents()
+        assert toasted[-1] == "[OK] push: only.txt"
+        assert traced == []
+    finally:
+        browser._closing = True

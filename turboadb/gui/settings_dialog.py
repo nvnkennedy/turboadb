@@ -23,7 +23,6 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QStackedWidget,
     QApplication,
-    QGridLayout,
     QToolButton,
     QSizePolicy,
 )

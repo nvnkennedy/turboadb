@@ -13,7 +13,7 @@ import os
 import posixpath
 import re
 import shlex
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .results import strip_ansi
 

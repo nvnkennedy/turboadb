@@ -763,3 +763,64 @@ def test_text_typed_for_the_device_never_reaches_the_log(qapp, monkeypatch):
         panel.close_panel()
         panel.deleteLater()
         qapp.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# a paste goes to the DEVICE, so this window has to say so
+# --------------------------------------------------------------------------- #
+def test_pasting_into_the_device_screen_reports_itself(qapp):
+    """Ctrl+V on the mirror sends the clipboard to the device. The text lands
+    there, not here, so with no message a paste that worked and one that did
+    nothing looked identical."""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication
+
+    from turboadb.gui.mirror_panel import _forward_device_key, device_paste_message
+
+    sent, told = [], []
+    event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_V, Qt.ControlModifier, "v")
+
+    QApplication.clipboard().setText("hello device")
+    handled = _forward_device_key(
+        event, lambda kind, payload, **k: sent.append((kind, payload)), notify=told.append
+    )
+    assert handled
+    assert sent == [("text", "hello device")]
+    assert told == ["hello device"]
+    assert device_paste_message(told[0]) == "[OK] Pasted 12 characters to the device"
+
+    # an empty clipboard must say so rather than look like a silent success
+    sent.clear()
+    told.clear()
+    QApplication.clipboard().setText("")
+    assert _forward_device_key(
+        event, lambda kind, payload, **k: sent.append((kind, payload)), notify=told.append
+    )
+    assert sent == []          # nothing was sent to the device
+    assert told == [""]        # but the caller was still told
+    assert device_paste_message("") == "[WARNING] Nothing on the clipboard to paste"
+
+    assert device_paste_message("x") == "[OK] Pasted 1 character to the device"
+
+
+def test_the_embed_container_routes_its_paste_to_the_panel_log(qapp):
+    """_EmbedContainer has no signals of its own; MirrorPanel hands it the
+    callback so the paste reaches the normal log/toast path."""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication
+
+    from turboadb.gui.mirror_panel import _EmbedContainer, device_paste_message
+
+    logged = []
+    container = _EmbedContainer(lambda *a, **k: None, on_paste=logged.append)
+    try:
+        QApplication.clipboard().setText("abc")
+        container.keyPressEvent(
+            QKeyEvent(QKeyEvent.KeyPress, Qt.Key_V, Qt.ControlModifier, "v")
+        )
+        assert logged == ["abc"]
+        assert device_paste_message(logged[0]) == "[OK] Pasted 3 characters to the device"
+    finally:
+        container.deleteLater()

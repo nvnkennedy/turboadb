@@ -51,3 +51,96 @@ def test_requires_python_declared():
     assert re.search(r"(?m)^requires-python\s*=", _read_pyproject()), (
         "requires-python must stay declared"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the GitHub Release page carries the version's changelog section
+# --------------------------------------------------------------------------- #
+def _release_notes_module():
+    import importlib.util
+
+    path = os.path.join(ROOT, "scripts", "release_notes.py")
+    spec = importlib.util.spec_from_file_location("release_notes", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SAMPLE = """# Changelog
+
+Intro text.
+
+## 3.0.0
+
+### New
+
+- **Big thing.** It does a lot.
+
+### Fixed
+
+- A small thing.
+
+## 2.9.1
+
+- Only a fix.
+
+## 2.9.0
+
+- The first one.
+"""
+
+
+def test_the_current_version_has_release_notes():
+    import turboadb
+
+    rn = _release_notes_module()
+    notes = rn.release_notes(turboadb.__version__)
+    assert "\n### " not in notes and notes.startswith("## ")
+    assert f"TurboADB-{turboadb.__version__}-win64.exe" in notes
+    assert "pip install --upgrade turboadb" in notes
+    assert f"...v{turboadb.__version__}" in notes  # the compare link
+
+
+def test_release_notes_take_exactly_one_section():
+    rn = _release_notes_module()
+    notes = rn.release_notes("v3.0.0", _SAMPLE)
+    assert notes.startswith("## New\n\n- **Big thing.**")
+    assert "## Fixed\n\n- A small thing." in notes
+    assert "Only a fix" not in notes and "Intro text" not in notes
+    assert notes.endswith("compare/v2.9.1...v3.0.0\n")
+    middle = rn.release_notes("2.9.1", _SAMPLE)
+    assert middle.startswith("- Only a fix.") and "v2.9.0...v2.9.1" in middle
+    assert "compare" not in rn.release_notes("2.9.0", _SAMPLE)  # the oldest entry
+
+
+def test_a_version_without_notes_is_refused():
+    import pytest
+
+    rn = _release_notes_module()
+    with pytest.raises(ValueError, match="no notes for 9.9.9"):
+        rn.release_notes("9.9.9", _SAMPLE)
+    with pytest.raises(ValueError):
+        rn.release_notes("3.0.0", "## 3.0.0\n\n## 2.9.0\n\n- x\n")  # empty section
+    with pytest.raises(SystemExit) as exc:
+        rn.main(["9.9.9"])
+    assert "no notes for 9.9.9" in str(exc.value)
+
+
+def test_release_notes_are_written_as_utf8(tmp_path):
+    rn = _release_notes_module()
+    out = tmp_path / "notes.md"
+    assert rn.main(["--output", str(out)]) == 0
+    data = out.read_bytes()
+    assert b"\r\n" not in data
+    import turboadb
+
+    assert data.decode("utf-8") == rn.release_notes(turboadb.__version__)
+
+
+def test_the_release_workflow_publishes_the_notes():
+    with open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8") as fh:
+        workflow = fh.read()
+    assert "python scripts/release_notes.py --output release-notes.md" in workflow
+    assert "body_path: release-notes.md" in workflow
+    # written before the long build, so missing notes fail fast
+    assert workflow.index("release_notes.py") < workflow.index("Build the one-file GUI exe")

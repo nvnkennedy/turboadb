@@ -45,6 +45,19 @@ from .exceptions import (
 )
 
 
+# Hoisted out of the per-poll read path: ShellSession.read() runs many times
+# a second per open terminal, and re-importing these each time is wasted work.
+if os.name == "nt":
+    import ctypes as _ctypes
+    import msvcrt as _msvcrt
+    from ctypes import wintypes as _wintypes
+
+    _PEEK_NAMED_PIPE = _ctypes.windll.kernel32.PeekNamedPipe
+else:  # pragma: no cover - POSIX has no named-pipe peek
+    _ctypes = _msvcrt = _wintypes = None
+    _PEEK_NAMED_PIPE = None
+
+
 _TOKEN_COUNTER = itertools.count()
 
 
@@ -54,6 +67,23 @@ def _unique_token() -> str:
     ``time.monotonic_ns()`` alone is not enough: on Windows it ticks only every
     ~15 ms, so two quick calls from one thread produced the same name."""
     return f"{os.getpid()}_{threading.get_ident()}_{next(_TOKEN_COUNTER)}_{time.time_ns()}"
+
+
+_ROW_SPLIT_RE = re.compile(r"(?m)^Row: \d+ ")
+
+
+def _iter_records(text):
+    """Yield ``content query`` records lazily.
+
+    re.split() built the whole list first, so a limit of 50 still paid
+    for every row on the device."""
+    previous = None
+    for match in _ROW_SPLIT_RE.finditer(text or ""):
+        if previous is not None:
+            yield text[previous:match.start()]
+        previous = match.end()
+    if previous is not None:
+        yield text[previous:]
 
 
 # --------------------------------------------------------------------------- #
@@ -111,12 +141,9 @@ class ShellSession:
                 self._eof = True
                 return b""
             if os.name == "nt":
-                import ctypes
-                import msvcrt
-                from ctypes import wintypes
-                h = msvcrt.get_osfhandle(self._proc.stdout.fileno())
-                avail = wintypes.DWORD()
-                if not ctypes.windll.kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+                h = _msvcrt.get_osfhandle(self._proc.stdout.fileno())
+                avail = _wintypes.DWORD()
+                if not _PEEK_NAMED_PIPE(h, None, 0, None, _ctypes.byref(avail), None):
                     self._eof = True  # broken pipe: the writer (adb) has exited
                     return b""
                 if avail.value == 0:
@@ -252,8 +279,12 @@ class ADBHandler:
         self._serial: Optional[str] = config.target  # active -s target
         self._connected = False
         self._owned_target: Optional[str] = None  # a TCP target THIS handler connected
+        # guards the one-time adb resolution; re-entrant, so a log callback
+        # that reads adb_path while it is being resolved can't deadlock
+        self._adb_lock = threading.RLock()
         self._cap_method: Optional[int] = None  # cached screencap method idx
         self._touch: Optional[tuple] = None  # cached (TouchDevice|None, writable)
+        self._screencap_ids: dict = {}  # logical display id -> physical id
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -305,27 +336,33 @@ class ADBHandler:
         specific ``adb_path`` was configured or ``TURBOADB_AUTO_FETCH=0`` is set.
         """
         if self._adb is None:
-            try:
-                self._adb = find_adb(self.config.adb_path)
-            except ADBNotFoundError:
-                # An explicit path is a caller error; never replace it with a
-                # download behind their back.  For normal auto-detection, honour
-                # the documented one-time managed-tools fallback.
-                if self.config.adb_path:
-                    raise
-                from . import toolsdl
-
-                result = toolsdl.ensure_tools(notify=lambda m: self._emit(logging.INFO, m))
-                try:
-                    self._adb = find_adb()
-                except ADBNotFoundError as exc:
-                    errors = (result or {}).get("errors", {})
-                    detail = "; ".join(f"{k}: {v}" for k, v in errors.items())
-                    raise ADBNotFoundError(
-                        "adb was not found and TurboADB could not install platform-tools"
-                        + (f" ({detail})" if detail else "")
-                    ) from exc
+            with self._adb_lock:
+                if self._adb is None:
+                    self._resolve_adb()
         return self._adb
+
+    def _resolve_adb(self) -> None:
+        """Resolve adb once, under :attr:`_adb_lock`."""
+        try:
+            self._adb = find_adb(self.config.adb_path)
+        except ADBNotFoundError:
+            # An explicit path is a caller error; never replace it with a
+            # download behind their back.  For normal auto-detection, honour
+            # the documented one-time managed-tools fallback.
+            if self.config.adb_path:
+                raise
+            from . import toolsdl
+
+            result = toolsdl.ensure_tools(notify=lambda m: self._emit(logging.INFO, m))
+            try:
+                self._adb = find_adb()
+            except ADBNotFoundError as exc:
+                errors = (result or {}).get("errors", {})
+                detail = "; ".join(f"{k}: {v}" for k, v in errors.items())
+                raise ADBNotFoundError(
+                    "adb was not found and TurboADB could not install platform-tools"
+                    + (f" ({detail})" if detail else "")
+                ) from exc
 
     @property
     def serial(self) -> Optional[str]:
@@ -347,6 +384,9 @@ class ADBHandler:
     ) -> CommandResult:
         cmd = self._base(target=target) + list(args)
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
+        # started_at and duration are one matched pair: callers add them to
+        # get the end time, so both stay on the wall clock.  Deadlines that
+        # drive control flow use time.monotonic() instead (see iter_lines).
         start = time.time()
         try:
             out = subprocess.run(
@@ -684,7 +724,9 @@ class ADBHandler:
 
     @staticmethod
     def devices(
-        adb_path: Optional[str] = None, server_host: Optional[str] = None, server_port: int = 5037
+        adb_path: Optional[str] = None,
+        server_host: Optional[str] = None,
+        server_port: int = DEFAULT_ADB_SERVER_PORT,
     ) -> list:
         """List devices on the local (or a remote) adb server."""
         return list_devices(adb_path, server_host=server_host, server_port=server_port)
@@ -1372,12 +1414,14 @@ class ADBHandler:
                        f"tapping {x},{y} {taps} times ({chosen})"
                        + (f" at up to {rate:g}/s" if rate else ""))
             done, problems = 0, []
+            keep_problems = 5  # only problems[:3] is ever reported
             started = time.monotonic()
             for line in self.iter_lines(["shell", script], timeout=limit):
                 value = touch.parse_progress(line)
                 if value is None:
                     if line.strip():
-                        problems.append(line.strip())
+                        if len(problems) < keep_problems:
+                            problems.append(line.strip())
                     continue
                 done = value
                 if on_progress is not None:
@@ -2510,7 +2554,7 @@ class ADBHandler:
                 re.S,
             )
         rows = []
-        for record in re.split(r"(?m)^Row: \d+ ", r.stdout or "")[1:]:
+        for record in _iter_records(r.stdout or ""):
             if len(rows) >= limit:
                 break
             body = record.rstrip("\r\n")
@@ -2798,17 +2842,27 @@ class ADBHandler:
             except Exception:  # identity is still useful without the classification
                 kind = None
             if kind:
-                info.update(
-                    kind=kind["kind"],
-                    kind_label=kind["label"],
-                    kind_reason=kind["reason"],
-                    telephony=kind["telephony"],
-                    display_size=kind["display_size"],
-                )
-                info["automotive"] = bool(info["automotive"] or kind["automotive"])
+                self.merge_kind(info, kind)
             return info
 
         return self._guard("device_info", _do, safe=safe)
+
+    @staticmethod
+    def merge_kind(info: dict, kind: dict) -> dict:
+        """Fold a :meth:`classify_device` result into a device-info dict.
+
+        The engine and the GUI's quick-scan both build the same summary, and
+        the same five keys were copied across in two places -- adding a field
+        to classify_device() meant remembering both."""
+        info.update(
+            kind=kind["kind"],
+            kind_label=kind["label"],
+            kind_reason=kind["reason"],
+            telephony=kind["telephony"],
+            display_size=kind["display_size"],
+        )
+        info["automotive"] = bool(info["automotive"] or kind["automotive"])
+        return info
 
     _QUICK_IDENTITY_KEYS = ("manufacturer", "model", "android_version", "sdk", "device", "abi")
 
@@ -3091,7 +3145,7 @@ class ADBHandler:
             creationflags=NO_WINDOW,
         )
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}  (streaming)")
-        start = time.time()
+        start = time.monotonic()
         buf = b""
 
         # A watcher thread terminates the process the instant a stop is requested
@@ -3103,7 +3157,7 @@ class ADBHandler:
             while not watcher_done.is_set():
                 if stop_event is not None and stop_event.is_set():
                     break
-                if timeout and (time.time() - start) > timeout:
+                if timeout and (time.monotonic() - start) > timeout:
                     break
                 watcher_done.wait(0.1)
             try:
@@ -3118,7 +3172,7 @@ class ADBHandler:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
-                if timeout and (time.time() - start) > timeout:
+                if timeout and (time.monotonic() - start) > timeout:
                     break
                 chunk = (
                     proc.stdout.read1(65536)
@@ -3135,6 +3189,9 @@ class ADBHandler:
                 buf = parts.pop()
                 for ln in parts:
                     yield ln.decode(encoding, errors="replace").rstrip("\r")
+                if len(buf) > self._MAX_LINE_BYTES:
+                    yield buf.decode(encoding, errors="replace").rstrip("\r")
+                    buf = b""
             if buf:
                 yield buf.decode(encoding, errors="replace").rstrip("\r")
         finally:
@@ -3155,6 +3212,10 @@ class ADBHandler:
                 watcher.join(timeout=1.0)
             except Exception:
                 pass
+
+    # Longest line iter_lines will assemble before flushing it as-is. A
+    # stream that never sends a newline must not grow the buffer forever.
+    _MAX_LINE_BYTES = 4 * 1024 * 1024
 
     def popen(self, args: Sequence[str]):
         """Spawn ``adb -s SERIAL <args>`` and return the raw Popen (stdout pipe,
@@ -3211,6 +3272,8 @@ class ADBHandler:
                     count += 1
                     if fh:
                         fh.write(line + "\n")
+                        # every line, at once: someone may be reading the
+                        # file while the stream runs (tail -f, a test)
                         fh.flush()
                     if on_line:
                         on_line(line)
@@ -3650,7 +3713,7 @@ class ADBHandler:
         cmd = self._base(target=True) + args
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
         self._emit(logging.INFO, f"{direction} {a} -> {b}")
-        start = time.time()
+        start = time.monotonic()
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -3710,7 +3773,13 @@ class ADBHandler:
                             on_progress(pct)
                         except Exception:
                             pass
-            rc = proc.wait(timeout=2)
+            try:
+                rc = proc.wait(timeout=2)
+            except subprocess.TimeoutExpired as exc:
+                self._stop_process(proc)
+                raise ADBTimeoutError(
+                    f"adb {direction} did not exit after finishing"
+                ) from exc
         finally:
             if proc.poll() is None:
                 self._stop_process(proc)
@@ -3742,7 +3811,7 @@ class ADBHandler:
         elif os.path.isfile(lp):
             size = os.path.getsize(lp)
         src, dst = (local, remote) if direction == "push" else (remote, local)
-        return TransferResult(src, dst, direction, size, time.time() - start, files)
+        return TransferResult(src, dst, direction, size, time.monotonic() - start, files)
 
     # ------------------------------------------------------------------ #
     # App management
@@ -4063,7 +4132,7 @@ class ADBHandler:
             self._cap_method = None  # nothing worked — re-probe next time
             if display_id is not None:
                 # the display may have been re-plugged under a new physical id
-                getattr(self, "_screencap_ids", {}).pop(int(display_id), None)
+                self._screencap_ids.pop(int(display_id), None)
             errtxt = ""
             for i in (0, 1):
                 if i in last and last[i][0].stderr:
@@ -4111,7 +4180,7 @@ class ADBHandler:
         logical = int(str(display_id).strip())
         if logical == 0:
             return [None]
-        cache = self.__dict__.setdefault("_screencap_ids", {})
+        cache = self._screencap_ids
         if logical not in cache:
             physical = None
             try:
@@ -4202,7 +4271,7 @@ class ADBHandler:
             script = self.screencap_stream_script(capture_id, interval=1.0 / fps, fmt=fmt)
             args = ["exec-out", script]
             self._emit(logging.DEBUG, f"$ adb exec-out '{script}'  (screencap stream)")
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 self._base(target=True) + args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -4210,8 +4279,72 @@ class ADBHandler:
                 bufsize=0,
                 creationflags=NO_WINDOW,
             )
+            self._drain_stderr(proc)
+            return proc
 
         return self._guard("open_screencap_stream", _do, safe=safe)
+
+    # A long-lived `adb exec-out` writes to stderr as it goes (device offline,
+    # reconnects, daemon notes).  Nothing read that pipe until the stdout loop
+    # ended, so once ~64 KB filled the OS pipe buffer adb blocked on the write,
+    # stopped producing frames, and the live view froze for good with no error.
+    # Drain it in the background instead and keep a bounded copy for the caller.
+    _STDERR_KEEP_BYTES = 64 * 1024
+
+    @classmethod
+    def _drain_stderr(cls, proc):
+        """Consume *proc*'s stderr in a daemon thread so it can never fill.
+
+        The text collected so far is always available from
+        :meth:`collected_stderr`, whether or not the process has exited."""
+        pipe = getattr(proc, "stderr", None)
+        if pipe is None:
+            return None
+        proc._turboadb_stderr = bytearray()
+        keep = cls._STDERR_KEEP_BYTES
+
+        def _pump():
+            try:
+                for chunk in iter(lambda: pipe.read(4096), b""):
+                    buf = proc._turboadb_stderr
+                    if len(buf) < keep:
+                        buf.extend(chunk[: keep - len(buf)])
+            except (OSError, ValueError):
+                pass  # the pipe was closed under us while stopping
+
+        thread = threading.Thread(
+            target=_pump, name="turboadb-stderr-drain", daemon=True
+        )
+        thread.start()
+        proc._turboadb_stderr_thread = thread
+        return thread
+
+    @staticmethod
+    def collected_stderr(proc, wait: float = 1.0) -> bytes:
+        """*proc*'s stderr text, however it was captured.
+
+        Returns the background drain's bounded copy when one is running;
+        for a process nobody drained, falls back to reading the pipe, so a
+        caller that builds its own Popen still gets adb's error text.
+
+        Once the process has ended, the drain gets up to *wait* seconds to
+        read what is left: adb's last message is usually the reason it
+        stopped, and it can still be in the pipe when the caller asks."""
+        drained = getattr(proc, "_turboadb_stderr", None)
+        if drained is not None:
+            thread = getattr(proc, "_turboadb_stderr_thread", None)
+            poll = getattr(proc, "poll", None)
+            ended = poll is None or poll() is not None
+            if thread is not None and wait and ended:
+                thread.join(wait)
+            return bytes(drained)
+        pipe = getattr(proc, "stderr", None)
+        if pipe is None:
+            return b""
+        try:
+            return pipe.read() or b""
+        except Exception:
+            return b""
 
     def screenshot(
         self,
@@ -4301,7 +4434,7 @@ class ADBHandler:
             )
             stage = "record"
             try:
-                start = time.time()
+                start = time.monotonic()
                 stopped_by_user = False
                 while proc.poll() is None:
                     if stop_event is not None and stop_event.is_set():
@@ -4326,7 +4459,7 @@ class ADBHandler:
                                 pass
                             time.sleep(0.1)
                         break
-                    if time.time() - start > ((limit or 180) + 5):
+                    if time.monotonic() - start > ((limit or 180) + 5):
                         break
                     time.sleep(0.2)
                 if stopped_by_user:

@@ -360,12 +360,14 @@ def ensure_local_ffmpeg(log=lambda m: None, should_cancel=None) -> str:
                 raise RuntimeError(
                     f"Couldn't download ffmpeg ({exc}). Install ffmpeg (so it's on PATH) "
                     f"or set its path in Settings → ffmpeg path."
-                )
+                ) from exc
             log("Extracting ffmpeg…")
             try:
                 _install_from_zip(zip_path, out)
             except Exception as exc:
-                raise RuntimeError(f"Couldn't extract ffmpeg from the download: {exc}")
+                raise RuntimeError(
+                    f"Couldn't extract ffmpeg from the download: {exc}"
+                ) from exc
         finally:
             _remove_quietly(zip_path)
     if not os.path.exists(out):
@@ -373,7 +375,9 @@ def ensure_local_ffmpeg(log=lambda m: None, should_cancel=None) -> str:
     try:
         digest = _sha256_file(out)
     except OSError as exc:
-        raise RuntimeError(f"Couldn't read the installed ffmpeg to check it: {exc}")
+        raise RuntimeError(
+            f"Couldn't read the installed ffmpeg to check it: {exc}"
+        ) from exc
     pinned = expected_sha256()
     if pinned and digest != pinned:
         _remove_quietly(out)

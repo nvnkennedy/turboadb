@@ -51,7 +51,7 @@ def test_file_browser_remote_mkdir_quotes_user_input(qapp, monkeypatch):
         monkeypatch.setattr(fb.QInputDialog, "getText",
                             staticmethod(lambda *a, **k: ("new $(x) 'q'", True)))
         monkeypatch.setattr(browser, "_run_shell_batch",
-                            lambda commands, timeout=30: captured.extend(commands))
+                            lambda commands, timeout=30, **_kw: captured.extend(commands))
         browser.remote_cwd = "/sdcard/My Files"
         browser._remote_mkdir()
         assert len(captured) == 1
@@ -1627,7 +1627,7 @@ def test_file_browser_remote_delete_goes_through_the_engine(qapp, monkeypatch):
         browser.remote_table.selectAll()  # the '..' row is never a target
         batches = []
         monkeypatch.setattr(browser, "_run_shell_batch",
-                            lambda commands, timeout=30: batches.append(commands))
+                            lambda commands, timeout=30, **_kw: batches.append(commands))
         jobs.clear()
         browser._remote_delete()
         assert batches == []  # no hand-built, unbounded `rm -rf` any more
@@ -1648,7 +1648,7 @@ def test_file_browser_new_item_names_cannot_escape_the_shown_folder(qapp, tmp_pa
         ran = []
         created = []
         monkeypatch.setattr(browser, "_run_shell_batch",
-                            lambda commands, timeout=30: ran.extend(commands))
+                            lambda commands, timeout=30, **_kw: ran.extend(commands))
         monkeypatch.setattr(browser, "_local_job",
                             lambda label, fn, error_title="": created.append(label))
         browser.remote_cwd = "/sdcard"

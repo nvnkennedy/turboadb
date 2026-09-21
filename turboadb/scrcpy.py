@@ -4,11 +4,13 @@ wrapping the scrcpy subprocess."""
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import socket
 import subprocess
 import threading
+import time
 from typing import Optional
 
 from .config import ScrcpyOptions, parse_host_port
@@ -26,6 +28,39 @@ TUNNEL_PORT_RANGE = f"{TUNNEL_PORT}:{TUNNEL_PORT_LAST}"
 TUNNEL_PORT_FIREWALL_RANGE = f"{TUNNEL_PORT}-{TUNNEL_PORT_LAST}"
 
 
+# resolve_host() and is_local_host() each do blocking name lookups —
+# gethostbyname, getaddrinfo(gethostname()) and getfqdn(), the last of which
+# does a reverse lookup and can stall for seconds on a misconfigured network.
+# mirror() calls them on the UI thread, so the answers are memoised briefly.
+_HOST_TTL_S = 30.0
+_HOST_CACHE_MAX = 64
+
+
+def _ttl_memo(seconds):
+    """Memoise a one-argument host lookup for *seconds*."""
+
+    def decorate(fn):
+        store = {}
+
+        @functools.wraps(fn)
+        def wrapper(host):
+            now = time.monotonic()
+            hit = store.get(host)
+            if hit is not None and hit[0] > now:
+                return hit[1]
+            value = fn(host)
+            if len(store) >= _HOST_CACHE_MAX:
+                store.clear()
+            store[host] = (now + seconds, value)
+            return value
+
+        wrapper.cache_clear = store.clear
+        return wrapper
+
+    return decorate
+
+
+@_ttl_memo(_HOST_TTL_S)
 def resolve_host(host: Optional[str]) -> Optional[str]:
     """Resolve a hostname to an IPv4 address. scrcpy's tunnel needs an actual IP
     (it won't resolve a name), so a remote adb server given by hostname must be
@@ -55,6 +90,7 @@ def resolve_host(host: Optional[str]) -> Optional[str]:
         return host  # let adb try; we did our best
 
 
+@_ttl_memo(_HOST_TTL_S)
 def is_local_host(host: Optional[str]) -> bool:
     """True if *host* refers to THIS machine (localhost, 127.0.0.1, or one of this
     machine's own IPs/hostname). When the "remote" adb server is actually local —
@@ -64,7 +100,9 @@ def is_local_host(host: Optional[str]) -> bool:
     if not host:
         return True
     h = resolve_host(host)  # strip :port, resolve name → IP
-    if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+    # resolve_host() has already turned a name into an address, so the
+    # literal "localhost" can never reach this test
+    if h in ("127.0.0.1", "::1", "0.0.0.0"):
         return True
     try:
         local = set()

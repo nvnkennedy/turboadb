@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMenu, QToolButton,
     QMessageBox, QSplitter, QStackedWidget, QDialog,
-    QDialogButtonBox, QComboBox, QFormLayout, QFrame, QSizePolicy
+    QDialogButtonBox, QComboBox, QFormLayout, QFrame, QSizePolicy, QTabBar
 )
 
 from ..config import ADBConfig
@@ -56,6 +56,15 @@ _SPLIT_VIEW_META = {
     "files": ("📁", "Files"),
     "logcat": ("📜", "Logcat"),
 }
+
+
+def _files_tab_number(key: str) -> int:
+    """``"files-3"`` -> 3: extra Files tabs sort by their number."""
+    try:
+        return int(str(key).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
 
 # Section tab label -> (icon name, colour tone). Each section keeps one colour
 # everywhere it appears.
@@ -174,7 +183,7 @@ def _boxed_banner(lines) -> str:
 
 def _render_box_banner(title: str, lines: list[str], min_width: int = 74) -> str:
     """Render a clean, fully enclosed ASCII box banner with ANSI styling."""
-    all_content = [title] + [f"  {l}" for l in lines]
+    all_content = [title] + [f"  {line}" for line in lines]
     max_c = max(_str_width(x) for x in all_content)
     width = max(min_width, max_c + 4)
     inner_w = width - 2
@@ -186,16 +195,16 @@ def _render_box_banner(title: str, lines: list[str], min_width: int = 74) -> str
     def center(s):
         sw = _str_width(s)
         pad = max(0, inner_w - sw)
-        l = pad // 2
-        r = pad - l
-        return "\x1b[90m│\x1b[0m" + (" " * l) + s + (" " * r) + "\x1b[90m│\x1b[0m"
+        left = pad // 2
+        right = pad - left
+        return "\x1b[90m│\x1b[0m" + (" " * left) + s + (" " * right) + "\x1b[90m│\x1b[0m"
 
     def left_row(s, indent=2):
         sw = _str_width(s)
         rem = max(0, inner_w - indent - sw)
         return "\x1b[90m│\x1b[0m" + (" " * indent) + s + (" " * rem) + "\x1b[90m│\x1b[0m"
 
-    body = [center(title), blank] + [left_row(l, indent=2) for l in lines]
+    body = [center(title), blank] + [left_row(line, indent=2) for line in lines]
     return "\n" + "\n".join([top] + body + [bot]) + "\n"
 
 
@@ -795,14 +804,7 @@ class _DeviceProbe:
         }
         if "displays" in self.sections:  # the feature list / wm size section is complete
             kind = ADBHandler.classify_device("\n".join(self.sections["kind"]))
-            info.update(
-                kind=kind["kind"],
-                kind_label=kind["label"],
-                kind_reason=kind["reason"],
-                telephony=kind["telephony"],
-                display_size=kind["display_size"],
-            )
-            info["automotive"] = bool(info["automotive"] or kind["automotive"])
+            ADBHandler.merge_kind(info, kind)
         return info
 
     def displays(self):
@@ -2750,6 +2752,10 @@ class DeviceTab(QWidget):
     connected = pyqtSignal()
     # progress of make_files_writable, from its worker thread
     access_step = pyqtSignal(str)
+    # Another terminal tab for this device, please (More -> New terminal
+    # session, or right-click the Terminal tab). MainWindow opens the same
+    # extra terminal session that opening the device a second time offers.
+    terminal_session_requested = pyqtSignal()
 
     # Built on first show (see _LazyPage); Terminal and Device Control are not.
     logcat = _lazy_page("logcat")
@@ -2783,6 +2789,9 @@ class DeviceTab(QWidget):
         self._session_closed = False
         self._announced_connected = False
         self._subtab_meta = {}
+        # More Files tabs on this connection: "files-2" -> FileBrowser. The
+        # first Files tab stays the lazy page in _lazy_pages["files"].
+        self._extra_files = {}
         self._split_keys = ()
         self._split_panes = {}
         self._split_root = None
@@ -2869,6 +2878,21 @@ class DeviceTab(QWidget):
         split_menu.addAction("Evenly resize active panes", self._even_split_sizes)
         split_menu.addSeparator()
         split_menu.addAction("Return to tabs", self._leave_split)
+        new_files = more_menu.addAction(
+            icons.icon("plus", "blue"), "New Files tab", self._new_files_tab_here
+        )
+        new_files.setToolTip(
+            "Open another Files tab on this device - Ctrl+Shift+T inside Files does "
+            "the same, starting in that tab's folders"
+        )
+        new_terminal = more_menu.addAction(
+            icons.icon("terminal", "teal"), "New terminal session",
+            self.request_terminal_session,
+        )
+        new_terminal.setToolTip(
+            "Open another terminal tab for this device, with its own Android shell, "
+            "PowerShell and Command Prompt"
+        )
 
         self.btn_restore_split = header_button(
             "Return to tabs", "Leave split view and return to the normal tabs",
@@ -2954,6 +2978,11 @@ class DeviceTab(QWidget):
         if tb is not None:
             tb.setExpanding(False)
             tb.setDrawBase(False)
+            # Files tabs: right-click for New / Close; a middle-click closes an
+            # extra one (see eventFilter)
+            tb.setContextMenuPolicy(Qt.CustomContextMenu)
+            tb.customContextMenuRequested.connect(self._tab_context_menu)
+            tb.installEventFilter(self)
         self.inner.setCornerWidget(actions, Qt.TopRightCorner)
         self.inner.currentChanged.connect(self._on_subtab_changed)
         self._content_stack = QStackedWidget()
@@ -3276,9 +3305,7 @@ class DeviceTab(QWidget):
                 shell.resume_adb_shells()
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
-        holder = self._lazy_pages.get("files")
-        page = holder.page if holder is not None else None
-        if page is not None:
+        for page in self._files_pages():
             page.refresh_remote()
 
     def _adbd_action(self, verb: str, fn) -> None:
@@ -3570,13 +3597,193 @@ class DeviceTab(QWidget):
 
     def _build_files(self):
         page = FileBrowser(self.handler, start="/sdcard", adb_gate=self._adb_gate)
-        page.log.connect(self.log)
-        page.write_access_needed.connect(lambda request: self.make_files_writable(**request))
+        self._wire_files_page(page)
         return page
+
+    def _wire_files_page(self, page):
+        """Connect a Files page to this tab - the first one and every extra one
+        get exactly the same wiring."""
+        page.log.connect(self.log)
+        page.trace.connect(self.trace)  # per-file batch lines: log panel only
+        page.write_access_needed.connect(lambda request: self.make_files_writable(**request))
+        page.new_tab_requested.connect(self.open_files_tab)
+
+    # ---- more Files tabs on this connection ------------------------------
+    # The first Files tab plus up to seven more: each is a full browser with
+    # its own listings and transfer queue, so there is a sensible ceiling.
+    MAX_FILES_TABS = 8
+
+    def _files_pages(self):
+        """Every built Files page: the first one (if it was ever shown) and
+        each extra one."""
+        pages = []
+        first = self._built_page("files")
+        if first is not None:
+            pages.append(first)
+        pages.extend(self._extra_files.values())
+        return pages
+
+    def _extra_files_key(self, widget):
+        """The key of an extra Files tab (``"files-2"``), or None."""
+        return next(
+            (key for key, page in getattr(self, "_extra_files", {}).items() if page is widget),
+            None,
+        )
+
+    def _files_page_for(self, widget):
+        """The FileBrowser behind a tab, if it is a Files tab (None for the
+        first Files tab while it was never shown, and for every other tab)."""
+        if widget is None:
+            return None
+        if self._extra_files_key(widget) is not None:
+            return widget
+        holder = self._lazy_pages.get("files")
+        if widget is holder:
+            return holder.page
+        return None
+
+    def _files_insert_index(self) -> int:
+        """Just after the last Files tab, so the Files tabs stay together."""
+        widgets = [self._lazy_pages.get("files"), *self._extra_files.values()]
+        indices = [self.inner.indexOf(widget) for widget in widgets if widget is not None]
+        indices = [index for index in indices if index >= 0]
+        return max(indices) + 1 if indices else self.inner.count()
+
+    def open_files_tab(self, remote_path: str = "", local_path: str = ""):
+        """Open another Files tab on this connection, starting in *remote_path*
+        on the device and *local_path* on the PC (the folders of the tab it was
+        opened from). Each tab browses, selects and transfers on its own; they
+        share this tab's device session. Returns the page, or None."""
+        if self._session_closed or not self.handler or self._terminal_only:
+            return None
+        if 1 + len(self._extra_files) >= self.MAX_FILES_TABS:
+            QMessageBox.information(
+                self, "Files",
+                f"This device already has {self.MAX_FILES_TABS} Files tabs open. "
+                "Close one to open another.",
+            )
+            return None
+        # The new tab must be where the user can see it: leave a split first,
+        # before it is registered (leaving rebuilds the tab strip).
+        if self._split_keys:
+            self._leave_split()
+        number = 2
+        while f"files-{number}" in self._extra_files:
+            number += 1  # the lowest free number: closing "Files 2" frees it
+        key, label = f"files-{number}", f"Files {number}"
+        page = FileBrowser(
+            self.handler, start=remote_path or "/sdcard",
+            local_start=local_path or None, adb_gate=self._adb_gate,
+        )
+        self._wire_files_page(page)
+        self._extra_files[key] = page
+        tabs = getattr(self, "_subtabs", None)
+        if tabs is None:
+            tabs = self._subtabs = {}
+        tabs[key] = page
+        self.inner.insertTab(self._files_insert_index(), page, label)
+        self._add_subtab(page, "📁", label)
+        self.inner.setCurrentWidget(page)
+        return page
+
+    def close_files_tab(self, page) -> bool:
+        """Close an extra Files tab (the first Files tab stays). While it is
+        still copying, ask first. Returns True when it closed."""
+        key = self._extra_files_key(page)
+        if key is None:
+            return False
+        label = self._subtab_meta.get(page, ("", key))[1]
+        active = sum(1 for item in page.transfers if item.active)
+        if active:
+            answer = QMessageBox.question(
+                self, f"Close {label}",
+                f"{label} is still copying ({active} transfer"
+                f"{'' if active == 1 else 's'} running or queued).\n\n"
+                "Close it and cancel them?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+        if key in self._split_keys:
+            self._leave_split()  # puts the page back in the strip, then it goes
+        del self._extra_files[key]
+        getattr(self, "_subtabs", {}).pop(key, None)
+        index = self.inner.indexOf(page)
+        if index >= 0:
+            self.inner.removeTab(index)
+        self._subtab_meta.pop(page, None)
+        page.close_panel()
+        page.setParent(None)
+        page.deleteLater()
+        return True
+
+    def _new_files_tab_here(self):
+        """More -> New Files tab: start in the folders of the Files tab on
+        screen, else of the first Files tab, else /sdcard and the home folder."""
+        source = self._files_page_for(self.inner.currentWidget()) or self._built_page("files")
+        self.open_files_tab(
+            getattr(source, "remote_cwd", "") or "", getattr(source, "local_cwd", "") or ""
+        )
+
+    def _attach_close_button(self, index, page):
+        """A small x on an extra Files tab; the first Files tab has none."""
+        bar = self.inner.tabBar()
+        button = QToolButton(bar)
+        button.setObjectName("tabCloseButton")
+        button.setAutoRaise(True)
+        button.setIcon(icons.icon("x", "dim"))
+        button.setIconSize(QSize(12, 12))
+        button.setFixedSize(18, 18)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setCursor(Qt.ArrowCursor)
+        button.setToolTip("Close this Files tab (a middle-click on the tab closes it too)")
+        button.clicked.connect(lambda _=False, page=page: self.close_files_tab(page))
+        bar.setTabButton(index, QTabBar.RightSide, button)
+
+    def request_terminal_session(self) -> None:
+        """Ask the main window for another terminal tab for this device."""
+        if not self._session_closed:
+            self.terminal_session_requested.emit()
+
+    def _tab_context_menu(self, pos):
+        """Right-click on a tab: the Terminal tab offers another terminal
+        session; a Files tab offers New Files tab here, and Close for an extra
+        one. Other tabs have no menu."""
+        bar = self.inner.tabBar()
+        index = bar.tabAt(pos)
+        widget = self.inner.widget(index) if index >= 0 else None
+        if widget is None or self._session_closed:
+            return
+        if widget is getattr(self, "shell", None):
+            # also in a terminal-only tab, whose header has no More menu
+            menu = QMenu(self)
+            menu.addAction(icons.icon("terminal", "teal"), "New terminal session",
+                           self.request_terminal_session)
+            menu.exec_(bar.mapToGlobal(pos))
+            menu.deleteLater()
+            return
+        extra = self._extra_files_key(widget) is not None
+        first = widget is self._lazy_pages.get("files")
+        if not (extra or first) or not self.handler or self._terminal_only:
+            return
+        source = self._files_page_for(widget)
+        menu = QMenu(self)
+        menu.addAction(
+            icons.icon("plus", "blue"), "New Files tab here",
+            lambda: self.open_files_tab(
+                getattr(source, "remote_cwd", "") or "", getattr(source, "local_cwd", "") or ""
+            ),
+        )
+        if extra:
+            menu.addAction(icons.icon("x", "dim"), "Close this Files tab",
+                           lambda: self.close_files_tab(widget))
+        menu.exec_(bar.mapToGlobal(pos))
+        menu.deleteLater()
 
     def _build_apps(self):
         page = AppsPanel(self.handler, automotive=self._automotive, adb_gate=self._adb_gate)
         page.log.connect(self.log)
+        page.trace.connect(self.trace)  # listing counts: log panel only
         return page
 
     def _build_phone(self):
@@ -3743,18 +3950,39 @@ class DeviceTab(QWidget):
             idx = self.inner.addTab(widget, label)
         else:
             self.inner.setTabText(idx, label)
-        glyph, tone = _SECTION_ICONS.get(label, ("apps", None))
+        extra = self._extra_files_key(widget) is not None
+        glyph, tone = _SECTION_ICONS.get("Files" if extra else label, ("apps", None))
         self.inner.setTabIcon(idx, icons.icon(glyph, tone))
+        if extra:
+            self._attach_close_button(idx, widget)
         return idx
 
+    def _split_meta(self, key):
+        """``(glyph, label)`` of a split-view page, extra Files tabs included;
+        None for a key that can't go into a split."""
+        if key in _SPLIT_VIEW_META:
+            return _SPLIT_VIEW_META[key]
+        page = getattr(self, "_extra_files", {}).get(key)
+        if page is not None:
+            return self._subtab_meta.get(page, ("📁", key))
+        return None
+
     def _split_choices(self):
-        """Return persistent workspace pages available for the current device."""
+        """Return persistent workspace pages available for the current device.
+
+        Extra Files tabs come last, so two Files tabs can sit side by side
+        (the defaults of the split dialog are unchanged)."""
         tabs = getattr(self, "_subtabs", {})
-        return [
+        choices = [
             (key, icon, label)
             for key, (icon, label) in _SPLIT_VIEW_META.items()
             if tabs.get(key) is not None
         ]
+        for key in sorted(getattr(self, "_extra_files", {}), key=_files_tab_number):
+            if tabs.get(key) is not None:
+                icon, label = self._split_meta(key)
+                choices.append((key, icon, label))
+        return choices
 
     def _configure_split(self, count, orientation=None):
         """Choose two or four distinct existing pages for a split workspace."""
@@ -3811,7 +4039,7 @@ class DeviceTab(QWidget):
         self._activate_split(keys, orientation)
 
     def _make_split_pane(self, key, widget):
-        icon, label = _SPLIT_VIEW_META[key]
+        icon, label = self._split_meta(key)
         pane = QFrame()
         pane.setObjectName("splitPane")
         # A File browser has a large preferred size; split mode must still
@@ -3858,7 +4086,7 @@ class DeviceTab(QWidget):
         if not self.handler:
             return
         tabs = getattr(self, "_subtabs", {})
-        if any(key not in _SPLIT_VIEW_META or tabs.get(key) is None for key in keys):
+        if any(self._split_meta(key) is None or tabs.get(key) is None for key in keys):
             return
         if len(keys) not in (2, 4) or len(set(keys)) != len(keys):
             return
@@ -3936,7 +4164,9 @@ class DeviceTab(QWidget):
         """Restore the normal, predictable page order after a split is closed."""
         tabs = getattr(self, "_subtabs", {})
         desired = []
-        for key in ("shell", "logcat", "files", "controls", "apps", "phone", "webcam", "ivi"):
+        extra = sorted(getattr(self, "_extra_files", {}), key=_files_tab_number)
+        for key in ("shell", "logcat", "files", *extra, "controls", "apps", "phone",
+                    "webcam", "ivi"):
             widget = tabs.get(key)
             if widget is not None and widget not in desired:
                 desired.append(widget)
@@ -4090,7 +4320,7 @@ class DeviceTab(QWidget):
             if self._split_keys:
                 canonical = next(
                     (
-                        key for key in _SPLIT_VIEW_META
+                        key for key in (*_SPLIT_VIEW_META, *self._extra_files)
                         if getattr(self, "_subtabs", {}).get(key) is w
                     ),
                     None,
@@ -4130,7 +4360,16 @@ class DeviceTab(QWidget):
             mirror.yield_keyboard()
 
     def eventFilter(self, watched, event):
-        """Let any terminal take focus away from an embedded screen immediately."""
+        """Let any terminal take focus away from an embedded screen immediately;
+        a middle-click on an extra Files tab closes it."""
+        inner = getattr(self, "inner", None)
+        if (inner is not None and watched is inner.tabBar()
+                and event.type() == QEvent.MouseButtonRelease
+                and event.button() == Qt.MiddleButton):
+            widget = inner.widget(watched.tabAt(event.pos()))
+            if widget is not None and self._extra_files_key(widget) is not None:
+                self.close_files_tab(widget)
+                return True
         if event.type() == QEvent.FocusIn:
             shell = getattr(self, "shell", None)
             if shell is not None and watched in (
@@ -4460,6 +4699,13 @@ class DeviceTab(QWidget):
                     p.close_panel()
                 except Exception:
                     pass
+        # The extra Files tabs are not in the list above: close them as well,
+        # or their workers and transfers would outlive the session.
+        for page in list(getattr(self, "_extra_files", {}).values()):
+            try:
+                page.close_panel()
+            except Exception:
+                pass
         mirror = getattr(self, "mirror_tab", None)
         if mirror is not None and hasattr(mirror, "shutdown_threads"):
             try:

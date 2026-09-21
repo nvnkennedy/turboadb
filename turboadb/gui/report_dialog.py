@@ -10,7 +10,6 @@ import time
 from PyQt5.QtCore import QRectF, Qt
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QTextDocument
 from PyQt5.QtWidgets import (
-    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -22,7 +21,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .fileutil import ask_save_path, save_output, write_file_async, write_text_file
+from .fileutil import (ask_save_path, copy_to_clipboard, save_output,
+                       write_file_async, write_text_file)
 from .icons import icon
 from . import settings as settings_mod
 
@@ -204,7 +204,7 @@ def show_report_dialog(parent, title: str, text: str, stem: str, description: st
     copy = QPushButton("Copy summary")
     copy.setProperty("role", "ghost")
     copy.setIcon(icon("copy", "blue"))
-    copy.clicked.connect(lambda: QApplication.clipboard().setText(summary))
+    copy.clicked.connect(lambda: copy_to_clipboard(copy, summary, "the summary"))
     actions.addWidget(copy)
 
     def stamped(extension):

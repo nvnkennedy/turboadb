@@ -5,7 +5,6 @@ A fake handler stands in for ADBHandler, so no adb, device or network is used.
 
 from __future__ import annotations
 
-import os
 import sys
 import threading
 import time

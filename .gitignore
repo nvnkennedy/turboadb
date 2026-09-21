@@ -17,6 +17,7 @@ venv/
 turboadb/bin/*.exe
 
 # Editor / OS noise
+*.lnk
 .idea/
 .vscode/
 .DS_Store

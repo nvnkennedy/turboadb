@@ -108,6 +108,22 @@ def fake_adb(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_host_lookups():
+    """Clear the scrcpy host-lookup memo between tests.
+
+    resolve_host()/is_local_host() memoise their blocking name lookups for 30 s,
+    so without this a value resolved by one test would leak into the next one's
+    monkeypatched socket and make the outcome depend on test order."""
+    from turboadb import scrcpy
+
+    scrcpy.resolve_host.cache_clear()
+    scrcpy.is_local_host.cache_clear()
+    yield
+    scrcpy.resolve_host.cache_clear()
+    scrcpy.is_local_host.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_device_connect(monkeypatch):
     """GUI tests build DeviceTabs for made-up serials such as "123". Their
     automatic connect ran the real ``adb -s 123 wait-for-device``, which waits

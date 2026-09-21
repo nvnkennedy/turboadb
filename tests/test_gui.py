@@ -10,7 +10,6 @@ if sys.path[0] != repo_root:
 import pytest
 
 pytest.importorskip("PyQt5")  # CI's [test] extra doesn't install the GUI
-from PyQt5.QtWidgets import QApplication
 
 
 def _contrast(fg, bg):

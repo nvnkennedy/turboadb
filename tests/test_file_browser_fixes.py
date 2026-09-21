@@ -204,7 +204,7 @@ def test_duplicate_names_refuse_destructive_actions(app, monkeypatch):
     browser = fb.FileBrowser(None)
     try:
         ran = []
-        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30: ran.extend(cmds))
+        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30, **_kw: ran.extend(cmds))
         row = ("dup", 0, "0 B", "File", "", "-rw-rw-rw-", "shell:shell", False)
         browser._populate(browser.remote_table, [row, row], parent_row=True)
         assert browser.remote_table.unsafe_names == {"dup"}
@@ -258,7 +258,7 @@ def test_remote_paste_merges_existing_folder_after_asking(app, monkeypatch):
     browser = fb.FileBrowser(None)
     try:
         ran = []
-        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30: ran.extend(cmds))
+        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30, **_kw: ran.extend(cmds))
         browser.remote_cwd = "/b"
         browser._clipboard, browser._clipboard_src = ["/a/pd", "/a/f.txt"], "remote"
         browser._remote_paste()
@@ -376,7 +376,7 @@ def test_rename_asks_before_replacing_and_refuses_folders(app, monkeypatch):
     browser = fb.FileBrowser(None)
     try:
         ran = []
-        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30: ran.extend(cmds))
+        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30, **_kw: ran.extend(cmds))
         boxes = _quiet_boxes(monkeypatch, answer=fb.QMessageBox.No)
         browser._on_rename_checked("a", "b", "/s/a", "/s/b", _Res("file\n"))
         assert ran == [] and boxes[-1][0] == "question"
@@ -540,7 +540,7 @@ def test_failed_remote_listing_restores_previous_folder(app, monkeypatch):
     browser = fb.FileBrowser(Handler())
     try:
         ran = []
-        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30: ran.extend(cmds))
+        monkeypatch.setattr(browser, "_run_shell_batch", lambda cmds, timeout=30, **_kw: ran.extend(cmds))
         browser._jump_remote("/sdcard")
         assert browser._remote_shown == "/sdcard" and _rows(browser.remote_table) == ["..", "a.txt"]
         browser.remote_path.setText("/sdcard/typo")

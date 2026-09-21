@@ -19,7 +19,6 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialogButtonBox,
     QGroupBox,
-    QLabel,
     QHBoxLayout,
     QPushButton,
     QMessageBox,

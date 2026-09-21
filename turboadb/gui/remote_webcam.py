@@ -99,6 +99,21 @@ def _clean_cam(camera: str) -> str:
     return out
 
 
+def _clean_exe(path: str) -> str:
+    """An executable path safe to embed in the generated PowerShell.
+
+    The command goes inside a single-quoted here-string (``@'`` ... ``'@``),
+    which is literal — except that a line consisting of ``'@`` ends it, after
+    which the rest would be executed as script. This path is read back from the
+    remote host's own output, so strip the characters that could break out.
+    Elsewhere the same value is passed through _ps_squote(); this is the one
+    place it is interpolated raw."""
+    out = path or ""
+    for ch in (chr(10), chr(13), chr(34), chr(96)):
+        out = out.replace(ch, "")
+    return out
+
+
 def _run_ps(host, login, password, script, winrm_port=5985):
     r = _session(host, login, password, winrm_port=winrm_port).run_ps(script)
     out = (r.std_out or b"").decode("utf-8", "replace")
@@ -316,7 +331,7 @@ def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
             f"• Remote download failed: {dl_exc}\n\n"
             "Easiest fix: paste ffmpeg.exe into C:\\Windows\\Temp\\turboadb-ffmpeg\\ "
             "on the remote over RDP, then Scan again."
-        )
+        ) from dl_exc
 
 
 def list_remote_cameras(host, login, password, *, winrm_port=5985, log=None):
@@ -371,7 +386,7 @@ def local_address_for(host, port=5985):
     try:
         infos = socket.getaddrinfo(host, int(port), 0, socket.SOCK_DGRAM)
     except OSError as exc:
-        raise RuntimeError(f"couldn't resolve {host}: {exc}")
+        raise RuntimeError(f"couldn't resolve {host}: {exc}") from exc
     for family, _type, _proto, _canon, addr in infos:
         s = socket.socket(family, socket.SOCK_DGRAM)
         try:
@@ -437,7 +452,7 @@ def start_remote_stream(
     if not client_ip:
         client_ip = local_address_for(host, winrm_port)
     cmd_line = (
-        f'"{ffmpeg}" -hide_banner -loglevel error -thread_queue_size 512 '
+        f'"{_clean_exe(ffmpeg)}" -hide_banner -loglevel error -thread_queue_size 512 '
         f'-f dshow -rtbufsize 64M -framerate {int(fps)} '
         f'-i video="{cam}" -an -vf scale={int(width)}:{int(height)} '
         f"-r {int(fps)} -f mjpeg -q:v 6 "

@@ -279,7 +279,11 @@ def _toast_window(host, name: str):
     return toast
 
 
-def _copy_text(text: str) -> None:
+def _copy_text(text: str, parent=None) -> None:
+    """Copy *text*; with a *parent* widget it also confirms with a toast."""
+    if parent is not None:
+        copy_to_clipboard(parent, text)
+        return
     from PyQt5.QtWidgets import QApplication
 
     QApplication.clipboard().setText(text or "")
@@ -421,7 +425,9 @@ def _clean_copy_menu(label, full_text) -> None:
         menu = QMenu(label)
         selected = label.selectedText()
         copy = menu.addAction("Copy")
-        copy.triggered.connect(lambda: _copy_text(_strip_breaks(selected or full_text())))
+        copy.triggered.connect(
+            lambda: _copy_text(_strip_breaks(selected or full_text()), label)
+        )
         select_all = menu.addAction("Select All")
         select_all.triggered.connect(lambda: label.setSelection(0, len(
             _plain_text(label.text()) if label.textFormat() == Qt.RichText else label.text()
@@ -754,6 +760,32 @@ def activity_toast(parent, message: str, *, level: str = "info", action_text: st
     return toast
 
 
+def copy_to_clipboard(parent, text: str, what: str = "") -> None:
+    """Put *text* on the clipboard and say so.
+
+    Every clipboard write in the GUI was silent, so a copy that worked looked
+    exactly like one that did nothing — the user had to paste somewhere else
+    to find out. *what* names the thing copied ("the phone number"); without
+    it the toast counts the lines.
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    text = text or ""
+    QApplication.clipboard().setText(text)
+    host = parent.window() if parent is not None else None
+    if host is None:
+        return
+    if not text:
+        activity_toast(host, "Nothing to copy", level="warning")
+        return
+    if what:
+        message = f"Copied {what}"
+    else:
+        lines = text.count(chr(10)) + 1
+        message = "Copied 1 line" if lines == 1 else f"Copied {lines} lines"
+    activity_toast(host, message, level="ok")
+
+
 def _fit_activity(toast, host, message: str, keep=None) -> None:
     """Give the activity toast's text its one-line width (wrapping only past
     the widest allowed width), then size the whole toast around it. With
@@ -855,7 +887,7 @@ def error_toast(parent, message: str, *, title: str = "Error", action_text: str 
         # terminal and stop its command. Copy the message with a button.
         copy = QPushButton("Copy")
         copy.setToolTip("Copy the error message")
-        copy.clicked.connect(lambda: _copy_text(toast.message))
+        copy.clicked.connect(lambda: _copy_text(toast.message, toast))
         head.addWidget(copy)
         close = QPushButton("Dismiss")
         close.clicked.connect(toast.hide)

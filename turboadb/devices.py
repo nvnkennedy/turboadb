@@ -88,7 +88,7 @@ def _parse_line(line: str) -> Optional[Device]:
     )
 
 
-def _list_devices_socket(host: str = "127.0.0.1", port: int = 5037, timeout: float = 1.0) -> list[Device] | None:
+def _list_devices_socket(host: str = "127.0.0.1", port: int = DEFAULT_ADB_SERVER_PORT, timeout: float = 1.0) -> list[Device] | None:
     """Query connected devices directly via ADB server socket protocol.
 
     Fast path (~10-15ms) that avoids spawning adb.exe subprocesses repeatedly on Windows.
@@ -134,7 +134,7 @@ def list_devices(
     adb_path: str | None = None,
     timeout: float = 5.0,
     server_host: str | None = None,
-    server_port: int = 5037,
+    server_port: int = DEFAULT_ADB_SERVER_PORT,
     strict: bool = False,
 ) -> list:
     """Return a list of :class:`Device` for every attached/known target.
@@ -231,7 +231,7 @@ def list_devices(
     return devices
 
 
-def remote_devices(server_host: str, server_port: int = 5037, adb_path: str | None = None) -> list:
+def remote_devices(server_host: str, server_port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> list:
     """Convenience: list devices attached to a remote machine's adb server."""
     return list_devices(adb_path, server_host=server_host, server_port=server_port)
 
@@ -320,7 +320,7 @@ def _lan_reachable(port: int, timeout: float = 2.0) -> Optional[bool]:
     return False
 
 
-def server_is_shared(port: int = 5037, adb_path: str | None = None) -> bool:
+def server_is_shared(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> bool:
     """True if an adb server is up AND reachable on a non-loopback interface —
     i.e. another machine could actually drive this PC's devices.
 
@@ -403,7 +403,7 @@ def open_firewall(ports=(5037, TUNNEL_PORT_FIREWALL_RANGE)) -> str:
 
 
 def start_shared_server(
-    port: int = 5037, adb_path: str | None = None, *, restart: bool = True
+    port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None, *, restart: bool = True
 ) -> str:
     """Start an adb server that listens on **all** network interfaces so other
     machines can drive this PC's devices via ``adb -H thispc -P {port}``.
@@ -486,7 +486,7 @@ def start_shared_server(
     return f"shared adb server is listening on 0.0.0.0:{port} ({count} device(s) attached here)"
 
 
-def stop_shared_server(port: int = 5037, adb_path: str | None = None) -> str:
+def stop_shared_server(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> str:
     """Stop the network-shared adb server and return to a normal local-only one:
     kill the ``-a`` (all-interfaces) server, then start a plain server that binds
     to localhost again, so this PC keeps working but no longer shares its devices.
@@ -585,6 +585,26 @@ def _pinned_adb(adb_path: str | None = None) -> Optional[str]:
         return None
 
 
+def _quotable(path: str, what: str) -> str:
+    """*path*, or a clear error when it cannot be safely double-quoted.
+
+    The result goes into a cmd.exe ``.bat`` and into ``schtasks /tr``, which
+    runs as SYSTEM. A quote would end the quoted argument early and let the
+    rest be read as further arguments, and a line break would start a new
+    command; neither can appear in a Windows path. ``%`` can (it is legal in
+    a folder name), but cmd.exe expands it even inside quotes, so the
+    launcher could not run that path as written. ``&``, ``^`` and the like
+    are literal inside the quotes and are allowed."""
+    bad = [ch for ch in (chr(34), chr(10), chr(13), "%") if ch in path]
+    if bad:
+        raise RuntimeError(
+            f"refusing to build a startup command: the {what} path contains "
+            f"{' '.join(repr(c) for c in bad)}, which cmd.exe and the task "
+            f"scheduler would read as syntax -- {path!r}"
+        )
+    return path
+
+
 def _serve_launcher(port: int, adb_path: str | None = None, *, short_paths: bool = False) -> str:
     """The quoted command that runs ``turboadb serve`` headlessly.
 
@@ -606,13 +626,13 @@ def _serve_launcher(port: int, adb_path: str | None = None, *, short_paths: bool
     if short_paths:
         python = _short_path(python)
         adb_path = _short_path(adb_path) if adb_path else adb_path
-    cmd = f'"{python}" -m turboadb serve --port {port}'
+    cmd = f'"{_quotable(python, "interpreter")}" -m turboadb serve --port {validate_port(port)}'
     if adb_path:
-        cmd += f' --adb-path "{adb_path}"'
+        cmd += f' --adb-path "{_quotable(adb_path, "adb")}"'
     return cmd
 
 
-def install_startup(port: int = 5037, adb_path: str | None = None) -> str:
+def install_startup(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> str:
     """Make the shared adb server start automatically at every Windows login by
     dropping a tiny launcher in the Startup folder. Returns the file path.
     So it really never has to be done by hand again."""
@@ -658,11 +678,6 @@ def uninstall_startup() -> bool:
     return False
 
 
-def _pythonw() -> str:
-    """Best windowless Python to run the background server with."""
-    return windowless_python()
-
-
 _SERVE_TASK = "TurboADBSharedADB"
 
 
@@ -689,7 +704,7 @@ def _task_last_result(task: str) -> str:
 
 
 def install_serve_task(
-    port: int = 5037, *, run_now: bool = True, adb_path: str | None = None,
+    port: int = DEFAULT_ADB_SERVER_PORT, *, run_now: bool = True, adb_path: str | None = None,
     ready_timeout: float = 20.0,
 ) -> str:
     """Register a Scheduled Task that runs the shared adb server at SYSTEM

@@ -1266,7 +1266,7 @@ def test_terminal_font_buttons_resize_existing_ansi_text(qapp, monkeypatch):
 
 def test_file_table_subfolder_drop_targeting(qapp):
     from PyQt5.QtWidgets import QTableWidgetItem
-    from PyQt5.QtCore import Qt, QPoint
+    from PyQt5.QtCore import Qt
     from turboadb.gui.file_browser import _FileTableWidget
 
     tbl = _FileTableWidget(is_remote=True)

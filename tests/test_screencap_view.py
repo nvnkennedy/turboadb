@@ -645,3 +645,55 @@ def test_the_view_reports_frame_rate_changes_for_its_owner(qapp):
         view._worker = None
         view.close_view()
         view.close()
+
+
+# --------------------------------------------------------------------------- #
+# a chatty stderr must never stall the capture stream
+# --------------------------------------------------------------------------- #
+def test_a_chatty_stderr_never_blocks_the_frame_stream():
+    """A long-lived ``adb exec-out`` writes to stderr while it streams frames.
+
+    Nothing read that pipe until the stdout loop ended, so once the OS pipe
+    buffer (~64 KB) filled, adb blocked on the write, stopped producing frames,
+    and the live view froze for good with no error. The background drain is
+    what keeps stdout flowing."""
+    import subprocess
+    import sys
+
+    # writes far more than any pipe buffer to stderr BEFORE its first frame
+    code = (
+        "import sys\n"
+        "sys.stderr.buffer.write(b'e' * 300000)\n"
+        "sys.stderr.buffer.flush()\n"
+        "sys.stdout.buffer.write(b'FRAME')\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    ADBHandler._drain_stderr(proc)
+    got = []
+    reader = threading.Thread(target=lambda: got.append(proc.stdout.read(5)), daemon=True)
+    reader.start()
+    reader.join(timeout=30)
+    try:
+        assert not reader.is_alive(), "the frame stream blocked on a full stderr pipe"
+        assert got == [b"FRAME"]
+        proc.wait(timeout=10)
+        stderr = ADBHandler.collected_stderr(proc)
+        assert stderr.startswith(b"eee")                      # it was captured
+        assert len(stderr) <= ADBHandler._STDERR_KEEP_BYTES   # and it is bounded
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_stderr_is_still_read_for_a_process_nobody_drained():
+    """A caller that builds its own Popen keeps the old behaviour."""
+    proc = type("P", (), {"stderr": io.BytesIO(b"adb: device offline")})()
+    assert ADBHandler.collected_stderr(proc) == b"adb: device offline"
+    assert ADBHandler.collected_stderr(type("P", (), {})()) == b""

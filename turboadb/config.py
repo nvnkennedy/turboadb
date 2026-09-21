@@ -286,7 +286,11 @@ class ScrcpyOptions:
                 args += ["--audio-buffer", str(self.audio_buffer)]
             if self.audio_output_buffer is not None:
                 args += ["--audio-output-buffer", str(self.audio_output_buffer)]
-            if self.audio_dup:
+            # --audio-dup belongs to the playback source: on its own scrcpy
+            # implies --audio-source=playback, but next to another chosen
+            # source it refuses to start ("--audio-dup is specific to
+            # --audio-source=playback"), so it is left out there.
+            if self.audio_dup and self.audio_source in (None, "", "playback"):
                 args += ["--audio-dup"]
         if self.no_control:
             args += ["--no-control"]

@@ -40,6 +40,11 @@ jobs:
             throw "tag $tag does not match turboadb.__version__ $ver"
           }
           Write-Host "version $ver"
+      - name: Release notes from CHANGELOG.md
+        # The release page gets this version's changelog section, not just a
+        # list of files. Written early, so a version with no notes fails before
+        # the long build rather than after it.
+        run: python scripts/release_notes.py --output release-notes.md
       - name: Offline smoke script
         run: python tests/test_offline.py
       - name: Pytest
@@ -88,6 +93,7 @@ jobs:
       - name: Attach to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: |
             dist/TurboADB-*-win64.exe
             dist/*.whl

@@ -4,7 +4,6 @@ states, and the icon wiring of toolbars, tiles and dialogs."""
 from __future__ import annotations
 
 import json
-import os
 
 
 import pytest

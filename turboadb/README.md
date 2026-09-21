@@ -127,9 +127,12 @@ A tabbed, multi-device workspace:
     highlight, a Crashes preset, pause, clear, save, and **instant stop**.
   - **Files** — **This PC** and **Device** panes with **Push** / **Pull**, drag
     and drop, new folder / file, a built-in editor, copy / paste, rename, delete
-    (Recycle Bin locally, Shift+Delete for good) and a progress bar with Cancel.
-    Select with a drag beside the names or Ctrl+A; a refused change offers
-    **adb root**, **disable-verity** and **remount**, then retries.
+    (Recycle Bin locally, Shift+Delete for good), and a **Transfers** panel:
+    overall progress, speed and time left, plus each file's size, progress and
+    error, with Retry failed and a copyable report. **New tab** (Ctrl+Shift+T)
+    opens more Files tabs on the same device. Rows use the system's own file
+    icons. Select with a drag beside the names or Ctrl+A; a refused change
+    offers **adb root**, **disable-verity** and **remount**, then retries.
   - **Apps** — install (incl. split APKs), list, uninstall, clear, start, stop.
   - **Device Control** — the device screen (Start screen, or open it in a
     separate window) beside a control centre: Back / Home / Recents, power,
@@ -630,11 +633,12 @@ python scripts/release.py patch    # bump -> test -> exe -> build -> twine check
 `turboadb-gui` runs from the installed package when PyQt5 is available
 (`turboadb[gui]`) and otherwise starts the executable bundled in the wheel
 (`turboadb/bin/turboadb-gui.exe`). The same executable is attached to the GitHub
-Release. The release helper reads the PyPI token from `TWINE_PASSWORD` (never
-hard-coded) and uploads the wheel and the source archive (about 59 MB each,
-because both carry the exe). It also supports `--wheel-only` if a flaky network
-makes the upload hang, `--rebuild-exe` to rebuild the executable first, and
-`--no-exe` for a lean package.
+Release, whose page shows that version's section of `CHANGELOG.md`
+(`python scripts/release_notes.py` prints it). The release helper reads the PyPI
+token from `TWINE_PASSWORD` (never hard-coded) and uploads the wheel and the
+source archive (about 59 MB each, because both carry the exe). It also supports
+`--wheel-only` if a flaky network makes the upload hang, `--rebuild-exe` to
+rebuild the executable first, and `--no-exe` for a lean package.
 
 ---
 

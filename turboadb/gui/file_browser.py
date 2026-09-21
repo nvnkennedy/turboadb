@@ -19,7 +19,6 @@ import mimetypes
 import os
 import posixpath
 import re
-import shlex
 import shutil
 import stat
 import string
@@ -27,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect,
@@ -34,21 +34,26 @@ from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QPoint
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
                              QInputDialog, QMessageBox, QLabel, QProgressBar,
-                             QSplitter, QFrame, QMenu, QShortcut, QComboBox,
+                             QSplitter, QMenu, QShortcut, QComboBox,
                              QAbstractItemView, QApplication, QDialog, QPlainTextEdit,
                              QRubberBand, QStyledItemDelegate, QToolButton)
 from PyQt5.QtGui import QColor, QCursor, QKeySequence, QFont, QPainter, QTextCursor, QDrag
-from ..results import strip_ansi
 from . import theme
+from .file_icons import file_icons
 from .fileutil import _alive, write_text_file
 from .icons import icon
 from .qtutil import (cached_icon, close_jobs, disconnect_signals, page_toolbar, park_thread,
                      run_job, thread_running)
+from .transfer_log import (CANCELLED, DONE, FAILED, TransferLog, measure_local,
+                           measure_remote, transfer_name)
+from .transfer_panel import TransferPanel
 from ..remotefs import (  # device file helpers, shared with the engine and CLI
-    _chmod_cmd, _copy_into_cmd, _cp_cmd, _edit_stat_cmd, _human_size, _list_remote_dir,
-    _ls_cmd, _mkdir_cmd, _mode_cmd, _mv_cmd, _normalize_remote_path, _output_lines,
-    _parse_edit_stat, _parse_ls_line, _parse_ls_listing, _probe_remote, _rename_check_cmd,
-    _rename_cmd, _result_error, _rm_cmd, _touch_cmd,
+    # _cp_cmd/_ls_cmd/_mv_cmd/_rm_cmd/_parse_ls_listing are re-exported:
+    # the tests reach them as file_browser.<name>, so they are not dead.
+    _chmod_cmd, _copy_into_cmd, _cp_cmd, _edit_stat_cmd, _human_size, _list_remote_dir,  # noqa: F401
+    _ls_cmd, _mkdir_cmd, _mode_cmd, _mv_cmd, _normalize_remote_path, _output_lines,  # noqa: F401
+    _parse_edit_stat, _parse_ls_line, _parse_ls_listing, _probe_remote, _rename_check_cmd,  # noqa: F401
+    _rename_cmd, _result_error, _rm_cmd, _touch_cmd,  # noqa: F401
 )
 
 
@@ -1030,12 +1035,9 @@ def _safe_local_name(name: str, windows: Optional[bool] = None) -> str:
     return safe or "_"
 
 
-def _transfer_name(path) -> str:
-    """Display name of a transfer source (``folder/.`` merge sources included)."""
-    text = str(path)
-    if text.endswith(("/.", "\\.")):
-        text = text[:-2]
-    return re.split(r"[/\\]", text.rstrip("/\\"))[-1] or text
+# Display name of a transfer source (``folder/.`` merge sources included);
+# the transfer history labels its rows with the same function.
+_transfer_name = transfer_name
 
 
 def _plan_push(handler, sources, dst_dir: str):
@@ -1173,6 +1175,9 @@ class _TransferThread(QThread):
     progress = pyqtSignal(int)
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
+    # The TransferResult itself, just before done: done carries only its
+    # text, which threw away the real size and time the history needs.
+    result = pyqtSignal(object)
 
     def __init__(self, handler, direction, a, b):
         super().__init__()
@@ -1192,6 +1197,7 @@ class _TransferThread(QThread):
                 res = self.handler.pull(self.a, self.b,
                                         on_progress=self.progress.emit,
                                         cancel_event=self.cancel_event, safe=False)
+            self.result.emit(res)
             self.done.emit(str(res))
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -1199,27 +1205,43 @@ class _TransferThread(QThread):
 
 class FileBrowser(QWidget):
     log = pyqtSignal(str)
+    # Per-file progress during a BATCH: the log panel keeps every line, but
+    # the window shows one activity toast at a time, so 200 of these in a
+    # row just thrash it and leave the last file name on screen instead of
+    # a result. The batch reports itself once when the queue drains.
+    trace = pyqtSignal(str)
     # {"path": device folder, "error": text, "action": "deleting 2 items",
     # "retry": callable}: the device refused a change; the device tab offers
     # adb root / disable-verity / remount and then calls retry.
     write_access_needed = pyqtSignal(object)
+    # (device folder, PC folder): open another Files tab there (Ctrl+Shift+T)
+    new_tab_requested = pyqtSignal(str, str)
 
     COLUMNS = ["Name", "Size", "Type", "Date Modified", "Permissions", "Owner"]
 
     _parse_ls_line = staticmethod(_parse_ls_line)
 
-    def __init__(self, handler, start="/sdcard", parent=None, *, adb_gate=None):
+    def __init__(self, handler, start="/sdcard", parent=None, *, adb_gate=None,
+                 local_start=None):
         """*adb_gate* (optional, from the device tab) has ``wrap(fn)``: device
-        jobs then wait for one of the tab's adb slots before starting adb."""
+        jobs then wait for one of the tab's adb slots before starting adb.
+        *local_start* opens the PC pane in that folder instead of the home
+        folder (a second Files tab opened from this one starts where it is)."""
         super().__init__(parent)
         self.handler = handler
         self._adb_gate = adb_gate
-        self.local_cwd = os.path.expanduser("~")
+        self.local_cwd = (local_start if local_start and os.path.isdir(local_start)
+                          else os.path.expanduser("~"))
         self.remote_cwd = start
         self._jobs = []           # listing / file-op workers (detached on close)
         self._save_jobs = []      # editor saves: never detached, the editor needs the result
         self._editors = []
         self._queue = []          # pending transfers: (src, dst, direction)
+        # Every queued transfer's history (what the Transfers panel shows), and
+        # the history ids still waiting in the queue: per job, in queue order.
+        self.transfers = TransferLog()
+        self._pending_ids = {}
+        self._summarised_batch = 0  # the batch whose summary toast was shown
         self._transfer = None     # the single active _TransferThread
         self._cancel = threading.Event()
         self._clipboard = []  # items in copy buffer
@@ -1270,6 +1292,18 @@ class FileBrowser(QWidget):
             b.setToolTip(f"Open {p} on the device")
             b.clicked.connect(lambda _=False, path=p: self._jump_remote(path))
             qbar.addWidget(b)
+        self.btn_new_tab = self._flat_button("New tab")
+        self.btn_new_tab.setIcon(icon("plus", "blue"))
+        self.btn_new_tab.setToolTip(
+            "Open another Files tab on this device, starting in these folders "
+            "(Ctrl+Shift+T)")
+        self.btn_new_tab.clicked.connect(self._request_new_tab)
+        self.btn_new_tab.hide()  # shown once a device tab listens (showEvent)
+        qbar.addWidget(self.btn_new_tab)
+        # Not Ctrl+T/Ctrl+W: the main window owns those (new session / close
+        # tab), and a second binding would make both ambiguous.
+        QShortcut(QKeySequence("Ctrl+Shift+T"), self, self._request_new_tab,
+                  context=Qt.WidgetWithChildrenShortcut)
         lay.addWidget(toolbar)
 
         body = QVBoxLayout()
@@ -1408,9 +1442,20 @@ class FileBrowser(QWidget):
         split.setStretchFactor(1, 0)
         split.setStretchFactor(2, 5)
         split.setSizes([460, 92, 460])
-        body.addWidget(split, 1)
+        # The panes above, the transfer history below: the handle between them
+        # gives the history as much room as the user wants.
+        self._vsplit = QSplitter(Qt.Vertical)
+        self._vsplit.setHandleWidth(8)
+        self._vsplit.setChildrenCollapsible(False)
+        self._vsplit.addWidget(split)
+        self.transfer_panel = TransferPanel(self.transfers)
+        self._vsplit.addWidget(self.transfer_panel)
+        self._vsplit.setStretchFactor(0, 1)
+        self._vsplit.setStretchFactor(1, 0)
+        body.addWidget(self._vsplit, 1)
 
-        # Bottom Progress Bar, with Cancel for the running transfer and the queue
+        # The running transfer's bar, with Cancel for it and the queue; it sits
+        # in the transfer panel, under the overall progress.
         self.bar = QProgressBar()
         self.bar.setVisible(False)
         self.btn_cancel_transfer = QPushButton("Cancel")
@@ -1420,11 +1465,17 @@ class FileBrowser(QWidget):
         self.btn_cancel_transfer.setVisible(False)
         self.btn_cancel_transfer.setFocusPolicy(Qt.TabFocus)
         self.btn_cancel_transfer.clicked.connect(self.cancel_transfers)
-        bar_row = QHBoxLayout()
+        current = QWidget()
+        bar_row = QHBoxLayout(current)
+        bar_row.setContentsMargins(0, 0, 0, 0)
         bar_row.setSpacing(8)
         bar_row.addWidget(self.bar, 1)
         bar_row.addWidget(self.btn_cancel_transfer)
-        body.addLayout(bar_row)
+        self.transfer_panel.set_current_widget(current)
+        self.transfer_panel.cancel_requested.connect(self.cancel_transfers)
+        self.transfer_panel.retry_requested.connect(self._retry_transfers)
+        self.transfer_panel.open_requested.connect(self._open_transfer_location)
+        self.transfer_panel.details_toggled.connect(self._on_transfer_details_toggled)
 
         delete_hint = "Del Recycle Bin   ·   Shift+Del Delete permanently" if recycle_bin_available() else \
             "Del Delete"
@@ -1483,6 +1534,8 @@ class FileBrowser(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # New tab only where something opens it (a device tab, not a test)
+        self.btn_new_tab.setVisible(self.receivers(self.new_tab_requested) > 0)
         if not self._loaded_remote:
             self.refresh_remote()
 
@@ -1920,7 +1973,10 @@ class FileBrowser(QWidget):
         it_name = _FileItem(name)
         it_name.setData(Qt.UserRole, (name, is_dir))
         glyph, tone = _entry_icon_key(name, is_dir, ftype)
-        it_name.setIcon(cached_icon(glyph, tone))
+        # the system's own icon where it has one (a PC row by its real path, a
+        # device row by its type); ICON_ROLE keeps the kind either way
+        local_dir = table.base_dir if table is self.local_table else ""
+        it_name.setIcon(file_icons().row_icon(name, is_dir, ftype, glyph, tone, local_dir))
         it_name.setData(ICON_ROLE, glyph)
         it_size = _FileItem(sz_str)
         it_size.setData(Qt.UserRole, raw_size)
@@ -2115,17 +2171,56 @@ class FileBrowser(QWidget):
         else:
             self.refresh_local()
 
+    def _batch_summary(self) -> str:
+        """One line for a batch that just finished, or "" when there is nothing
+        to say. Said once per batch: a second drain of the same queue is quiet."""
+        stats = self.transfers.stats()
+        batch = self.transfers.batch
+        if stats.total <= 1 or batch == self._summarised_batch:
+            return ""  # a single transfer already reported itself by name
+        self._summarised_batch = batch
+        items = f"{stats.done} item" + ("" if stats.done == 1 else "s")
+        if stats.cancelled:
+            return f"[INFO] {stats.past} {items} before the transfer was cancelled"
+        if stats.failed:
+            return (f"[WARNING] {stats.past} {stats.done} of {stats.total} items - "
+                    f"{stats.failed} failed (see the log)")
+        return f"[OK] {stats.past} {items}"
+
     def _enqueue_transfers(self, jobs, message: str):
-        """Append transfers to the queue; only one transfer thread runs at a time."""
+        """Append transfers to the queue; only one transfer thread runs at a time.
+
+        Each job is also recorded in :attr:`transfers` (the history the panel
+        shows) and sized on a worker; the queue itself keeps its plain
+        ``(src, dst, direction)`` tuples."""
         if self._closing or not jobs:
             return
         busy = self._transfer is not None
+        ids = self.transfers.add(jobs)
+        for job, item_id in zip(jobs, ids):
+            self._pending_ids.setdefault(tuple(job), deque()).append(item_id)
         self._queue.extend(jobs)
+        self._measure_transfers([(tuple(job), item_id) for job, item_id in zip(jobs, ids)])
+        self.transfer_panel.refresh()
         if busy:
             message += f" (queued; {len(self._queue)} waiting)"
         self.log.emit(message)
         if not busy:
             self._process_queue()
+
+    def _take_transfer_id(self, job) -> int:
+        """The history id of *job*, which was just taken off the queue.
+
+        Identical jobs queued twice keep their order: ids wait in a FIFO per
+        job. A job that reached the queue some other way is recorded now."""
+        key = tuple(job)
+        pending = self._pending_ids.get(key)
+        if pending:
+            item_id = pending.popleft()
+            if not pending:
+                del self._pending_ids[key]
+            return item_id
+        return self.transfers.add([key])[0]
 
     def _process_queue(self):
         if self._closing or self._transfer is not None:
@@ -2133,17 +2228,26 @@ class FileBrowser(QWidget):
         if not self._queue:
             self.bar.setVisible(False)
             self.btn_cancel_transfer.setVisible(False)
+            summary = self._batch_summary()
+            if summary:
+                self.log.emit(summary)
+            self.transfer_panel.refresh()
             self.refresh_local()
             self.refresh_remote()
             refused, self._refused_transfers = self._refused_transfers, []
             if refused:
                 jobs = [(src, dst, direction) for src, dst, direction, _error in refused]
+                # the failed rows this retry replaces, taken now: the retry may
+                # run much later, after the device was made writable
+                wanted = set(jobs)
+                ids = [item.id for item in self.transfers.batch_items()
+                       if item.status == FAILED and item.job in wanted]
                 src, dst, direction, error = refused[0]
                 device_path = dst if direction == "push" else src
                 self._offer_write_access(
                     posixpath.dirname(device_path.rstrip("/")) or "/", error,
                     f"the {direction} of {len(jobs)} item(s)",
-                    lambda: self._enqueue_transfers(jobs, f"Retrying {len(jobs)} transfer(s)…"))
+                    lambda: self._retry_refused(jobs, ids))
             return
 
         src, dst, direction = self._queue.pop(0)
@@ -2157,13 +2261,40 @@ class FileBrowser(QWidget):
 
         t = _TransferThread(self.handler, direction, src, dst)
         self._transfer = t
+        t._transfer_id = self._take_transfer_id((src, dst, direction))
+        self.transfers.start(t._transfer_id)
         t.progress.connect(self.bar.setValue)
+        t.progress.connect(lambda pct, t=t: self._on_transfer_progress(t, pct))
+        result = getattr(t, "result", None)  # a test double may not have one
+        if result is not None:
+            result.connect(lambda res, t=t: self._on_transfer_result(t, res))
         t.done.connect(lambda _res, t=t: self._on_transfer_finished(t, True, ""))
         t.failed.connect(lambda err, t=t: self._on_transfer_finished(t, False, err))
         # Safety net: a thread that ends without done/failed must not wedge the queue.
         t.finished.connect(lambda t=t: self._on_transfer_finished(t, False, "transfer stopped"))
         park_thread(t)
         t.start()
+        self.transfer_panel.refresh()
+
+    def _on_transfer_progress(self, t, percent) -> None:
+        if t is not self._transfer or self._closing:
+            return  # a late report from a transfer that already ended
+        self.transfers.progress(getattr(t, "_transfer_id", None), percent)
+        self.transfer_panel.refresh()
+
+    def _on_transfer_result(self, t, result) -> None:
+        """The worker's TransferResult: the real size and time of what it copied."""
+        if self._closing:
+            return
+        t._transfer_duration = getattr(result, "duration", None)
+        size = getattr(result, "size_bytes", None)
+        # Pulling ``dir/.`` merges into an existing folder, and measuring that
+        # folder afterwards also counts what was already in it: keep the estimate.
+        merged_pull = t.direction == "pull" and str(t.a).endswith("/.")
+        if size and not merged_pull:
+            self.transfers.set_size(getattr(t, "_transfer_id", None), size, exact=True,
+                                    files=getattr(result, "files", None))
+        self.transfer_panel.refresh()
 
     def _on_transfer_finished(self, t, ok: bool, message: str):
         if t is not self._transfer:
@@ -2171,24 +2302,35 @@ class FileBrowser(QWidget):
         self._transfer = None
         if self._closing or not _alive(self):
             return
+        item_id = getattr(t, "_transfer_id", None)
         if self._cancelled_transfer is t:
             self._cancelled_transfer = None
+            self.transfers.finish(item_id, CANCELLED,
+                                  error="" if ok else "cancelled - a partial copy may remain")
             self.log.emit(f"[CANCELLED] {t.direction} {_transfer_name(t.a)}"
                           + ("" if ok else " (a partial copy may remain)"))
         elif ok:
-            self.log.emit(f"[OK] {t.direction}: {_transfer_name(t.a)}")
+            self.transfers.finish(item_id, DONE, duration=getattr(t, "_transfer_duration", None))
+            line = f"[OK] {t.direction}: {_transfer_name(t.a)}"
+            # one of many: keep it in the log, out of the toast
+            (self.trace if self.transfers.batch_size() > 1 else self.log).emit(line)
         else:
+            self.transfers.finish(item_id, FAILED, error=message)
             self.log.emit(f"[ERROR] {t.direction} {t.a}: {message}")
             from .device_access import is_permission_problem
 
             if is_permission_problem(message):
                 self._refused_transfers.append((t.a, t.b, t.direction, message))
+        self.transfer_panel.refresh()
         self._process_queue()
 
     def cancel_transfers(self):
         """Stop the running transfer and drop everything still queued."""
         dropped = len(self._queue)
         self._queue.clear()
+        self._pending_ids.clear()
+        self.transfers.cancel_queued()  # the history says what never ran
+        self.transfer_panel.refresh()
         self._refused_transfers = []
         t = self._transfer
         if t is None:
@@ -2204,6 +2346,93 @@ class FileBrowser(QWidget):
         self.btn_cancel_transfer.setEnabled(False)
         extra = f" and {dropped} queued transfer(s)" if dropped else ""
         self.log.emit(f"Cancelling {t.direction} {_transfer_name(t.a)}{extra}…")
+
+    # ---- Transfer history (the Transfers panel) ----
+    def _measure_transfers(self, pairs) -> None:
+        """Size newly queued transfers on a worker - PC files for a push, the
+        device for a pull - for byte-weighted progress and a time left. No
+        transfer ever waits for this."""
+        pushes = [(job[0], item_id) for job, item_id in pairs if job[2] == "push"]
+        pulls = [(job[0], item_id) for job, item_id in pairs if job[2] == "pull"]
+        if pushes:
+            push_paths = [path for path, _ in pushes]
+            self._job(lambda: measure_local(push_paths),
+                      lambda sizes: self._apply_sizes(pushes, sizes, local=True))
+        if pulls and self.handler is not None:
+            handler = self.handler
+            pull_paths = [path for path, _ in pulls]
+            # no adb slot, like the transfers themselves: `du` on a big folder
+            # can take a while and must not hold up this tab's listings
+            self._job(lambda: measure_remote(handler, pull_paths),
+                      lambda sizes: self._apply_sizes(pulls, sizes, local=False))
+
+    def _apply_sizes(self, pairs, sizes, *, local: bool) -> None:
+        for path, item_id in pairs:
+            found = (sizes or {}).get(path)
+            if not found:
+                continue
+            if local:
+                size, files = found
+                self.transfers.set_size(item_id, size, exact=True, files=files)
+            else:
+                size, exact = found
+                self.transfers.set_size(item_id, size, exact=exact)
+        self.transfer_panel.refresh()
+
+    def _retry_refused(self, jobs, ids) -> None:
+        """The device was made writable: queue the refused transfers again.
+
+        Their failed rows go, like a Retry from the panel - left behind they
+        kept "Retry N failed" on offer after the retry had succeeded, and
+        using it copied the same files a second time."""
+        if self._closing or not jobs:
+            return
+        self.transfers.remove(self.transfers.retryable(ids))
+        self._enqueue_transfers(jobs, f"Retrying {len(jobs)} transfer(s)…")
+
+    def _retry_transfers(self, ids) -> None:
+        """Queue failed or cancelled transfers again: their old rows go, and
+        the new attempt gets fresh ones (and its own place in the batch)."""
+        if self._closing:
+            return
+        ids = self.transfers.retryable(ids)
+        jobs = [self.transfers.get(item_id).job for item_id in ids]
+        if not jobs:
+            return
+        self.transfers.remove(ids)
+        self._enqueue_transfers(jobs, f"Retrying {len(jobs)} transfer(s)…")
+
+    def _open_transfer_location(self, item) -> None:
+        """Show where *item* went: its device folder for a push, its PC folder
+        for a pull."""
+        if self._closing or item is None:
+            return
+        if item.direction == "push":
+            self._jump_remote(posixpath.dirname(item.dst.rstrip("/")) or "/")
+        else:
+            folder = os.path.dirname(os.path.normpath(item.dst))
+            self._jump_local(folder or item.dst)
+
+    def _on_transfer_details_toggled(self, shown: bool) -> None:
+        """Opening the details gives them room; closing hands it back to the
+        panes (the collapsed panel caps its own height)."""
+        if not shown:
+            return
+        sizes = self._vsplit.sizes()
+        if len(sizes) != 2:
+            return
+        total = sum(sizes)
+        # about two fifths of the page: enough for a screenful of rows while
+        # the panes stay usable; the handle moves it from there
+        want = min(400, max(240, total * 2 // 5))
+        if total > 0 and sizes[1] < want:
+            self._vsplit.setSizes([max(1, total - want), want])
+
+    def _request_new_tab(self) -> None:
+        """Ctrl+Shift+T / New tab: another Files tab on this connection, opened
+        in the folders this one shows (the device tab builds it)."""
+        if not self._closing:
+            self.new_tab_requested.emit(self.remote_cwd, self.local_cwd)
 
     # ---- File Operations: Local ----
     def _local_mkdir(self):
@@ -2364,7 +2593,7 @@ class FileBrowser(QWidget):
             if collisions and not self._ask_overwrite(collisions, "in this device folder"):
                 self.log.emit("[INFO] Paste cancelled: nothing was overwritten.")
                 return
-            self._run_shell_batch(commands, timeout=600)
+            self._run_shell_batch(commands, timeout=600, summary="Pasted")
 
         self._job(lambda: _plan_remote_copy(handler, sources, dst_dir), planned,
                   lambda msg: self._report_errors("Paste", [msg]), device=True)
@@ -2446,8 +2675,14 @@ class FileBrowser(QWidget):
     def _run_shell(self, label, cmd):
         self._run_shell_batch([(label, cmd)])
 
-    def _run_shell_batch(self, commands, timeout: float = 30):
-        """Run device commands in order on one worker, log each, refresh once."""
+    def _run_shell_batch(self, commands, timeout: float = 30, summary: str = ""):
+        """Run device commands in order on one worker, log each, refresh once.
+
+        A batch of more than one command reports ONCE: the per-command lines
+        stay in the log, and *summary* (a past-tense verb such as "Pasted")
+        names the single toast. Without it, pasting 200 files fired 200
+        toasts that replaced each other and left a file name on screen
+        instead of a result. Failures always surface individually."""
         handler = self.handler
 
         def work():
@@ -2464,8 +2699,24 @@ class FileBrowser(QWidget):
         folder = self.remote_cwd
 
         def done(results):
+            bulk = len(results) > 1
+            succeeded = 0
             for label, ok, err in results:
-                self.log.emit(f"[OK] {label}" if ok else f"[ERROR] {label}: {err}")
+                if ok:
+                    succeeded += 1
+                    # one of many: the log keeps it, the toast does not
+                    (self.trace if bulk else self.log).emit(f"[OK] {label}")
+                else:
+                    self.log.emit(f"[ERROR] {label}: {err}")
+            if bulk:
+                verb = summary or "Finished"
+                items = f"{succeeded} item" + ("" if succeeded == 1 else "s")
+                failed = len(results) - succeeded
+                if failed:
+                    self.log.emit(f"[WARNING] {verb} {succeeded} of {len(results)} "
+                                  f"items - {failed} failed (see the log)")
+                else:
+                    self.log.emit(f"[OK] {verb} {items}")
             self.refresh_remote()
             from .device_access import is_permission_problem
 
@@ -2474,7 +2725,8 @@ class FileBrowser(QWidget):
             if refused:
                 retry = [command for command, _err in refused]
                 self._offer_write_access(folder, refused[0][1], refused[0][0][0],
-                                         lambda: self._run_shell_batch(retry, timeout))
+                                         lambda: self._run_shell_batch(retry, timeout,
+                                                                      summary))
 
         def fail(msg):
             self.log.emit(f"[ERROR] {commands[0][0] if commands else 'device command'}: {msg}")
@@ -2754,6 +3006,8 @@ class FileBrowser(QWidget):
         self._closing = True
         self._cancel.set()
         self._queue.clear()
+        self._pending_ids.clear()
+        self.transfer_panel.close_panel()
         self._remote_refresh_pending = False
         transfer, self._transfer = self._transfer, None
         if transfer is not None:
@@ -2761,7 +3015,7 @@ class FileBrowser(QWidget):
                 transfer.stop()
             except RuntimeError:
                 pass
-            disconnect_signals(transfer, ("progress", "done", "failed"))
+            disconnect_signals(transfer, ("progress", "done", "failed", "result"))
             park_thread(transfer)
         close_jobs(self._jobs)
         self._ls = None

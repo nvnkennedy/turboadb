@@ -38,8 +38,6 @@ from PyQt5.QtWidgets import (
     QAction,
     QDialog,
     QGridLayout,
-    QScrollArea,
-    QFrame,
 )
 
 from ..config import ScrcpyOptions
@@ -676,13 +674,30 @@ _DEVICE_EDIT_SHORTCUTS = (
 )
 
 
-def _forward_device_key(event, send, *, with_repeat=False) -> bool:
+def device_paste_message(text: str) -> str:
+    """The log line for a paste that went to the DEVICE.
+
+    The text lands on the device, not in this window, so without a word
+    here a paste that worked and one that did nothing look identical.
+    """
+    if not text:
+        return "[WARNING] Nothing on the clipboard to paste"
+    count = len(text)
+    plural = "" if count == 1 else "s"
+    return f"[OK] Pasted {count} character{plural} to the device"
+
+
+def _forward_device_key(event, send, *, with_repeat=False, notify=None) -> bool:
     """Send one Qt key press to the device; False when it is not a device key.
 
     Paste arrives as one text batch, edit shortcuts become Android keycodes
     and everything else goes through :meth:`_DeviceKeyEdit.map_event`.  With
     *with_repeat*, ``send`` also receives ``auto_repeat=`` so the key batcher
     can drop keyboard auto-repeat the device cannot keep up with.
+
+    *notify* is called with the pasted text (``""`` for an empty clipboard)
+    so the caller can report it — the text appears on the device, where the
+    user is not looking.
     """
     extra = {"auto_repeat": bool(event.isAutoRepeat())} if with_repeat else {}
     if event.matches(QKeySequence.Paste):
@@ -691,6 +706,8 @@ def _forward_device_key(event, send, *, with_repeat=False) -> bool:
         text = QApplication.clipboard().text()
         if text:
             send("text", text, **extra)
+        if notify is not None:
+            notify(text)
         return True
     for sequence, code in _DEVICE_EDIT_SHORTCUTS:
         if event.matches(sequence):
@@ -1067,11 +1084,13 @@ class _EmbedContainer(QWidget):
     *on_key_release*, *send_key* also receives ``auto_repeat=`` and the real
     release of each device key is reported as ``on_key_release(keycode)``."""
 
-    def __init__(self, send_key, parent=None, on_child_click=None, on_key_release=None):
+    def __init__(self, send_key, parent=None, on_child_click=None, on_key_release=None,
+                 on_paste=None):
         super().__init__(parent)
         self._send_key = send_key
         self._on_child_click = on_child_click
         self._on_key_release = on_key_release
+        self._on_paste = on_paste
         self.setFocusPolicy(Qt.StrongFocus)
 
     def nativeEvent(self, event_type, message):
@@ -1101,7 +1120,8 @@ class _EmbedContainer(QWidget):
 
     def keyPressEvent(self, event):
         repeat_aware = self._on_key_release is not None
-        if not _forward_device_key(event, self._send_key, with_repeat=repeat_aware):
+        if not _forward_device_key(event, self._send_key, with_repeat=repeat_aware,
+                                   notify=self._on_paste):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
@@ -1901,6 +1921,7 @@ class MirrorPanel(QWidget):
             self._send_key,
             on_child_click=self._on_embedded_child_click,
             on_key_release=self._release_key,
+            on_paste=lambda text: self.log.emit(device_paste_message(text)),
         )
         self.container.setAttribute(Qt.WA_NativeWindow, True)
         self.container.setMinimumHeight(200)

@@ -16,11 +16,12 @@
 
 ---
 
-> **New in 2.2.2:** an ADB screencap renderer for builds where scrcpy can't
-> run, controls on every IVI display, Black and White themes, multi-line paste
-> that works in every terminal, call history on Android Automotive, a theme
-> toggle that remembers your dark and light choice, far fewer adb processes, and
-> less memory — plus a full code-review pass. Full notes in the
+> **New in 2.5.0:** a transfer history in Files with overall progress, speed,
+> time left and every file's size and error; more than one Files tab on the
+> same device; a second terminal session in one click; the system's own file
+> icons; and a notification for every copy, paste, APK install and bulk file
+> operation, plus fixes to the screencap view, streams and startup launchers.
+> Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -57,7 +58,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-2.2.2-win64.exe`** from the
+1. Download **`TurboADB-2.5.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
@@ -204,6 +205,10 @@ typed there, Stop sends Ctrl+C to the device instead: only the device command
 stops and you stay in adb shell. If that command ignores it, Stop again reopens
 adb shell in the same device folder.
 
+Need a second terminal on the same device? **More ▾ → New terminal session**,
+or right-click the **Terminal** tab, opens another terminal tab with its own
+Android shell, PowerShell and Command Prompt.
+
 **CLI** — one-shot commands (everything after `--` goes to the device):
 
 ```bash
@@ -270,6 +275,17 @@ Recycle Bin and **Shift+Delete** deletes them for good; device files always go
 for good. Each pane shows what it holds and what is selected. When the device
 refuses a change, TurboADB offers **adb root**, **adb disable-verity** and **adb
 remount** and retries afterwards (see Root & mount).
+
+The **Transfers** panel under the panes follows every copy: an overall bar with
+the files and bytes done, the speed and the time left, and under **Details** a
+row per file with its size, progress, speed and adb's exact error if it
+failed. **Retry failed**, **Clear finished** and **Copy** / **Save report…**
+are in its menu; right-click a row to retry it or open its folder.
+
+To browse two folders at once, press **New tab** (or **Ctrl+Shift+T**). The
+new Files tab starts in the same folders and has its own selection and
+transfers. You can open up to eight, and split view shows two side by side.
+Rows show the system's own file icons.
 
 **CLI**:
 

@@ -45,6 +45,7 @@ from PyQt5.QtWidgets import (
 from ..results import OperationResult
 from . import theme
 from .icons import svg as icon_svg
+from .fileutil import copy_to_clipboard
 from .qtutil import cached_icon, close_jobs, run_job, unwrap
 
 # Item data role holding a row's display dict (kind, label, icon, tone, ...).
@@ -1242,11 +1243,11 @@ class PhonePanel(QWidget):
             menu.addAction(cached_icon("message", "purple"), "Message…",
                            lambda: self.compose_to(number))
             menu.addAction(cached_icon("copy", "dim"), "Copy number",
-                           lambda: QApplication.clipboard().setText(number))
+                           lambda: copy_to_clipboard(self, number, "the phone number"))
         body = row.get("body") or ""
         if body:
             menu.addAction(cached_icon("copy", "dim"), "Copy message",
-                           lambda: QApplication.clipboard().setText(body))
+                           lambda: copy_to_clipboard(self, body, "the message"))
         if not menu.isEmpty():
             menu.exec_(view.viewport().mapToGlobal(pos))
 

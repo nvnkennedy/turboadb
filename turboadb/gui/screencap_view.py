@@ -798,11 +798,9 @@ class ScreencapWorker(QThread):
             _close_pipes(proc)
             detail = " ".join(decoder.device_error.split())[:300] or "screencap failed"
             return "failed", self._hint(f"screencap failed on the device: {detail}")
-        errors = b""
-        try:
-            errors = proc.stderr.read() or b""
-        except Exception:
-            pass
+        # read from the background drain: the pipe itself is already being
+        # consumed, and reading it here would return nothing (or block)
+        errors = ADBHandler.collected_stderr(proc)
         _close_pipes(proc)
         detail = " ".join(errors.decode("utf-8", "replace").split())[:300]
         return "failed", detail or f"the capture ended (adb exit code {proc.poll()})"
@@ -1272,9 +1270,12 @@ class ScreencapView(QWidget):
         return self._key_sink
 
     def keyPressEvent(self, event):
-        from .mirror_panel import _forward_device_key
+        from .mirror_panel import _forward_device_key, device_paste_message
 
-        if not _forward_device_key(event, self._keys(), with_repeat=True):
+        if not _forward_device_key(
+            event, self._keys(), with_repeat=True,
+            notify=lambda text: self.log.emit(device_paste_message(text)),
+        ):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):

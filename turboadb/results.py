@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Optional, Union
 
 
@@ -74,7 +74,10 @@ class CommandResult:
         return self.ok
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        # dataclasses.asdict() deep-copies every field, and stdout can be
+        # megabytes of screencap or logcat.  No field here is a nested
+        # dataclass, so a shallow mapping is identical and free.
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
     def __str__(self) -> str:
         status = "ok" if self.ok else f"FAILED (exit {self.exit_code})"

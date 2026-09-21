@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from PyQt5.QtCore import pyqtSignal, QSignalBlocker, QSize, Qt
 from PyQt5.QtWidgets import (
     QWidget,
@@ -43,6 +45,10 @@ def _unwrap_packages(res) -> list:
 
 class AppsPanel(QWidget):
     log = pyqtSignal(str)
+    # Routine chatter for the log panel only — never a toast. The window
+    # shows ONE activity toast at a time, so a package count emitted right
+    # after an action replaced that action's result before it was read.
+    trace = pyqtSignal(str)
 
     def __init__(self, handler, automotive=False, parent=None, *, adb_gate=None):
         """*adb_gate* (optional, from the device tab) has ``wrap(fn)``: device
@@ -223,9 +229,15 @@ class AppsPanel(QWidget):
     def _device_job(self, fn):
         return self._adb_gate.wrap(fn) if self._adb_gate is not None else fn
 
-    def refresh(self):
+    def refresh(self, *, announce: bool = True):
+        """Re-list the packages.
+
+        *announce* False keeps the resulting count out of the toast/status
+        bar: the action that asked for the refresh has already reported
+        itself, and its message is the one worth showing."""
         if self._closed:
             return
+        self._announce_count = announce
         self.list.clear()
         self._status_row("Loading…", "refresh", "dim")
         self._sync_actions()
@@ -268,7 +280,11 @@ class AppsPanel(QWidget):
         self._all = pkgs
         self._listed = True
         self._apply_filter(self.filt.text())
-        self.log.emit(f"[OK] {len(pkgs)} packages")
+        count = f"[OK] {len(pkgs)} packages"
+        if getattr(self, "_announce_count", True):
+            self.log.emit(count)
+        else:
+            self.trace.emit(count)
 
     def _on_packages_failed(self, generation, message):
         if self._closed or generation != self._list_generation:
@@ -349,7 +365,10 @@ class AppsPanel(QWidget):
         # An install can push hundreds of MB for minutes: like a file transfer
         # it takes no adb slot, so listings, Reboot and Health never queue
         # behind it.
-        self._do(fn, "install", refresh=True, gated=False)
+        names = ", ".join(os.path.basename(f) for f in files[:2])
+        if len(files) > 2:
+            names += f" +{len(files) - 2} more"
+        self._do(fn, f"install {names}", refresh=True, gated=False)
 
     def _uninstall(self):
         pkg = self._selected()
@@ -385,7 +404,8 @@ class AppsPanel(QWidget):
         def done(message):
             self.log.emit(f"[OK] {label}: {message}")
             if refresh:
-                self.refresh()
+                # quiet: this action's result is the news, not the new count
+                self.refresh(announce=False)
 
         def job():
             return str(unwrap(fn()))

@@ -3,6 +3,106 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 2.5.0
+
+### New
+
+- **A transfer history in Files.** Copying a mix of big and small files used to
+  show one bar for the current file and a queue count. A **Transfers** panel
+  under the panes now shows an overall bar and a live summary ("Pushing 24 of
+  57 · 1.2 GB of 2.9 GB · 18.4 MB/s · about 1:32 left"), the running file with
+  its own bar and Cancel, and under **Details** a table of every item: status,
+  name, direction, size, progress, speed, time, and the destination or adb's
+  exact error. Show **All**, **Active**, **Failed** or **Done**; **Retry
+  failed**, **Clear finished**, **Copy report** and **Save report…** are one
+  click away, and right-clicking a row retries it, opens its folder in the
+  other pane, or copies its paths or error. Progress counts **bytes** once the
+  sizes are known, so one 4 GB video among 99 photos no longer reads 99 % when
+  only the photos are done. Sizes are measured in the background (on the PC
+  for a push, with `stat`/`du` on the device for a pull), and no transfer waits
+  for them.
+- **More than one Files tab on the same device.** **New tab** in the Files
+  toolbar, **Ctrl+Shift+T**, **More ▾ → New Files tab**, or right-clicking a
+  Files tab opens another one (up to eight). It starts in the same device and PC
+  folders as the tab it came from. Each tab has its own listings, selection,
+  transfer queue and history. **Files 2**, **Files 3**… sit next to the first
+  one and close with their × or a middle-click (a tab that is still copying
+  asks first). Split view can show two of them side by side.
+- **Another terminal session in one click.** **More ▾ → New terminal
+  session**, or right-clicking the **Terminal** tab, opens a second terminal
+  tab for the device, with its own Android shell, PowerShell and Command Prompt.
+  Before, you had to open the same device again and answer a question.
+- **Files shows the system's own icons.** Rows in Files used flat outline
+  icons. They now show what Explorer (or Finder, or your Linux desktop's icon
+  theme) shows. On the PC side that means the folder icon, special folders such
+  as Downloads, each program's own icon, and a shortcut's target. On the device
+  side each file gets the icon of its type. A symbolic link gets a small link
+  badge, and an APK the PC has no application for gets an Android badge. Where
+  the system has no icons of its own, the previous icons stay.
+
+### Changed
+
+- **Bulk file operations report once.** Copying, pushing or pasting hundreds of
+  files used to flash one notification per file and leave the last file name
+  on screen, with nothing saying the job had finished. Now a single line
+  reports the outcome ("Pushed 57 items", "Pushed 56 of 57 items - 1 failed").
+  Each file still goes to the log, and a failure is still reported on its own.
+- **Lighter on long sessions.** A tap burst no longer keeps every line the
+  device prints. Reading SMS stops at the requested limit instead of splitting
+  the whole inbox first. Open terminals do less work each time they poll.
+  Starting a mirror no longer repeats slow host-name lookups: they are
+  remembered for 30 seconds. The adb tool cache no longer grows without limit.
+- **GitHub Releases come with notes.** A release page used to list only the
+  exe, the wheel and the source package. It now carries that version's
+  changelog entry, install instructions and a link to the full list of
+  changes. A version with no changelog entry stops the release before it is
+  built.
+
+### Fixed
+
+- **Copying to the clipboard now says so.** Terminal copy, the Phone tab's
+  **Copy number** and **Copy message**, and the report dialog's **Copy
+  summary** confirm with "Copied 3 lines", "Copied the phone number" or
+  "Nothing to copy". Before, a copy that worked looked exactly like one that did
+  nothing.
+- **Installing an APK reports its result.** The package list refresh that
+  follows an install replaced the install message within milliseconds, so the
+  notification read "1 packages". The result now stays and names the APK.
+- **Pasting on the device screen says so.** Ctrl+V on the mirror or the
+  screencap view types the clipboard on the device, not in this window. It now
+  confirms "Pasted 12 characters to the device", or warns that the clipboard is
+  empty.
+- **The screencap view could freeze for good.** adb writes notes to stderr
+  while it streams, and once about 64 KB piled up, adb stopped sending frames
+  without any error. That output is now read as it arrives, and adb's final
+  message is still shown when a capture ends.
+- **A clock change no longer ends a stream early or makes it run forever.**
+  Logcat, streams and screen recordings now time their limits with a steady
+  clock rather than the time of day. The time of day can jump with an NTP
+  correction, a DST change or a manual change.
+- A stream that never sends a newline (a binary dump, a stuck device) can no
+  longer use up memory: a line is cut off at 4 MB.
+- A transfer that timed out at the very end now raises TurboADB's own
+  `ADBTimeoutError` instead of Python's `subprocess.TimeoutExpired`, so
+  `safe=True` and `except ADBError` catch it.
+- Two background tasks starting at the same time could each download
+  platform-tools into the same folder. adb is now looked up once.
+- **Startup launchers refuse unsafe paths.** An adb or Python path with a
+  quote, a line break or a `%` could break the command line that the Startup
+  launcher and the SYSTEM task run. That path is now refused with a clear
+  message. `&`, `^`, spaces and non-English letters are still accepted. The
+  remote webcam's ffmpeg path is cleaned before it goes into PowerShell, as the
+  camera name already was.
+- `turboadb scrcpy --audio-dup` with an `--audio-source` other than playback
+  stopped scrcpy from starting. The option only exists for the playback source,
+  so it is now left out in that case. On its own it still works, and scrcpy
+  picks the playback source for it.
+- After **Make files writable** retried refused transfers, **Retry failed**
+  still listed the same files and would have copied them a second time.
+- The Linux CI job failed because one test built a Windows-only path.
+- Errors raised while handling another error now keep the original cause in
+  the traceback.
+
 ## 2.3.0
 
 ### New

@@ -343,16 +343,17 @@ def _engine_class():
     from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 
     class _VectorIconEngine(QIconEngine):
-        def __init__(self, name, tone=None, width=1.9):
+        def __init__(self, name, tone=None, width=1.9, fixed=None):
             super().__init__()
             self.name = name
             self.tone = tone
             self.width = width
+            self.fixed = fixed  # one colour whatever the theme (see icon_in)
 
         def colour(self, mode):
             if mode == QIcon.Disabled:
                 return theme.palette()["frame"]
-            return theme.hue(self.tone)
+            return self.fixed or theme.hue(self.tone)
 
         def paint(self, painter, rect, mode, state):
             colour = self.colour(mode)
@@ -383,7 +384,7 @@ def _engine_class():
             return pm
 
         def clone(self):
-            return _VectorIconEngine(self.name, self.tone, self.width)
+            return _VectorIconEngine(self.name, self.tone, self.width, self.fixed)
 
     _ENGINE = _VectorIconEngine
     return _ENGINE
@@ -394,6 +395,14 @@ def icon(name: str, tone: Optional[str] = None, *, width: float = 1.9):
     from PyQt5.QtGui import QIcon
 
     return QIcon(_engine_class()(ALIASES.get(name, name), tone, width))
+
+
+def icon_in(name: str, colour: str, *, width: float = 1.9):
+    """A vector icon in one fixed *colour*, whatever the theme - for a badge
+    drawn on a plate of its own, where the theme's tone could vanish."""
+    from PyQt5.QtGui import QIcon
+
+    return QIcon(_engine_class()(ALIASES.get(name, name), None, width, colour))
 
 
 def pixmap(name: str, size: int, tone: Optional[str] = None):

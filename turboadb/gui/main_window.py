@@ -11,7 +11,7 @@ import re
 from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QListWidget, QListWidgetItem, QPushButton,
+                             QListWidget, QListWidgetItem,
                              QDockWidget, QLabel, QLineEdit, QMessageBox,
                              QToolBar, QAction, QShortcut, QToolButton,
                              QApplication, QMenu, QSizePolicy, QProgressDialog,
@@ -1590,6 +1590,15 @@ class MainWindow(QMainWindow):
                     return
         self._add_device_tab(s, name)
 
+    def _open_terminal_session(self, tab, name: str) -> None:
+        """*tab* asked for another terminal session: the same extra terminal
+        tab that opening an already-open device offers, without the question
+        (the user just asked for exactly this)."""
+        session = getattr(tab, "session", None)
+        if session is None:
+            return
+        self._add_device_tab(dict(session), name, terminal_only=True)
+
     def _open_duplicate_device(self, session, name: str, existing_index: int) -> None:
         """Handle a second request for an open device without silently refusing
         the useful case: an independent trio of shell terminals."""
@@ -1626,6 +1635,11 @@ class MainWindow(QMainWindow):
             trace.connect(self._log_trace)
         self._watch_connection(w)
         w.screen_active.connect(self._on_screen_active)
+        # More -> New terminal session / right-click the Terminal tab
+        # (a stand-in tab may not have the signal)
+        request = getattr(w, "terminal_session_requested", None)
+        if request is not None:
+            request.connect(lambda ww=w, n=name: self._open_terminal_session(ww, n))
         if terminal_only:
             w.title_changed.connect(
                 lambda title, ww=w: self._set_tab_title(ww, f"{title} · Terminal")

@@ -6,7 +6,9 @@ line-length = 100
 [lint]
 select = ["F", "E9"]        # pyflakes + syntax/IO errors only
 ignore = [
-    "F401",   # unused imports — many are lazy/optional-dependency guards
+    # F401 is ENFORCED: the blanket ignore was hiding 15 genuinely dead imports.
+    # Intentional re-exports and lazy/optional-dependency guards carry an
+    # explicit `# noqa: F401` so the reason is visible where it applies.
     "F403",   # star imports (none, but keep noise down)
     "F405",
     "F841",   # assigned-but-unused local — a few side-effecting calls keep the

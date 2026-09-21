@@ -1093,7 +1093,9 @@ class AnsiConsole(QPlainTextEdit):
         # Use the application's clipboard explicitly.  Calling the inherited
         # ``copy`` is normally equivalent, but this remains reliable when the
         # console owns key handling and does not delegate to QPlainTextEdit.
-        QApplication.clipboard().setText(cursor.selectedText().replace("\u2029", "\n"))
+        from .fileutil import copy_to_clipboard
+
+        copy_to_clipboard(self, cursor.selectedText().replace("\u2029", "\n"))
         return True
 
     def _cut_selection(self) -> bool:
