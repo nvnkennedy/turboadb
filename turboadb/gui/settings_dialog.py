@@ -183,8 +183,18 @@ class SettingsDialog(QDialog):
         for index in range(self.pages.count()):
             page = self.pages.widget(index)
             lay = page.layout()
-            body = page.findChild(QScrollArea, "settingsPageScroll").widget()
+            scroll = page.findChild(QScrollArea, "settingsPageScroll")
+            body = scroll.widget()
             needed = max(body.heightForWidth(width), body.minimumSizeHint().height())
+            min_width = body.minimumSizeHint().width()
+            if min_width > width:
+                # Too wide for the page (long option names, large fonts): the
+                # scroll area lays it out at its own width and adds a sideways
+                # scroll bar, which takes height. Linux fonts left the scrcpy
+                # page exactly that bar short.
+                laid_out = max(body.heightForWidth(min_width), body.minimumSizeHint().height())
+                bar = scroll.horizontalScrollBar().sizeHint().height()
+                needed = max(needed, laid_out + bar)
             tallest = max(tallest, lay.itemAt(0).sizeHint().height() + lay.spacing() + needed)
         height = max(560, chrome.height() + tallest)
         parent = self.parentWidget()

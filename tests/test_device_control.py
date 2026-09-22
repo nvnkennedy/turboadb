@@ -886,6 +886,7 @@ def test_starting_and_stopping_a_screen_never_reflows_the_controls(qapp, width, 
 def test_the_display_picker_elides_only_a_name_that_does_not_fit(qapp):
     """Issue: "default display" painted as "default displ…" in a picker wide
     enough for it (4 px of slack where the style insets the label by 2)."""
+    from PyQt5.QtGui import QFont, QFontMetrics, QFontMetricsF
     from PyQt5.QtWidgets import QStyle, QStyleOptionComboBox
 
     tab, view = _control_view(qapp, 1346, 600)
@@ -905,6 +906,27 @@ def test_the_display_picker_elides_only_a_name_that_does_not_fit(qapp):
         assert combo.label_text() == "default display"
         combo.resize(fits + chrome - 1, combo.height())  # one pixel short
         assert combo.label_text().endswith("…")
+        # Linux fonts: glyphs a fraction of a pixel wide, so the text can be a
+        # little wider than its advance rounded to whole pixels - still shown
+        # whole in a box sized by that advance. Fractional letter spacing
+        # does the same with any font; pick one that rounds down.
+        font = combo.font()
+        for step in range(1, 20):
+            spaced = QFont(font)
+            spaced.setLetterSpacing(QFont.AbsoluteSpacing, step / 20)
+            exact = QFontMetrics(spaced).horizontalAdvance(text)
+            if QFontMetricsF(spaced).horizontalAdvance(text) > exact:
+                break
+        else:
+            pytest.fail("no letter spacing gave a fractional overshoot")
+        combo.setFont(spaced)
+        assert combo.fontMetrics().horizontalAdvance(text) == exact
+        combo.setMaximumWidth(exact + 2 + chrome + 10)
+        combo.resize(exact + 2 + chrome, combo.height())
+        assert combo.label_text() == "default display"
+        combo.resize(exact + 2 + chrome - 1, combo.height())
+        assert combo.label_text().endswith("…")
+        combo.setFont(font)
         combo.setMaximumWidth(combo.MAX_WIDTH)
         combo.addItem("Display 3  ·  Rear seat entertainment left  ·  2560x1440", 3)
         combo.setCurrentIndex(1)

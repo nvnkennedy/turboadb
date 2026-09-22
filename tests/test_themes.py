@@ -1129,6 +1129,34 @@ def test_settings_opens_tall_enough_for_every_page_on_a_large_screen(
         dlg.deleteLater()
 
 
+def test_settings_leaves_room_for_a_page_that_scrolls_sideways(
+    qapp, settings_file, app_theme, monkeypatch
+):
+    """A page too wide for the dialog scrolls sideways, and that scroll bar
+    takes height: with Linux fonts the scrcpy page opened 10 px short."""
+    from PyQt5.QtWidgets import QCheckBox, QScrollArea, QVBoxLayout, QWidget
+
+    dlg = _settings_on_screen(monkeypatch, 1400)
+    try:
+        wide = QWidget()
+        QVBoxLayout(wide).addWidget(QCheckBox("a check box that never wraps " * 12))
+        # the tallest page (still under the 1340 px work area), nothing to wrap
+        wide.setMinimumHeight(1000)
+        dlg._add_page("Wide", wide, "monitor", "purple")
+        dlg.resize(dlg.width(), dlg._open_height())
+        dlg.show()
+        dlg.nav.setCurrentRow(dlg.nav.count() - 1)
+        qapp.processEvents()
+        scroll = dlg.pages.widget(dlg.pages.count() - 1).findChild(
+            QScrollArea, "settingsPageScroll")
+        assert dlg.height() < 1400 - 60  # not capped by the screen
+        assert scroll.horizontalScrollBar().maximum() > 0  # it does scroll sideways
+        assert scroll.verticalScrollBar().maximum() == 0
+    finally:
+        dlg.reject()
+        dlg.deleteLater()
+
+
 def test_settings_renderer_change_reaches_open_screens(window, monkeypatch, app_theme):
     """OK with a new Screen renderer tells every open screen panel, passing the
     renderer that was in force before the dialog; an unchanged renderer

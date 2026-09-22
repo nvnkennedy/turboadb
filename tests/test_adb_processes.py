@@ -8,6 +8,7 @@ screen (or started), no overlapping polls, a cap on concurrent background
 commands, and nothing left running after the tab closes.
 """
 
+import os
 import subprocess
 import threading
 import time
@@ -970,8 +971,15 @@ def test_adb_root_reconnects_the_android_shell_and_reopens_nested_adb_shells(
         _close(qapp, tab)
 
 
+@pytest.mark.parametrize("inside, typed_in", [
+    ("powershell", "cmd"),
+    # a Command Prompt prompt is a Windows path (C:\...>): cmd.exe exists
+    # only there, and on Linux no folder can look like one
+    pytest.param("cmd", "powershell", marks=pytest.mark.skipif(
+        os.name != "nt", reason="cmd.exe prompts are Windows paths")),
+])
 def test_adb_root_typed_in_a_terminal_brings_the_other_terminals_along(
-        qapp, monkeypatch, tmp_path):
+        qapp, monkeypatch, tmp_path, inside, typed_in):
     device = _RootDevice()
     tab = _tab(qapp)
     monkeypatch.setattr(type(tab), "ADBD_RESTART_SETTLE_S", 0.0)
@@ -980,19 +988,21 @@ def test_adb_root_typed_in_a_terminal_brings_the_other_terminals_along(
         tab.show()
         tab.show_subtab("shell")
         assert _pump(qapp, lambda: len(device.sessions()) == 1)
-        command_prompt = tab.shell.cmd_widget
-        monkeypatch.setattr(command_prompt, "_stop_session", lambda **_kw: None)
-        session = _nested_adb_shell(command_prompt, tmp_path)
+        widgets = {"powershell": tab.shell.ps_widget, "cmd": tab.shell.cmd_widget}
+        nested = widgets[inside]
+        monkeypatch.setattr(nested, "_stop_session", lambda **_kw: None)
+        session = _nested_adb_shell(nested, tmp_path)
 
-        powershell = tab.shell.ps_widget
-        powershell._started = True
-        powershell.session = _LocalSession()
-        powershell._send(b"adb root\r\n")  # typed on the PC, not chosen from the menu
+        typist = widgets[typed_in]
+        typist._started = True
+        typist.session = _LocalSession()
+        typist._send(b"adb root\r\n")  # typed on the PC, not chosen from the menu
 
-        assert tab._adbd_busy and command_prompt._adb_resume is not None
+        assert tab._adbd_busy and nested._adb_resume is not None
         assert _pump(qapp, lambda: not tab._adbd_busy)
         assert "wait_for_device" in device.commands
-        command_prompt._feed_from(command_prompt.reader, f"\r\n{tmp_path}>".encode())
+        prompt = f"\r\nPS {tmp_path}> " if inside == "powershell" else f"\r\n{tmp_path}>"
+        nested._feed_from(nested.reader, prompt.encode())
         assert session.sent[-1] == b"adb shell -t -t\r\n"
     finally:
         tab.hide()

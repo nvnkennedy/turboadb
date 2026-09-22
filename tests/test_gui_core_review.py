@@ -193,7 +193,10 @@ def test_display_wall_starts_every_display_one_after_another(app):
         wall._on_tile_ready(wall._tiles[1])  # not the one being waited on: ignored
         assert started == [0] and wall._next_timer.remainingTime() > 5000
         wall._on_tile_ready(wall._tiles[0])  # display 0 is up: the next follows shortly
-        assert wall._next_timer.remainingTime() <= wall.START_GAP_MS
+        # the interval asked for, not remainingTime(): Qt may run a normal
+        # timer up to 5 % late (525 ms on Linux) to group wake-ups
+        assert wall._next_timer.isActive()
+        assert wall._next_timer.interval() == wall.START_GAP_MS
         wall._start_next()
         assert started == [0, 2]
         wall._start_next()  # display 2 never came up (timeout): move on

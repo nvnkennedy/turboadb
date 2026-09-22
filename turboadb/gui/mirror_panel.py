@@ -798,9 +798,16 @@ class _ElidingCombo(QComboBox):
             QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxEditField, self
         )
         # the style insets the label by 1 px on each side of the edit field
-        return self.fontMetrics().elidedText(
-            option.currentText, Qt.ElideRight, max(0, field.width() - self.LABEL_INSET)
-        )
+        available = max(0, field.width() - self.LABEL_INSET)
+        metrics = self.fontMetrics()
+        text = option.currentText
+        # Whole when its advance fits - the width QComboBox sizes itself by.
+        # elidedText measures in fractions of a pixel, and where glyph widths
+        # aren't whole pixels (Linux fonts) a name exactly that wide lost its
+        # last letters to a fraction.
+        if metrics.horizontalAdvance(text) <= available:
+            return text
+        return metrics.elidedText(text, Qt.ElideRight, available)
 
     def showPopup(self):
         widest = max(
