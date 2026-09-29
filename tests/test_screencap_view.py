@@ -460,7 +460,7 @@ def test_a_hidden_view_stops_reading_and_releases_its_image(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# review regressions
+# hidden views, the display lookup and capture errors
 # --------------------------------------------------------------------------- #
 def test_a_view_started_inside_a_hidden_parent_starts_paused(qapp):
     """Issue: _paused only flipped on show/hide events, which a view inside a

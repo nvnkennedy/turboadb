@@ -191,15 +191,23 @@ class WelcomeScreen(QScrollArea):
         outer.addStretch(3)  # sit in the upper third, not floating mid-canvas
 
     def _on_open_target(self):
-        """Intelligently open target: selected saved session, or first live device, or first saved target."""
+        """Open the selected saved target, else a connected device, else the
+        first saved target; with none of them, add a new target.
+
+        A connected device opens exactly as a double-click in the sidebar
+        opens it (the window's open_live_device): this tile used to build its
+        own USB target even for a Wi-Fi device ("host:port"), so opening the
+        same head unit from the sidebar later made a second full tab instead
+        of noticing the first."""
         if hasattr(self._win, "_selected_name") and self._win._selected_name():
             self._win.open_selected()
             return
-        live = getattr(self._win, "_live_devices", [])
+        live = list(getattr(self._win, "_live_devices", None) or [])
         if live:
-            d = live[0]
-            s = {"name": d.label or d.serial, "type": "usb", "serial": d.serial}
-            self._win._open_session(s, d.label or d.serial)
+            # Prefer one adb can talk to: an offline or unauthorized device
+            # would only fail to connect.
+            device = next((d for d in live if getattr(d, "is_online", False)), live[0])
+            self._win.open_live_device(device.serial)
             return
         if hasattr(self._win, "store") and self._win.store.sessions:
             first = self._win.store.sessions[0]

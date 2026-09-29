@@ -13,9 +13,9 @@ import os
 import posixpath
 import re
 import shlex
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from .results import strip_ansi
+from .results import human_bytes as _human_size, strip_ansi
 
 
 # File names are captured losslessly: ``ls -l`` puts exactly ONE space between
@@ -67,17 +67,6 @@ _ANSI_CSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 _PERMS_RE = re.compile(r'^' + _LS_PERMS + r'[.+@]?$')
 
 
-def _human_size(num_bytes: int) -> str:
-    """Format bytes into a clean, human-readable string ("500 B", "1.0 KB")."""
-    if num_bytes <= 0:
-        return "0 B"
-    for unit in ("B", "KB", "MB", "GB"):
-        if num_bytes < 1024.0:
-            return f"{num_bytes:3.1f} {unit}" if unit != "B" else f"{int(num_bytes)} B"
-        num_bytes /= 1024.0
-    return f"{num_bytes:.1f} TB"
-
-
 # ---- device shell command builders (every path shlex-quoted) ----------------
 
 
@@ -107,23 +96,58 @@ def _touch_cmd(path: str) -> str:
     return f"touch {q} 2>/dev/null || [ -e {q} ] || : > {q}"
 
 
-# Superseded by _copy_into_cmd / _rename_cmd, which add the ``--`` terminator
-# and mv's ``-T``/``-n`` guards.  Nothing here calls them any more; they are
-# kept only because gui/file_browser.py still imports the pair.  Use the two
-# builders below for new code.
-def _cp_cmd(src: str, dst: str) -> str:
-    return f"cp -r {shlex.quote(src)} {shlex.quote(dst)}"
-
-
-def _mv_cmd(src: str, dst: str) -> str:
-    return f"mv {shlex.quote(src)} {shlex.quote(dst)}"
-
-
 def _copy_into_cmd(src: str, dst: str, merge: bool) -> str:
     """Device copy of *src* to exactly *dst*.  *merge* copies a folder's contents
     into an existing *dst* folder (``src/.``) instead of nesting ``dst/name``."""
     source = src.rstrip("/") + "/." if merge else src
     return f"cp -r -- {shlex.quote(source)} {shlex.quote(dst)}"
+
+
+def _copy_decision(source: str, target: str, info, folder: str, taken=None):
+    """Decide a device copy of *source* to exactly *target*, which is in *folder*.
+
+    *info* holds :func:`_probe_remote` results for *source*, *target* and, when
+    *source* is a real folder, *folder*.  Returns ``(problem, exists, merge)``:
+    *problem* is ``""`` or why the copy must not run - ``missing`` (no source),
+    ``same`` (the target is the source), ``inside`` (a folder into itself or its
+    own subfolder: ``cp -r`` would recurse until it fails), ``taken``
+    (another item of the batch has this target; *taken* holds the batch's
+    targets so far) or ``different`` (another kind of item is at the target).
+    *exists* is True when an item is at the target; a file there is replaced, a
+    folder is merged into (*merge*: the copy runs as ``source/.``).
+
+    ``cp -r`` copies a symbolic link as a link and never follows it: a linked
+    source can't recurse into itself, so it is not checked for that, and it
+    never merges into a folder of its name (``link/.`` would copy what the link
+    points to instead) - a name already taken there is refused.
+
+    The Files tab's Paste and :meth:`ADBHandler.copy` (``turboadb cp``) both
+    decide with this, so the two never disagree about what may be copied."""
+    kind, is_link, resolved = info[source]
+    if kind == "n":
+        return "missing", False, False
+    n_source = posixpath.normpath(source)
+    if n_source == posixpath.normpath(target):
+        return "same", False, False
+    if kind == "d" and not is_link:
+        n_folder = posixpath.normpath(folder)
+        real_source = posixpath.normpath(resolved or source)
+        real_folder = posixpath.normpath((info[folder][2] if folder in info else "") or folder)
+        if posixpath.join(real_folder, posixpath.basename(target)) == real_source:
+            return "same", False, False
+        if any(b == a or b.startswith(a.rstrip("/") + "/")
+               for a, b in ((n_source, n_folder), (real_source, real_folder))):
+            return "inside", False, False
+    if taken is not None:
+        if target in taken:
+            return "taken", False, False
+        taken.add(target)
+    target_kind = info[target][0]
+    if target_kind == "n":
+        return "", False, False
+    if is_link or target_kind == "b" or (target_kind == "d") != (kind == "d"):
+        return "different", True, False
+    return "", True, kind == "d"
 
 
 def _rename_check_cmd(src: str, dst: str) -> str:
@@ -135,17 +159,36 @@ def _rename_check_cmd(src: str, dst: str) -> str:
             f"else echo free; fi")
 
 
+# How mv's option parser rejects ``-T`` on shells that predate it (toybox before
+# Android 11 says "Unknown option 'T'", busybox "invalid option").
+_NO_T_OPTION = '*"nknown option"*|*"nvalid option"*|*"llegal option"*'
+
+
 def _rename_cmd(src: str, dst: str, overwrite: bool = False, verify: bool = True) -> str:
     """``mv -T`` never moves *src* INTO an existing folder.  Without *overwrite*,
     ``-n`` refuses to replace anything; toybox then still exits 0, so the move
-    is verified."""
+    is verified.
+
+    Many head units run a toybox without ``-T``.  There the command falls back
+    to a plain ``mv`` that first refuses a folder at *dst*, or a link to one (a
+    plain mv would move *src* inside it, over a file of its name there), and
+    does a case-only rename of the same file in two steps through a temporary
+    name."""
     s, d = shlex.quote(src), shlex.quote(dst)
-    if overwrite:
-        return f"mv -f -T -- {s} {d}"
-    if not verify:
-        return f"mv -T -- {s} {d}"
-    return (f"mv -n -T -- {s} {d} && if [ -e {s} ] || [ -L {s} ]; then "
-            f"echo 'mv: not renamed: the new name already exists' >&2; exit 1; fi")
+    flag = "-f " if overwrite else "-n " if verify else ""
+    tmp = shlex.quote(dst.rstrip("/") + ".turboadb-rename")
+    plain = (f"if [ ! -L {s} ] && [ ! -L {d} ] && [ {s} -ef {d} ]; then "
+             f"[ ! -e {tmp} ] && mv -- {s} {tmp} && mv -- {tmp} {d}; "
+             f"elif [ -d {d} ]; then "
+             f"echo 'mv: not renamed: a folder with the new name exists' >&2; false; "
+             f"else mv {flag}-- {s} {d}; fi")
+    cmd = (f"err=$(mv {flag}-T -- {s} {d} 2>&1) || case \"$err\" in "
+           f"{_NO_T_OPTION}) {plain} || exit 1;; "
+           f"*) printf '%s\\n' \"$err\" >&2; exit 1;; esac")
+    if verify and not overwrite:
+        cmd += (f"; if [ -e {s} ] || [ -L {s} ]; then "
+                f"echo 'mv: not renamed: the new name already exists' >&2; exit 1; fi")
+    return cmd
 
 
 def _probe_cmd(paths) -> str:
@@ -172,12 +215,64 @@ def _mode_cmd(path: str) -> str:
     return f"stat -c %a -- {shlex.quote(path)}"
 
 
+def _stamp_cmd(path: str) -> str:
+    """``<size> <modified, in seconds since the epoch>`` of what *path* points to."""
+    return f"stat -L -c '%s %Y' -- {shlex.quote(path)}"
+
+
+# Printed once a copy was written over its target (see _write_over_cmd).
+WRITTEN_MARK = "TURBOADB_WRITTEN"
+
+
+def _write_over_cmd(src: str, dst: str) -> str:
+    """Write the device file *src* over *dst* in place: *dst* keeps its owner,
+    mode and SELinux label (``cat`` into it, where adb push would replace it),
+    and :data:`WRITTEN_MARK` is printed when it worked (old devices give no
+    exit status)."""
+    return f"cat {shlex.quote(src)} > {shlex.quote(dst)} && echo {WRITTEN_MARK}"
+
+
+def _rm_file_cmd(path: str) -> str:
+    return f"rm -f -- {shlex.quote(path)}"
+
+
+def _regular_file_cmd(path: str) -> str:
+    """Prints ``f`` when *path* is, or links to, a regular file (the shell's own
+    test: it works where there is no ``stat``)."""
+    q = shlex.quote(path)
+    return f"if [ -f {q} ]; then echo f; else echo x; fi"
+
+
 def _chmod_cmd(mode: str, path: str) -> str:
     return f"chmod {shlex.quote(mode)} -- {shlex.quote(path)}"
 
 
 def _rm_cmd(paths) -> str:
     return "rm -rf " + " ".join(shlex.quote(p) for p in paths)
+
+
+def _sizes_cmd(path: str) -> str:
+    """The size of every file *path* holds, one number per line: the file's
+    own, or each file under a folder (a link to a folder is followed, as adb
+    follows it).  Prints nothing for a missing path.  The PC adds them up:
+    mksh's arithmetic is 32-bit, and a few GB would overflow it."""
+    q = shlex.quote(path)
+    inside = shlex.quote(path.rstrip("/") + "/")
+    return (f"if [ -d {q} ]; then find {inside} -type f -exec stat -c %s {{}} + 2>/dev/null; "
+            f"elif [ -e {q} ]; then stat -L -c %s -- {q} 2>/dev/null; fi")
+
+
+def _push_target_size_cmd(remote: str, name: str) -> str:
+    """The size of the file ``adb push NAME REMOTE`` is writing: ``REMOTE/NAME``
+    when REMOTE is a folder, else REMOTE itself."""
+    return (f"d={shlex.quote(remote)}; [ -d \"$d\" ] && d=\"$d/\"{shlex.quote(name)}; "
+            f"stat -L -c %s -- \"$d\" 2>/dev/null")
+
+
+def _sum_sizes(stdout) -> Optional[int]:
+    """The total of the sizes a size command printed, or None when it printed none."""
+    numbers = [int(ln) for ln in _output_lines(stdout) if ln.strip().isdigit()]
+    return sum(numbers) if numbers else None
 
 
 def _link_dirs_cmd(paths) -> str:
@@ -415,7 +510,10 @@ def _parse_ls_listing(text, escaped: bool = False):
         name = prev = row[0]
         if name in (".", ".."):
             continue
-        if not exact or name in seen:
+        # A name that starts or ends with a line break ("out\r", made by a
+        # script with Windows line endings) is not what a path to it says:
+        # _normalize_remote_path trims those, so "out\r" would act on "out".
+        if not exact or name in seen or name != name.strip("\r\n"):
             clean = False
             uncertain.add(name)
         seen.add(name)
@@ -483,6 +581,13 @@ def _probe_remote(handler, paths):
 
 
 _EDIT_STAT_RE = re.compile(r"^(\d+) ([0-7]{3,4}) (.+)\Z")
+
+
+def _parse_stamp(stdout):
+    """``(size, modified)`` from :func:`_stamp_cmd` output, or None (no ``stat``)."""
+    lines = _output_lines(stdout)
+    m = re.fullmatch(r"(\d+) (\d+)", lines[0].strip()) if lines else None
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _parse_edit_stat(stdout, path: str):

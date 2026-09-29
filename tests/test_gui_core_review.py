@@ -1,6 +1,6 @@
-"""Regression tests for the review fixes in the large GUI modules: the device
-tab, the mirror panel and the main window.  Headless (Qt offscreen platform);
-no device, adb or network is used."""
+"""Regression tests for the large GUI modules: the device tab, the mirror
+panel and the main window.  Headless (Qt offscreen platform); no device, adb
+or network is used."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def _close_panel(panel):
 # mirror_panel.py
 # --------------------------------------------------------------------------- #
 def test_closing_during_integrated_recording_finalizes_through_rec_wait(app, monkeypatch):
-    """B12: a tab closed mid-recording must use the 15 s WM_CLOSE path."""
+    """A tab closed mid-recording must use the 15 s WM_CLOSE path."""
     import turboadb.gui.mirror_panel as mp_mod
 
     created = []
@@ -100,7 +100,7 @@ def test_closing_during_integrated_recording_finalizes_through_rec_wait(app, mon
 
 
 def test_failed_embed_does_not_keep_a_child_handle(app, monkeypatch):
-    """B13: _child_hwnd is only set once Windows accepted the reparent."""
+    """_child_hwnd is only set once Windows accepted the reparent."""
     import turboadb.gui.mirror_panel as mp_mod
     from PyQt5.QtCore import QTimer
 
@@ -132,7 +132,7 @@ def test_failed_embed_does_not_keep_a_child_handle(app, monkeypatch):
 
 
 def test_ready_session_poll_does_not_reread_the_log(app):
-    """B14: the 500 ms UI-thread monitor stops reading the log once ready."""
+    """The 500 ms UI-thread monitor stops reading the log once ready."""
     panel = _panel()
 
     class Session(_Session):
@@ -181,8 +181,9 @@ def _wall_with_fake_starts(displays):
     return wall, started, stopped
 
 
-def test_display_wall_starts_every_display_one_after_another(app):
-    """Issue: each IVI display had to be started by hand, one by one."""
+def test_start_all_starts_every_display_one_after_another(app):
+    """Start all (the wall never starts a display by itself) starts every
+    display in turn, never several scrcpy servers at once."""
     wall, started, stopped = _wall_with_fake_starts(
         [{"id": 2, "size": "1920x720"}, {"id": 0, "size": "1920x720"}, {"id": 3, "size": "800x480"}]
     )
@@ -226,7 +227,7 @@ def test_display_wall_focus_shows_one_display_then_all(app):
 
 
 def test_options_popover_restyles_on_theme_refresh(app):
-    """B22: the popover follows live theme switches through the application
+    """The popover follows live theme switches through the application
     stylesheet (#screenOptions rules), not per-widget stylesheets."""
     from turboadb.gui import theme
 
@@ -248,7 +249,7 @@ def test_options_popover_restyles_on_theme_refresh(app):
 
 
 def test_keyboard_bar_goes_straight_to_the_shared_dispatcher_in_order(app):
-    """B23: one queue (the dispatcher) and ordered, batched text."""
+    """One queue (the dispatcher) and ordered, batched text."""
     from turboadb.gui.mirror_panel import MirrorPanel
 
     order = []
@@ -317,7 +318,7 @@ def test_max_view_restores_docks_after_repeated_resume(app):
 
 
 def test_split_view_reattaches_embedded_screen_when_container_changes(app, monkeypatch):
-    """B21 safety net: re-adopt scrcpy only when the container handle changed."""
+    """Safety net: re-adopt scrcpy only when the container handle changed."""
     import turboadb.gui.mirror_panel as mp_mod
 
     reparented = []
@@ -388,7 +389,7 @@ def _close_tab(tab):
 
 
 def test_device_tab_mirror_keeps_device_control_defaults(app):
-    """B10: the ribbon/menu Mirror follows the selected display and IVI compat."""
+    """The ribbon/menu Mirror follows the selected display and IVI compat."""
     tab = _device_tab()
     try:
         calls = []
@@ -401,7 +402,7 @@ def test_device_tab_mirror_keeps_device_control_defaults(app):
 
 
 def test_connect_result_after_close_builds_nothing(app, monkeypatch):
-    """B19: a queued connect result must not build panels on a closed tab."""
+    """A queued connect result must not build panels on a closed tab."""
     from turboadb.gui.device_tab import DeviceTab
 
     released = []
@@ -417,14 +418,17 @@ def test_connect_result_after_close_builds_nothing(app, monkeypatch):
 
 
 def test_failed_connect_and_reconnect_timeout_offer_a_retry(app, monkeypatch):
-    """B20: failures leave a Reconnect path and a usable Reboot button."""
+    """Failures leave a Reconnect path and a usable Reboot button."""
     from turboadb.gui import device_tab as dt_mod
 
-    monkeypatch.setattr(dt_mod.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    shown = []
+    monkeypatch.setattr(dt_mod.DeviceTab, "_show_connect_failure",
+                        lambda self, msg: shown.append(msg))
     tab = _device_tab()
     try:
         tab._started_connect = True
         tab._on_fail("device offline")
+        assert shown == ["device offline"]
         assert tab._started_connect is False
         assert not tab.btn_reconnect.isHidden()
 
@@ -482,7 +486,7 @@ def test_hidden_device_tab_releases_max_view(app):
 
 
 def test_android_shell_stop_never_kills_device_wide_processes(app):
-    """B16: Stop ends this shell only; no pkill/killall of logcat or top."""
+    """Stop ends this shell only; no pkill/killall of logcat or top."""
     from turboadb.gui.device_tab import _AndroidShellWidget
 
     class Handler:
@@ -514,7 +518,7 @@ def test_android_shell_stop_never_kills_device_wide_processes(app):
 
 
 def test_prompt_probe_reads_the_device_user_and_host_in_safe_mode(app):
-    """B7: the probe copies the device's own user@host and root state, in safe mode."""
+    """The probe copies the device's own user@host and root state, in safe mode."""
     from turboadb.gui.device_tab import _PromptThread
     from turboadb.results import CommandResult, OperationResult
 
@@ -573,18 +577,15 @@ def test_device_actions_treat_safe_mode_failures_as_errors():
 # main_window.py
 # --------------------------------------------------------------------------- #
 def _fake_log_window(status, *, dock_visible=False, silent=False):
-    from turboadb.gui.main_window import MainWindow
-
     return types.SimpleNamespace(
         log_panel=types.SimpleNamespace(
             append=lambda _text: None,
             chk_silent=types.SimpleNamespace(isChecked=lambda: silent),
         ),
         _log_dock=types.SimpleNamespace(isVisible=lambda: dock_visible),
-        _LOG_LEVEL_RE=MainWindow._LOG_LEVEL_RE,
-        _LEVEL_ALIASES=MainWindow._LEVEL_ALIASES,
         _show_log_dock=lambda: None,
-        statusBar=lambda: types.SimpleNamespace(showMessage=lambda text, _ms: status.append(text)),
+        statusBar=lambda: types.SimpleNamespace(
+            show_message=lambda text, tone, _ms: status.append((tone, text))),
     )
 
 
@@ -610,8 +611,9 @@ def test_log_messages_reach_status_bar_and_toasts(app, monkeypatch):
         ("warning", "first"), ("ok", "Saved screenshot"), ("info", "Rebooting to recovery…"),
     ]
     assert errors == ["second"]
-    assert status == [
-        "Warning: first", "Error: second", "Saved screenshot", "Rebooting to recovery…",
+    assert status == [  # each in the colour of its kind
+        ("warn", "first"), ("error", "second"), ("ok", "Saved screenshot"),
+        ("info", "Rebooting to recovery…"),
     ]
 
 
@@ -623,7 +625,7 @@ def test_silent_mutes_toasts_only_while_the_log_is_open(app, monkeypatch):
     monkeypatch.setattr(fileutil, "activity_toast", lambda *_a, **_k: toasts.append("activity"))
     monkeypatch.setattr(fileutil, "error_toast", lambda *_a, **_k: toasts.append("error"))
     MainWindow._log(_fake_log_window(status, dock_visible=True, silent=True), "[ERROR] boom")
-    assert toasts == [] and status == ["Error: boom"]
+    assert toasts == [] and status == [("error", "boom")]
     MainWindow._log(_fake_log_window(status, dock_visible=True, silent=False), "[ERROR] boom")
     assert toasts == ["error"]
 
@@ -656,7 +658,7 @@ def test_device_poll_stays_socket_only_while_adb_restarts(app, monkeypatch):
 
 
 def test_changed_adb_path_offers_a_server_restart(app, monkeypatch):
-    """B25: a new adb binary must take over the daemon."""
+    """A new adb binary must take over the daemon."""
     import turboadb.gui.main_window as mw_mod
 
     changes = {"adb_path": "C:/new/adb.exe"}

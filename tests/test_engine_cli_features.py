@@ -432,6 +432,7 @@ def test_screen_record_expands_the_save_path(fake_adb, monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 def _edit_handler(fake_adb, monkeypatch, *, ftype="regular file", body=b"old\n"):
     fake_adb.add("stat -L", stdout="4 640 %s\n/data/app.ini\n" % ftype)
+    fake_adb.add("TURBOADB_WRITTEN", stdout="TURBOADB_WRITTEN\n")
     h = handler()
     pushed = []
 
@@ -460,8 +461,14 @@ def test_edit_file_pushes_back_only_what_changed(fake_adb, monkeypatch):
 
     out = h.edit_file("/data/link.ini", edit, editor="vi")
     assert out == {"changed": True, "path": "/data/app.ini", "editor_exit": 0}
-    assert pushed == [(b"new\n", "/data/app.ini")]
-    assert device_words(fake_adb) == ["chmod", "640", "--", "/data/app.ini"]  # push resets the mode
+    # pushed NEXT to the file (a push deletes its target first, and a push cut
+    # off halfway left no file), then written over it on the device
+    (content, temp), = pushed
+    assert content == b"new\n" and temp.startswith("/data/.turboadb-save-")
+    assert device_words(fake_adb, -2) == ["cat", temp, ">", "/data/app.ini", "&&", "echo",
+                                          "TURBOADB_WRITTEN"]
+    assert device_words(fake_adb) == ["rm", "-f", "--", temp]  # the temporary copy goes
+    assert not any("chmod" in c for c in joined(fake_adb))  # written over: its mode never changed
     assert not os.path.exists(seen["path"])  # the temporary copy is always removed
 
 
@@ -494,18 +501,32 @@ def test_edit_file_refuses_anything_but_a_regular_file(fake_adb, monkeypatch):
 # --------------------------------------------------------------------------- #
 # screen_record_continuous — parts past screenrecord's 3-minute cap
 # --------------------------------------------------------------------------- #
+# The continuous recorder records part N+1 while part N is pulled, so these
+# stand in for its two halves: recording a clip, and saving (pulling) it.
+def _parts(monkeypatch, h, *, fail_at=None, stop=None, stop_after=None):
+    made = []  # the local path each recorded part was saved to
+
+    def fake_record(_time_limit, **_kw):
+        if fail_at is not None and len(made) == fail_at:
+            raise ADBError("the device went away")
+        made.append(None)
+        if stop_after is not None and len(made) == stop_after:
+            stop.set()
+        return core._Clip(f"/sdcard/rec{len(made)}.mp4", False)
+
+    def fake_save(clip, path):
+        made[int(clip.remote_path[len("/sdcard/rec"):-len(".mp4")]) - 1] = path
+        return path
+
+    monkeypatch.setattr(h, "_record_clip", fake_record)
+    monkeypatch.setattr(h, "_save_clip", fake_save)
+    return made
+
+
 def test_screen_record_continuous_names_and_reports_every_part(fake_adb, tmp_path, monkeypatch):
     h = handler()
     stop = threading.Event()
-    made = []
-
-    def fake_record(path, **_kw):
-        made.append(path)
-        if len(made) == 3:
-            stop.set()
-        return path
-
-    monkeypatch.setattr(h, "screen_record", fake_record)
+    made = _parts(monkeypatch, h, stop=stop, stop_after=3)
     reported = []
     paths = h.screen_record_continuous(
         str(tmp_path / "drive.mp4"), stop_event=stop, on_part=reported.append
@@ -520,17 +541,17 @@ def test_screen_record_continuous_records_one_part_without_a_stop_event(
     fake_adb, tmp_path, monkeypatch
 ):
     h = handler()
-    monkeypatch.setattr(h, "screen_record", lambda path, **_kw: path)
+    _parts(monkeypatch, h)
     assert h.screen_record_continuous(str(tmp_path / "clip.mp4")) == [str(tmp_path / "clip.mp4")]
 
 
 def test_screen_record_continuous_raises_when_the_first_part_fails(fake_adb, tmp_path, monkeypatch):
     h = handler()
 
-    def boom(path, **_kw):
+    def boom(_time_limit, **_kw):
         raise ADBError("screenrecord is blocked on this build")
 
-    monkeypatch.setattr(h, "screen_record", boom)
+    monkeypatch.setattr(h, "_record_clip", boom)
     with pytest.raises(ADBError, match="blocked"):
         h.screen_record_continuous(str(tmp_path / "clip.mp4"), stop_event=threading.Event())
 
@@ -539,15 +560,7 @@ def test_screen_record_continuous_reports_earlier_parts_before_re_raising(
     fake_adb, tmp_path, monkeypatch
 ):
     h = handler()
-    made = []
-
-    def fake_record(path, **_kw):
-        if len(made) == 2:
-            raise ADBError("the device went away")
-        made.append(path)
-        return path
-
-    monkeypatch.setattr(h, "screen_record", fake_record)
+    _parts(monkeypatch, h, fail_at=2)
     reported = []
     with pytest.raises(ADBError, match="went away"):
         h.screen_record_continuous(

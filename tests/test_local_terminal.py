@@ -203,11 +203,14 @@ def _registry_sets(lt, name):
 def _drive(lt, shell, cwd, lines, marker, timeout=60.0):
     """Wait for the first prompt, type *lines* like the console does, and
     collect output until *marker* (which the echoed input never contains)."""
+    from turboadb.results import strip_ansi
+
     sess = lt.LocalShellSession(shell, cwd=str(cwd), adb_path="__missing__")
     out = ""
     try:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not out.rstrip().endswith(">"):
+        # every prompt ends with an invisible mark (an OSC string): skip it
+        while time.monotonic() < deadline and not strip_ansi(out).rstrip().endswith(">"):
             chunk = sess.read(65536)
             out += chunk.decode("utf-8", "replace")
             if not chunk:
@@ -245,7 +248,7 @@ def _whoami():
 def test_real_cmd_env_vars_current_directory_exe_and_non_ascii(lt, exe_dir, monkeypatch):
     monkeypatch.setenv("TADB_PROBE", "hello-probe")
     monkeypatch.setenv("TADB_END", "__TADB_END__")
-    # Agent/IDE launchers set this; a normal cmd window runs tool.exe from cwd.
+    # Some IDE launchers set this; a normal cmd window runs tool.exe from cwd.
     monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
     out = _drive(lt, "cmd", exe_dir, [
         "echo [%TADB_PROBE%]",

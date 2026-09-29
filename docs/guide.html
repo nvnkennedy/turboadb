@@ -84,19 +84,29 @@ dev.connect()</code></pre></div></div>
       <article class="feature" id="shell">
         <h3>Terminal</h3>
         <p class="desc">A real terminal with history, tab-completion, and a Stop
-        button that actually kills a runaway command like <code>logcat</code> — plus
-        PowerShell and Command Prompt on this PC.</p>
+        button that sends a real Ctrl+C to a runaway command like <code>logcat</code>
+        — plus PowerShell and Command Prompt on this PC.</p>
         <div class="mode"><span class="tag gui">GUI</span>
           <ol class="steps">
             <li>Open a device → <b>Terminal</b> tab → type. The boxed banner at the
-            top shows the connection, device type, Android version, CPU and serial.</li>
+            top shows the connection, device type, Android version, CPU and serial.
+            The Android shell runs on a device terminal, so <code>ping</code> and
+            <code>logcat | grep</code> show their output as it comes and programs that
+            ask for input (<code>read</code>, <code>su</code>) work. Full-screen
+            programs (<code>top</code>, <code>vi</code>, <code>less</code>) redraw in
+            place and get every key; the prompt, <code>ls</code>, <code>grep</code>
+            and logcat lines are shown in colour.</li>
             <li>Right-click for Copy / Paste / <b>Send key</b> / <b>Save full output to
-            file…</b>; <b>Stop</b> (Ctrl+C) halts whatever is running. <b>A−</b> /
+            file…</b>; <b>Stop</b> (Ctrl+C) stops whatever is running and keeps the
+            shell (<code>ping</code> prints its summary); a command that ignores it is
+            ended by reopening the shell in the same folder. <b>A−</b> /
             <b>A+</b> resize every terminal together (12 pt by default).</li>
             <li>Click <b>PowerShell</b> or <b>CMD</b> in the switcher for a Windows
             shell with TurboADB's <code>adb</code> first on PATH and
             <code>ANDROID_SERIAL</code> set — Python, Git and <code>where</code> work
-            like in a normal console. Inside an <code>adb shell</code> typed there,
+            like in a normal console, and <b>Stop</b> works like Ctrl+C in a console
+            window: the command stops and the shell keeps its folder and variables.
+            Inside an <code>adb shell</code> typed there,
             <b>Stop</b> stops only the device command and keeps you in adb shell;
             if the command ignores it, Stop again reopens adb shell in the same
             folder.</li>
@@ -112,15 +122,17 @@ sess = dev.open_shell(); sess.send("ls /sdcard\n"); print(sess.read())</code></p
       <!-- LOGCAT -->
       <article class="feature" id="logcat">
         <h3>Logcat</h3>
-        <p class="desc">Filter by level / tag / live regex, highlight keywords,
+        <p class="desc">Filter by level / tag / app / live regex, highlight keywords,
         pause, and save the complete log — nothing is dropped under a flood.</p>
         <div class="mode"><span class="tag gui">GUI</span>
           <ol class="steps">
             <li>Open the <b>Logcat</b> tab, pick the level and how much history to
             include (<b>Live from now</b>, <b>Last 1,000 + live</b>, …) and optionally
-            a <b>Tag</b>.</li>
+            <b>Tag(s)</b> (comma-separated) or an <b>App</b> (package name or PID,
+            Android 7+).</li>
             <li>Press <b>Start</b> (or the <b>Crashes</b> preset). Type a regex in
-            <b>Filter</b> to hide non-matching lines, or in <b>Highlight</b> (e.g.
+            <b>Filter</b> to hide non-matching lines (it ignores case unless <b>Aa</b> is
+            on, and searches the whole capture), or in <b>Highlight</b> (e.g.
             <code>error|anr|crash</code>) to mark matches in-line <em>without</em>
             hiding the rest.</li>
             <li><b>Save…</b> writes the complete log to a <code>.log</code> file.</li>
@@ -139,8 +151,14 @@ for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
         <div class="mode"><span class="tag gui">GUI</span>
           <p class="step"><b>Files</b> tab → <b>This PC</b> and <b>Device</b> side by
           side → select files and press <b>Push</b> or <b>Pull</b>, or drag and drop
-          (also from Explorer). New folder, New file, Edit (F4), Copy / Paste, Rename
-          (F2) and Delete work in both panes.</p>
+          (also from Explorer). New folder, New file, Open, Edit (F4), Copy / Paste,
+          Rename (F2) and Delete work in both panes.</p>
+          <p class="step"><b>Double-click</b> (or <b>Enter</b>) opens a file in its app
+          on this PC: pictures in Photos, videos in Media Player, text in Notepad, or
+          any app you pick with <b>Open with…</b>. A device file opens as a copy, and
+          each time you save it there it goes back to the device (TurboADB asks first if
+          the device file changed meanwhile). Programs are never started; scripts and
+          files no app opens go to the built-in editor.</p>
           <p class="step">Drag beside the names to select a block, <b>Ctrl+A</b> for
           all, <b>Enter</b> to open, <b>Backspace</b> to go up. <b>Delete</b> sends
           local files to the Recycle Bin, <b>Shift+Delete</b> deletes for good. If the
@@ -220,9 +238,11 @@ dev.open_url("https://maps.google.com"); dev.input_text("hello world")</code></p
             The controls sit beside the screen or below it, whichever shows the
             screen larger.</li>
             <li>On cars (and any device with several displays) the <b>IVI Displays</b>
-            tab shows every display live at once and starts them one after another,
-            each with its own Back, Home, Recents, volume, power and screenshot
-            buttons. <b>Maximize</b> shows a single display (Esc restores); <b>Start all</b>,
+            tab shows every display side by side, each with its own Start / Stop and
+            Back, Home, Recents, volume, power and screenshot buttons. Every display
+            starts stopped (opening the tab or a rescan never starts one): start the
+            ones you need, or <b>Start all</b> to start them one after another.
+            <b>Maximize</b> shows a single display (Esc restores); <b>Start all</b>,
             <b>Stop all</b> and <b>Rescan</b> are at the top.</li>
             <li>If scrcpy can't run on a build, <b>Settings → scrcpy → Screen
             renderer → ADB screencap</b> shows the screen through <code>adb
@@ -374,7 +394,12 @@ dev.connect()</code></pre></div></div>
           once</b> or <b>Start + run at login</b>; opening the firewall needs
           Administrator). To undo it, <b>ADB server ▾ → Stop sharing &amp; remove
           auto-start</b> — stops sharing and removes both the login launcher and the
-          SYSTEM startup task.</p></div>
+          SYSTEM startup task.</p>
+          <p class="muted">The shared adb server has no password: anyone who can reach
+          its port can control the devices. The firewall rules therefore apply on
+          Domain and Private networks only; on a network Windows calls Public nobody
+          can connect until you make it Private. Stopping sharing deletes the rules
+          again.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb serve --startup-task    # shared server + firewall, headless across reboots
 turboadb serve --uninstall-startup   # stop auto-start again</code></pre></div></div>

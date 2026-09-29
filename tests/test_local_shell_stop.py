@@ -1,8 +1,10 @@
 """Stop / Ctrl+C in the PowerShell and CMD terminals.
 
 Inside an ``adb shell`` started there, Stop interrupts the device command and
-keeps the adb shell; a stuck adb shell is reopened in its device folder. A
-local command is still hard-stopped with a fresh local shell.
+keeps the adb shell; a stuck adb shell is reopened in its device folder.  The
+sessions here cannot end a single command (no ``kill_command``), so a local
+command falls back to a fresh local shell; tests/test_local_stop.py covers
+the Stop that keeps the shell.
 """
 import pytest
 
@@ -136,7 +138,8 @@ def test_a_reopen_whose_local_shell_cannot_start_leaves_the_adb_shell_context(
     monkeypatch.setattr(shell, "_start_session", lambda *, show_banner=True: None)
     shell._on_adb_interrupt_timeout()
     assert shell.session is None and not shell._in_adb_shell
-    assert shell.term._completion_fn == shell._local_complete
+    # local completion again (it runs on a worker thread)
+    assert shell.term._completion_fn == shell._complete_local_async
 
 
 def test_stop_on_a_local_command_still_opens_a_fresh_local_shell(shell):
@@ -157,11 +160,15 @@ def test_an_adb_shell_that_ends_by_itself_hands_stop_back_to_the_local_shell(she
     _output(shell, "PD2318:/ $ ")
     _output(shell, "\r\n" + local_prompt)  # the device was unplugged
     assert not shell._in_adb_shell
-    assert shell.term._completion_fn == shell._local_complete
+    assert shell.term._completion_fn == shell._complete_local_async
     assert shell._shell_cwd == str(tmp_path)
 
     shell.interrupt()
-    assert shell.stops == [True]  # a local Stop again
+    # a local Stop again: no Ctrl+C byte for a device, and at the idle PC
+    # prompt only a new prompt line (the shell is not replaced)
+    session = shell.sessions[-1]
+    assert b"\x03" not in session.sent and session.sent[-1] == b"\n"
+    assert shell.stops == []
 
 
 def test_an_adb_error_ends_the_adb_shell_context(shell, tmp_path):
@@ -171,7 +178,7 @@ def test_an_adb_error_ends_the_adb_shell_context(shell, tmp_path):
     assert not shell._in_adb_shell
 
 
-def test_exit_and_close_clear_a_pending_ctrl_c(shell):
+def test_exit_and_close_clear_a_pending_ctrl_c(shell, tmp_path):
     shell._send(b"adb shell\r\n")
     _output(shell, "PD2318:/ $ ")
     shell.interrupt()
@@ -179,6 +186,7 @@ def test_exit_and_close_clear_a_pending_ctrl_c(shell):
     shell._send(b"exit\r\n")
     assert not shell._in_adb_shell and not shell._adb_interrupt_timer.isActive()
 
+    _output(shell, f"exit\r\nPS {tmp_path}> ")  # the PC prompt is back
     shell._send(b"adb shell\r\n")
     shell.interrupt()
     shell.close_panel()

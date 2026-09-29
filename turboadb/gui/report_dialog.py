@@ -27,7 +27,28 @@ from .icons import icon
 from . import settings as settings_mod
 
 _RAW_SEPARATOR = "--- RAW DIAGNOSTICS ---"
-_ROW_RE = re.compile(r"^(.+?)\s{2,}(.+)$")
+# "ro.build.date                      Mon Jan  2 12:00:00 UTC 2023": a one-word
+# key (a property name), a run of spaces, the value.
+_ROW_RE = re.compile(r"^(\S+)\s{2,}(.+)$")
+_SPACE_RUN_RE = re.compile(r"\s{2,}")
+
+
+def _label_row(line: str):
+    """``("Battery", "80%")`` for a ``Label: value`` line, else None.
+
+    Only a colon that ends a label counts: nothing before it but single
+    spaces, and a space (or nothing) after it. The aligned ``key  value``
+    rows carry colons in their values (fingerprints, dates, MAC and IP
+    addresses), and splitting those at the first colon put half the value
+    in the key column; a kernel line (``… Jan 2 12:00:00 UTC 2023``) is no
+    label either.
+    """
+    key, colon, value = line.partition(":")
+    if not colon or line.startswith("[") or not key.strip():
+        return None
+    if _SPACE_RUN_RE.search(key.strip()) or (value and not value[0].isspace()):
+        return None
+    return key.strip(), value.strip()
 
 
 def _report_palette() -> dict[str, str]:
@@ -79,14 +100,13 @@ def summary_html(title: str, summary: str, palette: dict[str, str] | None = None
             flush_rows()
             blocks.append(f"<h2>{html.escape(line)}</h2>")
             index += 1
-        elif ":" in line and not line.startswith("["):
-            key, value = line.split(":", 1)
-            rows.append((html.escape(key.strip()), html.escape(value.strip())))
         else:
             match = _ROW_RE.match(line)
-            if match:
-                rows.append((html.escape(match.group(1).strip()), html.escape(match.group(2).strip())))
+            row = _label_row(line) or (match.groups() if match else None)
+            if row:
+                rows.append((html.escape(row[0].strip()), html.escape(row[1].strip())))
             else:
+                # Free text, such as the Kernel section's uname line.
                 flush_rows()
                 blocks.append(f"<p>{html.escape(line)}</p>")
         index += 1

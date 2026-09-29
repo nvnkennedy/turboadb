@@ -2,23 +2,46 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import re
+import sys
 import time
 import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .config import parse_host_port, validate_port
+from .config import adb_server_args, parse_host_port, user_path, validate_port
 from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 from .tools import (
     DEFAULT_ADB_SERVER_PORT,
+    DETACHED,
     NO_WINDOW,
-    _recv_exact,
     find_adb,
     windowless_python,
 )
 
-_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+_log = logging.getLogger(__name__)
+
+# The serial adb gives a Wireless-debugging device it connected by itself
+# through mDNS: the service instance, "adb-SERIAL-xxxxxx._adb-tls-connect._tcp"
+# (some adb versions end it with a dot; older ones use the "_adb._tcp" service).
+_MDNS_SERIAL_RE = re.compile(r"\._adb(?:-tls-connect)?\._tcp\.?$", re.IGNORECASE)
+
+
+def is_mdns_serial(serial) -> bool:
+    """True for a device adb found and connected through mDNS (its serial is
+    the service name, which has no ``:port``)."""
+    return bool(_MDNS_SERIAL_RE.search(str(serial or "").strip()))
+
+
+def is_network_serial(serial) -> bool:
+    """True when adb reaches the device *serial* over the network: a TCP/IP
+    target (``192.168.0.5:5555``, ``[fe80::1]:5555``) or a device adb connected
+    through mDNS (``adb-XXXX-yyyyyy._adb-tls-connect._tcp``)."""
+    host, port = parse_host_port(serial)
+    return (bool(host) and port is not None) or is_mdns_serial(serial)
 
 
 @dataclass
@@ -39,9 +62,8 @@ class Device:
 
     @property
     def is_network(self) -> bool:
-        """A TCP/IP target looks like ``host:port`` (``192.168.0.5:5555``)."""
-        host, port = parse_host_port(self.serial)
-        return bool(host) and port is not None
+        """Reached over the network (see :func:`is_network_serial`)."""
+        return is_network_serial(self.serial)
 
     @property
     def label(self) -> str:
@@ -93,41 +115,19 @@ def _list_devices_socket(host: str = "127.0.0.1", port: int = DEFAULT_ADB_SERVER
 
     Fast path (~10-15ms) that avoids spawning adb.exe subprocesses repeatedly on Windows.
     Returns None if the server is not reachable so caller can fall back to CLI.
+    On a loopback *host* the default port follows ``ANDROID_ADB_SERVER_PORT``.
     """
-    import socket
+    from .tools import adb_query
 
-    s = None
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        # Command is "000ehost:devices-l" (14 chars = 0x000e)
-        s.sendall(b"000ehost:devices-l")
-        status = _recv_exact(s, 4)
-        if status != b"OKAY":
-            return None
-        hex_len = _recv_exact(s, 4)
-        if hex_len is None:
-            return None
-        length = int(hex_len, 16)
-        data = _recv_exact(s, length)
-        if data is None:
-            return None
-        text = data.decode("utf-8", errors="replace")
-        devices = []
-        for line in text.splitlines():
-            dev = _parse_line(line)
-            if dev is not None:
-                devices.append(dev)
-        return devices
-    except Exception:
+    data = adb_query("host:devices-l", host, port, timeout)
+    if data is None:
         return None
-    finally:
-        if s is not None:
-            try:
-                s.close()
-            except Exception:
-                pass
+    devices = []
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        dev = _parse_line(line)
+        if dev is not None:
+            devices.append(dev)
+    return devices
 
 
 def list_devices(
@@ -151,8 +151,17 @@ def list_devices(
     show an actionable status instead of mislabelling a broken daemon as an
     empty device list.
     """
+    from .scrcpy import is_local_host
+
     target_host = server_host or "127.0.0.1"
-    is_local = target_host in _LOCAL_HOSTS
+    # The one rule for "this PC", which the mirror follows too: a LAN address
+    # or the name of this machine is its own adb server, not a remote one.
+    is_local = is_local_host(target_host)
+    if not server_host:
+        from .tools import local_adb_port
+
+        # adb's default port, as ANDROID_ADB_SERVER_PORT may have moved it
+        server_port = local_adb_port(server_port)
     # Keep the fast local path genuinely fast.
     sock_timeout = min(0.25, timeout) if is_local else min(2.0, timeout)
     sock_devs = _list_devices_socket(target_host, server_port, timeout=sock_timeout)
@@ -187,7 +196,7 @@ def list_devices(
     adb = find_adb(adb_path)
     cmd = [adb]
     if server_host:
-        cmd += ["-H", server_host, "-P", str(server_port)]
+        cmd += adb_server_args(server_host, server_port)
     elif server_port != DEFAULT_ADB_SERVER_PORT:
         cmd += ["-P", str(server_port)]
     cmd += ["devices", "-l"]
@@ -262,18 +271,33 @@ def _parse_mdns_line(line: str) -> Optional[dict]:
     return {"name": name, "service": kind, "host": host, "port": port, "address": addr}
 
 
-def mdns_devices(adb_path: str | None = None, timeout: float = 10.0) -> list:
+def mdns_devices(
+    adb_path: str | None = None,
+    timeout: float = 10.0,
+    server_host: str | None = None,
+    server_port: int = DEFAULT_ADB_SERVER_PORT,
+) -> list:
     """Discover Android 11+ *Wireless debugging* devices on the LAN via
     ``adb mdns services``. Returns a list of dicts
     ``{"name","service","host","port","address"}`` where ``service`` is
     ``connect`` (ready for ``adb connect``) or ``pairing`` (shows a pair code).
 
+    The adb server does the discovery, so with *server_host* the devices are
+    the ones on **that** machine's network (``adb -H host -P port``), the
+    same server an ``adb connect`` through it would use; a non-default
+    *server_port* alone picks a local server on that port.
+
     Returns ``[]`` when nothing is found or this adb has no mdns support —
     never raises for those cases (only for adb itself being missing)."""
     adb = find_adb(adb_path)
+    cmd = [adb]
+    if server_host:
+        cmd += adb_server_args(server_host, server_port)
+    elif server_port != DEFAULT_ADB_SERVER_PORT:
+        cmd += ["-P", str(server_port)]
     try:
         out = subprocess.run(
-            [adb, "mdns", "services"],
+            cmd + ["mdns", "services"],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -320,31 +344,167 @@ def _lan_reachable(port: int, timeout: float = 2.0) -> Optional[bool]:
     return False
 
 
+def _listens_on_all_interfaces(port: int, timeout: float = 0.5) -> Optional[bool]:
+    """Whether the server on *port* is bound to every interface, asked on a
+    second loopback address: a localhost-only adb server is bound to 127.0.0.1
+    and refuses 127.0.0.2, while a shared one (``adb -a``) accepts it at once.
+    Needs no LAN address.  None when this system cannot tell (no 127.0.0.2)."""
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.2", port), timeout=timeout):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except socket.timeout:
+        # Windows retries a refused loopback connect for about 2 s, where an
+        # accept takes a millisecond.
+        return False if os.name == "nt" else None
+    except OSError:
+        return None
+
+
 def server_is_shared(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> bool:
-    """True if an adb server is up AND reachable on a non-loopback interface —
-    i.e. another machine could actually drive this PC's devices.
+    """True if an adb server is up AND listening beyond loopback — i.e. another
+    machine could drive this PC's devices (``turboadb serve``, ``adb -a``).
 
-    Uses a socket probe, never ``adb devices`` (which silently STARTS a
-    localhost-only daemon when none is running). *adb_path* is accepted for
-    backward compatibility and is no longer needed."""
-    from .tools import is_adb_server_alive
+    Uses socket probes, never ``adb devices`` (which silently STARTS a
+    localhost-only daemon when none is running). A PC without a LAN address
+    no longer counts every server as shared: a localhost-only one is not.
+    *adb_path* is accepted for backward compatibility and is no longer needed."""
+    from .tools import is_adb_server_alive, local_adb_port
 
-    port = validate_port(port)
+    port = local_adb_port(validate_port(port))
     if not is_adb_server_alive(port=port):
         return False
-    lan = _lan_reachable(port)
-    # no LAN address at all (offline machine): fall back to "server is up"
-    return True if lan is None else lan
+    everywhere = _listens_on_all_interfaces(port)
+    if everywhere is not None:
+        return everywhere
+    # cannot tell from here: judge by this PC's LAN address, if it has one
+    return bool(_lan_reachable(port))
 
 
-def open_firewall(ports=(5037, TUNNEL_PORT_FIREWALL_RANGE)) -> str:
-    """Best-effort: open the given TCP ports in the Windows firewall so a remote
-    machine can reach this PC's adb server (5037) AND scrcpy's video tunnel
-    range. Entries may be a port or an inclusive ``start-end`` range. Needs
-    admin rights; returns a status string (never raises)."""
-    if os.name != "nt":
-        return "firewall: not Windows, skipped"
-    opened, failed = [], []
+def _beyond_loopback(port: int) -> Optional[bool]:
+    """Whether the server on *port* listens beyond loopback (see
+    :func:`_listens_on_all_interfaces`, then this PC's LAN address); None
+    when neither can tell."""
+    everywhere = _listens_on_all_interfaces(port)
+    if everywhere is not None:
+        return everywhere
+    return _lan_reachable(port)
+
+
+def _shared_now(port: int) -> bool:
+    """A server answers on *port* and other machines can reach it.  Unlike
+    :func:`server_is_shared`, a PC that cannot tell counts it as shared, as
+    :func:`start_shared_server` does."""
+    from .tools import is_adb_server_alive
+
+    return is_adb_server_alive(port=port, timeout=0.25) and _beyond_loopback(port) is not False
+
+
+def _wait_shared(port: int, timeout: float) -> bool:
+    """Wait up to *timeout* s for a shared server on *port* (:func:`_shared_now`)."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if _shared_now(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+# --------------------------------------------------------------------------- #
+# What this account's device sharing remembers (~/.turboadb/sharing.json)
+# --------------------------------------------------------------------------- #
+def _sharing_path(home: str | None = None) -> str:
+    """This account's sharing record, or the one in the profile folder *home*."""
+    if home:
+        from .config import USER_DIR_NAME
+
+        return os.path.join(home, USER_DIR_NAME, "sharing.json")
+    return user_path("sharing.json")
+
+
+def _read_sharing(path: str | None = None) -> dict:
+    try:
+        with open(path or _sharing_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _change_sharing(change, path: str | None = None) -> bool:
+    """Apply *change* (a function of the record) and save the record; False
+    when it could not be saved.  The record only saves work later, so a
+    failure is never a reason to fail the sharing itself."""
+    path = path or _sharing_path()
+    data = _read_sharing(path)
+    change(data)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(temporary, path)
+        return True
+    except OSError as exc:
+        _log.debug("could not save %s: %s", path, exc)
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        return False
+
+
+def _remember_shared_port(port: int, shared: bool = True) -> None:
+    def change(data):
+        ports = [p for p in (data.get("ports") or []) if isinstance(p, int) and p != port]
+        data["ports"] = sorted(ports + [port]) if shared else ports
+
+    _change_sharing(change)
+
+
+def recorded_shared_ports() -> list:
+    """The ports this account started a shared adb server on (``turboadb
+    serve --port N``, Share THIS PC's devices), and the port of the SYSTEM
+    startup task it installed.  A port on the list may no longer be shared:
+    ask :func:`server_is_shared`.  A tools update uses it to stop, and then
+    bring back, every server that runs the adb it replaces."""
+    data = _read_sharing()
+    ports = []
+    for value in list(data.get("ports") or []) + [data.get("task_port")]:
+        try:
+            port = validate_port(value)
+        except ValueError:
+            continue
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+# --------------------------------------------------------------------------- #
+# Firewall rules for a shared server
+# --------------------------------------------------------------------------- #
+# The adb server has no password: anyone who reaches its port can drive every
+# device plugged in here.  The rules therefore apply on Domain and Private
+# networks only, never on the Public networks of cafés, hotels and airports.
+FIREWALL_PROFILES = "domain,private"
+_PROFILE_NAMES = ("domain", "private", "public")
+# What netsh accepts after remoteip=: addresses, ranges, subnets and keywords
+# such as localsubnet, comma-separated.
+_REMOTE_IP = re.compile(r"[A-Za-z0-9.:/,\-]+")
+
+
+def _rule_name(spec: str) -> str:
+    return f"TurboADB TCP {spec}"
+
+
+def _port_specs(ports) -> tuple:
+    """``(valid, invalid)``: each entry of *ports* as netsh spells it (a port,
+    or an inclusive ``start-end`` range), or in *invalid* when it is neither."""
+    valid, invalid = [], []
     for p in ports:
         try:
             raw = str(p).strip()
@@ -353,34 +513,113 @@ def open_firewall(ports=(5037, TUNNEL_PORT_FIREWALL_RANGE)) -> str:
                 first, last = validate_port(first), validate_port(last)
                 if first > last:
                     raise ValueError("invalid descending port range")
-                p = f"{first}-{last}"
+                valid.append(f"{first}-{last}")
             else:
-                p = str(validate_port(raw))
+                valid.append(str(validate_port(raw)))
         except ValueError:
-            failed.append(p)
-            continue
-        rule = f"TurboADB TCP {p}"
+            invalid.append(str(p))
+    return valid, invalid
+
+
+def _firewall_profiles(value) -> Optional[str]:
+    """*value* as netsh's ``profile=`` takes it, or None when it is not one."""
+    names = [n.strip().lower() for n in str(value or "").split(",") if n.strip()]
+    if names == ["any"]:
+        return "any"
+    if not names or any(n not in _PROFILE_NAMES for n in names):
+        return None
+    return ",".join(n for n in _PROFILE_NAMES if n in names)
+
+
+def _on_networks(profiles: str) -> str:
+    if profiles == "any":
+        return "on every network"
+    names = [n.capitalize() for n in profiles.split(",")]
+    if len(names) > 1:
+        names = [", ".join(names[:-1]), names[-1]]
+    return f"on {' and '.join(names)} networks"
+
+
+def _public_networks() -> list:
+    """The names of this PC's connected networks Windows treats as Public, where
+    rules for Domain and Private networks do not apply.  Best-effort: [] when
+    it cannot tell (no PowerShell, Windows 7)."""
+    script = (
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+        "Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' } "
+        "| ForEach-Object { $_.Name }"
+    )
+    try:
+        found = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            timeout=15,
+            creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return []
+    if found.returncode != 0:
+        return []
+    text = (found.stdout or b"").decode("utf-8", "replace")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def open_firewall(
+    ports=(5037, TUNNEL_PORT_FIREWALL_RANGE), *, profiles: str = FIREWALL_PROFILES,
+    remote_ip: str | None = None,
+) -> str:
+    """Best-effort: open the given TCP ports in the Windows firewall so a remote
+    machine can reach this PC's adb server (5037) AND scrcpy's video tunnel
+    range. Entries may be a port or an inclusive ``start-end`` range. Needs
+    admin rights; returns a status string (never raises).
+
+    The rules apply on Domain and Private networks only (*profiles*, a
+    comma-separated list of ``domain``, ``private``, ``public``, or ``any``):
+    the shared server has no password, and a laptop taken to a café or hotel
+    network (Public) used to let anyone there drive its devices.  On a
+    network Windows calls Public nobody reaches it until that network is made
+    Private, which the status says.  *remote_ip* narrows the rules to what
+    netsh accepts after ``remoteip=`` (``localsubnet``, ``10.1.0.0/16``, …);
+    by default any address on those networks may connect, as VPN and RDP labs
+    span subnets."""
+    if os.name != "nt":
+        return "firewall: not Windows, skipped"
+    scope = _firewall_profiles(profiles)
+    if scope is None:
+        return (f"firewall: not changed — {profiles!r} is not a list of firewall profiles "
+                "(domain, private, public, or any)")
+    remote = str(remote_ip or "").strip()
+    if remote and not _REMOTE_IP.fullmatch(remote):
+        return f"firewall: not changed — {remote_ip!r} is not an address list netsh accepts"
+    specs, failed = _port_specs(ports)
+    opened = []
+    for p in specs:
+        rule = _rule_name(p)
         try:
-            # remove any old rule, then add (idempotent)
+            # remove any old rule (an older one allowed every network), then add
             subprocess.run(
                 ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
                 capture_output=True,
                 timeout=15,
                 creationflags=NO_WINDOW,
             )
+            cmd = [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={rule}",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                f"localport={p}",
+                f"profile={scope}",
+            ]
+            if remote:
+                cmd.append(f"remoteip={remote}")
             r = subprocess.run(
-                [
-                    "netsh",
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    f"name={rule}",
-                    "dir=in",
-                    "action=allow",
-                    "protocol=TCP",
-                    f"localport={p}",
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -389,17 +628,84 @@ def open_firewall(ports=(5037, TUNNEL_PORT_FIREWALL_RANGE)) -> str:
             (opened if r.returncode == 0 else failed).append(p)
         except Exception:
             failed.append(p)
-    if opened and not failed:
-        return f"firewall: opened TCP {', '.join(map(str, opened))}"
-    if opened:
+    if not opened:
         return (
-            f"firewall: opened {opened}; could NOT open {failed} "
-            "(run as Administrator to allow those)"
+            "firewall: could not open ports (run TurboADB/`turboadb serve` as "
+            f"Administrator, or open TCP 5037 + {TUNNEL_PORT_FIREWALL_RANGE} manually)"
         )
-    return (
-        "firewall: could not open ports (run TurboADB/`turboadb serve` as "
-        f"Administrator, or open TCP 5037 + {TUNNEL_PORT_FIREWALL_RANGE} manually)"
-    )
+    where = _on_networks(scope) + (f" for {remote}" if remote else "")
+    status = f"firewall: opened TCP {', '.join(opened)} {where}"
+    if failed:
+        status += f"; could NOT open {', '.join(failed)} (run as Administrator to allow those)"
+    if scope != "any" and "public" not in scope:
+        public = _public_networks()
+        if public:
+            names = ", ".join(repr(name) for name in public)
+            status += (f"; this PC is on {names}, a Public network: make it Private in "
+                       "Windows Settings → Network & internet for other PCs there to connect")
+    return status + ". The adb server has no password: share it on trusted networks only."
+
+
+def _rule_exists(rule: str) -> bool:
+    try:
+        shown = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
+            capture_output=True,
+            timeout=15,
+            creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return True  # cannot tell: try to delete it anyway
+    return shown.returncode == 0
+
+
+def _close_firewall(ports) -> tuple:
+    """``(closed, failed)``: the port specs whose TurboADB rule was deleted,
+    and those whose rule is there but could not be (no admin rights)."""
+    closed, failed = [], []
+    if os.name != "nt":
+        return closed, failed
+    for p in _port_specs(ports)[0]:
+        rule = _rule_name(p)
+        if not _rule_exists(rule):
+            continue
+        try:
+            ok = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
+                capture_output=True,
+                timeout=15,
+                creationflags=NO_WINDOW,
+            ).returncode == 0
+        except Exception:
+            ok = False
+        (closed if ok else failed).append(p)
+    return closed, failed
+
+
+def _closed_note(closed, failed) -> str:
+    bits = []
+    if closed:
+        bits.append(f"firewall: closed TCP {', '.join(closed)}")
+    if failed:
+        bits.append(f"firewall: could not close TCP {', '.join(failed)} (run as Administrator, "
+                    "or delete the 'TurboADB TCP' rules in Windows Defender Firewall)")
+    return "; ".join(bits)
+
+
+def close_firewall(ports=(DEFAULT_ADB_SERVER_PORT, TUNNEL_PORT_FIREWALL_RANGE)) -> str:
+    """Best-effort: delete the rules :func:`open_firewall` added for *ports*,
+    once nothing here is shared any more.  Needs admin rights, like adding
+    them; returns a status string (never raises)."""
+    if os.name != "nt":
+        return "firewall: not Windows, skipped"
+    return _closed_note(*_close_firewall(ports)) or "firewall: no TurboADB rule was open"
+
+
+# --------------------------------------------------------------------------- #
+# Starting and stopping the shared server
+# --------------------------------------------------------------------------- #
+class _PortTaken(RuntimeError):
+    """A localhost-only server took the port while the shared one was starting."""
 
 
 def start_shared_server(
@@ -415,45 +721,78 @@ def start_shared_server(
 
     Readiness is confirmed with socket probes only (``adb devices`` would start a
     plain localhost daemon of its own and report a false success), and the port
-    must also answer on this PC's LAN address.
+    must also answer on this PC's LAN address.  The port is recorded, so a
+    tools update can bring this server back (see :func:`recorded_shared_ports`).
 
     Returns a short status string; raises RuntimeError on failure.
     """
-    from .tools import is_adb_server_alive
+    from . import tools
 
-    port = validate_port(port)
+    port = tools.local_adb_port(validate_port(port))
     adb = find_adb(adb_path)
-    if restart:
-        # drop any localhost-only server so the new one can bind all interfaces
-        subprocess.run(
-            [adb, "-P", str(port), "kill-server"],
-            capture_output=True,
-            timeout=15,
-            creationflags=NO_WINDOW,
-        )
-        deadline = time.monotonic() + 5.0
-        while is_adb_server_alive(port=port, timeout=0.2) and time.monotonic() < deadline:
-            time.sleep(0.1)  # wait for the old daemon to release the port
-    elif is_adb_server_alive(port=port, timeout=0.2):
+    # Held from the stop to the new server's first answer: a device tab that
+    # reconnects meanwhile would otherwise start a localhost-only server that
+    # takes the port first.
+    with tools.adb_server_lock():
+        status = _start_shared_server(port, adb, restart)
+    _remember_shared_port(port)
+    return status
+
+
+def _server_env() -> Optional[dict]:
+    """The environment for a shared server: this account's own plus the adb
+    keys recorded for it (see :func:`_share_keys_with_system`), or None to
+    inherit it unchanged."""
+    keys = [k for k in (_read_sharing().get("adb_vendor_keys") or [])
+            if isinstance(k, str) and k and os.path.exists(k)]
+    if not keys:
+        return None
+    env = dict(os.environ)
+    current = [p for p in (env.get("ADB_VENDOR_KEYS") or "").split(os.pathsep) if p]
+    env["ADB_VENDOR_KEYS"] = os.pathsep.join(current + [k for k in keys if k not in current])
+    return env
+
+
+def _start_shared_server(port: int, adb: str, restart: bool) -> str:
+    from .tools import is_adb_server_alive, kill_adb_server
+
+    if not restart and is_adb_server_alive(port=port, timeout=0.2):
         if _lan_reachable(port) is not False:
             return f"shared adb server is already listening on 0.0.0.0:{port}"
         raise RuntimeError(
             f"a localhost-only adb server is already running on port {port}; "
             "restart it (restart=True) so the shared server can bind all interfaces"
         )
-    flags = NO_WINDOW
+    if restart:
+        # drop any localhost-only server so the new one can bind all interfaces
+        # (kill_adb_server waits for the old daemon to release the port)
+        kill_adb_server(adb, port)
+    try:
+        return _launch_shared_server(port, adb)
+    except _PortTaken:
+        if not restart:
+            raise
+    # An adb client outside the server lock (a terminal's command, another
+    # tool) started a localhost-only server in the gap: stop it, try once
+    # more.  A plain server lets go of the port at once; one that does not
+    # within a second is not going away, and the second attempt says so.
+    kill_adb_server(adb, port, wait=1.0)
+    return _launch_shared_server(port, adb)
+
+
+def _launch_shared_server(port: int, adb: str) -> str:
+    from .tools import is_adb_server_alive
+
     extra = {}
-    if os.name == "nt":
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — survives, no console
-        flags |= 0x00000008 | 0x00000200
-    else:
+    if os.name != "nt":
         extra["start_new_session"] = True
     proc = subprocess.Popen(
         [adb, "-a", "-P", str(port), "nodaemon", "server", "start"],
-        creationflags=flags,
+        creationflags=NO_WINDOW | DETACHED,  # survives, no console
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_server_env(),
         **extra,
     )
     deadline = time.monotonic() + 10.0
@@ -462,6 +801,11 @@ def start_shared_server(
             break
         code = proc.poll()
         if code is not None:
+            if is_adb_server_alive(port=port, timeout=0.2) and _lan_reachable(port) is False:
+                raise _PortTaken(
+                    f"adb server exited with code {code}; another localhost-only adb "
+                    f"server holds port {port}, so this PC is NOT shared"
+                )
             raise RuntimeError(
                 f"adb server exited with code {code} before listening on port {port} "
                 "(port in use by another adb, or an incompatible adb binary)"
@@ -472,7 +816,7 @@ def start_shared_server(
     if proc.poll() is not None and _lan_reachable(port) is False:
         # our process died but SOMETHING answers on loopback: a localhost-only
         # server grabbed the port first — exactly the old false success
-        raise RuntimeError(
+        raise _PortTaken(
             f"adb server exited with code {proc.poll()}; another localhost-only adb "
             f"server holds port {port}, so this PC is NOT shared"
         )
@@ -490,32 +834,60 @@ def stop_shared_server(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None
     """Stop the network-shared adb server and return to a normal local-only one:
     kill the ``-a`` (all-interfaces) server, then start a plain server that binds
     to localhost again, so this PC keeps working but no longer shares its devices.
-    Best-effort; returns a short status string."""
-    from .tools import is_adb_server_alive
+    Best-effort; returns a short status string.
 
-    port = validate_port(port)
+    The stop waits for the shared daemon to release the port (a start in that
+    gap reached the dying server, reported success and left no server), and
+    the start goes through the shared launcher like every other start.  The
+    firewall rules :func:`open_firewall` added are deleted too (the video
+    tunnel's only when no other shared server needs them)."""
+    from . import tools
+
+    port = tools.local_adb_port(validate_port(port))
     adb = find_adb(adb_path)
-    stopped = subprocess.run(
-        [adb, "-P", str(port), "kill-server"],
-        capture_output=True,
-        timeout=15,
-        creationflags=NO_WINDOW,
-    )
+    stopped = tools.kill_adb_server(adb, port)
     # Several adb builds exit non-zero from kill-server when no daemon is
     # running, so "Stop sharing" used to fail loudly when it was ALREADY
     # stopped. Like core.restart_server, a failed kill is only a note and
     # success is judged by the local server coming back.
-    started = subprocess.run(
-        [adb, "-P", str(port), "start-server"],
-        capture_output=True,
-        timeout=15,
-        creationflags=NO_WINDOW,
-    )
-    if started.returncode != 0 and not is_adb_server_alive(port=port, timeout=1.0):
-        detail = (started.stderr or started.stdout or b"").decode("utf-8", "replace").strip()
+    if not tools.ensure_adb_server(adb, timeout=15.0, port=port):
+        detail = tools.last_adb_server_error()
         raise RuntimeError(f"could not start local adb server: {detail or 'unknown error'}")
-    note = " (it was not running)" if stopped.returncode != 0 else ""
-    return f"shared adb server stopped — back to local-only (localhost){note}"
+    _remember_shared_port(port, shared=False)
+    rules = [port]
+    if not any(p != port and server_is_shared(p) for p in recorded_shared_ports()):
+        rules.append(TUNNEL_PORT_FIREWALL_RANGE)
+    closed = _closed_note(*_close_firewall(rules))
+    note = " (it was not running)" if stopped is not None and stopped.returncode != 0 else ""
+    return (f"shared adb server stopped — back to local-only (localhost){note}"
+            + (f"  ·  {closed}" if closed else ""))
+
+
+def restart_shared_server(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = None) -> str:
+    """Share this PC's devices again after the shared server had to stop (a
+    tools update replaces the adb it runs).  The SYSTEM startup task starts it
+    when it is installed for this port, so the server stays one that survives
+    logoff; otherwise, or when this user may not run that task, it starts as
+    this user.  The task's server counts once other machines can reach it: a
+    localhost-only server something else started meanwhile answers at once,
+    and that is not the task's.  Returns a short status string; raises
+    RuntimeError on failure."""
+    from .tools import local_adb_port
+
+    port = local_adb_port(validate_port(port))
+    if os.name == "nt" and _task_port() == port and _serve_task_installed():
+        try:
+            ran = subprocess.run(
+                ["schtasks", "/run", "/tn", _SERVE_TASK],
+                capture_output=True,
+                timeout=30,
+                creationflags=NO_WINDOW,
+            )
+        except Exception:
+            ran = None
+        if ran is not None and ran.returncode == 0 and _wait_shared(port, 20.0):
+            return f"shared adb server restarted by the {_SERVE_TASK} startup task"
+    return start_shared_server(port, adb_path, restart=True)
 
 
 def _startup_dir() -> str:
@@ -614,8 +986,6 @@ def _serve_launcher(port: int, adb_path: str | None = None, *, short_paths: bool
     The standalone (PyInstaller) exe cannot do this: ``TurboADB.exe -m turboadb
     serve`` just opens the GUI and never starts a server, so a login launcher or
     SYSTEM task built from it would silently share nothing."""
-    import sys
-
     if getattr(sys, "frozen", False):
         raise RuntimeError(
             "The standalone TurboADB executable cannot run the headless 'serve' "
@@ -636,9 +1006,11 @@ def install_startup(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | None = 
     """Make the shared adb server start automatically at every Windows login by
     dropping a tiny launcher in the Startup folder. Returns the file path.
     So it really never has to be done by hand again."""
+    from .tools import local_adb_port
+
     if os.name != "nt":
         raise RuntimeError("Startup install is only supported on Windows.")
-    port = validate_port(port)
+    port = local_adb_port(validate_port(port))
     adb = _pinned_adb(adb_path)
     d = _startup_dir()
     os.makedirs(d, exist_ok=True)
@@ -681,6 +1053,20 @@ def uninstall_startup() -> bool:
 _SERVE_TASK = "TurboADBSharedADB"
 
 
+def _serve_task_installed() -> bool:
+    """True when the SYSTEM startup task of ``turboadb serve`` exists."""
+    try:
+        found = subprocess.run(
+            ["schtasks", "/query", "/tn", _SERVE_TASK],
+            capture_output=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return False
+    return found.returncode == 0
+
+
 def _task_last_result(task: str) -> str:
     """The scheduler's own verdict on the last run, for an actionable error.
 
@@ -703,6 +1089,106 @@ def _task_last_result(task: str) -> str:
     return ""
 
 
+def _task_port() -> int:
+    """The port the SYSTEM startup task shares, as recorded when this account
+    installed it; a task installed before that was recorded serves the
+    default one."""
+    from .tools import local_adb_port
+
+    try:
+        return validate_port(_read_sharing().get("task_port"))
+    except ValueError:
+        return local_adb_port()
+
+
+def _system_home() -> Optional[str]:
+    """The SYSTEM account's profile folder, the startup task's ``~`` (None
+    anywhere but Windows)."""
+    if sys.platform != "win32":
+        return None
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    return os.path.join(root, "System32", "config", "systemprofile")
+
+
+def _user_adb_keys() -> list:
+    """This user's adb key files, the ones this user's devices already trust:
+    ``adbkey`` in adb's user folder (``ANDROID_USER_HOME``, else
+    ``~/.android``) and whatever ``ADB_VENDOR_KEYS`` names."""
+    folder = (os.environ.get("ANDROID_USER_HOME") or "").strip()
+    if not folder:
+        sdk_home = (os.environ.get("ANDROID_SDK_HOME") or "").strip()
+        folder = os.path.join(sdk_home or os.path.expanduser("~"), ".android")
+    keys = []
+    candidates = [os.path.join(folder, "adbkey")]
+    candidates += (os.environ.get("ADB_VENDOR_KEYS") or "").split(os.pathsep)
+    for path in candidates:
+        path = path.strip()
+        if path and os.path.exists(path):
+            path = os.path.abspath(path)
+            if path not in keys:
+                keys.append(path)
+    return keys
+
+
+def _share_keys_with_system() -> None:
+    """Let the SYSTEM task's adb server sign in to devices with this user's
+    adb keys as well as its own.
+
+    adb signs with the key of the account it runs as, and devices had only
+    ever been told to trust this user's: every one of them showed as
+    "unauthorized" to the task's server until someone accepted SYSTEM's key
+    at its screen, which a headless rig cannot do.  adb also tries the keys
+    named in ``ADB_VENDOR_KEYS``; a scheduled task cannot set variables, so
+    they are recorded in SYSTEM's own sharing record, which the task's
+    :func:`start_shared_server` passes on (SYSTEM can read this profile)."""
+    system_home = _system_home()
+    if not system_home:
+        return
+    keys = _user_adb_keys()
+    path = _sharing_path(system_home)
+    if not keys:
+        _log.warning("this user has no adb key yet (~/.android/adbkey): each device must "
+                     "accept the startup task's own key once, at its screen")
+        if "adb_vendor_keys" in _read_sharing(path):  # another user's, from before
+            _change_sharing(lambda data: data.pop("adb_vendor_keys", None), path)
+        return
+    if _read_sharing(path).get("adb_vendor_keys") == keys:
+        return
+    if _change_sharing(lambda data: data.__setitem__("adb_vendor_keys", keys), path):
+        _log.info("the startup task's adb server also signs in with this user's adb key "
+                  "(%s)", ", ".join(keys))
+    else:
+        _log.warning("could not give the startup task this user's adb key (%s): each device "
+                     "must accept the task's own key once, at its screen", path)
+
+
+def _serve_on(port: int) -> Optional[str]:
+    """What answers on *port* now: "shared", "local" or None (nothing)."""
+    from .tools import is_adb_server_alive
+
+    if not is_adb_server_alive(port=port, timeout=0.25):
+        return None
+    return "shared" if _beyond_loopback(port) is not False else "local"
+
+
+def _serve_again(kind: Optional[str], port: int, adb: Optional[str]) -> str:
+    """Start the server that answered on *port* before (*kind*, see
+    :func:`_serve_on`) again after the startup task failed; a sentence for
+    the error, or ""."""
+    from . import tools
+
+    try:
+        if kind == "shared":
+            start_shared_server(port, adb, restart=True)
+            return " This PC shares its devices as this user meanwhile, until logoff."
+        if kind == "local" and not tools.ensure_adb_server(adb, port=port):
+            return (" The local adb server did not start again: "
+                    f"{tools.last_adb_server_error() or 'unknown error'}.")
+    except Exception as exc:
+        return f" The adb server that was running did not start again: {exc}."
+    return ""
+
+
 def install_serve_task(
     port: int = DEFAULT_ADB_SERVER_PORT, *, run_now: bool = True, adb_path: str | None = None,
     ready_timeout: float = 20.0,
@@ -715,18 +1201,27 @@ def install_serve_task(
 
     The adb THIS user resolves is pinned into the task's command line, because
     SYSTEM's profile has neither ``~/.turboadb/tools`` nor the GUI settings and
-    would otherwise bind port 5037 with a different adb binary.
+    would otherwise bind port 5037 with a different adb binary.  This user's
+    adb keys go with it (:func:`_share_keys_with_system`), so the devices it
+    already uses need no new authorization.
 
-    With *run_now*, success means the server is actually LISTENING: ``schtasks
-    /run`` only reports that the task was launched, so the port is polled for
-    *ready_timeout* seconds and the task's last result is reported if it never
-    binds."""
-    from .tools import is_adb_server_alive
+    With *run_now*, success means the TASK's server is listening for other
+    machines.  ``schtasks /run`` only reports that the task was launched, and
+    a server already on the port (the one ``turboadb serve`` itself started a
+    moment earlier) answered the check before the task had done anything, so
+    a task that could not even start Python passed.  That server is stopped
+    first, the port is polled for *ready_timeout* seconds, and when the task
+    does not bring its own up, its last result is reported and the server
+    that was there is started again."""
+    from . import tools
 
     if os.name != "nt":
         raise RuntimeError("Scheduled-task install is Windows-only.")
-    port = validate_port(port)
-    tr = _serve_launcher(port, _pinned_adb(adb_path))
+    # SYSTEM does not have this user's ANDROID_ADB_SERVER_PORT: the task gets
+    # the port it moves the server to, or its server is never found.
+    port = tools.local_adb_port(validate_port(port))
+    adb = _pinned_adb(adb_path)
+    tr = _serve_launcher(port, adb)
     created = subprocess.run(
         [
             "schtasks",
@@ -750,7 +1245,12 @@ def install_serve_task(
     if created.returncode != 0:
         detail = (created.stderr or created.stdout or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(f"could not create Scheduled Task {_SERVE_TASK}: {detail or 'unknown error'}")
+    _change_sharing(lambda data: data.__setitem__("task_port", port))
+    _share_keys_with_system()
     if run_now:
+        before = _serve_on(port)
+        if before:
+            tools.kill_adb_server(adb, port)
         started = subprocess.run(
             ["schtasks", "/run", "/tn", _SERVE_TASK],
             capture_output=True,
@@ -759,24 +1259,25 @@ def install_serve_task(
         )
         if started.returncode != 0:
             detail = (started.stderr or started.stdout or b"").decode("utf-8", "replace").strip()
-            raise RuntimeError(f"Scheduled Task {_SERVE_TASK} was created but could not start: {detail or 'unknown error'}")
-        deadline = time.monotonic() + max(0.0, ready_timeout)
-        while not is_adb_server_alive(port=port, timeout=0.25):
-            if time.monotonic() >= deadline:
-                last = _task_last_result(_SERVE_TASK)
-                raise RuntimeError(
-                    f"Scheduled Task {_SERVE_TASK} was started but no adb server is "
-                    f"listening on port {port} after {ready_timeout:g}s"
-                    + (f" — {last}" if last else "")
-                    + ". Check that Python and turboadb are installed machine-wide "
-                    "(SYSTEM cannot see a per-user install)."
-                )
-            time.sleep(0.25)
+            raise RuntimeError(
+                f"Scheduled Task {_SERVE_TASK} was created but could not start: "
+                f"{detail or 'unknown error'}." + _serve_again(before, port, adb))
+        if not _wait_shared(port, ready_timeout):
+            last = _task_last_result(_SERVE_TASK)
+            raise RuntimeError(
+                f"Scheduled Task {_SERVE_TASK} was started but no adb server is "
+                f"listening on port {port} for other machines after {ready_timeout:g}s"
+                + (f" — {last}" if last else "")
+                + ". Check that Python and turboadb are installed machine-wide "
+                "(SYSTEM cannot see a per-user install)."
+                + _serve_again(before, port, adb)
+            )
     return _SERVE_TASK
 
 
 def uninstall_serve_task() -> bool:
-    """Remove the startup Scheduled Task if present."""
+    """Remove the startup Scheduled Task if present (and what was recorded for
+    it: its port, and the adb keys it was given)."""
     if os.name != "nt":
         return False
     r = subprocess.run(
@@ -785,4 +1286,10 @@ def uninstall_serve_task() -> bool:
         timeout=30,
         creationflags=NO_WINDOW,
     )
-    return r.returncode == 0
+    if r.returncode != 0:
+        return False
+    _change_sharing(lambda data: data.pop("task_port", None))
+    system_home = _system_home()
+    if system_home and "adb_vendor_keys" in _read_sharing(_sharing_path(system_home)):
+        _change_sharing(lambda data: data.pop("adb_vendor_keys", None), _sharing_path(system_home))
+    return True

@@ -1,4 +1,5 @@
-"""Headless regression tests for the GUI panel code-review fixes."""
+"""Headless regression tests for the GUI panels: Files, the dialogs, the
+console, Logcat, the camera and webcam panels, and their shared helpers."""
 
 from __future__ import annotations
 
@@ -30,8 +31,12 @@ def test_file_browser_device_commands_quote_every_path():
     nasty = "/sdcard/it's a dir/$(reboot) `id`; rm -rf /"
     other = "/sdcard/new name"
     assert shlex.split(fb._mkdir_cmd(nasty)) == ["mkdir", "-p", nasty]
-    assert shlex.split(fb._cp_cmd(nasty, other)) == ["cp", "-r", nasty, other]
-    assert shlex.split(fb._mv_cmd(nasty, other)) == ["mv", nasty, other]
+    assert shlex.split(fb._copy_into_cmd(nasty, other, False)) == ["cp", "-r", "--", nasty, other]
+    assert shlex.split(fb._copy_into_cmd(nasty, other, True)) == [
+        "cp", "-r", "--", nasty.rstrip("/") + "/.", other]
+    rename = fb._rename_cmd(nasty, other)
+    assert shlex.quote(nasty) in rename and shlex.quote(other) in rename
+    assert nasty not in rename.replace(shlex.quote(nasty), "")  # never unquoted
     assert shlex.split(fb._rm_cmd([nasty, other])) == ["rm", "-rf", nasty, other]
     touch = shlex.split(fb._touch_cmd(nasty))
     assert touch[:2] == ["touch", nasty] and touch[-1] == nasty
@@ -852,8 +857,11 @@ def test_logcat_panel_refilter_restores_lines_and_counts_skips(qapp):
         panel.filt.setText("keep")
         panel._refilter_view()
         assert panel.view.toPlainText().splitlines() == ["keep 1", "keep 3"]
-        panel.filt.setText("kee(")  # invalid while typing: the previous filter stays
+        panel.filt.setText("kee(")  # still typing: the previous filter stays in effect
         assert panel._filter_re.pattern == "keep"
+        panel._refilter_view()  # once typing pauses, an invalid regex is plain text
+        assert panel._filter_re.pattern == "kee\\("
+        assert panel.view.toPlainText().splitlines() == []
         panel.filt.setText("")
         panel._refilter_view()
         assert panel.view.toPlainText().splitlines() == ["keep 1", "drop 2", "keep 3"]
@@ -893,7 +901,7 @@ def test_logcat_panel_forgets_finished_thread_and_close_never_waits(qapp, monkey
     panel.start()
     assert panel.thread.wait(5000)
     assert _pump(qapp, lambda: panel.thread is None)
-    assert "--------- beginning of main" in panel._recent
+    assert "--------- beginning of main" in panel._sb.memory_text()  # archived
     panel.toggle()  # a new start must not touch the deleted worker
     assert panel.thread is not None
     worker = panel.thread
@@ -1578,7 +1586,7 @@ def test_late_remote_start_after_close_stops_remote_not_reader(camera_panel, mon
     assert late_sock.closed and camera_panel.reader is None and camera_panel._sock is None
 
 
-# ---- second review round: shared helpers, buffers and device-path safety ----
+# ---- shared helpers, buffers and device-path safety ----
 
 
 def test_fileutil_alive_treats_none_as_alive(qapp, tmp_path, monkeypatch):
@@ -1685,15 +1693,18 @@ def test_file_browser_new_item_names_cannot_escape_the_shown_folder(qapp, tmp_pa
 def test_file_browser_imports_only_the_remotefs_helpers_it_uses():
     from turboadb.gui import file_browser as fb
 
-    for gone in ("_ANSI_CSI_RE", "_as_text", "_chunks", "_dir_arg", "_EDIT_STAT_RE",
+    for gone in ("_ANSI_CSI_RE", "_as_text", "_dir_arg", "_EDIT_STAT_RE",
                  "_link_dirs_cmd", "_Listing", "_LS_B_ESCAPES", "_LS_DATE", "_ls_escaped_cmd",
                  "_LS_FALLBACK_REGEX", "_LS_PERMS", "_LS_REGEX", "_LS_TOOLBOX_REGEX",
                  "_LS_TOTAL_RE", "_parse_ls_entry", "_parse_ls_output", "_PERMS_RE",
-                 "_probe_cmd", "_split_link", "_unescape_ls_b"):
+                 "_probe_cmd", "_split_link", "_unescape_ls_b",
+                 # the builders without "--" and mv's -T/-n guards are gone for good
+                 "_cp_cmd", "_mv_cmd"):
         assert not hasattr(fb, gone), f"{gone} is unused here and must not be re-exported"
     # Still reached through this module: by the panel itself, or patched by tests.
+    # (_chunks groups a device delete, so a closed tab can stop between groups.)
     for kept in ("_probe_remote", "_parse_ls_line", "_parse_ls_listing", "_rm_cmd", "_ls_cmd",
-                 "_cp_cmd", "_mv_cmd", "_human_size"):
+                 "_human_size", "_chunks"):
         assert hasattr(fb, kept)
 
 
@@ -1735,15 +1746,15 @@ def test_local_shell_interrupt_kills_the_tree_off_the_ui_thread(monkeypatch):
         killed.set()
 
     monkeypatch.setattr(lt, "_kill_process_tree", slow_kill)
-    landed = threading.Event()
     started = time.monotonic()
-    session.interrupt(on_done=landed.set)
+    session.interrupt()
     # Ctrl+C used to block the UI thread here for taskkill plus two waits.
     assert time.monotonic() - started < 1.0
-    assert not killed.is_set() and not landed.is_set()
+    assert not killed.is_set()
     assert not session.running
     gate.set()
-    assert landed.wait(5) and killed.is_set()
+    assert killed.wait(5)
+    assert lt.join_closers(5) == 0  # the kill ran on a closer the exit waits for
 
 
 def test_local_shell_read_holds_a_split_character_across_idle_polls(monkeypatch):
@@ -1812,7 +1823,9 @@ def test_logcat_render_timer_only_ticks_while_there_is_output(qapp):
     assert not panel._render_timer.isActive()
 
 
-def test_logcat_refilter_keeps_the_skip_count(qapp):
+def test_logcat_refilter_redraws_the_lines_the_screen_skipped(qapp):
+    """A new filter searches the whole capture, so lines the on-screen cap
+    skipped come back instead of being owed a "skipped" marker."""
     from turboadb.gui.logcat_view import LogcatPanel
 
     panel = LogcatPanel(None)
@@ -1822,13 +1835,14 @@ def test_logcat_refilter_keeps_the_skip_count(qapp):
         panel._on_batch(["a", "b", "c", "d"])
         assert panel._skipped == 2
         panel._paused = False
-        panel._refilter_view()  # editing the filter must not discard the marker
+        panel._refilter_view()  # the filter did not change: nothing to redraw
         assert panel._skipped == 2
+        panel.filt.setText("[abd]")
+        panel._refilter_view()
+        assert panel._skipped == 0 and panel._pending == []
+        assert panel.view.toPlainText().splitlines() == ["a", "b", "d"]
         panel._render_pending()
-        assert panel._skipped == 0
-        assert panel.view.toPlainText().splitlines()[-1] == (
-            "… (2 lines skipped on screen — saved log has all)"
-        )
+        assert panel.view.toPlainText().splitlines() == ["a", "b", "d"]
     finally:
         panel.close_panel()
 

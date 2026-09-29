@@ -6,29 +6,53 @@ from __future__ import annotations
 import os
 import sys
 import subprocess
+import threading
 import html
+
+
+def _known_dir(location: str, folder: str) -> str:
+    """The system's own answer for a user folder (``QStandardPaths.<location>``),
+    else ``~/<folder>``, else the home directory: always a real directory.
+
+    ``~/Desktop`` is not where Windows keeps a Desktop that OneDrive backs up
+    (``~\\OneDrive\\Desktop``), and Linux desktops name the folders in the
+    user's language; the system knows where they really are."""
+    d = ""
+    try:
+        from PyQt5.QtCore import QStandardPaths
+
+        d = QStandardPaths.writableLocation(getattr(QStandardPaths, location)) or ""
+    except Exception:
+        d = ""
+    if not d or not os.path.isdir(d):
+        cand = os.path.join(os.path.expanduser("~"), folder)
+        d = cand if os.path.isdir(cand) else os.path.expanduser("~")
+    return d
 
 
 def download_dir() -> str:
     """The user's Downloads folder — where saved files SHOULD land (screenshots,
     recordings, pulled files, logs…), not some arbitrary place. Falls back to
     ~/Downloads, then the home directory, and always returns a real directory."""
-    d = ""
-    try:
-        from PyQt5.QtCore import QStandardPaths
+    return _known_dir("DownloadLocation", "Downloads")
 
-        d = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or ""
-    except Exception:
-        d = ""
-    if not d or not os.path.isdir(d):
-        cand = os.path.join(os.path.expanduser("~"), "Downloads")
-        d = cand if os.path.isdir(cand) else os.path.expanduser("~")
-    return d
+
+def desktop_dir() -> str:
+    """The user's Desktop folder, wherever the system keeps it (see
+    :func:`_known_dir`); the home directory when there is none."""
+    return _known_dir("DesktopLocation", "Desktop")
 
 
 def download_path(filename: str) -> str:
     """A full path in the Downloads folder for *filename* (a bare name)."""
     return os.path.join(download_dir(), filename)
+
+
+def _reaped(proc) -> None:
+    """Wait for the opener *proc* on a daemon thread: ``open`` and ``xdg-open``
+    hand the file over and exit, and an exited child nobody waits for stays
+    behind as a zombie process."""
+    threading.Thread(target=proc.wait, name="opener-reaper", daemon=True).start()
 
 
 def open_path(path: str) -> None:
@@ -37,9 +61,9 @@ def open_path(path: str) -> None:
         if sys.platform == "win32":
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
+            _reaped(subprocess.Popen(["open", path]))
         else:
-            subprocess.Popen(["xdg-open", path])
+            _reaped(subprocess.Popen(["xdg-open", path]))
     except Exception:
         pass
 
@@ -50,11 +74,11 @@ def reveal_path(path: str) -> None:
     try:
         if sys.platform == "win32":
             # explorer needs the comma glued to /select and a quoted path
-            subprocess.Popen('explorer /select,"%s"' % path)
+            _reaped(subprocess.Popen('explorer /select,"%s"' % path))
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
+            _reaped(subprocess.Popen(["open", "-R", path]))
         else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+            _reaped(subprocess.Popen(["xdg-open", os.path.dirname(path) or "."]))
     except Exception:
         pass
 

@@ -9,11 +9,15 @@ from typing import Optional, Union
 
 
 # ANSI/VT escape sequences (CSI like ESC[1;32m, OSC like ESC]0;title BEL, etc.)
-# OSC and CSI must be tried BEFORE the two-byte Fe form: the old class
+# OSC and CSI must be tried BEFORE the two-byte forms: the old class
 # ``[@-Z\\-_]`` also matched ``]`` (0x5D), so "ESC ]" was consumed alone and the
 # OSC payload (e.g. a window title) leaked into the cleaned text.
+# Then ESC, intermediate bytes, final byte: the charset choice ESC ( B ends
+# terminfo's sgr0 (top, vi), and without it the ESC went and "(B" stayed.
+# Last the two-byte forms, including ESC 7 / ESC 8 (save / restore the cursor)
+# and ESC = / ESC > (keypad modes), which left "7", "=" and the like behind.
 _ANSI_RE = re.compile(
-    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\^_])"
+    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[ -/]+[0-~]|[0-Z\\^-~])"
 )
 # control chars except tab(09), newline(0a); carriage-return(0d) handled separately
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -29,12 +33,21 @@ def strip_ansi(text: str) -> str:
     return _CTRL_RE.sub("", text)
 
 
-def _human_size(num: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(num) < 1024.0:
-            return f"{num:.1f}{unit}"
+def human_bytes(num) -> str:
+    """``1536`` -> ``"1.5 KB"``, ``500`` -> ``"500 B"``; ``None`` -> ``"—"``.
+
+    The one size format: the CLI, TransferResult, the Files tab and the
+    Transfers panel all print a size the same way."""
+    if num is None:
+        return "—"
+    num = max(0.0, float(num))
+    if num < 1024:
+        return f"{int(num)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
         num /= 1024.0
-    return f"{num:.1f}PB"
+        if num < 1024 or unit == "TB":
+            return f"{num:.1f} {unit}"
+    return f"{num:.1f} TB"  # pragma: no cover - the loop always returns
 
 
 @dataclass
@@ -101,11 +114,11 @@ class TransferResult:
 
     @property
     def human_speed(self) -> str:
-        return f"{_human_size(self.speed_bps)}/s"
+        return f"{human_bytes(self.speed_bps)}/s"
 
     @property
     def human_size(self) -> str:
-        return _human_size(self.size_bytes)
+        return human_bytes(self.size_bytes)
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -125,15 +138,26 @@ class TransferResult:
 @dataclass
 class StreamResult:
     """Result of a streaming operation (logcat / live shell), returned when it
-    ends (stop_event, timeout, stop-on-match, or EOF)."""
+    ends (stop_event, timeout, stop-on-match, or EOF).
+
+    ``exit_code`` is the command's exit status when it ended by itself (None
+    when it was stopped), and ``stderr`` is adb's error text when the stream
+    kept it apart from the lines (logcat does)."""
 
     lines: int
     matches: list
     saved_to: Optional[str] = None
+    exit_code: Optional[int] = None
+    stderr: str = ""
 
     @property
     def matched(self) -> bool:
         return bool(self.matches)
+
+    @property
+    def failed(self) -> bool:
+        """The command ended by itself with a non-zero exit status."""
+        return self.exit_code not in (None, 0)
 
     def __bool__(self) -> bool:
         return self.matched

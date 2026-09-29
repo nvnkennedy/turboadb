@@ -124,6 +124,21 @@ def _fresh_host_lookups():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_adb_server_state():
+    """Forget the adb server launchers and ownership records between tests.
+
+    ensure_adb_server remembers its in-flight launcher and the servers it
+    started: a fake launcher left running by one test would make every later
+    start wait on it instead of launching, and a recorded server would make a
+    later exit test stop a server it never started."""
+    from turboadb import tools
+
+    tools._reset_server_state()
+    yield
+    tools._reset_server_state()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_device_connect(monkeypatch):
     """GUI tests build DeviceTabs for made-up serials such as "123". Their
     automatic connect ran the real ``adb -s 123 wait-for-device``, which waits
@@ -137,6 +152,22 @@ def _no_real_device_connect(monkeypatch):
         yield
         return
     monkeypatch.setattr(device_tab._ConnectThread, "run", lambda self: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_apps(monkeypatch, tmp_path):
+    """Opening a file from the Files tab starts the app this PC has for it
+    (``file_open.start``): no test ever does, and the copies of opened device
+    files go to the test's own folder. Tests that check what was opened patch
+    ``start`` themselves."""
+    try:
+        from turboadb.gui import file_open
+    except Exception:  # PyQt5 is not installed
+        yield
+        return
+    monkeypatch.setattr(file_open, "start", lambda path, choose=False: None)
+    monkeypatch.setattr(file_open, "copies_root", lambda: str(tmp_path / "opened"))
     yield
 
 

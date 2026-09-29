@@ -1,4 +1,5 @@
-"""Regression tests for the engine/CLI code-review fixes (section A).
+"""Regression tests for the engine and the CLI: device-shell quoting, exit
+codes, adb lookup, tool fetching, the shared server and the release script.
 
 All offline: the ``fake_adb`` fixture (tests/conftest.py) or monkeypatching
 stands in for adb, scrcpy, sockets and the network."""
@@ -40,7 +41,7 @@ def calls_joined(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-H3  caller data is quoted for the device shell
+# caller data is quoted for the device shell
 # --------------------------------------------------------------------------- #
 def test_start_activity_quotes_data_url_with_ampersand(fake_adb):
     h = ADBHandler(ADBConfig(serial="x"))
@@ -97,7 +98,7 @@ def test_launch_package_quotes_the_grep_pattern(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-H2  ForwardHandle.close is device scoped and reports failure
+# ForwardHandle.close is device scoped and reports failure
 # --------------------------------------------------------------------------- #
 def test_forward_close_is_scoped_to_the_device_and_reports_failure(fake_adb):
     from turboadb.core import ForwardHandle
@@ -122,7 +123,7 @@ def test_reverse_close_success(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-H4 / A-M20  CLI global flags, --adb-host everywhere, timeout default
+# CLI global flags, --adb-host everywhere, timeout default
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "argv",
@@ -157,7 +158,7 @@ def test_cli_timeout_default_keeps_the_command_timeout():
 
 
 # --------------------------------------------------------------------------- #
-# A-M1  socket.timeout is a timeout on every Python version
+# socket.timeout is a timeout on every Python version
 # --------------------------------------------------------------------------- #
 def test_recv_exact_retries_socket_timeout():
     from turboadb.tools import _recv_exact
@@ -178,7 +179,7 @@ def test_recv_exact_retries_socket_timeout():
 
 
 # --------------------------------------------------------------------------- #
-# A-M2  input_text payloads decode back to the original text on Android
+# input_text payloads decode back to the original text on Android
 # --------------------------------------------------------------------------- #
 def _android_input_text(payload):
     """Port of AOSP Input.sendText's escape handling: only %s -> space."""
@@ -208,7 +209,7 @@ def test_input_text_chunks_round_trip(text):
 
 
 # --------------------------------------------------------------------------- #
-# A-M3 / A-L7  screenshot capture robustness
+# screenshot capture robustness
 # --------------------------------------------------------------------------- #
 _SIG = b"\x89PNG\r\n\x1a\n"
 
@@ -265,7 +266,7 @@ def test_capture_file_method_uses_unique_remote_paths(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-M4  shortcut: refreshing existing shortcuts is success
+# shortcut: refreshing existing shortcuts is success
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(os.name != "nt", reason="shortcuts are Windows-only")
 def test_create_shortcut_succeeds_when_shortcuts_already_exist(monkeypatch, tmp_path):
@@ -279,7 +280,7 @@ def test_create_shortcut_succeeds_when_shortcuts_already_exist(monkeypatch, tmp_
 
 
 # --------------------------------------------------------------------------- #
-# A-M5 / A-L14 / A-M18  CLI exit codes, errors and tool auto-fetch gating
+# CLI exit codes, errors and tool auto-fetch gating
 # --------------------------------------------------------------------------- #
 class _StubDevice:
     config = ADBConfig(serial="stub")
@@ -359,7 +360,7 @@ def test_upgrade_tools_cli_checks_once_and_fails_on_download_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-M6 / A-L13  install surfaces stderr; multi-APK keeps --downgrade
+# install surfaces stderr; multi-APK keeps --downgrade
 # --------------------------------------------------------------------------- #
 def test_install_failure_message_includes_stderr(fake_adb, tmp_path):
     fake_adb.add(
@@ -379,7 +380,7 @@ def test_install_multiple_passes_downgrade(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-M7 / A-L1  pull into an existing directory; transfer decoding
+# pull into an existing directory; transfer decoding
 # --------------------------------------------------------------------------- #
 def test_pull_into_existing_directory_measures_only_the_pulled_file(fake_adb, monkeypatch, tmp_path):
     import turboadb.core as core
@@ -407,7 +408,7 @@ def test_pull_into_existing_directory_measures_only_the_pulled_file(fake_adb, mo
 
 
 # --------------------------------------------------------------------------- #
-# A-M8 / A-L3  root/remount/mount/tcpip failures are failures
+# root/remount/mount/tcpip failures are failures
 # --------------------------------------------------------------------------- #
 def test_root_on_production_build_fails(fake_adb):
     fake_adb.add("root", stdout="adbd cannot run as root in production builds\n")
@@ -434,7 +435,7 @@ def test_remount_success_message_wins(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-M9 / A-L18  URL normalisation and the intent echo
+# URL normalisation and the intent echo
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "url,expected",
@@ -464,7 +465,7 @@ def test_open_url_echo_containing_error_is_not_a_failure(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-M10  safe mode never raises for bad arguments
+# safe mode never raises for bad arguments
 # --------------------------------------------------------------------------- #
 def test_safe_mode_validation_errors_are_wrapped(fake_adb):
     h = ADBHandler(ADBConfig(serial="x"), safe=True)
@@ -481,7 +482,7 @@ def test_safe_mode_validation_errors_are_wrapped(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-M11  --no-control drops options scrcpy refuses without control
+# --no-control drops options scrcpy refuses without control
 # --------------------------------------------------------------------------- #
 def test_no_control_skips_control_only_flags():
     args = ScrcpyOptions(no_control=True, turn_screen_off=True, show_touches=True).to_args()
@@ -491,7 +492,7 @@ def test_no_control_skips_control_only_flags():
 
 
 # --------------------------------------------------------------------------- #
-# A-M12  remote deploy script judges native commands by exit code
+# remote deploy script judges native commands by exit code
 # --------------------------------------------------------------------------- #
 def test_deploy_script_checks_native_exit_codes():
     from turboadb.remote_deploy import _DEPLOY_PS
@@ -502,7 +503,7 @@ def test_deploy_script_checks_native_exit_codes():
 
 
 # --------------------------------------------------------------------------- #
-# A-M13 / A-M14 / A-D12  shared server readiness and frozen builds
+# shared server readiness and frozen builds
 # --------------------------------------------------------------------------- #
 def _patch_server_start(monkeypatch, alive_seq, poll_value, lan):
     import turboadb.devices as devices
@@ -552,7 +553,7 @@ def test_frozen_build_refuses_headless_serve_launchers(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-M15  only a missing PyQt5 is reported as "needs PyQt5"
+# only a missing PyQt5 is reported as "needs PyQt5"
 # --------------------------------------------------------------------------- #
 def test_launch_gui_does_not_hide_other_import_errors(monkeypatch):
     pytest.importorskip("PyQt5")
@@ -565,7 +566,7 @@ def test_launch_gui_does_not_hide_other_import_errors(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-M16 / A-M17  adb lookup precedence, cache key, no environment mutation
+# adb lookup precedence, cache key, no environment mutation
 # --------------------------------------------------------------------------- #
 def test_find_adb_precedence_and_no_env_mutation(monkeypatch, tmp_path):
     import turboadb.tools as tools
@@ -586,13 +587,13 @@ def test_find_adb_precedence_and_no_env_mutation(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# A-H1 / A-M18 / A-L11  ensure_tools: missing tools only, stamps, thread-safe
+# ensure_tools: missing tools only, stamps, thread-safe
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def fresh_ensure(monkeypatch):
     import turboadb.toolsdl as toolsdl
 
-    monkeypatch.setattr(toolsdl, "_ensured", False)
+    monkeypatch.setattr(toolsdl, "_ensured", set())
     monkeypatch.setenv("TURBOADB_AUTO_FETCH", "1")
     monkeypatch.setattr(toolsdl, "_sync_scrcpy_adb", lambda: None)
     monkeypatch.setattr(toolsdl, "upgrade_tools", lambda **kw: pytest.fail("ensure must not upgrade"))
@@ -644,7 +645,7 @@ def test_tools_dir_does_not_create_directories(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# A-M19  get_state reads problem states from stderr
+# get_state reads problem states from stderr
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "stderr,state",
@@ -660,7 +661,7 @@ def test_get_state_from_stderr(fake_adb, stderr, state):
 
 
 # --------------------------------------------------------------------------- #
-# A-M21 / A-L25  list_devices timeouts and non-default local port
+# list_devices timeouts and non-default local port
 # --------------------------------------------------------------------------- #
 def _no_socket(monkeypatch):
     import turboadb.devices as devices
@@ -702,7 +703,7 @@ def test_config_strips_server_host():
 
 
 # --------------------------------------------------------------------------- #
-# A-M22  a "remote" server that is this PC uses the local server for scrcpy
+# a "remote" server that is this PC uses the local server for scrcpy
 # --------------------------------------------------------------------------- #
 def test_scrcpy_local_host_gets_no_remote_env(monkeypatch):
     import turboadb.scrcpy as scrcpy
@@ -725,7 +726,7 @@ def test_scrcpy_local_host_gets_no_remote_env(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-M23 / A-M24  telephony URIs and content-provider rows
+# telephony URIs and content-provider rows
 # --------------------------------------------------------------------------- #
 def test_dial_percent_encodes_hash(fake_adb):
     ADBHandler(ADBConfig(serial="x")).dial("*#06#")
@@ -756,7 +757,7 @@ def test_content_provider_security_exception_is_raised(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-L2 / A-L20  screen size and device IP selection
+# screen size and device IP selection
 # --------------------------------------------------------------------------- #
 def test_screen_size_uses_current_rotated_size(fake_adb):
     fake_adb.add(
@@ -783,7 +784,7 @@ def test_device_ip_prefers_wifi_over_cellular(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-L4  airplane fallback is honest when the broadcast is refused
+# airplane fallback is honest when the broadcast is refused
 # --------------------------------------------------------------------------- #
 def test_airplane_fallback_reports_refused_broadcast(fake_adb):
     fake_adb.add("cmd connectivity airplane-mode", stdout="unknown command", returncode=1)
@@ -793,7 +794,7 @@ def test_airplane_fallback_reports_refused_broadcast(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-L5  mirror never mutates the caller's options; kwargs apply
+# mirror never mutates the caller's options; kwargs apply
 # --------------------------------------------------------------------------- #
 def test_mirror_copies_options(monkeypatch):
     import turboadb.scrcpy as scrcpy
@@ -810,7 +811,7 @@ def test_mirror_copies_options(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-L6  forwards are scoped to this device
+# forwards are scoped to this device
 # --------------------------------------------------------------------------- #
 def test_remove_all_forwards_only_touches_this_device(fake_adb):
     fake_adb.add("forward --list", stdout="dev1 tcp:1 tcp:2\ndev2 tcp:3 tcp:4\n")
@@ -822,7 +823,7 @@ def test_remove_all_forwards_only_touches_this_device(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-L8 / A-D2  context manager only disconnects what it connected
+# context manager only disconnects what it connected
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("reply,expect_disconnect", [
     ("already connected to 1.2.3.4:5555", False),
@@ -840,7 +841,7 @@ def test_exit_disconnects_only_owned_connections(fake_adb, monkeypatch, reply, e
 
 
 # --------------------------------------------------------------------------- #
-# A-L9 / A-L10  ANSI OSC stripping; started_at is the start time
+# ANSI OSC stripping; started_at is the start time
 # --------------------------------------------------------------------------- #
 def test_strip_ansi_removes_osc_sequences():
     from turboadb.results import strip_ansi
@@ -869,7 +870,7 @@ def test_command_result_started_at_is_the_start(fake_adb, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-L15 / A-D10  relaunch uses the running interpreter
+# relaunch uses the running interpreter
 # --------------------------------------------------------------------------- #
 def test_relaunch_uses_current_environment():
     from turboadb import update
@@ -879,7 +880,7 @@ def test_relaunch_uses_current_environment():
 
 
 # --------------------------------------------------------------------------- #
-# A-L16  the library attaches no handlers; quiet suppresses INFO
+# the library attaches no handlers; quiet suppresses INFO
 # --------------------------------------------------------------------------- #
 def test_handler_logger_has_no_handlers_and_quiet_is_respected(caplog):
     h = ADBHandler(ADBConfig(serial="log-test-serial"), quiet=True)
@@ -892,7 +893,7 @@ def test_handler_logger_has_no_handlers_and_quiet_is_respected(caplog):
 
 
 # --------------------------------------------------------------------------- #
-# A-L17  go_wireless retries the connect instead of a fixed sleep
+# go_wireless retries the connect instead of a fixed sleep
 # --------------------------------------------------------------------------- #
 def test_go_wireless_retries_connect(fake_adb, monkeypatch):
     import turboadb.core as core
@@ -915,7 +916,7 @@ def test_go_wireless_retries_connect(fake_adb, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-L19  get_brightness has no made-up default
+# get_brightness has no made-up default
 # --------------------------------------------------------------------------- #
 def test_get_brightness_raises_when_unreadable(fake_adb):
     fake_adb.add("screen_brightness", stdout="null")
@@ -926,7 +927,7 @@ def test_get_brightness_raises_when_unreadable(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# A-L21  the name-hint fallback tries only a few packages
+# the name-hint fallback tries only a few packages
 # --------------------------------------------------------------------------- #
 def test_open_app_hint_fallback_is_bounded(fake_adb, monkeypatch):
     h = ADBHandler(ADBConfig(serial="x"))
@@ -940,7 +941,7 @@ def test_open_app_hint_fallback_is_bounded(fake_adb, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-L22  screen_record clamps the limit and cleans up an interrupted recording
+# screen_record clamps the limit and cleans up an interrupted recording
 # --------------------------------------------------------------------------- #
 def _record_harness(monkeypatch, tmp_path, done):
     import turboadb.core as core
@@ -998,7 +999,7 @@ def test_interrupted_screen_record_removes_the_partial_device_file(monkeypatch, 
 
 
 # --------------------------------------------------------------------------- #
-# A-L23  ShellSession.send reports a dead pipe
+# ShellSession.send reports a dead pipe
 # --------------------------------------------------------------------------- #
 def test_shell_session_send_reports_broken_pipe():
     from turboadb.core import ShellSession
@@ -1016,7 +1017,7 @@ def test_shell_session_send_reports_broken_pipe():
 
 
 # --------------------------------------------------------------------------- #
-# A-L26  release: a failed build restores the version strings
+# release: a failed build restores the version strings
 # --------------------------------------------------------------------------- #
 def test_release_restores_version_when_build_fails(monkeypatch, tmp_path):
     import importlib.util
@@ -1030,6 +1031,8 @@ def test_release_restores_version_when_build_fails(monkeypatch, tmp_path):
     init = tmp_path / "__init__.py"
     pyproject.write_text('[project]\nversion = "1.2.3"\n', encoding="utf-8")
     init.write_text('__version__ = "1.2.3"\n', encoding="utf-8")
+    # a release needs the new version's notes before anything runs
+    (tmp_path / "CHANGELOG.md").write_text("## 1.2.4\n\n- A fix.\n", encoding="utf-8")
     monkeypatch.setattr(release, "ROOT", tmp_path)
     monkeypatch.setattr(release, "PYPROJECT", pyproject)
     monkeypatch.setattr(release, "INIT", init)
@@ -1045,7 +1048,7 @@ def test_release_restores_version_when_build_fails(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# A-L27  `scrcpy -s ip:port` connects first, without poking private attrs
+# `scrcpy -s ip:port` connects first, without poking private attrs
 # --------------------------------------------------------------------------- #
 def test_cli_scrcpy_connects_network_target(fake_adb, monkeypatch):
     import turboadb.cli as cli
@@ -1059,7 +1062,7 @@ def test_cli_scrcpy_connects_network_target(fake_adb, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# A-D3  one host:port parser
+# one host:port parser
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "value,expected",
@@ -1088,23 +1091,35 @@ def test_device_is_network_and_mdns_use_the_shared_parser():
 
 
 # --------------------------------------------------------------------------- #
-# A-D11  restart_server + tunnel firewall range constant
+# restart_server + tunnel firewall range constant
 # --------------------------------------------------------------------------- #
 def test_restart_server_kills_then_starts_globally(fake_adb, monkeypatch):
+    """The kill is a global kill-server; the start goes through the one shared
+    launcher (tools.ensure_adb_server), so a restart cannot race a start that
+    is already under way, and TurboADB knows it started the new server."""
     import turboadb.core as core
+    import turboadb.tools as tools
 
     monkeypatch.setattr(core, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    started = []
+    monkeypatch.setattr(tools, "ensure_adb_server",
+                        lambda adb, timeout, port: started.append(port) or True)
     h = ADBHandler(ADBConfig(serial="dev1"))
     res = h.restart_server()
     assert res.ok
-    assert [c[1:] for c in fake_adb.calls] == [["kill-server"], ["start-server"]]
+    assert [c[1:] for c in fake_adb.calls] == [["kill-server"]]
+    assert started == [5037]
 
 
 def test_restart_server_failure(fake_adb, monkeypatch):
     import turboadb.core as core
+    import turboadb.tools as tools
 
     monkeypatch.setattr(core, "is_adb_server_alive", lambda **kw: False)
-    fake_adb.add("start-server", returncode=1, stderr="could not bind to 5037")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(tools, "ensure_adb_server", lambda *a, **k: False)
+    monkeypatch.setattr(tools, "last_adb_server_error", lambda: "could not bind to 5037")
     h = ADBHandler(ADBConfig())
     with pytest.raises(ADBCommandError, match="could not bind"):
         h.restart_server()
@@ -1128,10 +1143,11 @@ def test_tunnel_firewall_range_constant():
 # Redundant: shell_many / get_serialno follow the safe-mode convention
 # --------------------------------------------------------------------------- #
 def test_shell_many_honours_kwargs_and_safe_mode(fake_adb):
+    fake_adb.add("@@su=", stdout="@@su=c\n")  # the device's su takes -c (Magisk)
     fake_adb.add("-c false", returncode=1)
     h = ADBHandler(ADBConfig(serial="x"))
     results = h.shell_many(["echo a", "false", "echo b"], su=True)
-    assert len(results) == 2 and "su -c" in " ".join(fake_adb.calls[0])
+    assert len(results) == 2 and "su -c 'echo a'" in " ".join(fake_adb.calls[1])
     with pytest.raises(TypeError):
         h.shell_many(["echo a"], bogus=1)
     wrapped = h.shell_many(["echo a"], bogus=1, safe=True)
@@ -1140,7 +1156,7 @@ def test_shell_many_honours_kwargs_and_safe_mode(fake_adb):
 
 
 # --------------------------------------------------------------------------- #
-# B-1 / B-2  the SYSTEM serve task pins ITS adb and proves the server came up
+# the SYSTEM serve task pins ITS adb and proves the server came up
 # --------------------------------------------------------------------------- #
 def _fake_schtasks(monkeypatch, devices, *, query_out=b""):
     """Record every schtasks/adb argv the installer runs; everything succeeds."""
@@ -1163,6 +1179,11 @@ def test_serve_task_pins_the_adb_the_installing_user_resolved(monkeypatch):
     monkeypatch.setattr(devices, "find_adb", lambda p=None: r"C:\Users\me\.turboadb\tools\adb.exe")
     monkeypatch.setattr(devices, "windowless_python", lambda: r"C:\Py\pythonw.exe")
     monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: True)
+    # the task's server listens for other machines; the one it replaces is
+    # stopped through the one stopper, and SYSTEM's profile is left alone
+    monkeypatch.setattr(devices, "_listens_on_all_interfaces", lambda port, timeout=0.5: True)
+    monkeypatch.setattr(tools, "kill_adb_server", lambda adb, port=5037, **kw: None)
+    monkeypatch.setattr(devices, "_share_keys_with_system", lambda: None)
     calls = _fake_schtasks(monkeypatch, devices)
 
     assert devices.install_serve_task(port=5037) == devices._SERVE_TASK
@@ -1182,6 +1203,7 @@ def test_serve_task_fails_when_the_shared_server_never_binds(monkeypatch):
     monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
     monkeypatch.setattr(devices, "windowless_python", lambda: "pythonw")
     monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(devices, "_share_keys_with_system", lambda: None)
     _fake_schtasks(monkeypatch, devices, query_out=b"Last Result: 0x1\r\n")
 
     # `schtasks /run` returning 0 only means the task LAUNCHED.
@@ -1197,6 +1219,7 @@ def test_serve_task_reports_the_schedulers_last_result(monkeypatch):
     monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
     monkeypatch.setattr(devices, "windowless_python", lambda: "pythonw")
     monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(devices, "_share_keys_with_system", lambda: None)
     _fake_schtasks(monkeypatch, devices, query_out=b"Last Result:  267011\r\n")
 
     with pytest.raises(RuntimeError, match="267011"):
@@ -1204,14 +1227,17 @@ def test_serve_task_reports_the_schedulers_last_result(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# B-3  "Stop sharing" works when the shared server is already stopped
+# "Stop sharing" works when the shared server is already stopped
 # --------------------------------------------------------------------------- #
 def test_stop_shared_server_tolerates_a_kill_server_that_had_nothing_to_kill(monkeypatch):
     import turboadb.devices as devices
     import turboadb.tools as tools
 
     monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
-    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: True)
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    started = []
+    monkeypatch.setattr(tools, "ensure_adb_server",
+                        lambda adb, timeout, port: started.append((adb, port)) or True)
 
     def run(cmd, **kw):
         if "kill-server" in cmd:  # several adb builds do this when idle
@@ -1220,6 +1246,8 @@ def test_stop_shared_server_tolerates_a_kill_server_that_had_nothing_to_kill(mon
 
     monkeypatch.setattr(devices.subprocess, "run", run)
     assert "not running" in devices.stop_shared_server()
+    # the local server comes back through the one shared launcher
+    assert started == [("adb", 5037)]
 
 
 def test_stop_shared_server_still_fails_when_the_local_server_does_not_return(monkeypatch):
@@ -1231,16 +1259,16 @@ def test_stop_shared_server_still_fails_when_the_local_server_does_not_return(mo
     monkeypatch.setattr(
         devices.subprocess,
         "run",
-        lambda cmd, **kw: types.SimpleNamespace(
-            returncode=1, stdout=b"", stderr=b"cannot bind 5037"
-        ),
+        lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
     )
+    monkeypatch.setattr(tools, "ensure_adb_server", lambda *a, **k: False)
+    monkeypatch.setattr(tools, "last_adb_server_error", lambda: "cannot bind 5037")
     with pytest.raises(RuntimeError, match="cannot bind"):
         devices.stop_shared_server()
 
 
 # --------------------------------------------------------------------------- #
-# B-4  the login .bat is written the way cmd.exe reads it; no Startup, no lie
+# the login .bat is written the way cmd.exe reads it; no Startup, no lie
 # --------------------------------------------------------------------------- #
 def test_startup_dir_fails_loudly_without_appdata(monkeypatch):
     import turboadb.devices as devices
@@ -1271,7 +1299,7 @@ def test_login_launcher_is_encoded_for_cmd_not_utf8(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# B-5  platform-tools is verified against Google's published checksum
+# platform-tools is verified against Google's published checksum
 # --------------------------------------------------------------------------- #
 _PT_XML = """<sdk:sdk-repository xmlns:sdk="http://schemas.android.com/repository">
  <remotePackage path="platform-tools">
@@ -1355,7 +1383,7 @@ def test_a_published_size_alone_is_checked_and_the_gap_is_logged(tmp_path, caplo
 
 
 # --------------------------------------------------------------------------- #
-# B-6  a stale cached release body is not an answer to "what is the latest?"
+# a stale cached release body is not an answer to "what is the latest?"
 # --------------------------------------------------------------------------- #
 def test_only_a_200_or_304_settles_the_latest_scrcpy_version(monkeypatch, tmp_path):
     import json as json_mod
@@ -1386,7 +1414,7 @@ def test_only_a_200_or_304_settles_the_latest_scrcpy_version(monkeypatch, tmp_pa
 
 
 # --------------------------------------------------------------------------- #
-# B-7  a missing MANAGED copy is "install", not "up to date"
+# a missing MANAGED copy is "install", not "up to date"
 # --------------------------------------------------------------------------- #
 def test_check_updates_reports_a_missing_managed_copy_and_the_path_one_apart(monkeypatch):
     import turboadb.toolsdl as toolsdl
@@ -1408,7 +1436,7 @@ def test_check_updates_reports_a_missing_managed_copy_and_the_path_one_apart(mon
 
 
 # --------------------------------------------------------------------------- #
-# B-8  the stamp actually gates the auto-fetch it was written for
+# the stamp actually gates the auto-fetch it was written for
 # --------------------------------------------------------------------------- #
 def test_a_matching_stamp_skips_the_whole_tool_check(fresh_ensure, monkeypatch):
     toolsdl = fresh_ensure
@@ -1437,7 +1465,7 @@ def test_a_stamp_does_not_cover_a_tool_that_was_deleted(fresh_ensure, monkeypatc
 
 
 # --------------------------------------------------------------------------- #
-# B-9  the upgrade's tool refresh and version report run in the NEW code
+# the upgrade's tool refresh and version report run in the NEW code
 # --------------------------------------------------------------------------- #
 def test_run_upgrade_never_drives_the_new_downloader_from_the_old_package(monkeypatch):
     import turboadb.toolsdl as toolsdl
@@ -1513,7 +1541,7 @@ def test_relaunch_on_exit_starts_nothing_while_this_instance_still_runs(monkeypa
 
 
 # --------------------------------------------------------------------------- #
-# B-10  ONE ~/.turboadb resolver, consulted on every call
+# ONE ~/.turboadb resolver, consulted on every call
 # --------------------------------------------------------------------------- #
 def test_every_user_state_path_follows_the_same_resolver(monkeypatch, tmp_path):
     from turboadb import config, tools, update
@@ -1544,7 +1572,7 @@ def test_an_explicit_settings_path_override_still_wins(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# B-11  a long-lived store must not delete targets added behind its back
+# a long-lived store must not delete targets added behind its back
 # --------------------------------------------------------------------------- #
 def test_saving_merges_targets_another_process_added(monkeypatch, tmp_path):
     from turboadb.gui import sessions
@@ -1575,7 +1603,7 @@ def test_renaming_does_not_resurrect_the_old_name(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# B-12  settings are serialised across PROCESSES, not just threads
+# settings are serialised across PROCESSES, not just threads
 # --------------------------------------------------------------------------- #
 def test_settings_lock_is_exclusive_across_processes_and_reentrant_within_one(tmp_path):
     from turboadb.gui import settings
@@ -1601,7 +1629,7 @@ def test_settings_writes_still_work_when_the_lock_cannot_be_taken(monkeypatch, t
 
 
 # --------------------------------------------------------------------------- #
-# B-13 / B-14  a bounded, parallel deploy, and a password that stays out of argv
+# a bounded, parallel deploy, and a password that stays out of argv
 # --------------------------------------------------------------------------- #
 def _deploy_env(monkeypatch, worker):
     import turboadb.remote_deploy as rd
@@ -1618,12 +1646,16 @@ def test_unreachable_hosts_cannot_outlast_the_total_budget(monkeypatch):
 
     rd = _deploy_env(monkeypatch, slow)
     said = []
+    started = time.monotonic()
     rc = rd.deploy_serve(
         ["a", "b", "c"], "D\\u", "pw", on_status=said.append, total_timeout=0.2, max_workers=1
     )
-    assert rc == 1
+    assert rc == 1 and time.monotonic() - started < 0.9  # not a whole host's 1 s
     skipped = [line for line in said if "Skipped" in line]
-    assert skipped and "a, b, c" in skipped[0]
+    # "a" was being deployed when the budget ran out: it may still finish
+    # there, so it is not called skipped
+    assert skipped and skipped[0].endswith(": b, c")
+    assert any(line.startswith("[ERROR] a: still running") for line in said)
 
 
 def test_independent_hosts_are_contacted_in_parallel_and_reported_in_order(monkeypatch):
@@ -1670,7 +1702,7 @@ def test_the_winrm_password_can_avoid_argv_entirely(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# B-15  packaging metadata matches what the code actually supports
+# packaging metadata matches what the code actually supports
 # --------------------------------------------------------------------------- #
 def _repo_file(*parts):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1699,7 +1731,7 @@ def test_the_sdist_ships_the_reference_docs():
 
 
 # --------------------------------------------------------------------------- #
-# B-16 / B-17 / B-19  CI really runs the GUI suite; releases are gated
+# CI really runs the GUI suite; releases are gated
 # --------------------------------------------------------------------------- #
 def test_ci_has_a_job_that_installs_qt_and_runs_the_gui_tests():
     ci = _repo_file(".github", "workflows", "ci.yml")
@@ -1724,7 +1756,7 @@ def test_conftest_fixes_the_qt_platform_for_the_whole_process():
 
 
 # --------------------------------------------------------------------------- #
-# B-18  the release script rebuilds a stale exe and never leaves a phantom bump
+# the release script rebuilds a stale exe and never leaves a phantom bump
 # --------------------------------------------------------------------------- #
 def _release_under_test():
     import importlib.util
@@ -1771,11 +1803,12 @@ def test_a_failed_upload_rolls_the_version_back(monkeypatch, tmp_path):
     init = tmp_path / "__init__.py"
     pyproject.write_text('[project]\nversion = "1.2.3"\n', encoding="utf-8")
     init.write_text('__version__ = "1.2.3"\n', encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text("## 1.2.4\n\n- A fix.\n", encoding="utf-8")
     (tmp_path / "dist").mkdir()
     monkeypatch.setattr(release, "ROOT", tmp_path)
     monkeypatch.setattr(release, "PYPROJECT", pyproject)
     monkeypatch.setattr(release, "INIT", init)
-    monkeypatch.setattr(release, "bundle_exe", lambda version, rebuild=False: None)
+    monkeypatch.setattr(release, "bundle_exe", lambda version, rebuild=False, **kw: None)
     monkeypatch.setattr(release, "wheel_has_exe", lambda wheel: True)
     monkeypatch.setenv("TWINE_PASSWORD", "pypi-token")
 

@@ -77,16 +77,22 @@ def exit_world(monkeypatch, tmp_path, settings_file):
     from turboadb.gui import adb_path as adb_path_mod
     from turboadb.gui import app as app_mod
 
-    state = {"scrcpy": 0, "stopped": 0, "alive": True, "shared": False}
+    # "ours": this process started the running server (tools.owned_adb_server)
+    state = {"scrcpy": 0, "stopped": 0, "alive": True, "shared": False, "ours": True,
+             "stopped_with": None}
     adb = tmp_path / "adb.exe"
     adb.write_text("")
     monkeypatch.setattr(scrcpy, "stop_all", lambda *a, **k: state.__setitem__("scrcpy", 1) or 1)
     monkeypatch.setattr(adb_path_mod, "gui_adb_path", lambda: str(adb))
     monkeypatch.setattr(tools_mod, "is_adb_server_alive", lambda *a, **k: state["alive"])
+    monkeypatch.setattr(tools_mod, "settle_adb_server_start", lambda *a, **k: None)
+    monkeypatch.setattr(tools_mod, "owned_adb_server",
+                        lambda *a, **k: str(adb) if state["ours"] else None)
     monkeypatch.setattr(devices_mod, "server_is_shared", lambda *a, **k: state["shared"])
 
     def stop_server(self, *, safe=None):
         state["stopped"] += 1
+        state["stopped_with"] = self.config.adb_path
         from turboadb.results import OperationResult
 
         return OperationResult(True, "stop_server", value=True)
@@ -99,15 +105,27 @@ def exit_world(monkeypatch, tmp_path, settings_file):
 def test_closing_the_app_closes_scrcpy_and_the_adb_server(exit_world):
     exit_world["run"]()
     assert exit_world["scrcpy"] == 1 and exit_world["stopped"] == 1
+    # stopped with the adb that started it
+    assert exit_world["stopped_with"].endswith("adb.exe")
 
 
-def test_the_setting_turns_the_adb_stop_off_but_scrcpy_still_closes(exit_world):
+def test_the_setting_leaves_both_scrcpy_and_the_adb_server_running(exit_world):
+    """Unticking "Close ADB and scrcpy when TurboADB closes" used to keep only
+    the adb server: every scrcpy window was still closed."""
     from turboadb.gui import settings as settings_mod
 
     settings_mod.set("stop_adb_on_exit", False)
     exit_world["run"]()
-    assert exit_world["scrcpy"] == 1 and exit_world["stopped"] == 0
+    assert exit_world["scrcpy"] == 0 and exit_world["stopped"] == 0
     assert settings_mod.DEFAULTS["stop_adb_on_exit"] is True  # on unless turned off
+
+
+def test_a_server_turboadb_did_not_start_is_left_running(exit_world):
+    """Android Studio's (or a script's) adb server was killed on exit, dropping
+    that tool's devices, although TurboADB had only joined it."""
+    exit_world["ours"] = False
+    exit_world["run"]()
+    assert exit_world["scrcpy"] == 1 and exit_world["stopped"] == 0
 
 
 def test_a_shared_server_is_left_running_for_the_other_machines(exit_world):

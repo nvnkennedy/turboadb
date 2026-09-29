@@ -23,6 +23,8 @@ import os
 import re
 import sys
 import json
+import stat
+import time
 import shutil
 import logging
 import zipfile
@@ -32,6 +34,7 @@ import threading
 import subprocess
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 
 from .exceptions import ADBError, ADBNotFoundError
 from .tools import (  # noqa: F401  (_exe re-exported for existing importers)
@@ -86,6 +89,36 @@ def _ensure_tools_dir() -> str:
     return d
 
 
+# A download is fetched and unpacked in a folder of this name inside the tools
+# folder, never under %TEMP%: on another volume the final move became a copy,
+# and a copy that failed halfway (a full disk) left platform-tools half there
+# with no adb.  Neither lookup of the tools (managed_adb, tools.find_adb) ever
+# looks inside it.
+_STAGING_PREFIX = ".download-"
+# A staging folder older than this is a leftover of an update that was killed.
+_STALE_STAGING_S = 3600
+
+
+def _staging_dir():
+    """A temporary folder for one download, on the tools folder's volume.
+    Leftovers of killed updates are removed first."""
+    parent = _ensure_tools_dir()
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        names = []
+    now = time.time()
+    for name in names:
+        path = os.path.join(parent, name)
+        try:
+            stale = name.startswith(_STAGING_PREFIX) and now - os.path.getmtime(path) > _STALE_STAGING_S
+        except OSError:
+            stale = False
+        if stale:
+            shutil.rmtree(path, ignore_errors=True)
+    return tempfile.TemporaryDirectory(prefix=_STAGING_PREFIX, dir=parent)
+
+
 def adb_dir() -> str:
     return os.path.join(tools_dir(), "platform-tools")
 
@@ -135,10 +168,17 @@ def _extract_zip(zip_path: str, dest_parent: str, *, strip_top_to: str | None = 
     """Extract *zip_path*. If *strip_top_to* is given, the archive's single
     top-level folder is flattened into that exact directory. Member paths are
     sanitized ('..' / absolute / backslash tricks dropped) so a crafted archive
-    can never write outside the target directory (zip-slip)."""
+    can never write outside the target directory (zip-slip).
+
+    On Linux and macOS each file keeps the permission bits the archive stores
+    for it: written with a plain ``open()`` every file came out 0644, so
+    fastboot and the other platform-tools besides adb could not run.  Write
+    access for group and others is never granted."""
     with zipfile.ZipFile(zip_path) as z:
-        members = z.namelist()
-        names = [n.replace("\\", "/") for n in members]
+        # ZipInfo entries, not names: of two entries with one name, each keeps
+        # its own permissions
+        members = z.infolist()
+        names = [m.filename.replace("\\", "/") for m in members]
         top = None
         if strip_top_to:
             tops = {n.split("/")[0] for n in names if n.strip("/")}
@@ -159,23 +199,134 @@ def _extract_zip(zip_path: str, dest_parent: str, *, strip_top_to: str | None = 
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with z.open(member) as src, open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
+            _keep_mode(target, member.external_attr >> 16)
 
 
-def _kill_adb_server(adb_path: str | None = None) -> None:
+def _keep_mode(path: str, mode: int) -> None:
+    """Give an extracted file the Unix permissions its zip entry stores (none
+    in an archive made on Windows); owner read/write always, nobody else's
+    write, no special bits."""
+    if os.name == "nt" or not mode or stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+        return
+    try:
+        os.chmod(path, (stat.S_IMODE(mode) & 0o755) | 0o600)
+    except OSError:
+        pass
+
+
+def _kill_adb_server(adb_path: str | None = None) -> list:
     """Best-effort stop of the adb server. On Windows a running server LOCKS its
     own adb.exe, so replacing the managed platform-tools in place silently fails
     (rmtree with ignore_errors dropped the error) — which is exactly why
-    'upgrade adb' sometimes did nothing. Always stop the server first."""
+    'upgrade adb' sometimes did nothing. Always stop the server first.
+
+    The stop waits until the server has let go of the port (and so of its
+    exe).  The local server always stops, and so does a server shared on
+    another port this account recorded (``turboadb serve --port N``, see
+    :func:`turboadb.devices.recorded_shared_ports`): it runs the same adb.
+    Returns the ports of the servers that were shared on the network, which
+    the caller must bring back after the swap with
+    :func:`_restore_shared_server`: other machines depend on them, and
+    nothing else would restart them."""
     try:
+        from . import devices, tools
+
         exe = adb_path or managed_adb() or find_adb()
+        local = tools.local_adb_port()
+        shared = []
+        for port in [local] + [p for p in devices.recorded_shared_ports() if p != local]:
+            if devices.server_is_shared(port):
+                shared.append(port)
+            elif port != local:
+                continue  # nothing of ours there any more
+            tools.kill_adb_server(exe, port)
+        return shared
     except Exception:
+        return []
+
+
+# Why a shared adb server stopped for an update is not back, for the result.
+_SHARE_PROBLEM = ""
+# While updates run together (see _one_restart), the ports of the shared
+# servers they stopped, brought back once at the end.
+_BATCH = threading.local()
+
+
+@contextmanager
+def _one_restart():
+    """Within the block, a shared server stopped for an update comes back once,
+    at the end: upgrading adb and scrcpy together restarted it twice, and each
+    restart dropped every other machine's shells, logcats and mirrors."""
+    if getattr(_BATCH, "ports", None) is not None:
+        yield  # an outer batch brings them back
         return
+    _BATCH.ports = []
     try:
-        subprocess.run(
-            [exe, "kill-server"], capture_output=True, timeout=15, creationflags=NO_WINDOW
-        )
-    except Exception:
-        pass
+        yield
+    finally:
+        ports, _BATCH.ports = _BATCH.ports, None
+        _restore_shared_server(ports)
+
+
+def _restore_shared_server(ports) -> None:
+    """Share this PC's devices again on *ports* after the update (see
+    :func:`_kill_adb_server`); never raises.  A failure is reported through
+    :func:`_take_share_problem`.  Within :func:`_one_restart` the ports wait
+    for the end of the batch."""
+    global _SHARE_PROBLEM
+    ports = [p for p in (ports or []) if p]
+    waiting = getattr(_BATCH, "ports", None)
+    if waiting is not None:
+        waiting.extend(p for p in ports if p not in waiting)
+        return
+    for port in ports:
+        try:
+            from .devices import restart_shared_server
+
+            _log.info(restart_shared_server(port, managed_adb()))
+        except Exception as exc:
+            again = "turboadb serve" + ("" if port == 5037 else f" --port {port}")
+            problem = (
+                f"the shared adb server on port {port} could not be restarted after the "
+                f"update ({exc}); share this PC's devices again ({again})"
+            )
+            _SHARE_PROBLEM = f"{_SHARE_PROBLEM}; {problem}" if _SHARE_PROBLEM else problem
+            _log.warning(problem)
+
+
+def _take_share_problem(errors: dict) -> None:
+    global _SHARE_PROBLEM
+    if _SHARE_PROBLEM:
+        errors["sharing"] = _SHARE_PROBLEM
+        _SHARE_PROBLEM = ""
+
+
+def _aside(dest: str) -> str:
+    """Where the current *dest* goes while it is replaced: ``dest.old``, emptied
+    first, or a fresh ``dest.old-N`` when an earlier copy there cannot be
+    removed (a terminal's working folder is inside it, a scanner holds a
+    file).  That copy used to make the update fail, blaming a running adb."""
+    old = dest + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if not os.path.lexists(old):
+        return old
+    n = 1
+    while os.path.lexists(f"{old}-{n}"):
+        n += 1
+    return f"{old}-{n}"
+
+
+def _clear_old_copies(dest: str) -> None:
+    """Remove the ``dest.old-N`` copies earlier updates could not put at
+    ``dest.old`` (best-effort: one still in use stays for the next time)."""
+    parent, base = os.path.split(dest)
+    try:
+        names = os.listdir(parent or ".")
+    except OSError:
+        return
+    for name in names:
+        if name.startswith(base + ".old-"):
+            shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
 
 
 def _swap_dir(new_dir: str, dest: str) -> None:
@@ -183,26 +334,32 @@ def _swap_dir(new_dir: str, dest: str) -> None:
     aside (kept as ``dest.old`` for a manual rollback), then move the new one
     in. If a file in the old dir is still locked (a running adb server / scrcpy
     session), the rename fails LOUDLY instead of silently leaving a
-    half-updated mix of old and new files."""
+    half-updated mix of old and new files.
+
+    *new_dir* belongs on the same volume as *dest* (see :func:`_staging_dir`),
+    so both moves are renames.  A move that failed halfway all the same (a
+    copy between volumes) is cleared away before the old version goes back."""
     old = None
     parent = os.path.dirname(dest)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    _clear_old_copies(dest)
     if os.path.isdir(dest):
-        old = dest + ".old"
-        shutil.rmtree(old, ignore_errors=True)
+        old = _aside(dest)
         try:
             os.rename(dest, old)
         except OSError as exc:
             raise ADBError(
                 f"cannot replace {dest} — a file in it is still in use "
-                f"(a running adb server or scrcpy/mirror session locks its exe; "
-                f"close mirrors/recordings and retry): {exc}"
+                f"(a running adb server or scrcpy/mirror session locks its exe, or a "
+                f"terminal's working folder is inside it; close those and retry): {exc}"
             ) from exc
     try:
         shutil.move(new_dir, dest)
     except Exception:
-        if old and not os.path.isdir(dest):
+        if old:
+            if os.path.lexists(dest):  # part of the new version
+                shutil.rmtree(dest, ignore_errors=True)
             try:
                 os.rename(old, dest)  # roll the old version back
             except OSError:
@@ -239,7 +396,7 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
     existing = managed_adb()
     if existing and not force:
         return existing
-    archive = latest_adb_archive()
+    archive = _archive_to_download()
     url = archive.get("url") or PLATFORM_TOOLS_URLS[_os_key()]
     if not archive.get("url"):
         archive = {}  # the alias isn't the artifact the manifest describes
@@ -247,8 +404,7 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
             "Could not read Google's platform-tools manifest; downloading the "
             "'latest' alias with no published checksum to verify it against."
         )
-    _ensure_tools_dir()
-    with tempfile.TemporaryDirectory() as tmp:
+    with _staging_dir() as tmp:
         zip_path = os.path.join(tmp, "platform-tools.zip")
         _download(url, zip_path, on_progress)
         _check_zip(zip_path)  # a truncated download must fail BEFORE the swap
@@ -262,16 +418,22 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
                 "platform-tools downloaded but adb was not "
                 "found in the archive (unexpected layout)."
             )
-        if existing:
-            _kill_adb_server(existing)  # unlock adb.exe before the swap
-        _swap_dir(new_dir, adb_dir())
+        # unlock adb.exe before the swap
+        shared = _kill_adb_server(existing) if existing else []
+        try:
+            _swap_dir(new_dir, adb_dir())
+        except Exception:
+            _restore_shared_server(shared)  # the previous adb is still in place
+            raise
     adb = managed_adb()
     if not adb:
+        _restore_shared_server(shared)
         raise ADBNotFoundError(
             "platform-tools downloaded but adb was not found after install (unexpected layout)."
         )
     _chmod_x(adb)
     _sync_scrcpy_adb()
+    _restore_shared_server(shared)  # other machines use it: back on the new adb
     return adb
 
 
@@ -457,8 +619,7 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
     if existing and not force:
         return existing
     url, asset_name, sums_url = _scrcpy_assets()
-    _ensure_tools_dir()
-    with tempfile.TemporaryDirectory() as tmp:
+    with _staging_dir() as tmp:
         zip_path = os.path.join(tmp, "scrcpy.zip")
         _download(url, zip_path, on_progress)
         _check_zip(zip_path)
@@ -470,17 +631,22 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
             raise ADBNotFoundError(
                 "scrcpy downloaded but scrcpy.exe was not found in the archive (unexpected layout)."
             )
-        if existing:
-            # the scrcpy folder bundles its own adb.exe, which may be running
-            # as the server — stop it so the swap isn't blocked by a file lock
-            _kill_adb_server()
-        _swap_dir(staging, scrcpy_dir())
+        # the scrcpy folder bundles its own adb.exe, which may be running as
+        # the server — stop it so the swap isn't blocked by a file lock
+        shared = _kill_adb_server() if existing else []
+        try:
+            _swap_dir(staging, scrcpy_dir())
+        except Exception:
+            _restore_shared_server(shared)
+            raise
     scr = managed_scrcpy()
     if not scr:
+        _restore_shared_server(shared)
         raise ADBNotFoundError(
             "scrcpy downloaded but scrcpy.exe was not found after install (unexpected layout)."
         )
     _sync_scrcpy_adb()
+    _restore_shared_server(shared)
     return scr
 
 
@@ -522,14 +688,17 @@ def auto_fetch_enabled() -> bool:
     return v.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-_ensured = False
+# The tools ensure_tools() has seen to in this process ("adb", "scrcpy"): a
+# CLI command ensures adb alone, the GUI both, and one must not stand in for
+# the other (a CLI run in the GUI's process kept the GUI from fetching scrcpy).
+_ensured = set()
 _ENSURE_LOCK = threading.Lock()
 
 
 def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
     """Make sure the managed cache has adb (and, where a prebuilt exists,
-    scrcpy). Runs at most once per process and downloads ONLY tools that are
-    missing from the cache — it never upgrades an existing copy, because
+    scrcpy). Checks each tool at most once per process and downloads ONLY tools
+    that are missing from the cache — it never upgrades an existing copy, because
     replacing platform-tools means stopping the running adb server (which drops
     every device session). Upgrades go through :func:`upgrade_tools`.
 
@@ -544,8 +713,6 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
 
     Disable entirely with the ``TURBOADB_AUTO_FETCH=0`` environment variable.
     """
-    global _ensured
-
     def norm(note, errors=None):
         return {
             "note": note,
@@ -555,9 +722,11 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
         }
 
     with _ENSURE_LOCK:
-        if _ensured:
+        wanted = {"adb", "scrcpy"} if scrcpy else {"adb"}
+        if wanted <= _ensured:
             return norm("already-ensured")
-        _ensured = True
+        check_adb = "adb" not in _ensured
+        _ensured.update(wanted)
         if not auto_fetch_enabled():
             return norm("disabled")
         # The stamp only short-circuits when the tools it covers are still
@@ -572,7 +741,8 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
         errors = {}
         note = "up-to-date"
         try:
-            want_adb = managed_adb() is None
+            # adb that an earlier call in this process saw to is not fetched again
+            want_adb = check_adb and managed_adb() is None
             # Requesting scrcpy where no prebuilt exists always "failed", so the
             # stamp was never written and every command retried the network.
             want_scrcpy = bool(scrcpy) and scrcpy_download_supported() and managed_scrcpy() is None
@@ -697,8 +867,29 @@ def latest_adb_archive() -> dict:
         return {}
 
 
+# The archive the last version check read, with the monotonic time it was read:
+# the download that follows the check uses it instead of fetching Google's
+# manifest a second time.
+_CHECKED_ARCHIVE = None
+_CHECKED_ARCHIVE_TTL = 300.0
+
+
 def latest_adb_version() -> str | None:
-    return latest_adb_archive().get("version")
+    global _CHECKED_ARCHIVE
+    archive = latest_adb_archive()
+    if archive.get("url"):
+        _CHECKED_ARCHIVE = (time.monotonic(), archive)
+    return archive.get("version")
+
+
+def _archive_to_download() -> dict:
+    """The platform-tools archive to download: the one a version check read in
+    the last few minutes (taken once), else Google's manifest read now."""
+    global _CHECKED_ARCHIVE
+    checked, _CHECKED_ARCHIVE = _CHECKED_ARCHIVE, None
+    if checked and time.monotonic() - checked[0] < _CHECKED_ARCHIVE_TTL:
+        return checked[1]
+    return latest_adb_archive()
 
 
 def installed_scrcpy_version(scrcpy_path: str | None = None) -> str | None:
@@ -820,16 +1011,18 @@ def upgrade_tools(*, on_progress=None, notify=None, checks: dict | None = None) 
         if want_scrcpy:
             bits.append(f"scrcpy {checks['scrcpy']['installed']}→{checks['scrcpy']['latest']}")
         notify("Updating " + ", ".join(bits) + " …")
-    if want_adb:
-        try:
-            updated["adb"] = download_platform_tools(force=True, on_progress=on_progress)
-        except Exception as exc:
-            errors["adb"] = str(exc)
-    if want_scrcpy:
-        try:
-            updated["scrcpy"] = download_scrcpy(force=True, on_progress=on_progress)
-        except Exception as exc:
-            errors["scrcpy"] = str(exc)
+    with _one_restart():
+        if want_adb:
+            try:
+                updated["adb"] = download_platform_tools(force=True, on_progress=on_progress)
+            except Exception as exc:
+                errors["adb"] = str(exc)
+        if want_scrcpy:
+            try:
+                updated["scrcpy"] = download_scrcpy(force=True, on_progress=on_progress)
+            except Exception as exc:
+                errors["scrcpy"] = str(exc)
+    _take_share_problem(errors)
     return {
         "checks": checks,
         "updated": updated,
@@ -862,16 +1055,18 @@ def fetch_tools(
 
     total = int(adb) + int(scrcpy)
     result = {"adb": None, "scrcpy": None, "errors": {}}
-    if adb:
-        stage(f"platform-tools / adb (1/{total})")
-        try:
-            result["adb"] = download_platform_tools(force=force, on_progress=on_progress)
-        except Exception as exc:
-            result["errors"]["adb"] = str(exc)
-    if scrcpy:
-        stage(f"scrcpy ({total}/{total})")
-        try:
-            result["scrcpy"] = download_scrcpy(force=force, on_progress=on_progress)
-        except Exception as exc:
-            result["errors"]["scrcpy"] = str(exc)
+    with _one_restart():
+        if adb:
+            stage(f"platform-tools / adb (1/{total})")
+            try:
+                result["adb"] = download_platform_tools(force=force, on_progress=on_progress)
+            except Exception as exc:
+                result["errors"]["adb"] = str(exc)
+        if scrcpy:
+            stage(f"scrcpy ({total}/{total})")
+            try:
+                result["scrcpy"] = download_scrcpy(force=force, on_progress=on_progress)
+            except Exception as exc:
+                result["errors"]["scrcpy"] = str(exc)
+    _take_share_problem(result["errors"])
     return result

@@ -11,6 +11,11 @@ Where there is no real source (a bare X server, the headless platform the
 tests run on) Qt would fall back to generic style icons, which say less than
 TurboADB's own glyphs, so those stay.
 
+Qt 5's GNOME, GTK and KDE platform themes give no icon for a file that does
+not exist, which every device file is to this PC: there the type's icon comes
+from the desktop icon theme by its MIME type, and where the theme has none
+either, the row keeps its glyph - never an empty space.
+
 Lookups are cheap: Qt's icon engines are lazy (the shell is asked only when a
 row is painted, i.e. for the rows on screen) and cache per type; this module
 adds one shared QIcon per extension on top.
@@ -22,7 +27,7 @@ import os
 import tempfile
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QFileInfo, QPoint, QRect, QRectF, Qt
+from PyQt5.QtCore import QFileInfo, QMimeDatabase, QPoint, QRect, QRectF, Qt
 from PyQt5.QtGui import (QColor, QGuiApplication, QIcon, QIconEngine, QPainter, QPen,
                          QPixmap)
 from PyQt5.QtWidgets import QFileIconProvider
@@ -135,11 +140,12 @@ class FileIcons:
         return self._folder
 
     def for_type(self, name: str) -> QIcon:
-        """The icon of *name*'s file type (by extension), shared per type."""
+        """The icon of *name*'s file type (by extension), shared per type; a
+        null icon where the system has none."""
         ext = os.path.splitext(name)[1].lower()
         icon = self._by_type.get(ext)
         if icon is None:
-            icon = self._provider.icon(QFileInfo(os.path.join(self._nowhere, "x" + ext)))
+            icon = self._type_icon(ext)
             if ext in ANDROID_PACKAGES and self._is_generic(icon):
                 # the system's own blank file, marked as an Android package
                 icon = QIcon(_BadgeEngine(
@@ -148,26 +154,42 @@ class FileIcons:
             self._by_type[ext] = icon
         return icon
 
+    def _type_icon(self, ext: str) -> QIcon:
+        """What the system shows for files ending in *ext*: the platform's own
+        answer, else the icon theme's for the type's MIME name (see the module
+        docstring), else a null icon."""
+        icon = self._provider.icon(QFileInfo(os.path.join(self._nowhere, "x" + ext)))
+        if icon.isNull():
+            mime = QMimeDatabase().mimeTypeForFile("x" + ext, QMimeDatabase.MatchExtension)
+            for theme_name in (mime.iconName(), mime.genericIconName()):
+                if theme_name and QIcon.hasThemeIcon(theme_name):
+                    return QIcon.fromTheme(theme_name)
+        return icon
+
     def for_path(self, path: str) -> QIcon:
         """The icon of an item on this PC, exactly as the system shows it: a
         program's own icon, a shortcut's target, a special folder's icon."""
         return self._provider.icon(QFileInfo(path))
 
     def with_link_badge(self, name: str, is_dir: bool) -> QIcon:
-        """A device symbolic link: its target kind's icon plus a link badge."""
+        """A device symbolic link: its target kind's icon plus a link badge
+        (null when the system has no icon for the target's kind)."""
         key = ("dir", "") if is_dir else ("file", os.path.splitext(name)[1].lower())
         icon = self._badged.get(key)
         if icon is None:
             base = self.folder() if is_dir else self.for_type(name)
-            icon = QIcon(_BadgeEngine(base, _badge_glyph("link", "blue"), "left"))
+            icon = base if base.isNull() else QIcon(
+                _BadgeEngine(base, _badge_glyph("link", "blue"), "left"))
             self._badged[key] = icon
         return icon
 
     def _is_generic(self, icon: QIcon) -> bool:
-        """True when *icon* is the system's "no application" icon."""
+        """True when *icon* is the system's "no application" icon (never a null
+        one: a badge on nothing floated in an empty space)."""
+        if icon.isNull():
+            return False
         if self._generic is None:
-            self._generic = self._provider.icon(
-                QFileInfo(os.path.join(self._nowhere, "x.turboadb-unknown-type")))
+            self._generic = self._type_icon(".turboadb-unknown-type")
         return _same_picture(icon, self._generic)
 
     # ---- one call for a listing row ----------------------------------------
@@ -176,16 +198,19 @@ class FileIcons:
         """The icon for one row of a listing.
 
         *glyph*/*tone* is the row's themed icon, used where there is no native
-        one: without a system source, and for the ``..`` row and device-only
-        entries (pipes, sockets, device nodes) that no PC file manager draws.
+        one: without a system source, for the ``..`` row and device-only
+        entries (pipes, sockets, device nodes) that no PC file manager draws,
+        and wherever the system has no icon for the row.
         *local_dir* is the PC folder the row is in; empty for the device."""
         if not self.native or glyph in ("arrow-up", "chip"):
             return cached_icon(glyph, tone)
         if local_dir:
-            return self.for_path(os.path.join(local_dir, name))
-        if ftype.endswith("Link"):
-            return self.with_link_badge(name, is_dir or ftype == "Folder Link")
-        return self.folder() if is_dir else self.for_type(name)
+            icon = self.for_path(os.path.join(local_dir, name))
+        elif ftype.endswith("Link"):
+            icon = self.with_link_badge(name, is_dir or ftype == "Folder Link")
+        else:
+            icon = self.folder() if is_dir else self.for_type(name)
+        return cached_icon(glyph, tone) if icon.isNull() else icon
 
 
 _shared: Optional[FileIcons] = None

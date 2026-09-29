@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QMenu,
 )
 
-from ..tools import NO_WINDOW as _NO_WINDOW
+from ..tools import NO_WINDOW
 from . import ffmpeg_tools
 from . import theme
 from .icons import icon
@@ -92,6 +92,13 @@ _NATIVE_FPS_CAMERAS = set()
 # without producing a frame is given up on after this long.
 _LOCAL_START_POLL_MS = 300
 _LOCAL_NO_VIDEO_TIMEOUT_S = 12.0
+# A stream that showed frames and then sends none for this long has ended: a
+# camera unplugged mid-stream, or a remote stream whose network went quiet
+# without closing the connection. Long enough for the slowest camera modes.
+_STREAM_STALL_S = 8.0
+# Local cameras are listed and opened through DirectShow (ffmpeg -f dshow),
+# which only Windows has.
+_LOCAL_CAMERAS = os.name == "nt"
 
 _RES = {
     "480p (640×480)": (640, 480),
@@ -313,22 +320,32 @@ class _LocalPrep(QThread):
     cameras — off the UI thread so the app never freezes during the one-time fetch.
 
     *cancel* is a :class:`threading.Event` the setup dialog's Cancel button sets;
-    the download checks it between chunks."""
+    the download checks it between chunks.  With *download* False (the scan
+    that runs when the page opens) nothing is downloaded: without an ffmpeg
+    already at hand it reports ``done("", [])``."""
 
+    source = "local"
     progress = pyqtSignal(str)
     done = pyqtSignal(str, list)  # ffmpeg path, cameras
     fail = pyqtSignal(str)
 
-    def __init__(self, cancel=None):
+    def __init__(self, cancel=None, download=True):
         super().__init__()
         self._cancel = cancel
+        self._download = bool(download)
 
     def run(self):
         try:
-            ff = ffmpeg_tools.ensure_local_ffmpeg(
-                self.progress.emit,
-                should_cancel=None if self._cancel is None else self._cancel.is_set,
-            )
+            if self._download:
+                ff = ffmpeg_tools.ensure_local_ffmpeg(
+                    self.progress.emit,
+                    should_cancel=None if self._cancel is None else self._cancel.is_set,
+                )
+            else:
+                ff = ffmpeg_tools.find_local_ffmpeg(self.progress.emit)
+                if not ff:
+                    self.done.emit("", [])
+                    return
             self.done.emit(ff, ffmpeg_tools.list_local_cameras(ff))
         except Exception as exc:
             self.fail.emit(f"{type(exc).__name__}: {exc}")
@@ -338,6 +355,7 @@ class _RemotePrep(QThread):
     """List cameras on a remote Windows/RDP host over WinRM (NTLM), provisioning
     ffmpeg there (one-time download) if it's missing."""
 
+    source = "remote"
     progress = pyqtSignal(str)
     done = pyqtSignal(str, list, str)  # remote ffmpeg path, cameras, diag
     fail = pyqtSignal(str)
@@ -707,10 +725,18 @@ class CameraPanel(QWidget):
         self.r_user.setPlaceholderText("user")
         self.r_domain = QLineEdit(_cfg.get("webcam_remote_domain", ""))
         self.r_domain.setPlaceholderText("domain (optional)")
-        # password comes from the OS credential vault (keyring), not settings.json
-        self.r_pass = QLineEdit(_s.webcam_remote_password())
+        # The password comes from the OS credential vault (keyring), never
+        # settings.json. It is read off the UI thread when Remote is chosen (a
+        # locked vault can block, or ask the user), and it is only filled in
+        # for the host, user and domain it was saved with (_sync_saved_password).
+        self.r_pass = QLineEdit()
         self.r_pass.setEchoMode(QLineEdit.Password)
         self.r_pass.setPlaceholderText("password")
+        self._saved_login = self._login_fields()
+        self._vault_password = ""
+        self._vault_asked = False
+        for field in (self.r_host, self.r_user, self.r_domain):
+            field.textChanged.connect(self._sync_saved_password)
         rl.addWidget(self.r_host, 2)
         rl.addSpacing(4)
         rl.addWidget(QLabel("User"))
@@ -784,7 +810,14 @@ class CameraPanel(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # 60 Hz presents a 30-fps camera frame-for-frame
         self._timer.timeout.connect(self._tick)
-        # started in _after_start, stopped in _stop_stream (no idle 60 Hz wakeups)
+        # Notices a stream that ended by itself (_check_stream), once a second
+        # so the 60 Hz paint stays lean. Both run only while a stream does:
+        # started in _after_start, stopped in _stop_stream.
+        self._alive_timer = QTimer(self)
+        self._alive_timer.setInterval(1000)
+        self._alive_timer.timeout.connect(self._check_stream)
+        self._seen_frames = -1  # the reader's source_frames at the last check
+        self._frames_seen_at = 0.0
         self._auto_scanned = False
         self._scan_quiet = False
         self._local_error_tail = []
@@ -792,7 +825,8 @@ class CameraPanel(QWidget):
 
         # Webcam discovery is intentionally automatic.  It happens in the
         # existing worker, so opening TurboADB stays responsive, but the camera
-        # chooser is ready when the user first opens this page.
+        # chooser is ready when the user first opens this page.  It never
+        # downloads ffmpeg: that one-time ~160 MB fetch waits for Scan cameras.
         QTimer.singleShot(150, self._auto_scan)
 
     def showEvent(self, event):
@@ -800,7 +834,8 @@ class CameraPanel(QWidget):
         self._auto_scan()
 
     def _auto_scan(self):
-        """Start one quiet local scan, whether this is a standalone or nested tab."""
+        """Start one quiet local scan, whether this is a standalone or nested
+        tab.  It uses an ffmpeg already at hand and downloads none."""
         if self._auto_scanned:
             return
         self._auto_scanned = True
@@ -890,20 +925,86 @@ class CameraPanel(QWidget):
         dom = self.r_domain.text().strip()
         return f"{dom}\\{user}" if dom else user
 
+    def _login_fields(self):
+        """(host, user, domain) as typed in the remote row."""
+        return (
+            self.r_host.text().strip(),
+            self.r_user.text().strip(),
+            self.r_domain.text().strip(),
+        )
+
+    def _load_saved_password(self):
+        """Read the remote password from the OS credential vault, once, on a
+        worker: a locked Secret Service or a Keychain prompt blocks the call."""
+        if self._vault_asked or self._closing:
+            return
+        self._vault_asked = True
+        from . import settings as _s
+
+        run_job(self._jobs, _s.webcam_remote_password, on_done=self._saved_password_read)
+
+    def _saved_password_read(self, password):
+        if self._closing:
+            return
+        self._vault_password = str(password or "")
+        self._sync_saved_password()
+
+    def _sync_saved_password(self, *_args):
+        """Fill in the saved password only while the host, user and domain are
+        the ones it was saved with: the vault keeps one password, and typing
+        another host must not send it there (NTLM) unasked. The user's own
+        typing is never overwritten."""
+        saved = self._vault_password
+        if not saved:
+            return
+        shown = self.r_pass.text()
+        if self._login_fields() == self._saved_login:
+            if not shown:
+                self.r_pass.setText(saved)
+        elif shown == saved:
+            self.r_pass.clear()
+
     def _source_changed(self, *_):
         self._stop_stream()
+        # A scan of the other source has nothing to give this one (its cameras
+        # would fill this list), and must not hold up a scan of this source.
+        prep = self._prep
+        if prep is not None and prep.source != self.source.currentData():
+            self._park_prep()
         self.remote_row.setVisible(self._is_remote())
         self.camera.clear()
         self.start_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(not thread_running(self._prep))
         if self._is_remote():
+            self._load_saved_password()
             self._set_status("Enter the RDP machine's details, then Scan cameras.", "idle")
+        elif not _LOCAL_CAMERAS:
+            self._set_status(self._NO_LOCAL_CAMERAS, "warn")
         else:
             self._set_status("Scan for a camera, then Start camera.", "idle")
 
-    # ---- enumerate ----
-    def _refresh(self, *, quiet=False):
-        if thread_running(self._prep):
+    def _park_prep(self) -> None:
+        """Let go of the running scan: its result lands nowhere any more."""
+        prep, self._prep = self._prep, None
+        if prep is None:
             return
+        disconnect_signals(prep, ("progress", "done", "fail", "finished"))
+        park_thread(prep)
+        if prep.source == "local":
+            self._close_dl_dialog()
+
+    # ---- enumerate ----
+    _NO_LOCAL_CAMERAS = (
+        "This PC's cameras can be shown on Windows only (DirectShow). "
+        "Choose Remote for a Windows PC's camera."
+    )
+
+    def _refresh(self, *, quiet=False):
+        source = self.source.currentData()
+        if thread_running(self._prep):
+            if self._prep.source == source:
+                return  # this source is being scanned already
+            self._park_prep()
         self._stop_stream()
         self.camera.clear()
         self.refresh_btn.setEnabled(False)
@@ -916,34 +1017,56 @@ class CameraPanel(QWidget):
                 self.refresh_btn.setEnabled(True)
                 return
             self._set_status(f"Connecting to {host} over WinRM…", "info")
-            self._prep = _RemotePrep(host, self._remote_login(), self.r_pass.text())
-            self._prep.progress.connect(lambda m: self._set_status(m, "info"))
-            self._prep.done.connect(self._remote_ready)
-            self._prep.fail.connect(self._prep_fail)
+            prep = _RemotePrep(host, self._remote_login(), self.r_pass.text())
+            prep.progress.connect(lambda m: self._set_status(m, "info"))
+            prep.done.connect(
+                lambda ff, cams, diag, t=prep: self._remote_ready(ff, cams, diag, t)
+            )
         else:
+            if not _LOCAL_CAMERAS:
+                self._set_status(self._NO_LOCAL_CAMERAS, "warn")
+                self.refresh_btn.setEnabled(True)
+                return
             self._set_status("Finding cameras…", "info")
             self._dl_cancel.clear()
-            self._prep = _LocalPrep(self._dl_cancel)
-            self._prep.progress.connect(self._on_progress)
-            self._prep.done.connect(self._local_ready)
-            self._prep.fail.connect(self._prep_fail)
+            # the scan that runs when the page opens never downloads ffmpeg,
+            # so it never opens the download dialog either
+            prep = _LocalPrep(self._dl_cancel, download=not quiet)
+            if quiet:
+                prep.progress.connect(lambda m: self._set_status(m, "info"))
+            else:
+                prep.progress.connect(self._on_progress)
+            prep.done.connect(lambda ff, cams, t=prep: self._local_ready(ff, cams, t))
+        prep.fail.connect(lambda msg, t=prep: self._prep_fail(msg, t))
         # One place gives "Scan cameras" back: a worker that ends without a
         # result (an unexpected error, a cancelled download) used to leave the
         # button greyed out for the rest of the session.
-        self._prep.finished.connect(lambda t=self._prep: self._prep_finished(t))
-        self._prep.start()
+        prep.finished.connect(lambda t=prep: self._prep_finished(t))
+        self._prep = prep
+        prep.start()
 
     def _prep_finished(self, thread=None):
         if self._closing or (thread is not None and thread is not self._prep):
             return  # a newer scan owns the button now
         self.refresh_btn.setEnabled(True)
 
-    def _local_ready(self, ffmpeg, cams):
+    def _local_ready(self, ffmpeg, cams, prep=None):
+        if prep is not None and prep is not self._prep:
+            return  # a scan the user moved on from: its cameras belong nowhere now
         self._close_dl_dialog()
+        if not ffmpeg:
+            # the scan when the page opened: there is no ffmpeg yet to list with
+            self._set_status(
+                "Scan cameras to set up ffmpeg (a one-time download of about 160 MB).",
+                "idle",
+            )
+            return
         self._ffmpeg = ffmpeg
         self._fill(cams, quiet=self._scan_quiet)
 
-    def _remote_ready(self, ffmpeg, cams, diag):
+    def _remote_ready(self, ffmpeg, cams, diag, prep=None):
+        if prep is not None and prep is not self._prep:
+            return  # a scan the user moved on from
         self._remote_ffmpeg = ffmpeg
         self._save_remote_details()  # remember host/user/domain (not password)
         self._fill(cams, diag, quiet=self._scan_quiet)
@@ -961,6 +1084,10 @@ class CameraPanel(QWidget):
             )
             # password -> OS credential vault (never settings.json)
             _s.set_webcam_remote_password(self.r_pass.text())
+            # the vault's password now belongs to these details
+            self._saved_login = self._login_fields()
+            self._vault_password = self.r_pass.text()
+            self._vault_asked = True
         except Exception as exc:  # disk / keyring trouble mustn't break the scan result
             _log.warning("couldn't remember the remote webcam details: %s", exc)
 
@@ -996,7 +1123,9 @@ class CameraPanel(QWidget):
                     "• Make sure nothing else is using the camera.",
                 )
 
-    def _prep_fail(self, msg):
+    def _prep_fail(self, msg, prep=None):
+        if prep is not None and prep is not self._prep:
+            return  # a scan the user moved on from
         self._close_dl_dialog()
         if self._dl_cancel.is_set():
             # The user pressed Cancel in the setup dialog; that is not an error.
@@ -1044,7 +1173,7 @@ class CameraPanel(QWidget):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
-                creationflags=_NO_WINDOW,
+                creationflags=NO_WINDOW,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Camera", f"Couldn't start the camera:\n\n{exc}")
@@ -1209,6 +1338,9 @@ class CameraPanel(QWidget):
         self._fps_t0 = time.time()
         self._last_paint = 0
         self._timer.start()
+        self._seen_frames = -1
+        self._frames_seen_at = time.monotonic()
+        self._alive_timer.start()
         if not self._is_remote():
             # A DirectShow failure (e.g. an unsupported frame rate) exits within
             # a few hundred ms: notice it quickly so the retry is seamless.
@@ -1274,6 +1406,51 @@ class CameraPanel(QWidget):
                 "other apps using it, check those settings, then Start again."
                 + cause,
             )
+
+    def _check_stream(self):
+        """Once a second while viewing: notice a stream that ended by itself.
+
+        ffmpeg exiting (a camera unplugged, the remote ffmpeg ended) or the
+        socket closing ends the reader; a remote stream whose network went
+        quiet without closing just stops delivering frames, so no new frame
+        for _STREAM_STALL_S ends it too.  The reader counts frames whether or
+        not the view is paused.  Until its first frame a stream is
+        _check_no_video's to judge."""
+        reader = self.reader
+        if reader is None or self._closing or not reader.frames:
+            return
+        proc = self._proc
+        ended = not reader.is_alive() or (proc is not None and proc.poll() is not None)
+        if not ended:
+            now = time.monotonic()
+            frames = reader.source_frames
+            if frames != self._seen_frames:
+                self._seen_frames, self._frames_seen_at = frames, now
+                return
+            if now - self._frames_seen_at < _STREAM_STALL_S:
+                return
+        self._stream_ended(closed=ended)
+
+    def _stream_ended(self, *, closed):
+        """Stop a stream that ended by itself and say so, instead of leaving
+        its last frame on screen as "Viewing"; a recording is finished and
+        saved with what it captured."""
+        cam = getattr(self, "_viewing_cam", "") or "the camera"
+        detail = "" if self._is_remote() else " ".join(self._local_error_tail[-2:]).strip()
+        recording = self._rec_path
+        self._stop_stream(announce=False)  # (finishes a running recording too)
+        self.view.clear()
+        self.view.setText(
+            "The camera stream ended — select Start camera to view again."
+            + (f"\n\nffmpeg reported: {detail}" if detail else "")
+        )
+        self._set_status("Camera stream ended", "error")
+        what = "ended" if closed else f"sent no video for {_STREAM_STALL_S:g} s"
+        self.log.emit(
+            f"[WARNING] webcam: the stream from {cam} {what}" + (f" ({detail})" if detail else "")
+        )
+        if recording:
+            self.log.emit(f"[WARNING] webcam: the recording stops where the stream did → {recording}")
 
     def _remote_no_video(self, cam, detail, gen=None):
         if self._closing or (gen is not None and gen != self._stream_gen):
@@ -1445,7 +1622,7 @@ class CameraPanel(QWidget):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=_NO_WINDOW,
+                creationflags=NO_WINDOW,
             )
             self._rec_path = path
             writer = _RecordWriter(self._rec_proc.stdin)
@@ -1498,6 +1675,10 @@ class CameraPanel(QWidget):
             self.log.emit(f"[OK] recording saved: {path}")
             if self.reader is not None:
                 self._set_status("Recording saved ✓ — still viewing", "ok")
+            elif self._rec_proc is None:
+                # the stream was stopped (or ended) first: never leave its
+                # "Finalizing recording…" progress up once the file is saved
+                self._set_status("Recording saved ✓", "ok")
             return
         self.log.emit(
             f"[ERROR] the recording saved no data → {path} "
@@ -1525,6 +1706,7 @@ class CameraPanel(QWidget):
         sets the next view/status itself, so no "Camera stopped" text flashes."""
         self._stream_gen += 1  # invalidates pending diagnostic timers / starts
         self._timer.stop()
+        self._alive_timer.stop()
         starting = self._cancel_starter()
         was_viewing = any(
             value is not None

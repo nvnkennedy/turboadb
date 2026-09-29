@@ -116,9 +116,10 @@ A tabbed, multi-device workspace:
     (TurboADB's adb first on PATH, `ANDROID_SERIAL` set), each under a boxed
     two-line welcome banner (the Android one shows the device type). Type
     straight into the terminal; **one Enter runs the command**
-    (reliable cooked line-editing, with Up/Down history and Ctrl+C; inside an
-    `adb shell` typed in PowerShell / CMD, Stop stops only the device command
-    and keeps you in adb shell). Full
+    (reliable cooked line-editing, with Up/Down history and Ctrl+C). The
+    Android shell runs on a device terminal (`adb shell -t -t`), so output
+    streams and Stop sends a real Ctrl+C that keeps the shell, as it does
+    inside an `adb shell` typed in PowerShell / CMD. Full
     **native text selection + copy/paste**, **save output to file**, a right-click
     menu (Copy / Paste / Save / Send-key: Tab/Esc/Ctrl-C/D/Z…), scrollback, and
     **auto-reconnect** — after a reboot or unplug it detects the dropped shell and
@@ -126,7 +127,8 @@ A tabbed, multi-device workspace:
   - **Logcat** — live viewer with level, history, tag, regex filter and
     highlight, a Crashes preset, pause, clear, save, and **instant stop**.
   - **Files** — **This PC** and **Device** panes with **Push** / **Pull**, drag
-    and drop, new folder / file, a built-in editor, copy / paste, rename, delete
+    and drop, open in the PC's own apps (a device file's saves go back to the
+    device), new folder / file, a built-in editor, copy / paste, rename, delete
     (Recycle Bin locally, Shift+Delete for good), and a **Transfers** panel:
     overall progress, speed and time left, plus each file's size, progress and
     error, with Retry failed and a copyable report. **New tab** (Ctrl+Shift+T)
@@ -148,9 +150,10 @@ A tabbed, multi-device workspace:
     **SMS messages** with a compose box that opens a draft in the device's
     Messages app, all over adb.
   - **Webcam** — a host USB / laptop camera, local or on a remote Windows PC.
-  - **IVI Displays** (cars and multi-display devices) — every display live and
-    controllable, side by side, started one after another, with Start all /
-    Stop all / Rescan, and Maximize / Restore on each display.
+  - **IVI Displays** (cars and multi-display devices) — every display side by
+    side and controllable, each stopped until you start it (or Start all, which
+    starts them one after another), with Stop all / Rescan, and Maximize /
+    Restore on each display.
   - **More ▾ → Root and mount** — `adb root`, `remount`, **Make files
     writable…** (root, disable-verity and remount with the reboots they need),
     `mount -o remount,rw /`,
@@ -169,10 +172,12 @@ A tabbed, multi-device workspace:
   adb/scrcpy/ffmpeg paths, logcat format, startup behaviour, and the screen
   renderer (scrcpy, or ADB screencap for builds where scrcpy can't run). The
   default pair is Graphite (dark) and Porcelain (light): layered neutral surfaces
-  with soft text. Black/White, Slate/Mist (cool blue-grey), Night/Paper (warm
-  reading) and Mocha/Latte are extra pairs, all with muted accents; the
-  toolbar toggle switches between your last dark and last light theme, and
-  terminal and log views stay dark in every theme.
+  with soft text. Ocean/Sky, Dusk/Lavender, Evergreen/Meadow, Black/White,
+  Slate/Mist (cool blue-grey), Night/Paper (warm reading), Mocha/Latte and High
+  contrast (dark and light) are extra pairs; the toolbar toggle switches
+  between your last dark and last light theme, and terminal and log views stay
+  dark in every theme. The status bar is coloured by state (connected, errors,
+  warnings, the ADB server and devices).
 - **Crash-proof:** a startup-failure native popup + crash log, a global
   exception hook that logs and shows a non-fatal popup, and clean thread
   shutdown when a tab closes.
@@ -273,7 +278,8 @@ dev.connect()
 
 `connect()` auto-runs `adb connect host:port` for network targets, waits for the
 device, and verifies it's `device` (not `unauthorized`/`offline`) with a clear,
-actionable error if not.
+actionable error if not. A device that has not authorised this PC yet is waited
+for (up to `connect_timeout`) while you accept its "Allow USB debugging?" prompt.
 
 ---
 
@@ -286,7 +292,7 @@ for line in res.lines:
     print(line)
 
 dev.shell("settings put global development_settings_enabled 1", check=True)
-dev.shell("svc power stayon true", su=True)      # wrap in su -c for rooted devices
+dev.shell("svc power stayon true", su=True)      # as root, through the device's su
 
 # an interactive shell session (used by the GUI terminal, usable in scripts)
 sh = dev.open_shell()
@@ -321,8 +327,15 @@ dev.logcat_clear()                                # adb logcat -c
 ```
 
 `fmt=` sets the `-v` format (default `threadtime`); `dump=True` does `-d`
-(dump current buffer and exit); `filterspecs=[...]` passes explicit `TAG:LEVEL`
-specs. Lines are ANSI/control-char cleaned by default (`clean=True`).
+(dump current buffer and exit); `tag="A, B"` takes several tags (each exact,
+everything else silenced); `filterspecs=[...]` passes explicit `TAG:LEVEL`
+specs as logcat takes them (add `"*:S"` to silence the other tags);
+`package=`/`pid=` keep one app's lines (Android 7+). Lines are ANSI/control-char
+cleaned by default (`clean=True`). If adb logcat itself fails before printing a
+line, `logcat()` raises `ADBCommandError` with adb's message; a later failure is
+on the result (`res.exit_code`, `res.stderr`), and `grep=` never hides it.
+`ADBHandler.logcat_args(...)` returns the argument list without running
+anything.
 
 ---
 
@@ -336,7 +349,7 @@ dev.push("local_dir/", "/sdcard/local_dir", on_progress=lambda p: print(p, "%"))
 dev.pull("/sdcard/Download", "out/", on_progress=print)
 
 tr = dev.push("big.bin", "/data/local/tmp/big.bin")
-print(tr.human_size, tr.human_speed, tr.duration)   # 12.0MB 48.0MB/s 0.25
+print(tr.human_size, tr.human_speed, tr.duration)   # 12.0 MB 48.0 MB/s 0.25
 ```
 
 ---
@@ -435,10 +448,11 @@ set `automotive`, so you can branch IVI-specific flows; the GUI uses it for the
 IVI-compatible screen profile and shows the type in the terminal banner.
 
 **In the GUI**, automotive devices (and any device with several displays) get an
-**IVI Displays** tab that shows every discovered display live, side by side.
+**IVI Displays** tab that shows every discovered display side by side.
 Each tile is a real, controllable screen with Start / Stop, Separate window,
-Screenshot and Record, and the displays start one after another when the tab
-first opens; **Maximize** shows one display (Esc restores), and **Start all**, **Stop all** and
+Screenshot and Record. Every display starts stopped — opening the tab, a rescan
+or a newly found display never starts one — so start the ones you need, or
+**Start all** to start them one after another; **Maximize** shows one display (Esc restores), and **Start all**, **Stop all** and
 **Rescan** sit at the top (**Device Control → Options → All displays** opens it).
 The Device Control display picker lists every display with its name and size as
 soon as the device connects. If a
@@ -491,7 +505,8 @@ else:
 Exception hierarchy (catch `ADBError` for everything):
 `ADBNotFoundError`, `ADBConnectionError`, `ADBTimeoutError`,
 `ADBNotConnectedError`, `ADBCommandError`, `ADBTransferError`,
-`ADBInstallError`, `ScrcpyError`.
+`ADBInstallError`, `ScrcpyError`. A command that runs out of time keeps what it
+printed: `ADBTimeoutError.result` is its `CommandResult` (exit code -1).
 
 ---
 
@@ -570,8 +585,8 @@ turboadb gui                          # launch the desktop GUI
 ```
 
 `-s` accepts a USB serial, a `host:port` network target, or `@NAME` for a saved
-target. `--timeout` also limits push and pull, and `--scrcpy-path` picks the
-scrcpy executable. Add `--json` for machine-readable output. Examples:
+target. `--timeout` also sets how long a push or pull may go without progress,
+and `--scrcpy-path` picks the scrcpy executable. Add `--json` for machine-readable output. Examples:
 
 ```bash
 turboadb -s 192.168.1.50:5555 shell -- dumpsys power | findstr mWakefulness

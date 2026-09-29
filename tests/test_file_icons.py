@@ -213,6 +213,50 @@ def test_icon_in_ignores_the_theme(qapp, themed):
 
 
 # --------------------------------------------------------------------------- #
+# Linux desktops: Qt 5's platform themes know no icon for a file that doesn't exist
+# --------------------------------------------------------------------------- #
+class NullTypeProvider(FakeProvider):
+    """Answers like Qt 5.15's GNOME, GTK and KDE platform themes: nothing for a
+    path that does not exist - which is every device file."""
+
+    def icon(self, what):
+        if isinstance(what, QFileInfo) and not what.exists():
+            self.asked.append(what.filePath())
+            return QIcon()
+        return super().icon(what)
+
+
+def test_without_a_type_icon_a_device_row_keeps_its_glyph(qapp):
+    """Every device file row was drawn with no icon at all, and an APK with a
+    green badge floating on nothing."""
+    provider = NullTypeProvider()
+    icons = fi.FileIcons(native=True, provider=lambda: provider)
+    assert icons.row_icon("a.txt", False, "File", "file", "blue") is cached_icon("file", "blue")
+    assert icons.row_icon("app.apk", False, "File", "apps", "green") is \
+        cached_icon("apps", "green")
+    assert icons.row_icon("clip.mp4", False, "File Link", "link", "teal") is \
+        cached_icon("link", "teal")
+    assert _colour(icons.row_icon("DCIM", True, "Folder", "folder", "amber")) == "#f0c040"
+
+
+def test_the_icon_theme_gives_a_device_file_its_types_icon(qapp, monkeypatch):
+    theme_icons = {"text-plain": _solid("#112233"), "image-x-generic": _solid("#445566"),
+                   "application-x-generic": _solid(FakeProvider.GENERIC)}
+    monkeypatch.setattr(fi.QIcon, "hasThemeIcon", staticmethod(lambda name: name in theme_icons))
+    monkeypatch.setattr(fi.QIcon, "fromTheme",
+                        staticmethod(lambda name, *fallback: theme_icons.get(name, QIcon())))
+    provider = NullTypeProvider()
+    icons = fi.FileIcons(native=True, provider=lambda: provider)
+    assert _colour(icons.row_icon("notes.txt", False, "File", "file", "blue")) == "#112233"
+    # no image-png in this theme: the generic image icon
+    assert _colour(icons.row_icon("a.png", False, "File", "image", "purple")) == "#445566"
+    # an APK the theme knows only as a generic file gets the Android badge
+    apk = icons.row_icon("app.apk", False, "File", "apps", "green")
+    assert _colour(apk, 3, 3) == FakeProvider.GENERIC
+    assert _corner_has(apk, fi._ANDROID_PLATE, "right")
+
+
+# --------------------------------------------------------------------------- #
 # in the Files tab
 # --------------------------------------------------------------------------- #
 def test_files_rows_use_native_icons_and_keep_their_kind(qapp, monkeypatch, tmp_path):

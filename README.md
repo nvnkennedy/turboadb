@@ -16,12 +16,16 @@
 
 ---
 
-> **New in 2.5.0:** a transfer history in Files with overall progress, speed,
-> time left and every file's size and error; more than one Files tab on the
-> same device; a second terminal session in one click; the system's own file
-> icons; and a notification for every copy, paste, APK install and bulk file
-> operation, plus fixes to the screencap view, streams and startup launchers.
-> Full notes in the
+> **New in 3.0.0:** the Android shell runs on a real device terminal, so `ping`,
+> `logcat | grep` and programs that wait for input work, and Stop sends Ctrl+C;
+> `top`, `vi` and `less` redraw in place; the prompt, `ls`, `grep` and logcat
+> lines are in colour; Stop in PowerShell and CMD keeps your shell; no more
+> stray blank lines; IVI displays start stopped; one adb server and no duplicate
+> adb processes; a Logcat page that keeps every line and filters the whole
+> capture; faster Files for big folders with real transfer progress, and device
+> files that open in the PC's own apps with your saves going back to the device;
+> safer sharing and deploy defaults; and well over a hundred other fixes. Full
+> notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -58,7 +62,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-2.5.0-win64.exe`** from the
+1. Download **`TurboADB-3.0.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
@@ -146,9 +150,11 @@ abort a run.
   scrcpy, open the host webcam, create shortcuts), then icons for the theme, the
   log panel, settings and help.
 - **Closing TurboADB closes ADB and scrcpy** — any mirror window it opened is
-  closed and the adb server is stopped, so nothing keeps the device busy after
-  you quit. A server shared with other machines (`turboadb serve`) is left
-  alone, and **Settings → Startup** turns this off.
+  closed and the adb server it started is stopped, so nothing keeps the device
+  busy after you quit. A server it did not start (Android Studio's, a
+  script's) or one shared with other machines (`turboadb serve`) is left
+  alone, and **Settings → Startup** turns this off (separate mirror windows
+  then stay open too).
 - **Devices sidebar** — **Connected** devices and **Saved targets**. Every device
   you connect is saved as a target automatically (named after the device, never
   twice; turn this off in **Settings → Startup**). Type in the search box to
@@ -163,17 +169,23 @@ abort a run.
 - **Device type** — TurboADB detects Android Automotive, an infotainment head
   unit, TV, watch, tablet or phone and shows it in the terminal's welcome banner.
   Cars get the IVI-compatible screen profile and the **IVI Displays** tab.
-- **Themes** — Graphite (dark) and Porcelain (light) by default, plus Black /
-  White, Slate / Mist (cool blue-grey), Night / Paper (a warm reading pair) and
-  Mocha / Latte — all with softened text and muted accents, never pure black or
-  glaring white. The top-bar sun or moon switches between your last dark and
-  your last light theme (pick Slate, and it toggles Slate ↔ Porcelain); its
-  arrow, the **Themes** menu and **Settings → Themes** pick any theme directly.
+- **Themes** — Graphite (dark) and Porcelain (light) by default, plus Ocean /
+  Sky (navy and crisp blue-white), Dusk / Lavender (violet), Evergreen /
+  Meadow (green), Black / White, Slate / Mist (cool blue-grey), Night / Paper (a warm
+  reading pair), Mocha / Latte and High contrast (dark and light, the most
+  readable) — never pure black or glaring white. The top-bar sun or moon
+  switches between your last dark and your last light theme (pick Slate, and
+  it toggles Slate ↔ Porcelain); its arrow, the **Themes** menu and
+  **Settings → Themes** pick any theme directly.
 - **Notifications** — every action shows in the status bar and a small toast;
-  errors show a red popup with a sound and a **Copy** button. The log panel (its
-  top-bar icon) filters Normal, Verbose, Warnings + Errors or Errors only.
-- **Settings** — Appearance (terminal font), Tools (adb / scrcpy / ffmpeg paths),
-  scrcpy (video and audio), Logcat, Themes and Startup.
+  errors show a red popup with a sound and a **Copy** button. The status bar
+  is coloured by state: a green **Connected**, a red **Error** or amber
+  **Warning** banner, and chips for the ADB server, the devices and the
+  version (click one for its menu). The log panel (its top-bar icon) filters
+  Normal, Verbose, Warnings + Errors or Errors only.
+- **Settings** — Appearance (terminal font, Android shell on a device terminal),
+  Tools (adb / scrcpy / ffmpeg paths), scrcpy (video and audio), Logcat, Themes
+  and Startup.
 - **Menu bar** — File (new target, save output, export / import saved targets),
   View, Themes, Device (including **Run a command on ALL devices…**), Tools and
   Help.
@@ -185,10 +197,21 @@ abort a run.
 ## Interactive shell
 
 A real terminal, not a one-shot: history, `Tab` completion, copy/paste, and a
-**Stop** button that actually kills a runaway command like `logcat` (there's no
-PTY, so a plain `Ctrl+C` can't — Stop tears the shell down, kills the device-side
-process, and reopens, keeping your working directory). A bare `ls` is shown in
-columns.
+**Stop** button that actually stops a runaway command like `logcat`. The Android
+shell runs on a device terminal (`adb shell -t -t`), so the device prints its own
+prompt, output such as `ping`, `logcat | grep` or a `sed` pipeline shows as it
+comes, programs that ask for input (`read`, `su`) work, and `ls` fits its columns
+to the window. **Stop** (or Ctrl+C) sends a real Ctrl+C: `ping` prints its
+summary and you stay in the same shell (a program that answers it, such as
+`sqlite3`, keeps running). A command that ignores it is ended by reopening the
+shell in the same folder after 3 s, or at once when you press Stop again;
+**Restart shell** always opens a fresh one. Full-screen programs such as
+`top` print frame after frame (the terminal moves no cursor).
+
+If the device or adb gives no terminal (an old adb, a locked-down build),
+TurboADB falls back to plain pipes and draws the prompt itself; there Stop always
+reopens the shell, keeping your folder. **Settings → Appearance → Android shell**
+turns the device terminal off.
 
 **In the GUI** — open a device → **Terminal** tab → start typing. A boxed
 two-line banner at the top shows the connection, device type, Android version,
@@ -199,11 +222,17 @@ Ctrl + mouse wheel) resize every terminal together (12 pt by default).
 The **Android / PowerShell / CMD** switcher at the left of the toolbar opens
 PowerShell or Command Prompt on this PC, with TurboADB's `adb` first on PATH and
 `ANDROID_SERIAL` set to the device. They behave like a normal console: Python,
-Node, Git, `where` and programs in the current folder all work. **Stop** ends the
-running command and opens a fresh shell in the same folder. Inside an `adb shell`
-typed there, Stop sends Ctrl+C to the device instead: only the device command
-stops and you stay in adb shell. If that command ignores it, Stop again reopens
-adb shell in the same device folder.
+Node, Git, `where` and programs in the current folder all work, and output such
+as `ping` or a Python script shows as it comes (`adb logcat | findstr word`
+too). **Stop** (or Ctrl+C) presses a real Ctrl+C in the shell: `ping` prints
+its summary, a script or batch file stops as in a console window, and the shell
+keeps its folder and variables. A command that ignores Ctrl+C has its processes
+ended, and the shell stays; only one that still won't end, or a shell waiting
+for an answer (`pause`, `Read-Host`, a `-Confirm` question — Stop never answers
+for you), gets a fresh shell in the same folder. At an idle prompt Ctrl+C just
+starts a new line. Inside an `adb shell` typed there, Stop sends Ctrl+C to the
+device instead: only the device command stops and you stay in adb shell. If
+that command ignores it, Stop again reopens adb shell in the same device folder.
 
 Need a second terminal on the same device? **More ▾ → New terminal session**,
 or right-click the **Terminal** tab, opens another terminal tab with its own
@@ -213,7 +242,7 @@ Android shell, PowerShell and Command Prompt.
 
 ```bash
 turboadb -s SERIAL shell -- getprop ro.build.version.release
-turboadb -s SERIAL shell --su -- "cat /data/misc/file"   # wrap in su -c
+turboadb -s SERIAL shell --su -- "cat /data/misc/file"   # as root, through su
 ```
 
 **Python** — `shell()` for one-shots, `open_shell()` for an interactive session:
@@ -230,15 +259,25 @@ sess.close()
 
 ## Logcat
 
-Filter by level, tag, or live regex; pause/clear; save the **complete** log (even
-under a flood the on-screen view trims to stay responsive, but every line is kept
-on disk).
+Filter by level, tag, app, or live regex; pause/clear; save the **complete** log
+(even under a flood, or while the tab is hidden, the on-screen view trims to stay
+responsive, but every line is kept on disk). So that an unattended capture can't
+fill the disk, each capture's history file (and each terminal's) is kept under
+1 GB: once it is full its oldest half goes (sooner while the disk is nearly
+full), and a save starts with a line saying what was dropped.
+`"history_limit_mb"` in `~/.turboadb/settings.json` changes the limit (`0`:
+none).
 
 **In the GUI** — **Logcat** tab → pick the level and how much history to include
-(**Live from now**, **Last 1,000 + live**, …), optionally a **Tag**, a live
-**Filter** regex or a **Highlight** pattern such as `error|anr` → **Start**.
-**Crashes** is a one-click preset, **Pause** / **Clear** do what they say, and
-**Save…** writes everything captured.
+(**Live from now**, **Last 1,000 + live**, …), optionally **Tag(s)** (exact,
+comma-separated), an **App** (package name or PID, Android 7+), a live **Filter**
+regex or a **Highlight** pattern such as `error|anr` → **Start**. The Filter
+ignores case unless **Aa** is on, matches text that isn't a valid regex as plain
+text, and searches the whole capture, not just what is on screen. Changing Tag,
+Level or App restarts a running capture where it left off, and a live capture
+resumes by itself after a reboot, an ADB restart or a reconnect. **Crashes** is
+a one-click preset, **Pause** / **Clear** do what they say, and **Save…** writes
+everything captured.
 
 **CLI**:
 
@@ -264,9 +303,16 @@ for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
 
 **In the GUI** — **Files** tab: **This PC** on one side, **Device** on the other.
 Select files and press **Push** or **Pull**, or drag and drop between the panes
-(also from Explorer). Both panes have **New folder**, **New file**, **Edit** (F4,
-a built-in editor), **Copy** / **Paste**, **Rename** (F2) and **Delete**, plus
-quick folders such as Downloads and `/sdcard`.
+(also from Explorer). Both panes have **New folder**, **New file**, **Open**,
+**Edit** (F4, a built-in editor), **Copy** / **Paste**, **Rename** (F2) and
+**Delete**, plus quick folders such as Downloads and `/sdcard`.
+
+**Double-click** a file (or press **Enter**) to open it in its app on this PC:
+pictures in Photos, videos in Media Player, text in Notepad, or any app you pick
+with **Open with…**. A device file opens as a copy, and each time you save it in
+that app it goes back to the device, keeping its permissions (TurboADB asks
+first if the device file changed meanwhile). Programs are never started from
+here; scripts and text files no app opens go to the built-in editor.
 
 Selecting works like a file manager: drag beside the names for a block of files,
 **Ctrl+A** for all of them, **Enter** to open, **Backspace** to go up,
@@ -466,11 +512,14 @@ and latency in **Settings → scrcpy**.
 
 **All displays at once** — cars, and any device with several displays, get an
 **IVI Displays** tab (**Displays** on other devices) that shows every display
-live and controllable, side by side, each with its own Start / Stop, Separate
-window, screenshot and Record. The displays start one after another the first
-time you open the tab. **Start all**, **Stop all** and **Rescan** are at the top,
-and **Maximize** on a display shows only that one (**Restore** or Esc brings the
-grid back). Each
+side by side, each controllable with its own Start / Stop, Separate window,
+screenshot and Record. Every display starts stopped: opening the tab (or
+**Options → All displays**), a rescan and a newly found display never start
+one, and a display you stopped stays stopped. Start the ones you need, or press
+**Start all** to start them one after another (it keeps going if you switch to
+another tab; **Stop all** ends it). **Start all**, **Stop all** and **Rescan** are
+at the top, and **Maximize** on a display shows only that one (**Restore** or
+Esc brings the grid back). Each
 display has its own Back, Home, Recents, volume, mute, power and screenshot
 buttons, sent to that display.
 
@@ -553,8 +602,10 @@ and **View**: Fit, Fill or Stretch. Right-click the video to copy the image.
 > a local admin. ffmpeg is **provisioned automatically**: TurboADB first **copies your
 > local `ffmpeg.exe` to the remote over its admin share** (`\\host\C$`, fast on a LAN
 > and no internet needed there — like TurboSSH's push); if the share isn't reachable
-> it falls back to the remote downloading ffmpeg itself, and failing that you can drop
-> `ffmpeg.exe` in `C:\Windows\Temp\turboadb-ffmpeg\` over RDP. The host / user / domain
+> it falls back to the remote downloading ffmpeg itself, and failing that you can put
+> `ffmpeg.exe` in `C:\Program Files\TurboADB\ffmpeg\` over RDP, as an administrator
+> (ffmpeg runs with the admin's rights, so it is only ever taken from folders only
+> administrators can write to). The host / user / domain
 > are remembered and the **password is saved in the Windows Credential vault**
 > (keyring), never in a file. A physical USB camera works headlessly; a camera
 > redirected into someone's RDP session is only visible inside that session.
@@ -739,6 +790,15 @@ print(open_firewall((5037, "27184-27199")))
 install_serve_task()              # SYSTEM startup task, headless
 ```
 
+The shared adb server has no password: anyone who can reach the port can control
+the devices. The firewall rules therefore apply on **Domain and Private networks
+only**: on a network Windows calls Public (a café or hotel Wi-Fi) nobody can
+connect until you make that network Private (the status line names it).
+`open_firewall(..., remote_ip="localsubnet")` narrows the rules further;
+`profiles="any"` opens them everywhere. Stopping sharing deletes the rules again.
+The startup task signs in to devices with your own adb key too, so devices you
+already use need no new authorization.
+
 ## Deploy serve over WinRM
 
 Push `serve` onto remote Windows hosts **from your machine** — one host or a whole
@@ -833,7 +893,8 @@ dev.screenshot("after_install.png")
 - `device_info()` flags `automotive` for Android Automotive OS and for head units
   running ordinary Android (see `device_kind()` in Device info); the GUI then
   uses the IVI-compatible screen profile and adds the **IVI Displays** tab, which
-  shows every display (centre stack, cluster, passenger) live at once.
+  shows every display (centre stack, cluster, passenger) side by side, each
+  stopped until you start it (or **Start all**).
 - `list_displays()` names each display (`Instrument cluster`, `Passenger`) and
   asks Android over adb; pass `method="scrcpy"` for scrcpy's own list.
 - If the default mirror fails, use **compatibility mode** (software decode).

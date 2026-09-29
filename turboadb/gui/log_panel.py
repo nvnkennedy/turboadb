@@ -46,6 +46,9 @@ _ALIASES = {
     "STDERR": "WARNING",
     "CRITICAL": "ERROR",
     "FATAL": "ERROR",
+    # "[CANCELLED] pull a.txt" (Files) is information, and says so in words.
+    "CANCELLED": "INFO",
+    "CANCELED": "INFO",
 }
 _FILTERS = [
     ("Normal", 1),
@@ -54,8 +57,35 @@ _FILTERS = [
     ("Errors only", 3),
 ]
 _PREFIX_RE = re.compile(
-    r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|CRITICAL|FATAL|ERROR)\]\s*", re.IGNORECASE
+    r"^\s*\[(DEBUG|INFO|OK|SUCCESS|WARNING|WARN|STDERR|CRITICAL|FATAL|ERROR|CANCELLED|CANCELED)\]\s*",
+    re.IGNORECASE,
 )
+
+
+def classify(text: str):
+    """``(level, message, tag)`` for one log message.
+
+    *tag* is its ``[TAG]`` prefix, upper-cased, *level* the level that tag
+    names and *message* the text after it. A message without a tag (tag
+    None) is INFO, except the raw ``$ adb …`` / ``-> …`` command trace,
+    which is DEBUG. A cancelled step keeps the word: "[CANCELLED] pull a.txt"
+    is the INFO message "Cancelled: pull a.txt".
+
+    The one reading of these tags, for the log panel and for the main
+    window's status bar and toasts; two copies of the table had already
+    drifted apart (the panel showed "[CANCELLED]" as part of the text).
+    """
+    m = _PREFIX_RE.match(text)
+    if m:
+        tag = m.group(1).upper()
+        level = _ALIASES.get(tag, tag)
+        message = text[m.end():]
+        if tag in ("CANCELLED", "CANCELED") and message.strip():
+            message = f"Cancelled: {message}"
+        return (level if level in _LEVELS else "INFO"), message, tag
+    if text.lstrip().startswith(("$ ", "-> ")):
+        return "DEBUG", text, None
+    return "INFO", text, None
 
 
 class LogPanel(QGroupBox):
@@ -120,8 +150,9 @@ class LogPanel(QGroupBox):
     def _on_silent_toggled(self, checked: bool):
         try:
             settings_mod.set("mute_popups_with_log", bool(checked))
-        except Exception:
-            pass
+        except Exception as exc:
+            # The box still works until TurboADB closes; only saving it failed.
+            self.append(f"[WARNING] Could not save the Silent choice: {exc}")
 
     # ---- public API ----
     def append(self, text: str):
@@ -131,30 +162,26 @@ class LogPanel(QGroupBox):
         # Follow new entries only when already at the bottom; someone reading
         # older lines must not be yanked away by every new message.
         at_bottom = sb.value() >= sb.maximum() - 4
+        # Only a message's first line carries its [TAG]: the lines after it
+        # (a traceback, a command's stderr) keep that level, or "Errors only"
+        # and a saved log showed "Unexpected error:" without the error. Lines
+        # of a message without a tag are read one by one, so an untagged adb
+        # command trace stays DEBUG.
+        header = None
         for raw in str(text).split("\n"):
             if not raw.strip():
                 continue
-            level, msg = self._classify(raw)
+            level, msg, tag = classify(raw)
+            if tag is not None:
+                header = level
+            elif header is not None:
+                level, msg = header, raw
             entry = (time.strftime("%H:%M:%S"), level, msg)
             self._entries.append(entry)
             if _LEVELS[level][0] >= self._min_rank:
                 self._render(entry)
         if at_bottom:
             sb.setValue(sb.maximum())
-
-    # ---- classification ----
-    @staticmethod
-    def _classify(text):
-        m = _PREFIX_RE.match(text)
-        if m:
-            lvl = m.group(1).upper()
-            lvl = _ALIASES.get(lvl, lvl)
-            return (lvl if lvl in _LEVELS else "INFO"), text[m.end() :]
-        # unprefixed: the raw command trace is DEBUG; everything else is INFO
-        s = text.lstrip()
-        if s.startswith("$ ") or s.startswith("-> ") or s.startswith("  -> "):
-            return "DEBUG", text
-        return "INFO", text
 
     # ---- rendering ----
     def _render(self, entry):

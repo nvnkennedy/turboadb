@@ -1,6 +1,5 @@
-"""Engine fixes from the 2.5.0 review: log files flushed per line, adb's last
-stderr words kept, the startup-command guard, --audio-dup, and re-entrant adb
-resolution."""
+"""Engine hardening: log files flushed per line, adb's last stderr words kept,
+the startup-command guard, --audio-dup, and re-entrant adb resolution."""
 
 import subprocess
 import sys

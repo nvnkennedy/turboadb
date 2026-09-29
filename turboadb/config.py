@@ -45,8 +45,8 @@ def validate_port(value, name: str = "port") -> int:
     return port
 
 
-def format_host_port(host: str, port: int) -> str:
-    """Format an ADB endpoint, preserving brackets required for IPv6 literals."""
+def _address_host(host: str) -> str:
+    """*host* as it is written in an adb address: an IPv6 literal in brackets."""
     host = (host or "").strip()
     if not host:
         raise ValueError("host must not be empty")
@@ -54,7 +54,30 @@ def format_host_port(host: str, port: int) -> str:
         host = host[1:-1]
     if ":" in host:
         host = f"[{host}]"
-    return f"{host}:{validate_port(port)}"
+    return host
+
+
+def format_host_port(host: str, port: int) -> str:
+    """Format an ADB endpoint, preserving brackets required for IPv6 literals."""
+    return f"{_address_host(host)}:{validate_port(port)}"
+
+
+def adb_server_args(host: str, port: int) -> list:
+    """``["-H", HOST, "-P", PORT]``: the adb flags for a server on another
+    machine, built in one place for every adb command line.
+
+    adb joins the two into ``tcp:HOST:PORT``, so an IPv6 literal keeps its
+    brackets: with a bare ``-H fd00::10 -P 5037`` adb dialled host
+    ``fd00::10:5037`` on port 5555 and never reached the server."""
+    return ["-H", adb_server_address(host), "-P", str(validate_port(port))]
+
+
+def adb_server_address(host: str) -> str:
+    """*host* as ``ANDROID_ADB_SERVER_ADDRESS`` takes it.  adb reads that
+    variable in place of a missing ``-H`` and joins it with the port the same
+    way, so an IPv6 literal needs its brackets there too; an IPv4 address or
+    a host name stays bare (adb adds ``tcp:`` and the port itself)."""
+    return _address_host(host)
 
 
 def parse_host_port(value, default_port: Optional[int] = None):
@@ -116,7 +139,7 @@ class ADBConfig:
 
     # --- behaviour ---
     command_timeout: Optional[float] = 60.0  # default per-command timeout (s)
-    transfer_timeout: Optional[float] = 600.0  # default push/pull timeout (s)
+    transfer_timeout: Optional[float] = 600.0  # a push/pull fails after this long without progress (s)
     connect_timeout: float = 20.0  # wait-for-device window on connect
     auto_connect: bool = True  # run `adb connect` for network targets
     auto_wait: bool = True  # wait-for-device after connect
@@ -129,6 +152,16 @@ class ADBConfig:
             raise ValueError("command_timeout must be positive or None")
         if self.transfer_timeout is not None and self.transfer_timeout <= 0:
             raise ValueError("transfer_timeout must be positive or None")
+        # A network host given WITH a port ("10.0.0.5:5555" from an imported or
+        # hand-edited target) is split like the adb server host below:
+        # format_host_port would otherwise bracket the whole value into
+        # "[10.0.0.5:5555]:5555", which adb cannot resolve. A bare IPv6 literal
+        # is never split, and a port in the host wins over the port argument.
+        if self.host is not None:
+            h, p = parse_host_port(self.host)
+            self.host = h or None
+            if h and p is not None:
+                self.port = p
         # A bare "host:port" passed as serial is also a valid network target.
         if self.serial and self.host is None and ":" in self.serial:
             h, p = parse_host_port(self.serial)

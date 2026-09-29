@@ -26,7 +26,9 @@ TurboADB command-line interface (fully argument-driven).
 Network targets: pass ``-s host:port`` (or use ``connect`` first). USB: omit
 ``-s`` for the only device, or pass its serial. The shared flags (``-s``,
 ``--adb-path``, ``--scrcpy-path``, ``--adb-host``, ``--adb-port``,
-``--timeout``, ``--json``) work before or after the subcommand.
+``--timeout``, ``--json``) work before or after the subcommand — but before
+the words of ``shell``, ``adb``, ``text``, ``search`` and ``send-sms``, which
+take everything after their first word as it is.
 
 The setup commands (``doctor``, ``fetch-tools``, ``upgrade-tools``,
 ``self-update``, ``shortcut``, ``gui`` and ``deploy-serve``) drive no device, so
@@ -46,7 +48,7 @@ from .config import ADBConfig, ScrcpyOptions, parse_host_port
 from .core import ADBHandler
 from .devices import list_devices
 from .results import CommandResult, TransferResult, StreamResult
-from .exceptions import ADBError, ADBNotFoundError
+from .exceptions import ADBError, ADBNotFoundError, ADBTimeoutError
 from .tools import NO_WINDOW, adb_available, scrcpy_available, windowless_python
 
 DOCS_URL = "https://pypi.org/project/turboadb/"
@@ -72,27 +74,15 @@ def _prewarm_gui_adb_server() -> None:
     """Start the GUI's managed ADB daemon before importing PyQt.
 
     The Windows daemon's first USB scan is the only expensive part of a cold
-    launch.  Running it on a daemon thread here overlaps that scan with PyQt
-    import and window construction.  ``gui.app`` performs the same guarded
-    warm-up for alternate entry points; :func:`ensure_adb_server` serializes
-    both callers so only one identical ADB client ever starts the daemon.
+    launch.  Starting it here overlaps that scan with PyQt import and window
+    construction.  This is the same once-per-process start ``gui.app`` makes
+    for the other entry points (:func:`gui.adb_path.prewarm_adb_server`), so
+    exactly one pre-warm runs whichever way the GUI was launched.
     """
     try:
-        import threading
+        from .gui.adb_path import prewarm_adb_server  # dependency-free (no PyQt import)
 
-        from .gui.adb_path import gui_adb_path  # dependency-free (no PyQt import)
-        from .tools import ensure_adb_server
-
-        adb_path = gui_adb_path()
-        if not adb_path:
-            return
-        threading.Thread(
-            target=ensure_adb_server,
-            args=(adb_path,),
-            kwargs={"timeout": 12.0},
-            name="TurboADB-launch-server-start",
-            daemon=True,
-        ).start()
+        prewarm_adb_server()
     except Exception:
         # The GUI shows an actionable tool/server error after it has a window.
         # This early start is strictly a launch-latency optimisation.
@@ -200,11 +190,16 @@ def create_start_menu_shortcut(name: str = "TurboADB") -> bool:
 def _windows_folder(csidl: int) -> str:
     """Resolve a Windows known folder by CSIDL (handles OneDrive-redirected
     Desktops), matching .NET's GetFolderPath so our existence-checks line up with
-    where the shortcuts actually get written."""
+    where the shortcuts actually get written.
+
+    Raises OSError when Windows can't say: an empty answer made the shortcut
+    path relative, so its existence was checked in the current folder."""
     import ctypes
 
     buf = ctypes.create_unicode_buffer(260)
-    ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
+    hr = ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
+    if hr != 0 or not buf.value:
+        raise OSError(f"SHGetFolderPathW({csidl:#x}) failed (HRESULT {hr & 0xFFFFFFFF:#010x})")
     return buf.value
 
 
@@ -227,23 +222,62 @@ def _shortcut_paths(name: str = "TurboADB"):
     ]
 
 
+def _shortcut_blocker() -> str | None:
+    """Why this process must not write the shortcuts, or None.
+
+    A shortcut starts the TurboADB installed in this Python (its turboadb-gui
+    launcher, or ``pythonw -m turboadb gui`` from the interpreter's folder).
+    When this process runs another copy — a source checkout started with
+    ``python main.py`` while an older release is installed — a shortcut
+    written now would start that other copy (or nothing), and every fix made
+    in the checkout would look as if it did not work."""
+    if getattr(sys, "frozen", False):
+        return None  # the exe the user started is the launcher
+    from . import update
+
+    copy = update.running_copy()
+    if copy["same"] is not False:
+        return None
+    root = os.path.dirname(copy["path"])
+    if os.path.isfile(os.path.join(root, "pyproject.toml")):
+        fix = f'install this copy with:  pip install -e "{root}"  and run: turboadb shortcut'
+    else:
+        fix = "install this copy with pip first"
+    started = "would start that copy" if copy["installed_path"] else "could not start TurboADB"
+    return f"{copy['note']}, so a shortcut {started}. To use this one, {fix}"
+
+
 def ensure_shortcuts(name: str = "TurboADB", force: bool = False) -> dict:
-    """Make sure the Desktop and Start-menu shortcuts exist. With *force* (used at
-    every GUI launch) it re-creates them so they always point at the right
-    launcher and reappear even if an antivirus or cleanup tool removed one; it
-    only REPORTS a location when it was actually missing before (so a normal
-    launch logs nothing). Returns {location: ok_bool} for created/repaired or
-    failed locations only."""
+    """Make sure the Desktop and Start-menu shortcuts exist. With *force* (the
+    menu's refresh, and ``turboadb shortcut``) it re-creates them so they point
+    at the right launcher again. It only REPORTS a location that was missing
+    before or whose refresh failed, so an ordinary GUI launch logs nothing.
+    Returns {location: ok_bool} for created/repaired or failed locations only.
+
+    Nothing is written while this process runs a different TurboADB than the
+    one a shortcut starts (see :func:`_shortcut_blocker`): a launch then leaves
+    the shortcuts alone quietly, and a forced refresh reports every location
+    as failed."""
     out = {}
-    for loc, path, maker in _shortcut_paths(name):
+    wanted = [
+        (loc, path, maker)
+        for loc, path, maker in _shortcut_paths(name)
+        if force or not os.path.exists(path)
+    ]
+    if not wanted:
+        return out
+    if _shortcut_blocker() is not None:
+        return {loc: False for loc, _path, _maker in wanted} if force else {}
+    for loc, path, maker in wanted:
         existed = os.path.exists(path)
-        if not existed or force:
-            maker(name)
-            landed = os.path.exists(path)
-            if not existed:
-                out[loc] = landed  # newly created (True) or failed (False)
-            elif not landed:
-                out[loc] = False  # was present but the refresh lost it
+        ok = maker(name)
+        landed = os.path.exists(path)
+        if not existed:
+            out[loc] = bool(ok) and landed  # newly created (True) or failed (False)
+        elif not (ok and landed):
+            # was present but could not be refreshed (PowerShell refused, timed
+            # out) or the refresh lost it: the old link may point anywhere
+            out[loc] = False
     return out
 
 
@@ -253,19 +287,24 @@ def create_shortcut(argv=None) -> int:
         print("Shortcut creation is Windows-only.", file=sys.stderr)
         return 2
     res = ensure_shortcuts(force=True)
-    # ensure_shortcuts only reports locations that were missing (or lost), so an
+    # ensure_shortcuts only reports locations that were missing or failed, so an
     # empty result after refreshing existing shortcuts is success, not failure
-    present = [loc for loc, path, _maker in _shortcut_paths() if os.path.exists(path)]
     failed = [loc for loc, ok in res.items() if not ok]
-    if present and not failed:
-        return _report(True, f"Created/refreshed the 'TurboADB' shortcut ({' and '.join(present)}).", "")
-    if present:
-        return _report(
-            False, "",
-            f"Shortcut ready in {' and '.join(present)}, but could not create it in "
-            f"{' and '.join(failed)}.",
-        )
-    return _report(False, "", "Could not create the shortcut.")
+    ready = [
+        loc for loc, path, _maker in _shortcut_paths() if os.path.exists(path) and loc not in failed
+    ]
+    if ready and not failed:
+        return _report(True, f"Created/refreshed the 'TurboADB' shortcut ({' and '.join(ready)}).", "")
+    if not failed:
+        return _report(False, "", "Could not create the shortcut.")
+    reason = _shortcut_blocker()
+    if reason:
+        return _report(False, "", f"The shortcuts were not changed: {reason}.")
+    return _report(
+        False, "",
+        f"Could not create or refresh the 'TurboADB' shortcut in {' and '.join(failed)}"
+        + (f" (the {' and '.join(ready)} one is fine)." if ready else "."),
+    )
 
 
 def _staged_exe(src: str) -> str:
@@ -274,7 +313,8 @@ def _staged_exe(src: str) -> str:
     A running .exe is locked by Windows, so running the installed one in place
     would make ``pip install --upgrade`` fail to replace it. The temp name
     includes the version and size, so a new build lands in a new file instead
-    of clashing with a copy that may still be running."""
+    of clashing with a copy that may still be running. The copies of earlier
+    builds (tens of MB each) are deleted, except one that is still running."""
     import shutil
     import tempfile
 
@@ -287,9 +327,31 @@ def _staged_exe(src: str) -> str:
         dst = os.path.join(tempfile.gettempdir(), f"turboadb-gui-{ver}-{size}.exe")
         if not os.path.exists(dst) or os.path.getsize(dst) != size:
             shutil.copy2(src, dst)
-        return dst
     except Exception:
         return src  # fall back to running in place
+    _remove_stale_staged_exes(dst)
+    return dst
+
+
+def _remove_stale_staged_exes(keep: str) -> None:
+    """Delete the temp copies :func:`_staged_exe` made of other builds. Best
+    effort: a copy that is still running is locked, and stays until next time."""
+    import re
+
+    pattern = re.compile(r"turboadb-gui-[^-]+-\d+\.exe", re.IGNORECASE)
+    folder = os.path.dirname(keep)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(folder, name)
+        if not pattern.fullmatch(name) or os.path.normcase(path) == os.path.normcase(keep):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def launch_gui(argv=None) -> int:
@@ -360,8 +422,31 @@ def _add_target(p: argparse.ArgumentParser, suppress: bool = True) -> None:
     p.add_argument(
         "--adb-port", type=int, default=_port, help="adb server port (default 5037)"
     )
-    p.add_argument("--timeout", type=float, default=_none, help="per-command timeout (seconds)")
+    p.add_argument(
+        "--timeout", type=_timeout_value, default=_none,
+        help="per-command timeout in seconds (0: no limit)",
+    )
     p.add_argument("--json", action="store_true", default=_json, help="emit machine-readable JSON")
+
+
+def _timeout_value(text: str) -> float:
+    """``--timeout``: seconds, where 0 means no limit."""
+    import math
+
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if value < 0 or not math.isfinite(value):
+        raise argparse.ArgumentTypeError("must be 0 (no limit) or a number of seconds")
+    return value
+
+
+def _attached_timeout(args):
+    """The limit for a command whose output is shown as it arrives: only an
+    explicit ``--timeout`` (a stream such as ``ping`` or ``logcat`` must not
+    end after the 60 s default), and ``--timeout 0`` is none."""
+    return getattr(args, "timeout", None) or None
 
 
 def _config(args, **overrides) -> ADBConfig:
@@ -380,9 +465,10 @@ def _config(args, **overrides) -> ADBConfig:
     timeout = getattr(args, "timeout", None)
     if timeout is not None:
         # only when given: passing None would DISABLE the default timeouts.
-        # --timeout covers push/pull too, not just short commands.
-        kwargs["command_timeout"] = timeout
-        kwargs["transfer_timeout"] = timeout
+        # --timeout covers push/pull too, not just short commands, and
+        # --timeout 0 lifts both limits.
+        kwargs["command_timeout"] = timeout or None
+        kwargs["transfer_timeout"] = timeout or None
     kwargs.update(overrides)
     return ADBConfig(**kwargs)
 
@@ -431,8 +517,27 @@ def _output(args, obj) -> None:
             )
         else:
             print(json.dumps(obj, default=str, indent=2))
+    elif isinstance(obj, dict):
+        _print_fields(obj)
     else:
         print(obj)
+
+
+def _print_fields(fields: dict) -> None:
+    """A dict as ``key: value`` lines lined up on the longest key (``info``),
+    the human form of what ``--json`` prints; a list or dict value is joined
+    onto its line instead of shown as a Python repr."""
+    width = max((len(str(key)) for key in fields), default=0) + 1
+    for key, value in fields.items():
+        if isinstance(value, bool):
+            value = "yes" if value else "no"
+        elif isinstance(value, dict):
+            value = ", ".join(f"{k}={v}" for k, v in value.items())
+        elif isinstance(value, (list, tuple, set)):
+            value = ", ".join(str(v) for v in value)
+        elif value is None:
+            value = ""
+        print(f"{str(key) + ':':{width}} {value}".rstrip())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -537,7 +642,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_tg = device_cmd("targets", "saved device targets: list, add, remove, export, import")
     targets = p_tg.add_subparsers(dest="targets_cmd", required=True)
     t_list = targets.add_parser("list", help="list the saved targets")
-    t_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     t_add = targets.add_parser(
         "add", help="save a target: usb [SERIAL] | network HOST[:PORT] | remote ADBHOST[:PORT] [SERIAL]"
     )
@@ -557,12 +661,20 @@ def build_parser() -> argparse.ArgumentParser:
     t_exp.add_argument("file")
     t_imp = targets.add_parser("import", help="merge saved targets from a JSON file")
     t_imp.add_argument("file")
+    for t_sub in (t_list, t_add, t_rm, t_exp, t_imp):
+        # --json after the action too (`targets add … --json`), which argparse
+        # otherwise rejected as an unrecognized argument
+        t_sub.add_argument(
+            "--json", action="store_true", default=argparse.SUPPRESS,
+            help="emit machine-readable JSON",
+        )
 
     # --- shell, logs and reports ---
     p_shell = device_cmd(
         "shell", "run a device shell command; with no command, open an interactive shell"
     )
-    p_shell.add_argument("--su", action="store_true", help="wrap in su -c (rooted)")
+    p_shell.add_argument("--su", action="store_true",
+                         help="run it as root through su (rooted, userdebug and eng builds)")
     p_shell.add_argument("--all", action="store_true", help="run the command on every online device")
     p_shell.add_argument(
         "--batch", metavar="FILE", default=None,
@@ -576,18 +688,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_adb.add_argument("adb_args", nargs=argparse.REMAINDER, metavar="ARGS")
 
     p_log = device_cmd("logcat", "stream logcat live, with filters, match + save")
-    p_log.add_argument("--tag", default=None)
+    p_log.add_argument(
+        "--tag", default=None,
+        help="only these tags (comma-separated; exact and case-sensitive); silences the rest (*:S)",
+    )
     p_log.add_argument("--priority", default=None, help="V/D/I/W/E/F")
     p_log.add_argument(
         "--filter", action="append", default=None, metavar="TAG:LEVEL",
-        help="logcat filter spec, repeatable (e.g. ActivityManager:I); overrides --tag/--priority",
+        help="logcat filter spec, repeatable (e.g. ActivityManager:I); overrides --tag/--priority. "
+        "Like logcat's own, specs don't silence other tags: add --filter '*:S' for that",
     )
     p_log.add_argument(
         "--buffer", action="append", default=None,
         help="logcat buffer (repeatable): main/system/crash/...",
     )
     p_log.add_argument("--format", default="threadtime", help="logcat -v format")
-    p_log.add_argument("--match", default=None, help="regex to flag (count) matching lines")
+    p_log.add_argument(
+        "--match", default=None, help="regex to flag (count) matching lines (case-sensitive)"
+    )
     p_log.add_argument(
         "--grep", default=None, metavar="REGEX",
         help="print only lines matching REGEX (case-insensitive)",
@@ -596,13 +714,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--crashes", action="store_true",
         help="crashes and ANRs: the crash/main/system buffers at Error level",
     )
+    p_log.add_argument(
+        "--pid", type=int, default=None, help="only this process's lines (Android 7+)"
+    )
+    p_log.add_argument(
+        "--package", default=None, metavar="NAME",
+        help="only this app's lines: its running process, looked up at the start (Android 7+)",
+    )
     p_log.add_argument("--save", default=None, help="tee output to this file")
-    p_log.add_argument("--stop-on-match", action="store_true")
+    p_log.add_argument(
+        "--stop-on-match", action="store_true", help="stop at the first line matching --match"
+    )
     p_log.add_argument("--clear", action="store_true", help="logcat -c first")
     p_log.add_argument("--dump", action="store_true", help="-d: dump then exit")
     p_log.add_argument(
         "--tail", type=int, default=None, metavar="N",
-        help="only the last N lines: with --dump the last N buffered lines (-t N); "
+        help="only the last N lines (N >= 1): with --dump the last N buffered lines (-t N); "
         "otherwise start the live stream there (-T N), skipping the cached backlog",
     )
     device_cmd("logcat-clear", "clear logcat buffers (-c)")
@@ -899,8 +1026,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
     p_reb = device_cmd("reboot", "reboot the device")
     p_reb.add_argument(
+        # no None among the choices: --help printed it as {None,recovery,…}
+        # (an absent MODE keeps the default without being checked)
         "mode", nargs="?", default=None,
-        choices=[None, "recovery", "bootloader", "sideload", "fastboot"],
+        choices=["recovery", "bootloader", "sideload", "fastboot"],
     )
     p_reb.add_argument(
         "--wait", action="store_true", help="wait until the device has booted again"
@@ -931,7 +1060,10 @@ def build_parser() -> argparse.ArgumentParser:
         "expose THIS PC's adb server to the network so other machines can "
         "drive its devices (auto 'adb -a nodaemon server start')",
     )
-    p_serve.add_argument("--port", type=int, default=5037, help="adb server port (default 5037)")
+    p_serve.add_argument(
+        "--port", type=int, default=None,
+        help="adb server port (default: --adb-port, 5037)",
+    )
     p_serve.add_argument(
         "--install-startup",
         action="store_true",
@@ -1002,6 +1134,83 @@ def _words(ws):
     return ws
 
 
+# The commands that drive no device: no tool auto-fetch, and no adb path check.
+_NO_DEVICE_COMMANDS = (
+    "doctor",
+    "fetch-tools",
+    "upgrade-tools",
+    "self-update",
+    "shortcut",
+    "gui",
+    "deploy-serve",
+    "targets",
+)
+
+# Commands whose trailing words are text for the device, and what the words are.
+_TEXT_WORDS = {"text": ("words", "text"), "search": ("query", "query"), "send-sms": ("body", "message")}
+_WORD_OPTIONS = ("-s", "--serial", "--adb-path", "--scrcpy-path", "--adb-host", "--adb-port",
+                 "--timeout", "--json", "-h", "--help")
+
+
+def _usage_error(args, argv) -> str | None:
+    """Why these options can't work together, checked before anything connects
+    (exit 2), or None."""
+    cmd = args.cmd
+    if cmd in ("health", "build-info") and args.output and not args.full:
+        return "-o/--output saves the --full report: add --full"
+    if (
+        cmd == "serve"
+        and args.port is not None
+        and args.adb_port != 5037
+        and args.port != args.adb_port
+    ):
+        return f"serve --port {args.port} and --adb-port {args.adb_port} name different ports: give one"
+    if cmd in _TEXT_WORDS and "--" not in argv:
+        # Everything after the first word is taken as it is, options too: `text
+        # hello --display 2` typed "hello --display 2" on display 0, and a
+        # trailing -s SERIAL was typed on whichever device answered.
+        attr, noun = _TEXT_WORDS[cmd]
+        options = _WORD_OPTIONS + (("--display",) if cmd == "text" else ())
+        for word in getattr(args, attr) or []:
+            option = word.split("=", 1)[0]
+            if option in options:
+                return (
+                    f"{option} after the {noun} would be sent as part of it: put options before "
+                    f"the {noun}, or -- before the {noun} to send it exactly as written"
+                )
+    return None
+
+
+def _missing_explicit_tool(args) -> str | None:
+    """A ``--adb-path`` (or, for ``scrcpy``, ``--scrcpy-path``) that names no
+    executable, or None.  Without the option, ``TURBOADB_ADB`` (and
+    ``TURBOADB_SCRCPY``) is checked the same way: it is the path set on
+    purpose then.
+
+    Tool lookup falls back to any other adb it can find, and the auto-fetch
+    downloaded one first, so a typo quietly ran a different adb than the one
+    asked for — after a download, or a network timeout offline.  (A download
+    can't help a path set on purpose: that path is still the one used.)"""
+    from .tools import _path_candidate
+
+    if args.cmd in _NO_DEVICE_COMMANDS:
+        return None
+    checks = [("adb", "--adb-path", getattr(args, "adb_path", None), "TURBOADB_ADB")]
+    if args.cmd == "scrcpy":
+        checks.append(("scrcpy", "--scrcpy-path", getattr(args, "scrcpy_path", None),
+                       "TURBOADB_SCRCPY"))
+    for name, option, given, env_var in checks:
+        if given:
+            if _path_candidate(name, given) is None:
+                return f"{option} {given}: there is no {name} executable there"
+            continue
+        env = (os.environ.get(env_var) or "").strip()
+        if env and _path_candidate(name, env) is None:
+            return (f"{env_var}={env}: there is no {name} executable there; correct it, "
+                    f"or unset it to let TurboADB find {name}")
+    return None
+
+
 def _progress_printer():
     """A stderr ``NN%`` progress callback (the one shared implementation)."""
     state = {"last": -1}
@@ -1053,7 +1262,10 @@ class _StderrHandler(logging.StreamHandler):
 
 def _configure_logging() -> None:
     """Show the engine's INFO+ events on stderr (the library itself attaches no
-    handlers; raw ``$ adb …`` traces stay at DEBUG and hidden)."""
+    handlers; raw ``$ adb …`` traces stay at DEBUG and hidden). Not without a
+    stderr (``pythonw -m turboadb serve`` at login): every record would fail."""
+    if sys.stderr is None:
+        return
     logger = logging.getLogger("turboadb")
     if any(getattr(h, "_turboadb_cli", False) for h in logger.handlers):
         return
@@ -1087,6 +1299,21 @@ def _result(value) -> None:
         print(json.dumps({"ok": True, "result": value}, default=str, indent=2))
     else:
         print(value)
+
+
+def _timed_out_doc(exc, **extra) -> dict:
+    """The --json document of a one-shot command that ran out of time: what it
+    printed until then (``exit_code`` -1), the error, and ``timed_out``."""
+    return dict(exc.result.as_dict(), **extra, error=str(exc), timed_out=True)
+
+
+def _print_timed_out(exc) -> int:
+    """--json for a one-shot command that ran out of time (``exc.result`` set):
+    its document instead of only the error on stderr, which dropped what the
+    command had printed.  Exit status 1, as for any other failure."""
+    print(json.dumps(_timed_out_doc(exc), default=str, indent=2))
+    print(f"ERROR: {exc}", file=sys.stderr)
+    return 1
 
 
 def _saved(path) -> None:
@@ -1149,7 +1376,16 @@ def _shell_all(args) -> int:
     for d in devs:
         # host=None so the enumerated serial is the target even when the saved
         # target is a network device
-        res = _handler(args, serial=d.serial, host=None).shell(command, su=args.su)
+        try:
+            res = _handler(args, serial=d.serial, host=None).shell(command, su=args.su)
+        except ADBTimeoutError as exc:
+            if not _JSON["on"] or exc.result is None:
+                raise
+            # the devices done so far and what this one printed in time
+            results.append(_timed_out_doc(exc, serial=d.serial))
+            print(json.dumps(results, default=str, indent=2))
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         if not res.ok:
             rc = 1
         if _JSON["on"]:
@@ -1174,6 +1410,107 @@ def _shell_batch(dev, args) -> int:
             print(f"$ {cmd}")
             _print_command(res)
     return 0 if len(results) == len(commands) and all(r.ok for r in results) else 1
+
+
+def _logcat_usage_error(args) -> int:
+    """2 (after saying why) when these logcat options can't work, else 0.
+
+    Checked before anything connects: a typo must not wait for a device, and
+    must never get as far as ``--clear``."""
+    import re
+
+    for flag, pattern, flags in (("--grep", args.grep, re.I), ("--match", args.match, 0)):
+        if pattern:
+            try:
+                re.compile(pattern, flags)
+            except re.error as exc:
+                print(f"ERROR: invalid {flag} pattern: {exc}", file=sys.stderr)
+                return 2
+    problem = None
+    if args.stop_on_match and not args.match:
+        problem = "--stop-on-match needs --match REGEX"
+    elif args.tail is not None and args.tail < 1:
+        problem = "--tail needs at least 1 line"
+    elif args.pid is not None and args.package:
+        problem = "give --pid or --package, not both"
+    if problem:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _closed_pipe(exc) -> bool:
+    """Whoever read our stdout has gone (``| head``): EPIPE, or EINVAL on Windows."""
+    import errno
+
+    return isinstance(exc, BrokenPipeError) or getattr(exc, "errno", None) in (
+        errno.EPIPE, errno.EINVAL,
+    )
+
+
+def _quiet_stdout() -> None:
+    """Point stdout at the null device, so the interpreter's last flush can't
+    report the closed pipe all over again ("Exception ignored …")."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _logcat(dev, args) -> int:
+    """`logcat`: stream (or dump) to stdout, live even through a pipe.
+
+    Every line is flushed as it arrives, so ``| findstr``, ``| tee`` and a
+    redirect see it at once; a reader that goes away (``| head``) ends the
+    stream quietly; Ctrl+C still prints the --match total (exit 130); and
+    adb's own failure is an ERROR with exit 1, even when --grep hides every
+    line."""
+    matched = [0]
+
+    def emit(line):
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def count(_line):
+        matched[0] += 1
+
+    print("Dumping logcat…" if args.dump else "Streaming logcat (Ctrl+C to stop)…", file=sys.stderr)
+    try:
+        res = dev.logcat(
+            tag=args.tag,
+            priority=args.priority,
+            filterspecs=args.filter,
+            buffers=args.buffer,
+            fmt=args.format,
+            match=args.match,
+            grep=args.grep,
+            crashes=args.crashes,
+            pid=args.pid,
+            package=args.package,
+            save_to=args.save,
+            stop_on_match=args.stop_on_match,
+            clear_first=args.clear,
+            dump=args.dump,
+            tail=args.tail,
+            on_line=emit,
+            on_match=count if args.match else None,
+        )
+    except KeyboardInterrupt:
+        return 130
+    except OSError as exc:
+        if not _closed_pipe(exc):
+            raise
+        _quiet_stdout()
+        return 0
+    finally:
+        if args.match:
+            print(f"\n[{matched[0]} matched lines]", file=sys.stderr)
+    code = getattr(res, "exit_code", None)
+    if code not in (None, 0):
+        detail = " ".join((getattr(res, "stderr", "") or "").split()) or "no error text"
+        print(f"ERROR: adb logcat ended with exit {code}: {detail}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _forwarding(dev, args) -> int:
@@ -1203,13 +1540,53 @@ def _forwarding(dev, args) -> int:
         return 2
     handle = dev.forward(first, second) if forward else dev.reverse(first, second)
     if args.no_wait:
-        return _report(True, f"{handle} — stays active; remove it with: turboadb {name} --remove {first}", "")
-    print(f"{handle}\n{name.capitalize()} active. Ctrl+C to remove it.")
+        bound = handle.local if forward else handle.remote  # tcp:0 -> the port adb picked
+        return _report(True, f"{handle} — stays active; remove it with: turboadb {name} --remove {bound}", "")
+    # with --json this is progress: stdout keeps the one document printed at the end
+    print(f"{handle}\n{name.capitalize()} active. Ctrl+C to remove it.",
+          file=sys.stderr if _JSON["on"] else sys.stdout)
     try:
         _block()
     except KeyboardInterrupt:
-        return _report(handle.close(), f"\n{name} removed.", f"\nERROR: could not remove the {name}")
+        return _report(handle.close(), f"\n{name} {first} {second} removed.",
+                       f"\nERROR: could not remove the {name} {first} {second}")
     return 0
+
+
+def _editor_command(editor: str) -> list:
+    """The argv that starts *editor* (a path, or a command line such as
+    ``code --wait``), with the program found the way a console would find it.
+
+    On Windows a bare name is looked up with PATHEXT (``code`` is
+    ``code.cmd``), which CreateProcess alone never does, and the quotes around
+    a quoted path (``"C:\\Program Files\\…\\subl.exe" -w``) are removed —
+    kept, they became part of the program name. Raises ValueError when the
+    program can't be found, before anything is pulled from the device."""
+    import shlex
+    import shutil
+
+    if os.path.isfile(editor):
+        return [editor]
+    words = shlex.split(editor, posix=os.name != "nt")
+    if os.name == "nt":
+        words = [w[1:-1] if len(w) >= 2 and w[0] == w[-1] == '"' else w for w in words]
+    program = shutil.which(words[0]) if words else None
+    if not program:
+        raise ValueError(
+            f"editor {words[0] if words else editor!r} not found — pass --editor, or set "
+            "VISUAL or EDITOR"
+        )
+    return [program] + words[1:]
+
+
+def _run_editor(command: list, path: str) -> int:
+    """Run the editor on *path* and return its exit code. A batch-file editor
+    (``code.cmd``) is run by cmd.exe, which would read ``&``, ``|`` or ``^``
+    in an unquoted path as its own syntax, so there the path is always
+    quoted."""
+    if os.name == "nt" and command[0].lower().endswith((".cmd", ".bat")):
+        return subprocess.call(f'{subprocess.list2cmdline(command)} "{path}"')
+    return subprocess.call(command + [path])
 
 
 def _edit(dev, args) -> int:
@@ -1217,12 +1594,10 @@ def _edit(dev, args) -> int:
 
     Choosing and running the editor is the CLI's job; the pull / push / restore
     the file mode / clean up dance is :meth:`ADBHandler.edit_file`'s."""
-    import shlex
-
     editor = (args.editor or os.environ.get("VISUAL") or os.environ.get("EDITOR")
               or ("notepad" if os.name == "nt" else "vi"))
-    command = [editor] if os.path.exists(editor) else shlex.split(editor, posix=os.name != "nt")
-    res = dev.edit_file(args.path, lambda tmp: subprocess.call(command + [tmp]), editor=editor)
+    command = _editor_command(editor)
+    res = dev.edit_file(args.path, lambda tmp: _run_editor(command, tmp), editor=editor)
     if res["editor_exit"]:
         return _report(False, "", f"the editor exited with {res['editor_exit']}")
     if res["changed"]:
@@ -1327,7 +1702,10 @@ def _record(dev, args) -> int:
     except KeyboardInterrupt:
         print("\nStopping the recording and saving it…", file=sys.stderr)
         stop.set()
-        worker.join()  # a second Ctrl+C aborts outright
+        # a second Ctrl+C aborts outright: short joins, because on Windows a
+        # join without a timeout can't be interrupted
+        while worker.is_alive():
+            worker.join(0.2)
     paths = [str(p) for p in (result.get("paths") or done)]
     error = result.get("error")
     if error is not None and not paths:
@@ -1346,6 +1724,37 @@ def _record(dev, args) -> int:
     return 0 if error is None else 1
 
 
+def _adb_server_report(adb_path) -> dict:
+    """The local adb server, for ``doctor``: its port, protocol, release and
+    executable (socket queries only — nothing is started), and the notes the
+    GUI logs at launch about an environment that moves the server, or a server
+    another adb would keep restarting."""
+    from . import tools
+
+    port = tools.local_adb_port()
+    protocol = tools.adb_server_version(port)
+    status = (tools.adb_server_status(port) or {}) if protocol is not None else {}
+    notes = []
+    for note in (tools.adb_server_env_note(), tools.describe_adb_server(adb_path, port)):
+        if note:
+            notes.append({"level": note[0], "text": note[1]})
+    return {
+        "port": port,
+        "protocol": protocol,
+        "version": status.get("version"),
+        "executable": status.get("executable"),
+        "notes": notes,
+    }
+
+
+def _install_report() -> dict:
+    """Which TurboADB runs, and the one this Python has installed (for
+    ``doctor``; see :func:`turboadb.update.running_copy`)."""
+    from . import update
+
+    return update.running_copy()
+
+
 def main(argv=None) -> int:
     _make_output_crashproof()
     parser = build_parser()
@@ -1355,10 +1764,28 @@ def main(argv=None) -> int:
         argcomplete.autocomplete(parser)
     except ImportError:
         pass
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     cmd = args.cmd
-    _configure_logging()
     _JSON["on"] = bool(getattr(args, "json", False))
+    if cmd == "gui":
+        # Before the CLI's logging and tool fetch. The GUI keeps its own log: a
+        # stderr handler echoed every event of the session to the console, and
+        # under pythonw (the shortcut, the restart after an update) failed on
+        # each one. And it fetches adb AND scrcpy itself, with a progress
+        # dialog, once its window is up: a fetch here held the window back
+        # and, having fetched only adb, kept the GUI's own from getting scrcpy.
+        return launch_gui([])
+    _configure_logging()
+
+    problem = _usage_error(args, argv)
+    if problem:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        return 2
+    problem = _missing_explicit_tool(args)
+    if problem:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        return 3
 
     # Auto-fetch ONLY when a tool this command needs is missing. Upgrading an
     # existing adb stops the running server (dropping every device session), so
@@ -1368,16 +1795,7 @@ def main(argv=None) -> int:
     # profile, where a fetch drops a SECOND adb into that profile and binds port
     # 5037 with it — the classic cause of Windows device disconnects. Better to
     # fail loudly there than to serve devices with a stranger's adb.
-    if cmd not in (
-        "doctor",
-        "fetch-tools",
-        "upgrade-tools",
-        "self-update",
-        "shortcut",
-        "deploy-serve",
-        "serve",
-        "targets",
-    ):
+    if cmd not in _NO_DEVICE_COMMANDS + ("serve",):
         try:
             need_scrcpy = cmd == "scrcpy" and not scrcpy_available(
                 getattr(args, "scrcpy_path", None)
@@ -1397,16 +1815,38 @@ def main(argv=None) -> int:
         if cmd == "doctor":
             from . import tools
 
-            d = tools.diagnose()
+            d = dict(tools.diagnose())
+            d["adb_server"] = _adb_server_report(d["adb_path"])
+            d["turboadb"] = _install_report()
             if _JSON["on"]:
                 print(json.dumps(d, default=str, indent=2))
                 return 0 if d["adb"] else 1
-            print(f"adb    : {d['adb'] or 'NOT FOUND'}")
-            print(f"         {d['adb_path'] or tools.ADB_DOWNLOAD}")
-            print(f"scrcpy : {'found at ' + d['scrcpy_path'] if d['scrcpy'] else 'NOT FOUND'}")
+            # A path set on purpose that names nothing is to be corrected:
+            # say why, not where to download one
+            print(f"adb      : {d['adb'] or 'NOT FOUND'}")
+            print(f"           {d['adb_path'] or d.get('adb_error') or tools.ADB_DOWNLOAD}")
+            print(f"scrcpy   : {'found at ' + d['scrcpy_path'] if d['scrcpy'] else 'NOT FOUND'}")
             if not d["scrcpy"]:
-                print(f"         {tools.SCRCPY_DOWNLOAD}")
-            if not d["adb"] or not d["scrcpy"]:
+                print(f"           {d.get('scrcpy_error') or tools.SCRCPY_DOWNLOAD}")
+            server = d["adb_server"]
+            if server["protocol"] is None:
+                print(f"server   : not running on port {server['port']}")
+            else:
+                release = f"adb {server['version']}, " if server["version"] else ""
+                print(f"server   : port {server['port']}, {release}protocol {server['protocol']}")
+                if server["executable"]:
+                    print(f"           {server['executable']}")
+            copy = d["turboadb"]
+            print(f"turboadb : {copy['version']}")
+            print(f"           {copy['path']}")
+            notes = [(note["level"], note["text"]) for note in server["notes"]]
+            if copy["note"]:
+                notes.append(("WARNING", f"{copy['note']}. The shortcuts and self-update work on "
+                                         "the TurboADB installed in this Python, not on this one."))
+            for level, text in notes:
+                print(f"\n[{level}] {text}")
+            if ((not d["adb"] and not d.get("adb_error"))
+                    or (not d["scrcpy"] and not d.get("scrcpy_error"))):
                 print(
                     "\nTip: run  turboadb fetch-tools  to download what's missing "
                     "into ~/.turboadb/tools"
@@ -1532,20 +1972,35 @@ def main(argv=None) -> int:
                 else:
                     print(f"TurboADB {current} is the latest version.")
                 return 0 if latest else 1
-            if not _upd.can_self_update():
-                print(
-                    "Running the standalone executable — upgrade with: pip install --upgrade turboadb",
-                    file=sys.stderr,
-                )
+            blocker = _upd.self_update_blocker()
+            if blocker:
+                message = f"Can't update this TurboADB with pip: {blocker}."
+                if _JSON["on"]:
+                    print(json.dumps({"ok": False, "old": _upd.current_version(), "new": None,
+                                      "error": message}, indent=2))
+                else:
+                    print(message, file=sys.stderr)
+                    print("adb and scrcpy update with: turboadb upgrade-tools", file=sys.stderr)
                 return 1
             latest = _upd.pypi_latest()
-            if latest and not _upd.is_newer(latest):
+            newer = bool(latest) and _upd.is_newer(latest)
+            if latest and not newer:
                 print(
                     f"TurboADB {_upd.current_version()} is already the latest; "
                     f"refreshing adb/scrcpy…",
                     file=sys.stderr,
                 )
-            res = _upd.run_upgrade(notify=lambda m: print(m, file=sys.stderr))
+            # Pinned to the release PyPI offers, and a run that installs nothing
+            # newer is a failure — unless PyPI had nothing newer (or couldn't be
+            # asked), when refreshing adb and scrcpy is the point.
+            res = _upd.run_upgrade(
+                notify=lambda m: print(m, file=sys.stderr),
+                expected=latest if newer else None,
+                allow_unchanged=not newer,
+            )
+            if _JSON["on"]:
+                print(json.dumps(res, default=str, indent=2))
+                return 0 if res.get("ok") else 1
             if not res.get("ok"):
                 print(f"Update failed: {res.get('error')}", file=sys.stderr)
                 return 1
@@ -1557,9 +2012,11 @@ def main(argv=None) -> int:
                 )
                 if b
             ]
-            print(
-                f"Updated to TurboADB {res.get('new')}" + (f"  ({', '.join(bits)})" if bits else "")
-            )
+            tools_text = f"  ({', '.join(bits)})" if bits else ""
+            if res.get("unchanged"):
+                print(f"TurboADB {res.get('new')} is already up to date{tools_text}")
+            else:
+                print(f"Updated to TurboADB {res.get('new')}{tools_text}")
             return 0
 
         if cmd == "devices":
@@ -1590,13 +2047,23 @@ def main(argv=None) -> int:
         if cmd == "discover":
             from .devices import mdns_devices
 
-            # _config so -s @saved-name's adb (and server) is the one asked
-            found = mdns_devices(_config(args, serial=None).adb_path)
+            # The adb server does the discovery, so ask the one --adb-host or
+            # -s @saved-remote selects: the server --connect then connects
+            # through, which can reach what it found on its own network.
+            cfg = _config(args, serial=None)
+            found = mdns_devices(
+                cfg.adb_path, server_host=cfg.adb_server_host, server_port=cfg.adb_server_port
+            )
             if _JSON["on"]:
                 print(json.dumps(found, indent=2))
             elif not found:
+                where = (
+                    f"by the adb server at {cfg.adb_server_host}:{cfg.adb_server_port}"
+                    if cfg.adb_server_host
+                    else "on the LAN"
+                )
                 print(
-                    "No Wireless-debugging devices found on the LAN.\n"
+                    f"No Wireless-debugging devices found {where}.\n"
                     "On the device: Settings > Developer options > Wireless "
                     "debugging (Android 11+). Pairing entries need "
                     "'turboadb pair' first."
@@ -1645,38 +2112,62 @@ def main(argv=None) -> int:
                 uninstall_serve_task,
             )
             from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
+            from .tools import local_adb_port
+
+            # --port, else the shared --adb-port (which serve used to ignore).
+            # The port the server really listens on: ANDROID_ADB_SERVER_PORT
+            # moves the default 5037 (start_shared_server follows it too).
+            asked = args.port if args.port is not None else args.adb_port
+            port = local_adb_port(asked)
+            said = {"out": [], "err": []}
 
             def _say(msg, err=False):
+                if _JSON["on"]:  # one document at the end instead (_done)
+                    said["err" if err else "out"].append(str(msg))
+                    return
                 # at Windows login we run under pythonw (no console / stdout=None)
                 try:
                     print(msg, file=sys.stderr if err else sys.stdout)
                 except Exception:
                     pass
 
-            if args.status:
-                shared = server_is_shared(port=args.port)
+            def _done(rc):
                 if _JSON["on"]:
-                    print(json.dumps({"port": args.port, "shared": shared}))
+                    doc = {"ok": rc == 0, "port": port, "messages": said["out"]}
+                    if said["err"]:
+                        doc["errors"] = said["err"]
+                    try:
+                        print(json.dumps(doc, indent=2))
+                    except Exception:
+                        pass
+                return rc
+
+            if args.status:
+                shared = server_is_shared(port=asked)
+                if _JSON["on"]:
+                    print(json.dumps({"port": port, "shared": shared}))
                 else:
-                    _say(f"adb server on port {args.port}: "
+                    _say(f"adb server on port {port}: "
                          + ("shared on the network" if shared else "not shared"))
                 return 0
             if args.stop:
-                _say(stop_shared_server(port=args.port, adb_path=args.adb_path))
-                return 0
+                _say(stop_shared_server(port=asked, adb_path=args.adb_path))
+                return _done(0)
             if args.uninstall_startup:
                 a = uninstall_startup()
                 b = uninstall_serve_task()
                 _say("Removed auto-start." if (a or b) else "No auto-start was installed.")
-                return 0
-            _say(start_shared_server(port=args.port, adb_path=args.adb_path))
+                return _done(0)
+            _say(start_shared_server(port=asked, adb_path=args.adb_path))
             # open BOTH the adb port and scrcpy's video-tunnel port so a remote
             # laptop can mirror this PC's device
-            _say(open_firewall((args.port, TUNNEL_PORT_FIREWALL_RANGE)))
+            _say(open_firewall((port, TUNNEL_PORT_FIREWALL_RANGE)))
             rc = 0
+            # The auto-starts pin the adb the server was just started with: left
+            # to find their own, they could restart it with another version.
             if args.startup_task:
                 try:
-                    name = install_serve_task(port=args.port)
+                    name = install_serve_task(port=asked, adb_path=args.adb_path)
                     _say(
                         f"Installed startup Scheduled Task '{name}' (runs at "
                         f"system startup, headless — survives logoff)."
@@ -1686,7 +2177,7 @@ def main(argv=None) -> int:
                     rc = 1
             if args.install_startup:
                 try:
-                    path = install_startup(port=args.port)
+                    path = install_startup(port=asked, adb_path=args.adb_path)
                     _say(f"Installed login auto-start: {path}")
                 except Exception as exc:
                     _say(f"Could not install login auto-start: {exc}", err=True)
@@ -1698,7 +2189,7 @@ def main(argv=None) -> int:
                     "Tip: add  --startup-task  so it runs headless at every "
                     "startup (best for remote/RDP hosts)."
                 )
-            return rc
+            return _done(rc)
 
         if cmd == "connect":
             host, port = parse_host_port(args.hostport, 5555)
@@ -1732,6 +2223,8 @@ def main(argv=None) -> int:
 
         if cmd == "shell" and args.all:
             return _shell_all(args)
+        if cmd == "logcat" and _logcat_usage_error(args):
+            return 2
 
         # everything below operates on a device handler
         dev = _handler(args)
@@ -1804,12 +2297,21 @@ def main(argv=None) -> int:
             if not words:
                 print("adb needs arguments, e.g.: turboadb -s SERIAL adb -- get-state", file=sys.stderr)
                 return 2
-            res = dev.adb(*words)
             if _JSON["on"]:
+                # the output goes into the one JSON document, so it is collected
+                try:
+                    res = dev.adb(*words)
+                except ADBTimeoutError as exc:
+                    if exc.result is None:
+                        raise
+                    return _print_timed_out(exc)
                 print(json.dumps(res.as_dict(), default=str, indent=2))
-            else:
-                _print_command(res)
-            return res.exit_code
+                return res.exit_code
+            # As adb itself runs it: output as it arrives (a logcat, a slow
+            # install, wait-for-device), exec-out bytes intact, prompts answered.
+            # Collected, nothing showed until the end and the 60 s command
+            # timeout threw all of it away.
+            return dev.run_attached(words, timeout=_attached_timeout(args))
 
         dev.connect()
         rc = 0
@@ -1825,45 +2327,20 @@ def main(argv=None) -> int:
                     print("No command given (an interactive shell needs a terminal).", file=sys.stderr)
                     return 2
                 return dev.interactive_shell()
-            res = dev.shell(command, su=args.su)
-            if not args.json:
-                _print_command(res)
-                return res.exit_code
+            if not _JSON["on"]:
+                # shown as it is written, as `adb shell` does: a ping, top or
+                # logcat streams instead of arriving all at once at the end
+                return dev.interactive_shell(command, su=args.su, timeout=_attached_timeout(args))
+            try:
+                res = dev.shell(command, su=args.su)
+            except ADBTimeoutError as exc:
+                if exc.result is None:
+                    raise
+                return _print_timed_out(exc)
             _output(args, res)
             return res.exit_code
         elif cmd == "logcat":
-            import re as _re
-
-            if args.grep:
-                # the engine does the filtering; catch a bad pattern up front so
-                # it's a usage error and not a traceback mid-stream
-                try:
-                    _re.compile(args.grep, _re.I)
-                except _re.error as exc:
-                    print(f"ERROR: invalid --grep pattern: {exc}", file=sys.stderr)
-                    return 2
-            print("Dumping logcat…" if args.dump else "Streaming logcat (Ctrl+C to stop)…", file=sys.stderr)
-            try:
-                res = dev.logcat(
-                    tag=args.tag,
-                    priority=args.priority,
-                    filterspecs=args.filter,
-                    buffers=args.buffer,
-                    fmt=args.format,
-                    match=args.match,
-                    grep=args.grep,
-                    crashes=args.crashes,
-                    save_to=args.save,
-                    stop_on_match=args.stop_on_match,
-                    clear_first=args.clear,
-                    dump=args.dump,
-                    tail=args.tail,
-                    on_line=print,
-                )
-                if args.match:
-                    print(f"\n[{len(res.matches)} matched lines]", file=sys.stderr)
-            except KeyboardInterrupt:
-                pass
+            rc = _logcat(dev, args)
         elif cmd == "logcat-clear":
             rc = _report(dev.logcat_clear(), "logcat buffers cleared.", "could not clear logcat")
         elif cmd == "push":
@@ -1952,12 +2429,12 @@ def main(argv=None) -> int:
             for flag in ("es", "ei", "ez"):
                 for key, value in getattr(args, flag) or []:
                     extras += [f"--{flag}", key, value]
-            out = dev.start_activity(args.component, action=args.action, data=args.data, extras=extras)
-            if "error" in (out or "").lower():
-                print(out, file=sys.stderr)
-                rc = 1
-            else:
-                _result(out)
+            # The engine raises when am refuses; it reads am's output WITHOUT the
+            # "Starting: Intent { … }" echo, which names the component and the
+            # data (ErrorReportActivity, https://host/error) and made a second
+            # "error" sniff here fail activities that had started.
+            _result(dev.start_activity(args.component, action=args.action, data=args.data,
+                                       extras=extras))
         elif cmd == "activity":
             _result(dev.current_activity())
         elif cmd == "grant":
@@ -1999,10 +2476,10 @@ def main(argv=None) -> int:
 
             out = args.path or _t.strftime("bugreport-%Y%m%d-%H%M%S.zip")
             print("Capturing bugreport (takes a few minutes)…", file=sys.stderr)
-            if args.timeout:
-                _saved(dev.bugreport(out, timeout=args.timeout))
+            if args.timeout is None:
+                _saved(dev.bugreport(out))  # the engine's own, generous limit
             else:
-                _saved(dev.bugreport(out))
+                _saved(dev.bugreport(out, timeout=args.timeout or None))  # 0: no limit
         elif cmd == "reboot":
             label = f"reboot {args.mode or ''}".strip()
             ok = dev.reboot(args.mode)
@@ -2055,6 +2532,7 @@ def main(argv=None) -> int:
             report = dev.tap_burst(
                 args.x, args.y, count=args.count, rate=args.rate, duration=args.duration,
                 display_id=args.display, method=args.method, on_progress=show,
+                timeout=getattr(args, "timeout", None),  # --timeout caps the whole burst
             )
             if not _JSON["on"] and last[0]:
                 print("", file=sys.stderr)

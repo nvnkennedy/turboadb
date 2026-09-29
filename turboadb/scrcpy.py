@@ -13,7 +13,8 @@ import threading
 import time
 from typing import Optional
 
-from .config import ScrcpyOptions, parse_host_port
+from .config import ScrcpyOptions, adb_server_address, parse_host_port
+from .proctree import CONSOLE_LOCK
 from .tools import find_scrcpy, NO_WINDOW, DEFAULT_ADB_SERVER_PORT
 from .exceptions import ScrcpyError
 
@@ -119,12 +120,13 @@ def is_local_host(host: Optional[str]) -> bool:
 
 
 def _remote_server_host(host: Optional[str]) -> Optional[str]:
-    """*host* when it names ANOTHER machine's adb server, else None — resolved
-    once per call so the tunnel flag and the ``ANDROID_ADB_SERVER_*`` environment
-    always agree (a "remote" host that is really this PC must use the local
-    server, not its LAN address)."""
+    """The address of *host* (resolved, as the tunnel needs it) when it names
+    ANOTHER machine's adb server, else None — decided once per launch so the
+    tunnel flag and the ``ANDROID_ADB_SERVER_*`` environment always agree (a
+    "remote" host that is really this PC must use the local server, not its
+    LAN address)."""
     if host and not is_local_host(host):
-        return host
+        return resolve_host(host)
     return None
 
 
@@ -169,7 +171,10 @@ def _server_env(host: Optional[str], port: int, adb_path: Optional[str] = None):
         # gets double-wrapped into the infamous "tcp:tcp:ip:port:port" / "no
         # host" error. HOST+PORT alone are ignored (adb falls back to the LOCAL
         # server → "no adb device found"). So: bare IP in ADDRESS + the port.
-        env["ANDROID_ADB_SERVER_ADDRESS"] = ip
+        # An IPv6 literal is the exception: adb joins it with the port as it
+        # does -H, so a bare "2001:db8::1" dialled "2001:db8::1:5037" on port
+        # 5555; it goes in brackets, as in adb_server_args.
+        env["ANDROID_ADB_SERVER_ADDRESS"] = adb_server_address(ip) if ip else ip
         env["ANDROID_ADB_SERVER_HOST"] = ip
         env["ANDROID_ADB_SERVER_PORT"] = str(port)
     return env
@@ -196,7 +201,7 @@ def list_displays(
     if serial:
         cmd += ["--serial", serial]
     if remote:
-        cmd += ["--tunnel-host", resolve_host(remote)]
+        cmd += ["--tunnel-host", remote]
     cmd += ["--list-displays"]
     try:
         out = subprocess.run(
@@ -263,6 +268,14 @@ _CTRL_BREAK_HELPER = (
     "sys.exit(0 if k.AttachConsole(p) and k.GenerateConsoleCtrlEvent(1,p) else 1)\n"
 )
 _ERROR_ACCESS_DENIED = 5
+# AttachConsole and FreeConsole act on the whole process, not on the calling
+# thread, so only one Ctrl+Break is raised at a time (see _send_ctrl_break),
+# and never while a local terminal's Stop is on a shell's console: the one
+# lock for both (proctree.CONSOLE_LOCK).
+_CTRL_BREAK_LOCK = CONSOLE_LOCK
+# How long to wait before asking for a console again after AttachConsole was
+# refused: the console of a moment ago may not have let go of this process yet.
+_ATTACH_RETRY_S = 0.1
 
 
 def _send_ctrl_break(pid: int) -> bool:
@@ -275,6 +288,12 @@ def _send_ctrl_break(pid: int) -> bool:
     (``--no-window``) recorder was therefore always terminated, leaving an MP4
     without its index.  Attach to scrcpy's console just long enough to raise the
     event; the caller is not in scrcpy's process group, so it never receives it.
+
+    A process is attached to one console at a time, so the whole attach, raise,
+    free and restore runs under a lock: recorders stopped together (closing the
+    displays tab while several displays record) were refused their attach
+    (ERROR_ACCESS_DENIED) while another one held it, and were then ended
+    without their index, or had the standard handles restored under them.
     """
     if os.name != "nt" or not pid:
         return False
@@ -294,18 +313,24 @@ def _send_ctrl_break(pid: int) -> bool:
         k.SetStdHandle.restype = wintypes.BOOL
         k.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
         std_ids = (0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4)  # STD_INPUT/OUTPUT/ERROR_HANDLE
-        saved = [k.GetStdHandle(n) for n in std_ids]
-        if k.AttachConsole(pid):
-            try:
-                return bool(k.GenerateConsoleCtrlEvent(1, pid))  # CTRL_BREAK_EVENT
-            finally:
-                k.FreeConsole()
-                # AttachConsole may have replaced empty standard handles with
-                # console handles that FreeConsole just invalidated.
-                for n, handle in zip(std_ids, saved):
-                    k.SetStdHandle(n, handle)
-        if ctypes.get_last_error() != _ERROR_ACCESS_DENIED:
-            return False  # the process is gone, or has no console
+        with _CTRL_BREAK_LOCK:
+            for attempt in range(2):
+                saved = [k.GetStdHandle(n) for n in std_ids]
+                if k.AttachConsole(pid):
+                    try:
+                        return bool(k.GenerateConsoleCtrlEvent(1, pid))  # CTRL_BREAK_EVENT
+                    finally:
+                        k.FreeConsole()
+                        # AttachConsole may have replaced empty standard handles
+                        # with console handles that FreeConsole just invalidated.
+                        for n, handle in zip(std_ids, saved):
+                            k.SetStdHandle(n, handle)
+                if ctypes.get_last_error() != _ERROR_ACCESS_DENIED:
+                    return False  # the process is gone, or has no console
+                if not attempt:
+                    time.sleep(_ATTACH_RETRY_S)
+        # Still refused: this process has a console of its own (it was run
+        # from a terminal) and cannot attach to another, so a helper raises it.
         if getattr(sys, "frozen", False) or not sys.executable:
             return False
         done = subprocess.run(
@@ -339,24 +364,46 @@ def live_sessions() -> list:
     return alive
 
 
+# How long stop_all waits, past the sessions' own *timeout* to quit, for the
+# ones that did not to be ended (a process-tree kill each).
+_STOP_ALL_SLACK_S = 3.0
+
+
 def stop_all(timeout: float = 5.0) -> int:
     """Stop every scrcpy still running from this process; returns how many.
 
     Called when TurboADB closes, so no mirror window (and no adb connection
     behind it) is left behind — a scrcpy that was never stopped keeps running
-    after the app exits."""
-    stopped = 0
-    for session in live_sessions():
+    after the app exits.  The sessions are stopped all at once and share one
+    *timeout* to quit cleanly (a recording writes its MP4 index then) before
+    they are ended: one after another, a closing app with several mirrors
+    open waited up to *timeout* for each of them."""
+    stopped = []
+
+    def stop(session):
         try:
             session.stop(timeout=timeout)
-            stopped += 1
         except Exception:
-            pass
-    return stopped
+            return
+        stopped.append(session)
+
+    workers = [
+        threading.Thread(target=stop, args=(session,), name="turboadb-scrcpy-stop", daemon=True)
+        for session in live_sessions()
+    ]
+    for worker in workers:
+        worker.start()
+    deadline = time.monotonic() + timeout + _STOP_ALL_SLACK_S
+    for worker in workers:
+        worker.join(max(0.0, deadline - time.monotonic()))
+    return len(stopped)
 
 
 class ScrcpySession:
-    """A running scrcpy process. Call :meth:`stop` to close the mirror window."""
+    """A running scrcpy process. Call :meth:`stop` to close the mirror window.
+
+    :attr:`tunnel_host` is the address of the remote adb server scrcpy
+    tunnels the video from, or None when it uses this PC's own server."""
 
     def __init__(
         self,
@@ -364,11 +411,13 @@ class ScrcpySession:
         serial: Optional[str],
         log_path: Optional[str] = None,
         logfh=None,
+        tunnel_host: Optional[str] = None,
     ):
         self._proc = proc
         self.serial = serial
         self.log_path = log_path
         self._logfh = logfh
+        self.tunnel_host = tunnel_host
         with _LIVE_LOCK:
             # drop the ones that have since exited, so a long session that
             # starts many screens does not hold on to every finished process
@@ -391,49 +440,57 @@ class ScrcpySession:
 
     @property
     def running(self) -> bool:
-        return self._proc.poll() is None
+        if self._proc.poll() is None:
+            return True
+        # Ended, by stop() or by itself (its window closed, a crash): nothing
+        # writes the log any more, and an open handle keeps it from being
+        # deleted on Windows.
+        self._close_log()
+        return False
 
     def wait(self, timeout: Optional[float] = None) -> int:
-        return self._proc.wait(timeout=timeout)
+        code = self._proc.wait(timeout=timeout)
+        self._close_log()
+        return code
+
+    def _close_log(self) -> None:
+        logfh, self._logfh = self._logfh, None
+        if logfh is not None:
+            try:
+                logfh.close()
+            except Exception:
+                pass
 
     def stop(self, timeout: float = 5.0) -> None:
         """Ask scrcpy to quit cleanly, as closing its window does, and wait up to
         *timeout* seconds (a recording's MP4 index is written then) before
-        ending the process."""
+        ending the process and the adb clients it started.
+
+        scrcpy.exe is not a job object, so killing it alone orphaned its
+        ``adb shell ... app_process`` server client and any ``adb push`` /
+        ``forward`` still running, and they lived on until the device side
+        gave up: the hard way ends its process tree, sparing an adb server
+        one of them had to start (proctree)."""
+        from .proctree import stop_process
+
         try:
-            if self.running:
-                if os.name == "nt":
-                    _post_close_to_pid(self._proc.pid)
-                    # a windowless session (--no-window) has nothing to close
-                    _send_ctrl_break(self._proc.pid)
-                    try:
-                        self._proc.wait(timeout=timeout)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self._proc.terminate()
-                        self._proc.wait(timeout=timeout)
-                    except Exception:
-                        pass
-                if self.running:
-                    self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3.0)
-            except Exception:
+            grace = timeout
+            if self.running and os.name == "nt":
+                # TerminateProcess is no request to quit: close the window, and
+                # Ctrl+Break a windowless session (--no-window), which has none
+                _post_close_to_pid(self._proc.pid)
+                _send_ctrl_break(self._proc.pid)
                 try:
-                    self._proc.kill()
-                    self._proc.wait(timeout=1.0)
+                    self._proc.wait(timeout=timeout)
                 except Exception:
                     pass
+                grace = 0
+            # off Windows terminate() is SIGTERM: scrcpy quits as cleanly
+            stop_process(self._proc, grace=grace, tree=True)
         except Exception:
             pass
 
-        try:
-            if self._logfh:
-                self._logfh.close()
-        except Exception:
-            pass
+        self._close_log()
         with _LIVE_LOCK:
             if self in _LIVE_SESSIONS:
                 _LIVE_SESSIONS.remove(self)
@@ -464,7 +521,8 @@ def launch_scrcpy(
     :class:`ScrcpySession` immediately; the mirror runs in its own window.
 
     With *adb_server_host* set, scrcpy is pointed at that remote adb server (so
-    you can mirror a device plugged into another machine).
+    you can mirror a device plugged into another machine); a host that is this
+    PC uses its own server (see :attr:`ScrcpySession.tunnel_host`).
 
     Raises :class:`ADBNotFoundError` if scrcpy is missing, or
     :class:`ScrcpyError` if it cannot be launched.
@@ -480,7 +538,7 @@ def launch_scrcpy(
         # network. Keep selection inside a known firewall range, while allowing
         # simultaneous tabs to choose different ports instead of colliding.
         cmd += [
-            f"--tunnel-host={resolve_host(remote)}",
+            f"--tunnel-host={remote}",
             f"--port={TUNNEL_PORT_RANGE}",
         ]
     cmd += opts.to_args()
@@ -528,4 +586,13 @@ def launch_scrcpy(
 
     except Exception as exc:  # pragma: no cover
         raise ScrcpyError(f"Failed to launch scrcpy: {exc}") from exc
-    return ScrcpySession(proc, serial, log_path=log_path, logfh=logfh)
+    finally:
+        # scrcpy writes through its own inherited copy of the handle. Ours only
+        # kept the file open (on Windows: undeletable) after scrcpy had ended,
+        # and leaked outright when the launch failed.
+        if logfh is not None:
+            try:
+                logfh.close()
+            except Exception:
+                pass
+    return ScrcpySession(proc, serial, log_path=log_path, tunnel_host=remote)

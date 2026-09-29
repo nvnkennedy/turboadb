@@ -72,7 +72,7 @@ class SessionDialog(QDialog):
         row.setSpacing(8)
         self.serial = QComboBox()
         self.serial.setEditable(True)
-        pick = QPushButton("Detect")
+        self.btn_detect = pick = QPushButton("Detect")
         pick.setProperty("role", "ghost")
         pick.setIcon(icon("search", "accent"))
         pick.clicked.connect(self._detect)
@@ -106,7 +106,7 @@ class SessionDialog(QDialog):
         self.rserial = QComboBox()
         self.rserial.setEditable(True)
         self.rserial.setToolTip("Device serial on that machine (blank = only device)")
-        rpick = QPushButton("List")
+        self.btn_list = rpick = QPushButton("List")
         rpick.setProperty("role", "ghost")
         rpick.setIcon(icon("search", "accent"))
         rpick.clicked.connect(self._detect_remote)
@@ -149,25 +149,44 @@ class SessionDialog(QDialog):
         return form
 
     def _detect(self):
-        self._scan_into(self.serial, None, 5037, quiet=True)
+        self._scan_into(self.serial, None, 5037, quiet=True, button=self.btn_detect)
 
     def _detect_remote(self):
         host = self.srv_host.text().strip()
         if not host:
             return
-        self._scan_into(self.rserial, host, self.srv_port.value(), quiet=False)
+        self._scan_into(self.rserial, host, self.srv_port.value(), quiet=False,
+                        button=self.btn_list)
 
-    def _scan_into(self, combo, host, port, *, quiet):
+    def _scan_into(self, combo, host, port, *, quiet, button=None):
         """List devices OFF the UI thread — a remote scan blocks for up to the
-        adb timeout (15 s), which used to freeze this modal dialog."""
+        adb timeout (15 s), which used to freeze this modal dialog.
+
+        The serial being edited stays in the box while the scan runs: "scanning…"
+        written there was saved as the serial when OK came first. Progress shows
+        on the scan's button, and as the box's placeholder while it is empty."""
         if thread_running(self._scan):
             return
         prev = combo.currentText().strip()
         combo.clear()
-        combo.setEditText("scanning…")
+        combo.setEditText(prev)
+        edit = combo.lineEdit()
+        hint = edit.placeholderText()
+        edit.setPlaceholderText("scanning…")
+        label = button.text() if button is not None else ""
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("Scanning…")
         self._scan = _ScanThread(host, port, self._adb_path)
 
+        def finished():
+            edit.setPlaceholderText(hint)
+            if button is not None:
+                button.setText(label)
+                button.setEnabled(True)
+
         def done(devs):
+            finished()
             combo.clear()
             for d in devs:
                 combo.addItem(d.serial)
@@ -175,6 +194,7 @@ class SessionDialog(QDialog):
                 combo.setEditText(prev)
 
         def fail(msg):
+            finished()
             combo.clear()
             combo.setEditText(prev)
             if not quiet:

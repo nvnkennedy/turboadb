@@ -23,6 +23,8 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..results import human_bytes  # the one size format, shared with the CLI
+
 QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
@@ -41,20 +43,6 @@ def transfer_name(path) -> str:
     if text.endswith(("/.", "\\.")):
         text = text[:-2]
     return re.split(r"[/\\]", text.rstrip("/\\"))[-1] or text
-
-
-def human_bytes(num) -> str:
-    """``1536`` -> ``"1.5 KB"``; ``None`` -> ``"—"``."""
-    if num is None:
-        return "—"
-    num = float(num)
-    if num < 1024:
-        return f"{int(num)} B"
-    for unit in ("KB", "MB", "GB", "TB"):
-        num /= 1024.0
-        if num < 1024 or unit == "TB":
-            return f"{num:.1f} {unit}"
-    return f"{num:.1f} TB"  # pragma: no cover - the loop always returns
 
 
 def human_speed(bytes_per_second) -> str:

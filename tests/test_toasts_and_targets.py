@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,8 +27,6 @@ _BIG = 1 << 20
 def _fake_window(host, status=None, *, dock_visible=False, silent=False):
     """Just enough of MainWindow for ``MainWindow._log`` to run against a real
     host window (the toasts attach to it)."""
-    from turboadb.gui.main_window import MainWindow
-
     status = [] if status is None else status
     return types.SimpleNamespace(
         window=lambda: host,
@@ -36,8 +35,6 @@ def _fake_window(host, status=None, *, dock_visible=False, silent=False):
             chk_silent=types.SimpleNamespace(isChecked=lambda: silent),
         ),
         _log_dock=types.SimpleNamespace(isVisible=lambda: dock_visible),
-        _LOG_LEVEL_RE=MainWindow._LOG_LEVEL_RE,
-        _LEVEL_ALIASES=MainWindow._LEVEL_ALIASES,
         _show_log_dock=lambda: None,
         statusBar=lambda: types.SimpleNamespace(
             showMessage=lambda text, _ms: status.append(text)
@@ -654,6 +651,27 @@ def test_a_failed_auto_save_is_a_warning_and_leaves_the_file_alone(qapp, target_
     assert fake.refreshed == []
 
 
+def test_one_invalid_saved_target_does_not_stop_the_auto_save(qapp, target_files):
+    """Every connect logged "could not be read … left untouched" and saved
+    nothing while sessions.json had one entry that is not a valid target."""
+    import warnings
+
+    from turboadb.gui.main_window import MainWindow
+
+    car = {"name": "Car", "type": "network", "host": "192.168.1.50", "port": 5555}
+    _write_targets(target_files, [car, {"name": "bad", "type": "usb", "serial": 7}])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the load and the copy kept of the file say so
+        fake = _fake_main()
+        MainWindow._auto_save_target(
+            fake, _tab({"name": "V2318", "type": "usb", "serial": "10AD5F1E2B"}, "10AD5F1E2B",
+                       "vivo V2318"))
+    assert fake.logged == ["[OK] Saved target 'vivo V2318'"]
+    assert _saved(target_files) == [car, {"name": "vivo V2318", "type": "usb",
+                                          "serial": "10AD5F1E2B"}]
+    assert len(list(target_files.glob("sessions.json.corrupt-*"))) == 1
+
+
 def test_the_sidebar_lists_the_saved_target(qapp, target_files):
     from PyQt5.QtWidgets import QLabel, QLineEdit, QListWidget
 
@@ -772,7 +790,7 @@ def test_session_store_identity_helpers(target_files):
 
 
 # --------------------------------------------------------------------------- #
-# review fixes
+# toast sizing and markup, log routing, saved-target updates
 # --------------------------------------------------------------------------- #
 ZWSP = chr(0x200B)
 
@@ -1342,8 +1360,6 @@ def _toast_host(qapp, window):
     """Give a plain window the few attributes MainWindow._log needs."""
     from turboadb.gui.main_window import MainWindow
 
-    window._LOG_LEVEL_RE = MainWindow._LOG_LEVEL_RE
-    window._LEVEL_ALIASES = MainWindow._LEVEL_ALIASES
     window.log_panel = types.SimpleNamespace(append=lambda *_a: None, chk_silent=None)
     window._log_dock = None
     window._show_log_dock = lambda *_a: None
@@ -1351,7 +1367,19 @@ def _toast_host(qapp, window):
     return lambda text: MainWindow._log(window, text)
 
 
-def test_installing_an_apk_reports_the_install_not_the_package_count(qapp, host, themed):
+def _pump_until(qapp, done, timeout=10.0):
+    """Process events until *done()* or the deadline: workers finish when the
+    machine gets to them, not after a fixed number of event-loop passes."""
+    deadline = time.monotonic() + timeout
+    while not done() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+    return done()
+
+
+def test_installing_an_apk_reports_the_install_not_the_package_count(qapp, host, themed,
+                                                                      monkeypatch):
     """The window shows ONE activity toast, replaced in place.
 
     AppsPanel logged the install result and then immediately re-listed, and the
@@ -1373,11 +1401,12 @@ def test_installing_an_apk_reports_the_install_not_the_package_count(qapp, host,
     panel.log.connect(_toast_host(qapp, host))
     traced = []
     panel.trace.connect(traced.append)
-    ap.QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: (["/tmp/demo.apk"], ""))
+    monkeypatch.setattr(ap.QFileDialog, "getOpenFileNames",
+                        staticmethod(lambda *a, **k: (["/tmp/demo.apk"], "")))
     try:
         panel._install()
-        for _ in range(80):
-            qapp.processEvents()
+        # the install and the quiet re-listing it asks for both run on workers
+        assert _pump_until(qapp, lambda: panel._listed and not panel._listing)
         toast = host._turboadb_activity_toast
         assert "demo.apk" in toast.text.text()      # the install is what shows
         assert "packages" not in toast.text.text()  # not the refresh that followed

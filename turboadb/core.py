@@ -19,6 +19,7 @@ import os
 import re
 import time
 import shlex
+import atexit
 import itertools
 import logging
 import posixpath
@@ -26,11 +27,12 @@ import threading
 import queue
 import dataclasses
 import subprocess
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, NamedTuple, Optional, Sequence, Union
 
-from .config import ADBConfig, ScrcpyOptions, format_host_port, validate_port
-from .devices import list_devices
+from .config import ADBConfig, ScrcpyOptions, adb_server_args, format_host_port, validate_port
+from .devices import is_mdns_serial, is_network_serial, list_devices
 from . import touch
+from .proctree import stop_process
 from .results import CommandResult, TransferResult, StreamResult, OperationResult, strip_ansi
 from .tools import DEFAULT_ADB_SERVER_PORT, NO_WINDOW, find_adb, is_adb_server_alive
 from .exceptions import (
@@ -69,6 +71,10 @@ def _unique_token() -> str:
     return f"{os.getpid()}_{threading.get_ident()}_{next(_TOKEN_COUNTER)}_{time.time_ns()}"
 
 
+class _Cancelled(Exception):
+    """A cancellable adb command was called off (see ADBHandler._run_cancellable)."""
+
+
 _ROW_SPLIT_RE = re.compile(r"(?m)^Row: \d+ ")
 
 
@@ -84,6 +90,242 @@ def _iter_records(text):
         previous = match.end()
     if previous is not None:
         yield text[previous:]
+
+
+# The one shutdown path for every child the engine starts (terminate, wait,
+# kill, reap; see proctree.stop_process, which scrcpy and the GUI use too).
+_stop_child = stop_process
+
+
+# On Linux and macOS a child in the terminal's process group gets the Ctrl+C
+# typed at `turboadb record` as well: adb died before TurboADB could stop the
+# recording itself (a SIGINT to the device's screenrecord writes the MP4
+# index) and pull it.  Children that TurboADB stops itself — a recorder, a
+# push or pull — therefore run in a session of their own, and the Ctrl+C
+# reaches Python alone.  (On Windows they have no console, see NO_WINDOW.)
+_OWN_SESSION = os.name != "nt"
+
+# Those children while they run, each with what to clean up after it.  When
+# the interpreter exits before their caller stopped them (a second Ctrl+C
+# aborts at once), they are ended here instead of being left running.
+_TRACKED: dict = {}
+_TRACKED_LOCK = threading.Lock()
+
+
+def _track_child(proc, cleanup=None) -> None:
+    with _TRACKED_LOCK:
+        _TRACKED[proc] = cleanup
+
+
+def _untrack_child(proc) -> None:
+    with _TRACKED_LOCK:
+        _TRACKED.pop(proc, None)
+
+
+@atexit.register
+def _end_tracked_children() -> None:
+    """Stop the children nobody stopped before the exit, then clean up."""
+    with _TRACKED_LOCK:
+        left = list(_TRACKED.items())
+        _TRACKED.clear()
+    for proc, cleanup in left:
+        _stop_child(proc, close_pipes=True, grace=1.0)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+
+class _AnyOf:
+    """Set when any of *events* is set (Nones are ignored): a stop request
+    that more than one party may make."""
+
+    def __init__(self, *events):
+        self._events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+
+class _Clip(NamedTuple):
+    """A recording screenrecord has finished on the device, not pulled yet."""
+
+    remote_path: str
+    forced: bool  # adb had to be ended: the device may still write the MP4 index
+
+
+def _local_files(path) -> dict:
+    """``{file: (size, mtime_ns)}`` for *path*: itself when it is a file, every
+    file under it when it is a folder (folder links are not followed).
+    Entries that can't be read are left out."""
+    if not os.path.isdir(path):
+        try:
+            info = os.stat(path)
+        except OSError:
+            return {}
+        return {path: (info.st_size, info.st_mtime_ns)}
+    found = {}
+    stack = [path]
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file():
+                            info = entry.stat()
+                            found[entry.path] = (info.st_size, info.st_mtime_ns)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return found
+
+
+class _TransferWatch:
+    """Follows a running ``adb push`` / ``adb pull`` by its sizes.
+
+    adb prints its ``[ NN%]`` progress only to a terminal; into a pipe it
+    says nothing until the copy is over.  So this measures instead, on a
+    thread of its own: what has arrived on this PC for a pull (every file
+    written since it started), what the device holds for a push (an adb call
+    every couple of seconds).  :meth:`ADBHandler._transfer` reads
+    :meth:`percent` and :attr:`moved_at` from it.  Nothing is measured before
+    :attr:`DELAY_S`, so a quick copy never pays for it."""
+
+    DELAY_S = 1.0
+    LOCAL_EVERY_S = 0.5  # re-measure what a pull has written
+    DEVICE_EVERY_S = 2.0  # ask the device what a push has written
+
+    def __init__(self, handler, direction, local, remote, *, window=None, percent=True):
+        """*local* is the path on this PC (what a pull writes, what a push
+        reads), *remote* the device path as given to adb.  *window* is the
+        stall limit: the sizes are looked at several times within it.  Without
+        *percent* (nobody shows it) the total is never measured, which spares
+        a pull its device call."""
+        self._handler = handler
+        self._pull = direction == "pull"
+        self._local = local
+        self._remote = remote
+        self._want_total = percent
+        self._delay = self.DELAY_S
+        self._every = self.LOCAL_EVERY_S if self._pull else self.DEVICE_EVERY_S
+        self._most = None
+        if window:
+            self._delay = min(self._delay, window / 4.0)
+            self._every = self._most = min(self._every, window / 4.0)
+        self.total = None  # bytes the copy moves, once measured
+        self.done = 0  # bytes moved so far
+        self.moved_at = None  # time.monotonic() when `done` last changed
+        self._seen = 0
+        self._stop = threading.Event()
+        # What was there before adb started, so that it isn't counted.
+        self._before = {}
+        self._folder = not self._pull and os.path.isdir(local)
+        self._target = None  # a pushed folder: where on the device it goes
+        self._merge = False  # ... into a folder that was already there
+        self._baseline = None
+        if self._pull:
+            self._before = _local_files(local)
+        elif self._folder:
+            self._target, self._merge = self._folder_target()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="turboadb-transfer-watch", daemon=True).start()
+
+    def stop(self) -> None:
+        """Measure no more (an adb call in flight ends within its own timeout)."""
+        self._stop.set()
+
+    def percent(self) -> Optional[int]:
+        """0-99 while the copy runs, or None while its size is unknown."""
+        total = self.total
+        if not total or total <= 0:
+            return None
+        return max(0, min(99, self.done * 100 // total))
+
+    def _name(self) -> str:
+        """The last part of the local path as adb takes it (``.`` for a
+        ``folder/.`` merge source)."""
+        return re.split(r"[\\/]", str(self._local).rstrip("\\/"))[-1]
+
+    def _folder_target(self):
+        """``(device path, merge)`` for a pushed folder, asked before adb
+        starts: adb puts it under its own name into a folder that is there
+        already, and makes the given path the folder otherwise."""
+        inner = posixpath.normpath(posixpath.join(self._remote, self._name()))
+        q_remote, q_inner = shlex.quote(self._remote), shlex.quote(inner)
+        script = (f"if [ -e {q_remote} ]; then if [ -e {q_inner} ]; then echo @@merge; "
+                  f"else echo @@into; fi; else echo @@new; fi")
+        try:
+            text = self._handler._run(["shell", script], timeout=15, check=False).text
+        except ADBError:
+            return None, False
+        if "@@merge" in text:
+            return inner, True
+        if "@@into" in text:
+            return inner, False
+        return (self._remote, False) if "@@new" in text else (None, False)
+
+    def _device_bytes(self, command) -> Optional[int]:
+        from . import remotefs
+
+        res = self._handler._run(["shell", command], timeout=30, check=False)
+        return remotefs._sum_sizes(res.stdout)
+
+    def _total(self) -> Optional[int]:
+        from . import remotefs
+
+        if self._pull:
+            return self._device_bytes(remotefs._sizes_cmd(self._remote))
+        return sum(size for size, _mtime in _local_files(self._local).values())
+
+    def _moved(self) -> Optional[int]:
+        """Bytes copied so far, or None when they can't be told now."""
+        from . import remotefs
+
+        if self._pull:
+            before = self._before
+            return sum(size for path, (size, mtime) in _local_files(self._local).items()
+                       if before.get(path) != (size, mtime))
+        if not self._folder:
+            return self._device_bytes(remotefs._push_target_size_cmd(self._remote, self._name()))
+        if self._target is None:
+            return None
+        found = self._device_bytes(remotefs._sizes_cmd(self._target))
+        if found is not None and self._merge:
+            if self._baseline is None:
+                self._baseline = found  # what the folder held (roughly) before
+            found = max(0, found - self._baseline)
+        return found
+
+    def _run(self) -> None:
+        if self._stop.wait(self._delay):
+            return
+        if self._want_total:
+            try:
+                self.total = self._total()
+            except Exception:
+                self.total = None
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                moved = self._moved()
+            except Exception:
+                moved = None
+            if moved is not None and moved != self._seen:
+                self._seen = moved
+                self.done = moved
+                self.moved_at = time.monotonic()
+            # never let measuring itself cost more than a fifth of the time
+            pause = max(self._every, 4 * (time.monotonic() - started))
+            if self._most is not None:
+                pause = min(pause, self._most)
+            if self._stop.wait(pause):
+                return
 
 
 # --------------------------------------------------------------------------- #
@@ -171,29 +413,7 @@ class ShellSession:
 
     def close(self) -> None:
         self._eof = True
-        try:
-            if self.running:
-                self._proc.terminate()
-            if self._proc.stdin:
-                try:
-                    self._proc.stdin.close()
-                except Exception:
-                    pass
-            if self._proc.stdout:
-                try:
-                    self._proc.stdout.close()
-                except Exception:
-                    pass
-            try:
-                self._proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self._proc.kill()
-                    self._proc.wait(timeout=1.0)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _stop_child(self._proc, close_pipes=True)
 
     def __enter__(self) -> "ShellSession":
         return self
@@ -285,6 +505,7 @@ class ADBHandler:
         self._cap_method: Optional[int] = None  # cached screencap method idx
         self._touch: Optional[tuple] = None  # cached (TouchDevice|None, writable)
         self._screencap_ids: dict = {}  # logical display id -> physical id
+        self._su_forms: dict = {}  # serial -> how its su runs a command (see _su_form)
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -345,11 +566,13 @@ class ADBHandler:
         """Resolve adb once, under :attr:`_adb_lock`."""
         try:
             self._adb = find_adb(self.config.adb_path)
-        except ADBNotFoundError:
+        except ADBNotFoundError as exc:
             # An explicit path is a caller error; never replace it with a
-            # download behind their back.  For normal auto-detection, honour
-            # the documented one-time managed-tools fallback.
-            if self.config.adb_path:
+            # download behind their back.  Nor TURBOADB_ADB: a download could
+            # not change which adb it names, and its error says what to fix.
+            # For normal auto-detection, honour the documented one-time
+            # managed-tools fallback.
+            if self.config.adb_path or getattr(exc, "configured", None):
                 raise
             from . import toolsdl
 
@@ -372,7 +595,7 @@ class ADBHandler:
     def _base(self, target: bool = True) -> list:
         cmd = [self.adb_path]
         if self.config.adb_server_host:  # route through a remote adb server
-            cmd += ["-H", self.config.adb_server_host, "-P", str(self.config.adb_server_port)]
+            cmd += adb_server_args(self.config.adb_server_host, self.config.adb_server_port)
         elif self.config.adb_server_port != DEFAULT_ADB_SERVER_PORT:
             cmd += ["-P", str(self.config.adb_server_port)]  # local server, other port
         if target and self._serial:
@@ -380,57 +603,135 @@ class ADBHandler:
         return cmd
 
     def _exec(
-        self, args: Sequence[str], *, timeout, target: bool, check: bool, binary: bool = False
+        self,
+        args: Sequence[str],
+        *,
+        timeout,
+        target: bool,
+        check: bool,
+        binary: bool = False,
+        cancel=None,
+        log_as: Optional[str] = None,
     ) -> CommandResult:
+        """Run one adb command to completion. *cancel* (a ``threading.Event``,
+        used by the connect path) lets another thread end it early: see
+        :meth:`_run_cancellable`. *log_as* names the command in the result
+        and in errors instead of its arguments (see :meth:`_logged_run`).
+
+        A command that runs out of time raises ADBTimeoutError whose
+        ``result`` holds what it printed until then (exit code -1)."""
         cmd = self._base(target=target) + list(args)
+        command = " ".join(args) if log_as is None else log_as
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
         # started_at and duration are one matched pair: callers add them to
         # get the end time, so both stay on the wall clock.  Deadlines that
         # drive control flow use time.monotonic() instead (see iter_lines).
         start = time.time()
-        try:
-            out = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=eff_timeout,
-                creationflags=NO_WINDOW,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ADBTimeoutError(
-                f"adb command timed out after {eff_timeout}s: {' '.join(args)!r}"
-            ) from exc
-        except FileNotFoundError as exc:  # pragma: no cover
-            raise ADBError(f"adb executable not runnable: {exc}") from exc
         enc = "utf-8" if binary else self.config.encoding
-        stdout = (out.stdout or b"") if binary else (out.stdout or b"").decode(enc, "replace")
-        result = CommandResult(
-            " ".join(args),
-            out.returncode,
-            stdout,
-            (out.stderr or b"").decode(enc, "replace"),
-            time.time() - start,
-            device=self._serial or "",
-            started_at=start,
+
+        def result(exit_code, stdout, stderr) -> CommandResult:
+            return CommandResult(
+                command,
+                exit_code,
+                (stdout or b"") if binary else (stdout or b"").decode(enc, "replace"),
+                (stderr or b"").decode(enc, "replace"),
+                time.time() - start,
+                device=self._serial or "",
+                started_at=start,
+            )
+
+        try:
+            if cancel is not None:
+                out = self._run_cancellable(cmd, eff_timeout, cancel)
+            else:
+                out = subprocess.run(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=eff_timeout,
+                    creationflags=NO_WINDOW,
+                )
+        except subprocess.TimeoutExpired as exc:
+            # A hidden command line stays hidden: the TimeoutExpired it would
+            # be chained to spells it out.
+            raise ADBTimeoutError(
+                f"adb command timed out after {eff_timeout}s: {command!r}",
+                result=result(-1, exc.stdout, exc.stderr),
+            ) from (exc if log_as is None else None)
+        except _Cancelled:
+            raise ADBConnectionError(f"adb {command} was cancelled") from None
+        except OSError as exc:
+            # not only a missing adb: one that antivirus quarantined or locked,
+            # or a file that is not a program, must still be an ADBError
+            raise ADBError(f"adb executable not runnable: {exc}") from exc
+        res = result(out.returncode, out.stdout, out.stderr)
+        if check and not res.ok:
+            raise ADBCommandError(command, res)
+        return res
+
+    # How often a cancellable command looks at its cancel event.
+    _CANCEL_POLL_S = 0.1
+
+    def _run_cancellable(self, cmd, timeout, cancel) -> subprocess.CompletedProcess:
+        """``subprocess.run(cmd, capture_output=True, timeout=timeout)`` that
+        another thread can call off by setting *cancel*: the adb child is then
+        killed at once, instead of waiting out the rest of its timeout (a
+        ``wait-for-device`` for a tab that was closed ran on for up to 20 s)."""
+        if cancel.is_set():
+            raise _Cancelled()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=NO_WINDOW,
         )
-        if check and not result.ok:
-            raise ADBCommandError(" ".join(args), result)
-        return result
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=self._CANCEL_POLL_S)
+                except subprocess.TimeoutExpired:
+                    if cancel.is_set():
+                        raise _Cancelled() from None
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(cmd, timeout) from None
+                    continue
+                return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        except BaseException as exc:
+            proc.kill()
+            try:
+                out, err = proc.communicate(timeout=5.0)  # reap it and close its pipes
+            except Exception:
+                out = err = None
+            if isinstance(exc, subprocess.TimeoutExpired):
+                exc.stdout, exc.stderr = out, err  # what it printed in time
+            raise
 
-    def _run(self, args, *, timeout=None, check=False, binary=False) -> CommandResult:
+    def _run(
+        self, args, *, timeout=None, check=False, binary=False, cancel=None, log_as=None
+    ) -> CommandResult:
         """Run an adb command scoped to this device (``adb -s SERIAL ...``)."""
-        return self._exec(args, timeout=timeout, target=True, check=check, binary=binary)
+        return self._exec(
+            args, timeout=timeout, target=True, check=check, binary=binary, cancel=cancel,
+            log_as=log_as,
+        )
 
-    def _run_global(self, args, *, timeout=None, check=False) -> CommandResult:
+    def _run_global(self, args, *, timeout=None, check=False, cancel=None) -> CommandResult:
         """Run an adb command not scoped to a device (connect/devices/pair...)."""
-        return self._exec(args, timeout=timeout, target=False, check=check)
+        return self._exec(args, timeout=timeout, target=False, check=check, cancel=cancel)
 
-    def _logged_run(self, label, args, *, timeout=None, check=False) -> CommandResult:
+    def _logged_run(self, label, args, *, timeout=None, check=False, log_as=None) -> CommandResult:
         """Run a device command, logging the real adb command line and its
         outcome (duration on success; exit code + stderr on failure) so the GUI
-        log explains exactly what happened, not just 'ok'."""
-        self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
-        res = self._run(args, timeout=timeout)
+        log explains exactly what happened, not just 'ok'.
+
+        *log_as* is logged in place of the arguments, for a command whose words
+        must not be written down (the text :meth:`input_text` types can be a
+        password): the log file and the log panel keep every line."""
+        command = " ".join(args) if log_as is None else log_as
+        self._emit(logging.DEBUG, f"$ adb {command}")
+        res = self._run(args, timeout=timeout, log_as=log_as)
         if res.ok:
             self._emit(logging.DEBUG, f"  -> {label}: ok ({res.duration:.2f}s)")
         else:
@@ -441,7 +742,7 @@ class ADBHandler:
                 f"  -> {label}: exit {res.exit_code} ({res.duration:.2f}s): {detail}",
             )
         if check and not res.ok:
-            raise ADBCommandError(" ".join(args), res)
+            raise ADBCommandError(command, res)
         return res
 
     # ------------------------------------------------------------------ #
@@ -541,29 +842,55 @@ class ADBHandler:
     # ------------------------------------------------------------------ #
     # Connect / disconnect
     # ------------------------------------------------------------------ #
-    def connect(self, *, safe: Optional[bool] = None):
+    def connect(
+        self,
+        *,
+        known_state: Optional[str] = None,
+        cancel=None,
+        safe: Optional[bool] = None,
+    ):
         """Bring the configured target online.
 
         Network target: ``adb connect host:port``. USB target: just verify the
         device is present (optionally waiting for it). Returns this handler (or
         an OperationResult in safe mode).
-        """
-        return self._guard("connect", self._connect, safe=safe)
 
-    def _connect(self) -> "ADBHandler":
+        *known_state* is the target's state as this handler's adb server
+        reported it a moment ago (the GUI passes its device tracker's): for
+        ``"device"`` the ``wait-for-device`` and ``get-state`` round trips,
+        which would only confirm it, are skipped. A network target is still
+        ``adb connect``-ed, and a connection that command has just made is
+        checked as usual. *cancel* is a ``threading.Event``: setting it from
+        another thread ends a connect that is still waiting (``adb connect``,
+        ``wait-for-device``) at once, killing that adb child, with
+        ADBConnectionError.
+        """
+        return self._guard(
+            "connect", self._connect, known_state=known_state, cancel=cancel, safe=safe
+        )
+
+    def _connect(self, known_state=None, cancel=None) -> "ADBHandler":
         cfg = self.config
         remote = cfg.is_remote_server
+        # "device" from the server a moment ago: nothing left to wait for
+        state = "device" if known_state == "device" and self._serial else None
         # make sure the (local) server is up; for a remote server we don't start
         # a local one — we talk to theirs.
         if not remote and not is_adb_server_alive(port=cfg.adb_server_port):
             # The shared launcher observes the port directly and is protected
             # by one process-local lock.  Spawning a second `adb start-server`
             # here raced the GUI pre-warm worker and made first connection slow.
-            from .tools import ensure_adb_server
+            from .tools import ensure_adb_server, last_adb_server_error, local_adb_port
 
-            if not ensure_adb_server(cfg.adb_path, timeout=12.0, port=cfg.adb_server_port):
+            # self.adb_path, not cfg.adb_path (usually None): resolving adb runs
+            # the one-time platform-tools download when none is installed, and a
+            # missing adb is reported as such, not as a server that never started
+            if not ensure_adb_server(self.adb_path, timeout=12.0, port=cfg.adb_server_port):
+                detail = last_adb_server_error()
+                # the port it really waited on (ANDROID_ADB_SERVER_PORT moves 5037)
                 raise ADBConnectionError(
-                    f"ADB server did not become ready on port {cfg.adb_server_port}"
+                    "ADB server did not become ready on port "
+                    f"{local_adb_port(cfg.adb_server_port)}" + (f": {detail}" if detail else "")
                 )
 
         if cfg.host and cfg.auto_connect and not remote:
@@ -571,7 +898,7 @@ class ADBHandler:
             if not target:  # guarded by cfg.host, keeps static type checkers honest
                 raise ADBConnectionError("network target is missing a host")
             self._emit(logging.INFO, f"Connecting to {target}…")
-            owned = self._adb_connect(
+            made = self._adb_connect(
                 target,
                 cfg.connect_timeout,
                 hint=(
@@ -579,22 +906,33 @@ class ADBHandler:
                     f"over USB first (or wireless debugging is on), and that you can "
                     f"reach it on the network."
                 ),
+                cancel=cancel,
             )
-            self._owned_target = target if owned else None
-            self._serial = target
+            self._use_target(target, owned=made != "already")
+            if made == "unauthorized" and cfg.auto_wait:
+                # made, but the device is still asking whether to trust this PC
+                self._await_authorization(target, cfg.connect_timeout, cancel=cancel)
+                state = "device"
+            elif made != "already":
+                state = None  # a brand-new connection may still be authorizing
 
         if self._serial is None:
             # no explicit target: bind to the only online device on the (local or
             # remote) adb server
             try:
                 devs = list_devices(
-                    cfg.adb_path, server_host=cfg.adb_server_host, server_port=cfg.adb_server_port
+                    # a remote server is asked over its socket first: a PC
+                    # without adb must not download one just to list it
+                    cfg.adb_path if remote else self.adb_path,
+                    server_host=cfg.adb_server_host,
+                    server_port=cfg.adb_server_port,
                 )
             except ConnectionError as exc:
                 raise ADBConnectionError(str(exc)) from exc
             online = [d for d in devs if d.is_online]
             if len(online) == 1:
                 self._serial = online[0].serial
+                state = "device"  # the server has just listed it online
             elif len(online) > 1:
                 raise ADBConnectionError(
                     f"Multiple devices on {'the remote server' if remote else 'USB'} "
@@ -603,15 +941,18 @@ class ADBHandler:
                 )
             elif remote:
                 raise ADBConnectionError(
-                    f"No online devices on the adb server at {cfg.adb_server_host}:"
-                    f"{cfg.adb_server_port}. Plug a device into that machine and "
-                    f"check 'adb devices' there."
+                    "No online devices on the adb server at "
+                    f"{format_host_port(cfg.adb_server_host, cfg.adb_server_port)}. Plug a "
+                    f"device into that machine and check 'adb devices' there."
                 )
 
-        if cfg.auto_wait:
-            self._wait_for_device(cfg.connect_timeout)
-
-        state = self.get_state()
+        if state != "device":
+            # wait-for-device exits 0 only once the device is online, so a
+            # get-state after it would just say "device" again
+            if cfg.auto_wait and self._wait_for_device(cfg.connect_timeout, cancel=cancel).ok:
+                state = "device"
+            else:
+                state = self.get_state()
         if state != "device":
             raise ADBConnectionError(
                 f"Device {self._serial or '(any)'} is '{state}', not ready. "
@@ -622,24 +963,88 @@ class ADBHandler:
         self._emit(logging.INFO, f"Connected to {self._serial or 'device'} ({state}).")
         return self
 
-    def _adb_connect(self, target: str, timeout: float, *, hint: str = "") -> bool:
+    def _adb_connect(self, target: str, timeout: float, *, hint: str = "", cancel=None) -> str:
         """``adb connect TARGET`` — the one place its output is judged. Raises
-        ADBConnectionError on failure; returns True when this call created the
-        connection (False when adb reports it was already connected)."""
+        ADBConnectionError on failure, else says what happened:
+
+        * ``"connected"`` — this call made the connection;
+        * ``"already"`` — adb reports it was already connected;
+        * ``"unauthorized"`` — this call made the connection, but the device
+          has not accepted this PC's key yet. adb answers "failed to
+          authenticate", yet the connection stays, 'unauthorized' until
+          someone accepts the "Allow USB debugging?" prompt on the device."""
         self._emit(logging.DEBUG, f"$ adb connect {target}")
-        res = self._run_global(["connect", target], timeout=timeout)
+        res = self._run_global(["connect", target], timeout=timeout, cancel=cancel)
         text = self._combined_output(res)
         low = text.lower()
+        if "failed to authenticate" in low:
+            self._emit(
+                logging.WARNING,
+                f"{target} has not authorised this PC yet: accept the "
+                f"'Allow USB debugging?' prompt on the device's screen.",
+            )
+            return "unauthorized"
         if not res.ok or any(w in low for w in ("cannot", "failed", "unable", "error:")):
             raise ADBConnectionError(
                 f"adb connect {target} failed: {text or f'exit {res.exit_code}'}{hint}"
             )
-        return "already connected" not in low
+        return "already" if "already connected" in low else "connected"
 
-    def _wait_for_device(self, timeout: float) -> CommandResult:
+    # How often a connection waiting on the device's prompt is checked again.
+    _AUTH_POLL_S = 0.5
+
+    def _await_authorization(self, target: str, timeout: float, cancel=None) -> None:
+        """Wait up to *timeout* s for *target* to accept this PC's key, after
+        ``adb connect`` made an 'unauthorized' connection to it.
+
+        get-state is polled, so a device that never answers the prompt is
+        reported in the state it was left in. Raises ADBConnectionError when
+        it has not accepted in time, or when *cancel* is set."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise ADBConnectionError(f"adb connect {target} was cancelled")
+            try:
+                state = self._parse_state(
+                    self._run_global(["-s", target, "get-state"], timeout=10)
+                )
+            except ADBError:
+                state = "unknown"
+            if state == "device":
+                return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if cancel is not None:
+                cancel.wait(min(self._AUTH_POLL_S, left))
+            else:
+                time.sleep(min(self._AUTH_POLL_S, left))
+        raise ADBConnectionError(
+            f"Device {target} is '{state}': it did not authorise this PC within "
+            f"{timeout:g}s. Accept the 'Allow USB debugging?' prompt on the device's "
+            f"screen, then connect again."
+        )
+
+    def _use_target(self, target: str, *, owned: bool) -> None:
+        """Make *target* this handler's device. *owned*: this handler's own
+        ``adb connect`` made the connection (see :attr:`owns_connection`)."""
+        if target != self._serial:
+            self._reset_device_caches()
+        self._serial = target
+        self._owned_target = target if owned else None
+
+    def _reset_device_caches(self) -> None:
+        """Forget what was learnt about the device: its touchscreen node, its
+        displays' physical ids and the screencap method that works on it all
+        belong to one device, and a handler can be moved to another one."""
+        self._touch = None
+        self._screencap_ids = {}
+        self._cap_method = None
+
+    def _wait_for_device(self, timeout: float, cancel=None) -> CommandResult:
         args = ["wait-for-device"]
         try:
-            return self._run(args, timeout=timeout, check=False)
+            return self._run(args, timeout=timeout, check=False, cancel=cancel)
         except ADBTimeoutError as exc:
             raise ADBConnectionError(
                 f"Timed out after {timeout}s waiting for {self._serial or 'a device'}."
@@ -673,14 +1078,37 @@ class ADBHandler:
 
         return self._guard("wait_for_device", _do, safe=safe)
 
+    # `adb disconnect` answers at once; a server that stopped answering must
+    # not hold the caller (a closing device tab's worker) for a whole minute.
+    _DISCONNECT_TIMEOUT = 10.0
+
     def disconnect(self, *, safe: Optional[bool] = None):
-        """Disconnect. For network targets this runs ``adb disconnect host:port``;
-        USB targets are simply released (the device stays attached)."""
+        """Disconnect. For network targets (``host:port``, or a Wireless-debugging
+        device adb connected through mDNS) this runs ``adb disconnect SERIAL``;
+        USB targets are simply released (the device stays attached).
+
+        This drops the connection for every user of the adb server. To let go
+        of only what this handler set up, see :attr:`owns_connection`."""
 
         def _do():
-            if self._serial and ":" in self._serial:
-                self._run_global(["disconnect", self._serial], check=False)
-                self._emit(logging.INFO, f"Disconnected {self._serial}.")
+            serial = self._serial
+            if is_network_serial(serial):
+                res = self._run_global(
+                    ["disconnect", serial], timeout=self._DISCONNECT_TIMEOUT, check=False
+                )
+                said = self._combined_output(res)
+                if is_mdns_serial(serial) and (not res.ok or "error" in said.lower()):
+                    # adb 37 reads a service name as NAME:5555 and finds no
+                    # such device; while the device advertises the service,
+                    # adb would connect it again by itself anyway.
+                    self._emit(
+                        logging.WARNING,
+                        f"adb could not disconnect {serial} ({said or f'exit {res.exit_code}'}): "
+                        "a device adb found through Wireless debugging stays connected "
+                        "until Wireless debugging is turned off on it.",
+                    )
+                else:
+                    self._emit(logging.INFO, f"Disconnected {serial}.")
             self._owned_target = None
             self._connected = False
             return True
@@ -688,6 +1116,14 @@ class ADBHandler:
         return self._guard("disconnect", _do, safe=safe)
 
     close = disconnect
+
+    @property
+    def owns_connection(self) -> bool:
+        """True when this handler's ``connect()`` / ``connect_tcp()`` made the
+        network connection it uses: adb answered "connected to", not "already
+        connected to". Only such a connection is this handler's to drop; one
+        that another program (or another handler) made stays connected."""
+        return bool(self._owned_target) and self._owned_target == self._serial
 
     @property
     def is_connected(self) -> bool:
@@ -705,11 +1141,16 @@ class ADBHandler:
             res = self._run(["get-state"], timeout=10, check=False)
         except ADBError:
             return "unknown"
+        return self._parse_state(res)
+
+    @classmethod
+    def _parse_state(cls, res) -> str:
+        """The state a ``get-state`` result reports (see :meth:`get_state`)."""
         if res.ok and res.text:
             return res.text.split()[0]
         m = re.search(
             r"\b(unauthorized|offline|no permissions|authorizing|connecting)\b",
-            self._combined_output(res),
+            cls._combined_output(res),
             re.I,
         )
         return m.group(1).lower() if m else "unknown"
@@ -732,19 +1173,32 @@ class ADBHandler:
         return list_devices(adb_path, server_host=server_host, server_port=server_port)
 
     def restart_server(self, *, safe: Optional[bool] = None):
-        """Kill and restart the adb server this handler talks to (``adb
-        kill-server`` then ``adb start-server``, honouring a remote host or a
-        non-default port). Fixes 'device not visible' after an adb version
-        clash. Every shell/stream on that server is dropped.
+        """Kill and restart this PC's adb server (``adb kill-server`` then
+        ``adb start-server``, on the configured port). Fixes 'device not
+        visible' after an adb version clash. Every shell/stream on that server
+        is dropped.
+
+        A server on another machine (``adb_server_host``) is refused with
+        ADBError before anything is sent to it: adb cannot start a server on
+        a remote host, so a kill from here would leave that machine, and
+        everyone using its devices, without one. Restart it on that machine.
 
         Returns the ``start-server`` CommandResult; raises ADBCommandError when
         the server could not be started (a failed kill — usually "not running"
         — is only logged as a warning)."""
 
         def _do():
+            host = self.config.adb_server_host
+            if host:
+                where = format_host_port(host, self.config.adb_server_port)
+                raise ADBError(
+                    f"cannot restart the adb server at {where} from here: adb can only "
+                    f"start a server on this PC. Restart it on that machine (for example "
+                    f"with 'turboadb serve' there)."
+                )
             self._emit(logging.INFO, "Restarting the adb server…")
             stopped = self._kill_server()
-            started = self._run_global(["start-server"], timeout=30)
+            started = self._start_local_server(timeout=30.0)
             if not started.ok:
                 raise self._command_error("start-server", started)
             if not stopped.ok:
@@ -759,14 +1213,49 @@ class ADBHandler:
         return self._guard("restart_server", _do, safe=safe)
 
     def _kill_server(self):
-        """``adb kill-server``, then wait for a local daemon to release its port."""
-        stopped = self._run_global(["kill-server"], timeout=15)
-        if not self.config.adb_server_host:
-            port = self.config.adb_server_port
-            deadline = time.monotonic() + 5.0
-            while is_adb_server_alive(port=port, timeout=0.1) and time.monotonic() < deadline:
-                time.sleep(0.1)
-        return stopped
+        """``adb kill-server``, then wait for a local daemon to release its port.
+
+        A local server is stopped by :func:`tools.kill_adb_server`, the one
+        stopper, which also retires a launcher still starting it."""
+        if self.config.adb_server_host:
+            return self._run_global(["kill-server"], timeout=15)
+        from .tools import kill_adb_server
+
+        start = time.time()
+        done = kill_adb_server(self.adb_path, port=self.config.adb_server_port)
+
+        def text(data):
+            if isinstance(data, bytes):
+                return data.decode(self.config.encoding, "replace")
+            return data or ""
+
+        return CommandResult(
+            "kill-server",
+            done.returncode if done is not None else 1,
+            text(getattr(done, "stdout", None)),
+            text(getattr(done, "stderr", None)) if done is not None else "adb could not be run",
+            time.time() - start,
+            device=self._serial or "",
+            started_at=start,
+        )
+
+    def _start_local_server(self, timeout: float) -> CommandResult:
+        """Start the local server through :func:`tools.ensure_adb_server`, the
+        one starter, so a restart joins (never races) a start already under
+        way and TurboADB knows it started the new server."""
+        from .tools import ensure_adb_server, last_adb_server_error
+
+        start = time.time()
+        ok = ensure_adb_server(self.adb_path, timeout=timeout, port=self.config.adb_server_port)
+        return CommandResult(
+            "start-server",
+            0 if ok else 1,
+            "",
+            "" if ok else (last_adb_server_error() or "the adb server did not start"),
+            time.time() - start,
+            device=self._serial or "",
+            started_at=start,
+        )
 
     def stop_server(self, *, safe: Optional[bool] = None):
         """Stop the adb server this handler talks to (``adb kill-server``).
@@ -874,13 +1363,21 @@ class ADBHandler:
         return self._guard("go_wireless", _do, safe=safe)
 
     def connect_tcp(self, host: str, port: int = 5555, *, safe: Optional[bool] = None):
-        """``adb connect host:port`` and switch this handler to that target."""
+        """``adb connect host:port`` and switch this handler to that target.
+
+        A device that has not authorised this PC yet is waited for (up to
+        ``connect_timeout``, unless ``auto_wait`` is off) while someone accepts
+        its "Allow USB debugging?" prompt."""
 
         def _do():
             target = format_host_port(host, port)
-            owned = self._adb_connect(target, 20)
-            self._owned_target = target if owned else None
-            self._serial = target
+            made = self._adb_connect(target, 20)
+            if made == "unauthorized" and self.config.auto_wait:
+                # switched only once it answers: like any failed connect, a
+                # prompt nobody accepts leaves the handler on the device it
+                # had (go_wireless on a tab keeps its USB device)
+                self._await_authorization(target, self.config.connect_timeout)
+            self._use_target(target, owned=made != "already")
             self.config.host, self.config.port = host, int(port)
             return self._serial
 
@@ -903,6 +1400,8 @@ class ADBHandler:
                 raise ADBTimeoutError(
                     f"adb pair {format_host_port(host, port)} timed out after 30s"
                 ) from exc
+            except OSError as exc:
+                raise ADBError(f"adb executable not runnable: {exc}") from exc
             out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
             if "Successfully paired" not in out:
                 raise ADBConnectionError(f"Pairing failed: {out.strip()}")
@@ -920,17 +1419,14 @@ class ADBHandler:
         args = ["reboot"] + ([mode] if mode else [])
         return self._guard("reboot", lambda: self._run(args, timeout=30, check=False).ok, safe=safe)
 
-    def _checked_adb(self, args, markers, *, timeout=30, success_marker=None, shell=False):
+    def _checked_adb(self, args, markers, *, timeout=30, shell=False):
         """Run *args*; raise ADBCommandError on a non-zero exit or when the
         output contains one of *markers* (these commands often exit 0 while
-        refusing). *success_marker* in the output overrides the markers.
-        Returns the combined output, or "ok" when there was none."""
+        refusing). Returns the combined output, or "ok" when there was none."""
         res = self._run(self._shell_args(*args) if shell else list(args), timeout=timeout)
         text = self._combined_output(res)
         low = text.lower()
         refused = any(m in low for m in markers)
-        if success_marker and success_marker in low:
-            refused = False
         if not res.ok or refused:
             raise self._command_error(" ".join(("shell",) + tuple(args)) if shell else " ".join(args), res)
         return text or "ok"
@@ -959,19 +1455,27 @@ class ADBHandler:
         )
 
     _REMOUNT_REFUSALS = ("remount failed", "not running as root", "permission denied", "error:")
+    _REMOUNT_REBOOT_NOTE = (
+        "Reboot the device and run adb remount again: /system stays read-only until then."
+    )
 
     def remount(self, *, safe: Optional[bool] = None):
-        """Remount /system (and friends) read-write (needs root)."""
-        return self._guard(
-            "remount",
-            lambda: self._checked_adb(
-                ["remount"],
-                self._REMOUNT_REFUSALS,
-                timeout=60,
-                success_marker="remount succeeded",
-            ),
-            safe=safe,
-        )
+        """Remount /system (and friends) read-write (needs root). Returns adb's
+        output; raises ADBCommandError when the remount is refused.
+
+        On Android 10+ the first remount may only set up overlayfs (or turn
+        verity off) and ask for a reboot: the partitions stay read-only until
+        then. That is logged as a warning and said at the end of the returned
+        text. :meth:`make_writable` reboots and remounts by itself."""
+
+        def _do():
+            text, reboot_needed = self._remount_once()
+            if reboot_needed:
+                self._emit(logging.WARNING, f"adb remount: {self._REMOUNT_REBOOT_NOTE}")
+                text = f"{text}\n{self._REMOUNT_REBOOT_NOTE}"
+            return text
+
+        return self._guard("remount", _do, safe=safe)
 
     # "Now reboot your device for settings to take effect", "Reboot the device
     # for changes to take effect": adbd changed verity/overlayfs and needs a boot.
@@ -1250,6 +1754,10 @@ class ADBHandler:
                 chunks.append(piece.replace(" ", "%s"))
         return chunks
 
+    @staticmethod
+    def _characters(count: int) -> str:
+        return f"{count} character{'' if count == 1 else 's'}"
+
     def input_text(
         self,
         text: str,
@@ -1258,13 +1766,22 @@ class ADBHandler:
         safe: Optional[bool] = None,
     ):
         """Type *text* into the currently focused field on the device — works as
-        a keyboard for head units / devices with no on-screen keyboard."""
+        a keyboard for head units / devices with no on-screen keyboard.
+
+        The text is often a password or a PIN, so the log (and the log file)
+        only ever says how many characters were typed."""
 
         def _do():
             disp = self._display_flag(display_id)
+            label = f"type {self._characters(len(str(text)))}"
             for chunk in self._input_text_chunks(text):
+                # %s is the space escape: count the characters it types
+                typed = self._characters(len(chunk.replace("%s", " ")))
                 res = self._logged_run(
-                    f"type {text!r}", self._shell_args("input", *disp, "text", chunk), timeout=15
+                    label,
+                    self._shell_args("input", *disp, "text", chunk),
+                    timeout=15,
+                    log_as=" ".join(["shell", "input", *disp, "text", f"<{typed}>"]),
                 )
                 if not res.ok:
                     return False
@@ -1288,9 +1805,14 @@ class ADBHandler:
             safe=safe,
         )
 
-    # A tap costs about this long, without any rate limit: one `input` call
-    # starts a JVM on the device, while `sendevent` is a small native tool.
-    _BURST_TAP_SECONDS = {"input": 0.25, "events": 0.05}
+    # The longest one tap may take before a burst counts as stalled, without
+    # any rate limit: one `input` call starts a JVM on the device (up to a
+    # second or so on an automotive SoC), while `sendevent` is a small native
+    # tool.  A burst is ended when the device reports no progress for that
+    # long per tap between two progress lines (see _run_burst); its total
+    # time alone never ends it, since a slow device is still a working one.
+    _BURST_TAP_SECONDS = {"input": 2.0, "events": 0.5}
+    _BURST_QUIET_SLACK_S = 60.0  # on top: adb starting, a busy device
     _BURST_MAX_TAPS = 1_000_000
 
     def touch_device(self, *, refresh: bool = False, safe: Optional[bool] = None):
@@ -1317,10 +1839,26 @@ class ADBHandler:
         device = touch.pick_touch_device(touch.parse_touch_devices(text))
         writable = False
         if device is not None:
-            writable = self._run(self._shell_args("test", "-w", device.path),
-                                 timeout=15, check=False).ok
+            # Read the answer, not the exit code: before Android 7 (no shell
+            # protocol) `adb shell` exits 0 whatever the command did.
+            probe = f"test -w {shlex.quote(device.path)} && echo @@writable"
+            res = self._run(["shell", probe], timeout=15, check=False)
+            writable = "@@writable" in res.text
         self._touch = (device, writable)
         return self._touch
+
+    def _touch_rotation(self, device, screen) -> Optional[int]:
+        """Quarter turns between the touchscreen's reports and the display:
+        what ``dumpsys input`` says Android applies to that panel, else 0 when
+        the panel's shape matches the display's. None when neither tells."""
+        try:
+            text = self._run(["shell", "dumpsys", "input"], timeout=15).text
+        except ADBError:
+            text = ""
+        turns = touch.input_rotation(text, device.name)
+        if turns is not None:
+            return turns
+        return 0 if touch.looks_rotated(screen, device) is False else None
 
     def _burst_taps(self, count, rate, duration) -> int:
         """How many taps a burst makes, from *count* or *rate*+*duration*."""
@@ -1342,7 +1880,10 @@ class ADBHandler:
 
         ``"events"`` needs a touchscreen the shell may write to, and sends to
         whichever display that screen belongs to — so a burst aimed at another
-        display always goes through ``input``."""
+        display always goes through ``input``. The panel reports in its own
+        orientation, so on a turned display ``"auto"`` taps through ``input``
+        as well, and ``"events"`` turns the point back the way Android turns
+        the panel's reports."""
         wanted = (method or "auto").lower()
         if wanted not in ("auto", "input", "events"):
             raise ValueError('method must be "auto", "input" or "events"')
@@ -1363,11 +1904,19 @@ class ADBHandler:
                     "display with method='input'")
         if wanted == "auto" and (device is None or not writable or display_id is not None):
             device = None
+        if device is not None:
+            screen = self._gesture_size(display_id=None)
+            rotation = self._touch_rotation(device, screen)
+            if wanted == "auto" and rotation != 0:
+                device = None  # `input` maps a turned display itself
+            elif rotation is None:
+                raise ADBError(
+                    f"could not tell how the display is turned against {device.path} "
+                    "('dumpsys input' does not say) — use method='input'")
         if device is None:
             flag = self._display_flag(display_id)
             return "input", touch.input_tap(int(x), int(y), flag), None
-        screen = self._gesture_size(display_id=None)
-        ev_x, ev_y = touch.scale_point(int(x), int(y), screen, device)
+        ev_x, ev_y = touch.scale_point(int(x), int(y), screen, device, rotation)
         return "events", touch.sendevent_tap(device, ev_x, ev_y), device
 
     def tap_burst(
@@ -1393,11 +1942,13 @@ class ADBHandler:
         *rate* caps taps per second (a delay between taps, so it is an upper
         bound); *duration* with *rate* says how long to keep tapping instead of
         how many taps. *on_progress(done, total)* is called as the device
-        reports its progress.
+        reports its progress. The burst runs as long as the device keeps
+        reporting progress; *timeout* (seconds) caps the whole burst as well.
 
         Returns ``{"method", "taps", "seconds", "rate", "device"}``. Raises
         ADBError when the device stopped tapping early (for example when it
-        refused the events)."""
+        refused the events). With ``"auto"``, a touchscreen that refuses the
+        very first event gets the whole burst through ``input`` instead."""
 
         def _do():
             if rate is not None and float(rate) <= 0:
@@ -1406,29 +1957,28 @@ class ADBHandler:
             chosen, command, device = self._burst_command(x, y, method=method,
                                                           display_id=display_id)
             sleep_s = 1.0 / float(rate) if rate else 0.0
-            every = max(1, min(100, taps // 20)) if taps > 20 else 0
-            script = touch.burst_script(command, taps, sleep_s=sleep_s, progress_every=every)
-            per_tap = sleep_s + self._BURST_TAP_SECONDS[chosen]
-            limit = float(timeout) if timeout else max(60.0, taps * per_tap + 30.0)
             self._emit(logging.INFO,
                        f"tapping {x},{y} {taps} times ({chosen})"
                        + (f" at up to {rate:g}/s" if rate else ""))
-            done, problems = 0, []
-            keep_problems = 5  # only problems[:3] is ever reported
-            started = time.monotonic()
-            for line in self.iter_lines(["shell", script], timeout=limit):
-                value = touch.parse_progress(line)
-                if value is None:
-                    if line.strip():
-                        if len(problems) < keep_problems:
-                            problems.append(line.strip())
-                    continue
-                done = value
-                if on_progress is not None:
-                    on_progress(done, taps)
-            elapsed = max(time.monotonic() - started, 1e-6)
+            done, problems, elapsed, stalled = self._run_burst(
+                command, taps, chosen, sleep_s, on_progress, timeout)
+            refused = next((n for n in map(touch.refused_after, problems) if n is not None), None)
+            if (done < taps and chosen == "events" and refused == 0
+                    and (method or "auto").lower() == "auto"):
+                # `test -w` said yes, but the node refused the first event (an
+                # SELinux rule, say): nothing was tapped, so `input` can do it all
+                self._touch = (device, False)
+                self._emit(logging.WARNING,
+                           f"{device.path} refused the touch events; tapping with input instead")
+                chosen, command, device = "input", touch.input_tap(int(x), int(y)), None
+                done, problems, elapsed, stalled = self._run_burst(
+                    command, taps, chosen, sleep_s, on_progress, timeout)
             if done < taps:
-                detail = "; ".join(problems[:3]) or f"it stopped after {done} of {taps} taps"
+                if stalled:
+                    detail = (f"the device reported no progress for {stalled:g} s "
+                              f"(after {done} of {taps} taps)")
+                else:
+                    detail = "; ".join(problems[:3]) or f"it stopped after {done} of {taps} taps"
                 raise ADBError(f"the tap burst did not finish: {detail}")
             return {
                 "method": chosen,
@@ -1439,6 +1989,50 @@ class ADBHandler:
             }
 
         return self._guard("tap_burst", _do, safe=safe)
+
+    def _run_burst(self, command, taps, chosen, sleep_s, on_progress, timeout):
+        """Run one burst loop on the device.
+
+        Returns ``(done, problems, seconds, stalled)``: the taps the device
+        reported, the other lines it printed (the first few), the time it took,
+        and — when it went quiet for too long and was ended — that limit in
+        seconds, else 0."""
+        every = max(1, min(100, taps // 20)) if taps > 20 else 0
+        script = touch.burst_script(command, taps, sleep_s=sleep_s, progress_every=every)
+        per_tap = sleep_s + self._BURST_TAP_SECONDS[chosen]
+        # A progress line comes every *every* taps (a short burst reports only
+        # at its end): silence for that many slow taps means it hangs.
+        quiet = (every or taps) * per_tap + self._BURST_QUIET_SLACK_S
+        limit = float(timeout) if timeout else taps * per_tap + quiet  # a backstop
+        heard = [time.monotonic()]
+        silent, finished = threading.Event(), threading.Event()
+
+        def _watch():
+            while not finished.wait(0.5):
+                if time.monotonic() - heard[0] > quiet:
+                    silent.set()
+                    return
+
+        threading.Thread(target=_watch, name="turboadb-burst-watch", daemon=True).start()
+        done, problems = 0, []
+        keep_problems = 5  # only problems[:3] is ever reported
+        started = time.monotonic()
+        try:
+            for line in self.iter_lines(["shell", script], timeout=limit, stop_event=silent):
+                heard[0] = time.monotonic()
+                value = touch.parse_progress(line)
+                if value is None:
+                    if line.strip():
+                        if len(problems) < keep_problems:
+                            problems.append(line.strip())
+                    continue
+                done = value
+                if on_progress is not None:
+                    on_progress(done, taps)
+        finally:
+            finished.set()
+        elapsed = max(time.monotonic() - started, 1e-6)
+        return done, problems, elapsed, (quiet if silent.is_set() else 0)
 
     def swipe(
         self,
@@ -2508,21 +3102,29 @@ class ADBHandler:
         Never raises: a lookup that fails or times out means "no ``--user``",
         and that answer is cached like any other, so a slow device doesn't
         wait again for every query."""
-        cached = self._foreground_user_cache
-        now = time.monotonic()
-        if cached and cached[0] == self._serial and now - cached[1] < self._FOREGROUND_USER_TTL:
-            return cached[2]
-        try:
-            res = self._run(
-                ["shell", "am", "get-current-user"], timeout=self._FOREGROUND_USER_TIMEOUT
-            )
-        except ADBError as exc:
-            self._emit(logging.DEBUG, f"foreground user unknown, querying the default user: {exc}")
-            user = None
-        else:
-            user = (self.parse_current_user(res.text) if res.ok else None) or None  # 0 = default
-        self._foreground_user_cache = (self._serial, now, user)
-        return user
+        # Held across the lookup: the Phone page reads the call log and the
+        # messages on two workers at once, and the second now waits for the
+        # first one's answer instead of asking the device again. setdefault is
+        # atomic, so both get the same lock.
+        with self.__dict__.setdefault("_foreground_user_lock", threading.Lock()):
+            cached = self._foreground_user_cache
+            now = time.monotonic()
+            if cached and cached[0] == self._serial and now - cached[1] < self._FOREGROUND_USER_TTL:
+                return cached[2]
+            try:
+                res = self._run(
+                    ["shell", "am", "get-current-user"], timeout=self._FOREGROUND_USER_TIMEOUT
+                )
+            except ADBError as exc:
+                self._emit(
+                    logging.DEBUG, f"foreground user unknown, querying the default user: {exc}"
+                )
+                user = None
+            else:
+                # 0 is the default user: no --user needed
+                user = (self.parse_current_user(res.text) if res.ok else None) or None
+            self._foreground_user_cache = (self._serial, now, user)
+            return user
 
     def _query_rows(self, uri, fields, limit, free_last=False):
         """Run ``content query`` and parse its ``Row: N k=v, ...`` records.
@@ -3021,14 +3623,56 @@ class ADBHandler:
     ):
         """Run a one-shot ``adb shell`` command. Returns CommandResult.
 
-        *su=True* wraps the command in ``su -c`` for rooted devices.
+        *su=True* runs it as root: through the device's ``su`` in the form that
+        su takes (``su -c`` for Magisk and SuperSU, ``su 0 sh -c`` for the su
+        of userdebug and eng builds), or as it is when adbd already runs as
+        root (``adb root``).
         """
 
         def _do():
-            cmd = f"su -c {shlex.quote(command)}" if su else command
+            cmd = self._as_root(command) if su else command
             return self._logged_run("shell", ["shell", cmd], timeout=timeout, check=check)
 
         return self._guard("shell", _do, safe=safe)
+
+    # Which form this device's su takes, asked once per device: "c" is
+    # `su -c CMD` (Magisk, SuperSU, KernelSU), "0" is `su 0 sh -c CMD` (AOSP's
+    # su on userdebug and eng builds — the usual rooted head unit — takes a
+    # user and a command, and rejects -c as "invalid uid/gid"), "none" is no
+    # su that gives root. stdin is /dev/null so a su that ignores its
+    # arguments and waits for input ends at once.
+    _SU_PROBE = (
+        'case "$(su -c id 2>&1 </dev/null)" in *"uid=0("*) echo @@su=c;; '
+        '*) case "$(su 0 sh -c id 2>&1 </dev/null)" in *"uid=0("*) echo @@su=0;; '
+        '*) echo @@su=none;; esac;; esac'
+    )
+
+    def _su_form(self) -> str:
+        """``"c"``, ``"0"`` or ``"none"`` (see :attr:`_SU_PROBE`), cached per
+        device; ``""`` while the device could not be asked."""
+        key = self._serial or ""
+        form = self._su_forms.get(key)
+        if form is None:
+            try:
+                # 30 s: Magisk asks on the device's screen before it grants root
+                res = self._run(["shell", self._SU_PROBE], timeout=30, check=False)
+            except ADBError:
+                return ""
+            found = re.search(r"@@su=(c|0|none)\b", res.text)
+            form = found.group(1) if found else ""
+            if form:
+                self._su_forms[key] = form
+        return form
+
+    def _as_root(self, command: str) -> str:
+        """*command* as a shell line that runs it as root: as it is when adbd
+        is root already (checked on the device each time, since ``adb root``
+        and ``unroot`` change it), else through su in this device's form.
+        Without a working su it stays ``su -c``, so the device's own error
+        comes back."""
+        inner = shlex.quote(command)
+        via_su = f"su 0 sh -c {inner}" if self._su_form() == "0" else f"su -c {inner}"
+        return f'case "$(id)" in "uid=0("*) sh -c {inner};; *) {via_su};; esac'
 
     def shell_many(
         self,
@@ -3069,6 +3713,19 @@ class ADBHandler:
         you get a real interactive shell — prompt, character echo, line editing,
         and full-screen apps — exactly like a native console. Set it False for a
         raw, non-echoing pipe (e.g. when scripting a send/expect flow yourself).
+        A device without shell_v2 (Android 6 and older) gives a terminal either
+        way; a build that allows none, or an adb too old for ``-t``, ends the
+        session at once.
+
+        The session passes bytes through unchanged, so with a terminal:
+
+        * output lines end in CR LF, which adb.exe on Windows (its stdout is in
+          text mode) writes as CR CR LF;
+        * end every line you send with a LF only: adb on Linux and macOS hands
+          a CR to the terminal as is (a second Enter), and adb.exe holds a
+          trailing bare CR back until the next byte arrives;
+        * ``\\x03`` is Ctrl+C for the device command; never send ``\\x1a``,
+          which is end of input to adb.exe: it then forwards nothing more.
         """
 
         def _do():
@@ -3087,11 +3744,60 @@ class ADBHandler:
 
         return self._guard("open_shell", _do, safe=safe)
 
-    def interactive_shell(self) -> int:
+    def resize_terminal(self, tty: str, columns: int, rows: int, *, safe: Optional[bool] = None):
+        """Give the device terminal *tty* (``/dev/pts/N``, what ``tty`` prints
+        in its shell) a new size, as a terminal window does when it is
+        resized: the kernel tells the program running on it (SIGWINCH), so a
+        full-screen program such as ``top`` or ``vi`` can redraw for it, and
+        nothing is typed into that program.  adb cannot resize a shell whose
+        input is a pipe (what :meth:`open_shell` gives), so this runs
+        ``stty -F`` in a one-shot ``adb shell``."""
+
+        def _do():
+            if not re.fullmatch(r"/dev/pts/\d+", tty or ""):
+                raise ADBError(f"not a device terminal: {tty!r}")
+            command = f"stty -F {tty} cols {int(columns)} rows {int(rows)}"
+            return self._logged_run("resize terminal", ["shell", command], timeout=10, check=True)
+
+        return self._guard("resize_terminal", _do, safe=safe)
+
+    def interactive_shell(
+        self, command: Optional[str] = None, *, su: bool = False, timeout: Optional[float] = None
+    ) -> int:
         """Run ``adb shell`` attached to this console (stdin, stdout and stderr
-        inherited) until the user leaves it, and return its exit code — the
-        interactive ``turboadb shell`` with no command."""
-        return subprocess.call(self._base(target=True) + ["shell"])
+        inherited) and return its exit code: with no *command*, the interactive
+        ``turboadb shell`` until the user leaves it; with one, that command, its
+        output shown as it is written (``turboadb shell -- ping …``).  *su*
+        runs the command as root, as :meth:`shell` does; *timeout* is
+        :meth:`run_attached`'s."""
+        args = ["shell"]
+        if command:
+            args.append(self._as_root(command) if su else command)
+        return self.run_attached(args, timeout=timeout)
+
+    def run_attached(self, args: Sequence[str], *, timeout: Optional[float] = None) -> int:
+        """Run ``adb -s SERIAL <args>`` attached to this console and return its
+        exit code.  stdin, stdout and stderr are inherited, as in a terminal:
+        output appears as adb writes it (a streaming ``logcat``, binary
+        ``exec-out`` data redirected to a file) and adb can read input.
+
+        *timeout* (seconds; None waits as long as it takes) ends a command that
+        runs longer: adb is killed and ADBTimeoutError raised, after everything
+        it printed has been shown.  Ctrl+C reaches adb too (it shares the
+        console); adb is ended before the KeyboardInterrupt goes on, so it
+        never outlives the caller."""
+        cmd = self._base(target=True) + list(args)
+        self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
+        try:
+            # call() kills and reaps the child on any exception, Ctrl+C included
+            return subprocess.call(cmd, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise ADBTimeoutError(
+                f"adb command timed out after {timeout:g}s: {' '.join(args)!r}"
+            ) from None
+        except OSError as exc:
+            # not only a missing adb (see _exec): a locked or quarantined one too
+            raise ADBError(f"adb executable not runnable: {exc}") from exc
 
     def wait_for_boot(self, timeout: float = 180, *, safe: Optional[bool] = None):
         """After a reboot: wait until adb sees the device again and Android
@@ -3132,21 +3838,39 @@ class ADBHandler:
         timeout: Optional[float] = None,
         stop_event=None,
         encoding: str = "utf-8",
+        stderr: str = "merge",
+        status: Optional[dict] = None,
     ):
         """Run an adb command and yield its stdout **line by line, live**. Stop
         by breaking out, setting ``stop_event`` (a threading.Event), or after
-        ``timeout`` seconds. The process is always terminated on exit."""
+        ``timeout`` seconds. The process is always terminated on exit.
+
+        *stderr* ``"merge"`` (the default) yields adb's error text as ordinary
+        lines; ``"separate"`` keeps it out of them (it is drained in the
+        background, so it can never block adb).  Pass a dict as *status* to
+        learn how the command ended once the generator is done: ``returncode``,
+        ``stderr`` (the text, with ``"separate"``) and ``stopped`` — True when
+        *stop_event*, *timeout* or the consumer ended the stream, not the
+        command itself."""
+        if stderr not in ("merge", "separate"):
+            raise ValueError("stderr must be 'merge' or 'separate'")
+        separate = stderr == "separate"
         cmd = self._base(target=True) + list(args)
         proc = subprocess.Popen(
             cmd,
+            # never the caller's stdin: `adb shell CMD` would forward it to the device
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE if separate else subprocess.STDOUT,
             bufsize=0,
             creationflags=NO_WINDOW,
         )
+        if separate:
+            self._drain_stderr(proc)
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}  (streaming)")
         start = time.monotonic()
         buf = b""
+        ended = False  # the command itself finished (EOF and exit)
 
         # A watcher thread terminates the process the instant a stop is requested
         # (or the timeout elapses) so a blocking read on a quiet stream — e.g.
@@ -3181,7 +3905,8 @@ class ADBHandler:
                 )
                 if chunk == b"":
                     if proc.poll() is not None:
-                        break  # process ended (or was terminated by the watcher)
+                        ended = True  # (or the watcher terminated it: see *stopped*)
+                        break
                     time.sleep(0.03)
                     continue
                 buf += chunk
@@ -3196,37 +3921,50 @@ class ADBHandler:
                 yield buf.decode(encoding, errors="replace").rstrip("\r")
         finally:
             watcher_done.set()
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-                if proc.stdout:
-                    proc.stdout.close()
-                proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    pass
+            stopped = (
+                not ended
+                or (stop_event is not None and stop_event.is_set())
+                or bool(timeout and (time.monotonic() - start) > timeout)
+            )
+            err = b""
+            if separate and not stopped:
+                # adb's last words are usually why it ended: let the drain finish
+                err = self.collected_stderr(proc, wait=1.0)
+            code = self._stop_process(proc, close_pipes=True)
+            if separate and stopped:
+                err = self.collected_stderr(proc, wait=0.2)
             try:
                 watcher.join(timeout=1.0)
             except Exception:
                 pass
+            if status is not None:
+                status.update(
+                    returncode=code,
+                    stopped=stopped,
+                    stderr=err.decode(encoding, errors="replace"),
+                )
 
     # Longest line iter_lines will assemble before flushing it as-is. A
     # stream that never sends a newline must not grow the buffer forever.
     _MAX_LINE_BYTES = 4 * 1024 * 1024
 
-    def popen(self, args: Sequence[str]):
-        """Spawn ``adb -s SERIAL <args>`` and return the raw Popen (stdout pipe,
-        stderr merged). The caller owns it — read its stdout, and ``kill()`` +
-        ``stdout.close()`` to stop a blocking read immediately. Used by the GUI
-        logcat viewer for instant stop."""
+    def popen(self, args: Sequence[str], *, stderr: str = "merge"):
+        """Spawn ``adb -s SERIAL <args>`` and return the raw Popen (stdout pipe;
+        stdin is never inherited). The caller owns it — read its stdout, and
+        ``kill()`` + ``stdout.close()`` to stop a blocking read immediately.
+        Used by the GUI logcat viewer for instant stop.
+
+        *stderr* ``"merge"`` (the default) folds adb's error text into stdout;
+        ``"pipe"`` gives it a pipe of its own, which the caller must keep
+        reading (or hand to :meth:`_drain_stderr`) so adb never blocks on it."""
+        if stderr not in ("merge", "pipe"):
+            raise ValueError("stderr must be 'merge' or 'pipe'")
         cmd = self._base(target=True) + list(args)
         return subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE if stderr == "pipe" else subprocess.STDOUT,
             bufsize=0,
             creationflags=NO_WINDOW,
         )
@@ -3246,6 +3984,7 @@ class ADBHandler:
         timeout: Optional[float] = None,
         stop_event=None,
         encoding: str = "utf-8",
+        stderr: str = "merge",
         safe: Optional[bool] = None,
     ):
         """Consume a streaming adb command with built-in matching + file logging.
@@ -3254,17 +3993,31 @@ class ADBHandler:
         *keep* is an optional predicate applied first: a line it rejects is
         dropped entirely — not counted, not written to *save_to*, not matched
         and not passed to *on_line*. *save_to* is expanded (``~``) and its
-        folder created, as for :meth:`screenshot`."""
+        folder created, as for :meth:`screenshot`.
+
+        The result says how the command ended: ``exit_code`` is its exit status
+        when it ended by itself (None when *stop_event*, *timeout*,
+        *stop_on_match* or a failing callback ended it), and with
+        ``stderr="separate"`` (see :meth:`iter_lines`) adb's error text is in
+        ``stderr`` — kept out of the lines, so *keep* can never hide it.  A
+        command that fails before printing a single line raises
+        ADBCommandError (a failed result in safe mode); one that fails later
+        returns what it streamed and logs a warning."""
 
         def _do():
             pat = re.compile(match) if isinstance(match, str) else match
-            matches, count = [], 0
+            matches, count, received = [], 0, 0
+            started = time.time()
             path = self._prepare_local_path(save_to)
             fh = open(path, "a" if append else "w", encoding=encoding) if path else None
+            status = {}
+            lines = self.iter_lines(
+                args, timeout=timeout, stop_event=stop_event, encoding=encoding,
+                stderr=stderr, status=status,
+            )
             try:
-                for line in self.iter_lines(
-                    args, timeout=timeout, stop_event=stop_event, encoding=encoding
-                ):
+                for line in lines:
+                    received += 1
                     if clean:
                         line = strip_ansi(line)
                     if keep is not None and not keep(line):
@@ -3283,12 +4036,127 @@ class ADBHandler:
                             on_match(line)
                         if stop_on_match:
                             break
-                return StreamResult(count, matches, path)
             finally:
+                # Ends adb at once (stop_on_match, a failing callback) and
+                # fills *status* before it is read below.
+                close = getattr(lines, "close", None)
+                if close is not None:
+                    close()
                 if fh:
                     fh.close()
+            code = None if status.get("stopped", True) else status.get("returncode")
+            err = status.get("stderr") or ""
+            if code not in (None, 0):
+                command = " ".join(args)
+                if not received:
+                    raise ADBCommandError(command, CommandResult(
+                        command, code, "", err, time.time() - started,
+                        device=self._serial or "", started_at=started,
+                    ))
+                detail = " ".join(err.split())[:240] or "no error text"
+                self._emit(logging.WARNING, f"adb {command} ended with exit {code}: {detail}")
+            return StreamResult(count, matches, path, exit_code=code, stderr=err)
 
         return self._guard("stream", _do, safe=safe)
+
+    # logcat's own vocabulary: the priority letters, and the time form its -t
+    # and -T take besides a line count ('MM-DD hh:mm:ss.mmm', as threadtime
+    # prints it).
+    _LOGCAT_PRIORITIES = "VDIWEFS"
+    _LOGCAT_TIME_RE = re.compile(r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d+$")
+
+    @classmethod
+    def logcat_args(
+        cls,
+        *,
+        buffers: Optional[Sequence[str]] = None,
+        fmt: str = "threadtime",
+        tag=None,
+        priority: Optional[str] = None,
+        filterspecs: Optional[Sequence[str]] = None,
+        dump: bool = False,
+        tail=None,
+        crashes: bool = False,
+        pid=None,
+    ) -> list:
+        """The ``adb logcat`` arguments for these options, starting with
+        ``"logcat"`` — the one builder behind :meth:`logcat`, the CLI and the
+        GUI's Logcat tab.  It runs nothing; see :meth:`logcat` for the options.
+        Raises ValueError for a *tail*, *priority* or *pid* logcat can't take."""
+        use_buffers, use_priority = buffers, priority
+        if crashes:
+            use_buffers = use_buffers or ["crash", "main", "system"]
+            use_priority = use_priority or "E"
+        if use_priority:
+            use_priority = str(use_priority).strip().upper()
+            if len(use_priority) != 1 or use_priority not in cls._LOGCAT_PRIORITIES:
+                raise ValueError(f"priority must be one of V, D, I, W, E, F or S, not {priority!r}")
+        args = ["logcat"]
+        if pid is not None:
+            text = str(pid).strip()
+            if not text.isdigit() or int(text) < 1:
+                raise ValueError(f"not a process id: {pid!r}")
+            args.append(f"--pid={int(text)}")  # Android 7+
+        if dump:
+            args.append("-d")
+        if tail is not None:
+            # -T starts the live stream there; when dumping, the matching flag
+            # is -t (only the last lines, then exit)
+            args += ["-t" if dump else "-T", cls._logcat_tail(tail)]
+        if fmt:
+            args += ["-v", fmt]
+        for b in use_buffers or []:
+            args += ["-b", b]
+        if filterspecs:
+            args += list(filterspecs)  # verbatim, as logcat takes them: no implied *:S
+        else:
+            tags = cls._logcat_tags(tag)
+            if tags:
+                level = use_priority or "V"
+                args += [t if ":" in t else f"{t}:{level}" for t in tags] + ["*:S"]
+            elif use_priority:
+                args.append(f"*:{use_priority}")
+        return args
+
+    @classmethod
+    def _logcat_tail(cls, tail) -> str:
+        """-t/-T's value: at least one line, or a logcat time."""
+        if isinstance(tail, str) and cls._LOGCAT_TIME_RE.match(tail.strip()):
+            return tail.strip()
+        try:
+            count = int(tail)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"tail must be a number of lines or a time like '09-27 12:00:00.000', not {tail!r}"
+            ) from None
+        if count < 1:
+            # logcat itself would read 0 as "the whole buffer"
+            raise ValueError(f"tail must be at least 1 line, not {tail!r}")
+        return str(count)
+
+    @staticmethod
+    def _logcat_tags(tag) -> list:
+        """Tags from ``"A, B"``, ``"A B"`` or a list.  logcat compares each one
+        exactly (case-sensitive) and splits specs on spaces and commas itself,
+        so a tag can't contain either.  ``TAG:LEVEL`` words stay as given."""
+        if not tag:
+            return []
+        words = [tag] if isinstance(tag, str) else [str(t) for t in tag]
+        return [w for word in words for w in re.split(r"[\s,]+", word) if w]
+
+    def pid_of(self, name: str, *, safe: Optional[bool] = None):
+        """The PID of the running process *name* — an app's package name — or
+        None when nothing by that name runs (``pidof -s``)."""
+
+        def _do():
+            target = str(name or "").strip()
+            if not target or any(ch.isspace() for ch in target):
+                raise ValueError(f"not a process or package name: {name!r}")
+            res = self._run(self._shell_args("pidof", "-s", target), timeout=15)
+            words = res.text.split() if res.ok else []
+            return int(words[0]) if words and words[0].isdigit() else None
+
+        return self._guard("pid_of", _do, safe=safe)
 
     def logcat(
         self,
@@ -3302,6 +4170,8 @@ class ADBHandler:
         tail: Optional[int] = None,
         grep: Optional[str] = None,
         crashes: bool = False,
+        pid: Optional[int] = None,
+        package: Optional[str] = None,
         on_line=None,
         on_match=None,
         match=None,
@@ -3320,63 +4190,69 @@ class ADBHandler:
 
         :param buffers:    logcat buffers, e.g. ``["main","system","crash"]``.
         :param fmt:        logcat ``-v`` format (default ``threadtime``).
-        :param tag:        single tag filter; pairs with *priority*. Implies
-                           ``*:S`` (silence everything else).
+        :param tag:        tag filter: one tag or several (``"A, B"``, ``"A B"``
+                           or a list), each matched exactly (case-sensitive);
+                           pairs with *priority*. Implies ``*:S`` (silence
+                           everything else).
         :param priority:   minimum priority letter (V/D/I/W/E/F). With *tag* it
-                           filters that tag; alone it sets ``*:PRIORITY``.
-        :param filterspecs: explicit ``TAG:LEVEL`` specs (overrides tag/priority).
+                           filters those tags; alone it sets ``*:PRIORITY``.
+        :param filterspecs: explicit ``TAG:LEVEL`` specs (overrides tag/priority),
+                           passed as given: like logcat itself they do NOT
+                           silence the other tags — add ``"*:S"`` for that.
         :param dump:       ``-d`` — dump the current buffer and exit (no live).
         :param tail:       ``-T N`` — start from only the last *N* buffered
-                           lines, then stream live. Without it, adb dumps the
-                           device's ENTIRE in-memory log buffer first (often
-                           hundreds of thousands of cached lines) before
-                           following — pass ``tail=1`` for live-only output.
+                           lines (at least 1), then stream live. Without it,
+                           adb dumps the device's ENTIRE in-memory log buffer
+                           first (often hundreds of thousands of cached lines)
+                           before following — pass ``tail=1`` for live-only
+                           output. With *dump* it is ``-t N``, the last N
+                           lines. A logcat time (``"09-27 12:00:00.000"``)
+                           starts from that moment instead.
         :param grep:       case-insensitive regex kept CLIENT-side: only the
                            lines it matches reach *on_line* and *save_to* (and
                            only they are counted). Unlike *filterspecs* it can
                            search the message text, not just tag and level.
+                           adb's own error text never goes through it.
         :param crashes:    crashes and ANRs: defaults *buffers* to
                            crash/main/system and *priority* to ``E`` when the
                            caller set neither.
+        :param pid:        only this process's lines (``--pid``, Android 7+).
+        :param package:    only this app's lines: its running process is looked
+                           up once, when the stream starts (ADBError if it
+                           isn't running). Give *pid* or *package*, not both.
         :param match:      regex; matching lines collected + trigger on_match.
-        :param clear_first: run ``logcat -c`` before streaming (fresh start).
+        :param clear_first: run ``logcat -c`` before streaming (fresh start),
+                           once every option and pattern has been accepted.
+
+        The :class:`StreamResult` has ``exit_code`` and ``stderr`` for a logcat
+        that failed or ended by itself (see :meth:`stream`).
 
         >>> dev.logcat(tag="ActivityManager", priority="I",
         ...            match=r"ANR|FATAL", on_line=print, save_to="boot.log")
         """
 
         def _do():
+            # Everything that can be refused is checked before the device is
+            # touched: a bad pattern must never cost the user their log buffers.
+            spec = dict(buffers=buffers, fmt=fmt, tag=tag, priority=priority,
+                        filterspecs=filterspecs, dump=dump, tail=tail, crashes=crashes)
+            args = self.logcat_args(pid=pid, **spec)
+            pat = re.compile(grep, re.I) if isinstance(grep, str) else grep
+            wanted = re.compile(match) if isinstance(match, str) else match
+            if package:
+                if pid is not None:
+                    raise ValueError("give pid or package, not both")
+                found = self.pid_of(package, safe=False)
+                if found is None:
+                    raise ADBError(f"{package} is not running on the device")
+                args = self.logcat_args(pid=found, **spec)
             if clear_first:
                 self.logcat_clear(safe=False)
-            use_buffers, use_priority = buffers, priority
-            if crashes:
-                use_buffers = use_buffers or ["crash", "main", "system"]
-                use_priority = use_priority or "E"
-            pat = re.compile(grep, re.I) if isinstance(grep, str) else grep
-            args = ["logcat"]
-            if dump:
-                args.append("-d")
-            if tail:
-                # -T N starts the live stream at the last N lines; when dumping
-                # the matching flag is -t N (only the last N lines, then exit)
-                args += ["-t" if dump else "-T", str(int(tail))]
-            if fmt:
-                args += ["-v", fmt]
-            for b in use_buffers or []:
-                args += ["-b", b]
-            if filterspecs:
-                args += list(filterspecs)
-            elif tag and use_priority:
-                args += [f"{tag}:{use_priority}", "*:S"]
-            elif tag:
-                args += [f"{tag}:V", "*:S"]
-            elif use_priority:
-                args += [f"*:{use_priority}"]
             return self.stream(
                 args,
                 on_line=on_line,
                 on_match=on_match,
-                match=match,
+                match=wanted,
                 stop_on_match=stop_on_match,
                 save_to=save_to,
                 append=append,
@@ -3384,6 +4260,7 @@ class ADBHandler:
                 keep=(pat.search if pat is not None else None),
                 timeout=timeout,
                 stop_event=stop_event,
+                stderr="separate",
                 safe=False,
             )
 
@@ -3527,7 +4404,11 @@ class ADBHandler:
         """Copy a device file or folder to *dst* — into *dst* when it is an
         existing folder, merging into a folder of the same name that is already
         there. A folder is never copied into itself (also not through a
-        symlinked path). Returns the new path."""
+        symlinked path); a symbolic link is copied as a link, and never over
+        an existing item or one of another kind. Returns the new path.
+
+        The Files tab's Paste decides with the same rules
+        (``remotefs._copy_decision``)."""
 
         def _do():
             from . import remotefs
@@ -3535,22 +4416,25 @@ class ADBHandler:
             source = remotefs._normalize_remote_path(src)
             target = remotefs._normalize_remote_path(dst)
             info = self._probe_paths([source, target])
-            kind, _is_link, resolved = info[source]
+            kind, is_link, _resolved = info[source]
             if kind == "n":
                 raise ADBError(f"{source}: no such file or folder")
             if info[target][0] == "d":
                 target = posixpath.join(target, posixpath.basename(source))
                 info.update(self._probe_paths([target]))
-            if target == source:
+            folder = posixpath.dirname(target) or "/"
+            if kind == "d" and not is_link:  # where the folder would land, links resolved
+                info.update(self._probe_paths([folder]))
+            problem, _exists, merge = remotefs._copy_decision(source, target, info, folder)
+            if problem == "same":
                 raise ADBError(f"{source}: the source and destination are the same")
-            if kind == "d":
-                real_src = posixpath.normpath(resolved or source)
-                parent = posixpath.dirname(target)
-                real_parent = posixpath.normpath(self._probe_paths([parent])[parent][2] or parent)
-                real_target = posixpath.join(real_parent, posixpath.basename(target))
-                if real_target == real_src or real_target.startswith(real_src.rstrip("/") + "/"):
-                    raise ADBError(f"can't copy the folder {source} into itself")
-            merge = kind == "d" and info[target][0] == "d"
+            if problem == "inside":
+                raise ADBError(f"can't copy the folder {source} into itself")
+            if problem and is_link:
+                raise ADBError(f"can't copy the link {source} over the existing {target}")
+            if problem:
+                raise ADBError(f"can't copy {source} over {target}: "
+                               "a different kind of item is there")
             self._file_command(
                 f"cp {source} {target}", remotefs._copy_into_cmd(source, target, merge), timeout=600
             )
@@ -3590,14 +4474,65 @@ class ADBHandler:
 
         return self._guard("chmod", _do, safe=safe)
 
+    _SAVES = itertools.count(1)  # numbers the temporary copies replace_file pushes
+
+    def replace_file(self, local_path: str, path: str, *, mode: str = "",
+                     safe: Optional[bool] = None):
+        """Put the PC file *local_path* in place of the device file *path*.
+
+        ``adb push`` deletes a file before writing it anew, so a push cut off
+        halfway (a loose cable, a full disk) left no file at all, and the new
+        one had adb's owner and mode. The copy is pushed next to the file
+        under a temporary name instead and then written over it on the device
+        (see remotefs._write_over_cmd): the file keeps its owner, mode and
+        SELinux label, a link is written through, and a failed push leaves
+        the file as it was. The temporary copy is removed either way.
+        Returns the file's octal mode (*mode* when the device can't say).
+        :meth:`edit_file` and the Files tab's editor and Open save through this."""
+
+        def _do():
+            from . import remotefs
+
+            target = remotefs._normalize_remote_path(path)
+            kept = str(mode or "")
+            try:
+                res = self.shell(remotefs._mode_cmd(target), timeout=30, safe=False)
+                lines = remotefs._output_lines(res.stdout) if res.ok else []
+                if lines and re.fullmatch(r"[0-7]{3,4}", lines[0].strip()):
+                    kept = lines[0].strip()
+            except (ADBError, OSError):
+                pass
+            temp = posixpath.join(posixpath.dirname(target) or "/",
+                                  f".turboadb-save-{os.getpid()}-{next(self._SAVES)}")
+            try:
+                self.push(local_path, temp, safe=False)
+                try:
+                    size = os.path.getsize(local_path)
+                except OSError:
+                    size = 0
+                res = self.shell(remotefs._write_over_cmd(temp, target),
+                                 timeout=60 + size / 20e6, safe=False)
+                if remotefs.WRITTEN_MARK not in remotefs._as_text(getattr(res, "stdout", "")):
+                    raise ADBError(f"{target} was not saved: "
+                                   f"{self._combined_output(res) or 'the device did not write it'}")
+            finally:
+                try:
+                    self.shell(remotefs._rm_file_cmd(temp), timeout=30, safe=False)
+                except (ADBError, OSError):
+                    pass
+            return kept
+
+        return self._guard("replace_file", _do, safe=safe)
+
     def edit_file(self, path: str, opener, *, editor: Optional[str] = None,
                   safe: Optional[bool] = None):
         """Edit a device text file on this machine and save it back.
 
         The file is pulled to a temporary copy, *opener* is called with that
         local path and returns the editor's exit code, and the copy is pushed
-        back ONLY when its bytes changed — restoring the octal mode, which
-        ``adb push`` resets. A non-zero editor exit leaves the device untouched.
+        back ONLY when its bytes changed (:meth:`replace_file`), keeping the
+        octal mode the file has at that moment, which ``adb push`` resets. A
+        non-zero editor exit leaves the device untouched.
         *editor* is the command name, used only in the log line.
 
         Returns ``{"changed": bool, "path": str, "editor_exit": int}``, where
@@ -3628,9 +4563,7 @@ class ADBHandler:
                     with open(tmp, "rb") as fh:
                         changed = fh.read() != before
                 if changed:
-                    self.push(tmp, real, safe=False)
-                    if info.get("mode"):
-                        self.chmod(real, info["mode"], safe=False)
+                    self.replace_file(tmp, real, mode=info.get("mode") or "", safe=False)
                     self._emit(logging.INFO, f"Saved {real}")
                 return {"changed": changed, "path": real, "editor_exit": code}
             finally:
@@ -3655,7 +4588,12 @@ class ADBHandler:
         safe: Optional[bool] = None,
     ):
         """Upload a file or directory to the device. Returns TransferResult.
-        *on_progress* receives an int percent (0-100) as adb reports it."""
+
+        *on_progress* receives an int percent as the copy goes (never
+        backwards; 100 once it is done). *timeout* (default
+        ``transfer_timeout``) ends a copy that moves nothing for that many
+        seconds, however long it takes in all; *cancel_event* ends it at once.
+        After either, files already copied stay on the device."""
         return self._guard(
             "push", self._transfer, "push", local_path, remote_path, on_progress, timeout,
             cancel_event, safe=safe
@@ -3671,7 +4609,12 @@ class ADBHandler:
         cancel_event=None,
         safe: Optional[bool] = None,
     ):
-        """Download a file or directory from the device. Returns TransferResult."""
+        """Download a file or directory from the device. Returns TransferResult.
+
+        *on_progress*, *timeout* and *cancel_event* work as for :meth:`push`.
+        A pull of one file that is ended early removes the unfinished file it
+        created (one it overwrote, or a folder, is left and the error says
+        so), so a cut-off copy is never mistaken for the real thing."""
         return self._guard(
             "pull", self._transfer, "pull", remote_path, local_path, on_progress, timeout,
             cancel_event, safe=safe
@@ -3679,20 +4622,47 @@ class ADBHandler:
 
     _PCT_RE = re.compile(r"\[\s*(\d+)%\]")
 
+    # Terminate an adb child promptly, escalating to kill only when necessary
+    # (see _stop_child: every engine child stops through it).
+    _stop_process = staticmethod(_stop_child)
+
     @staticmethod
-    def _stop_process(proc) -> None:
-        """Terminate an ADB child promptly, escalating only when necessary."""
-        if proc.poll() is not None:
-            return
+    def _report_progress(on_progress, percent, last):
+        """Hand *percent* to *on_progress* when it moved forward; returns the
+        last value handed on.  Never backwards, and 100 only once the copy is
+        over (a folder's copy of its last file says 100 too early)."""
+        if on_progress is None or percent is None:
+            return last
+        percent = max(0, min(99, int(percent)))
+        if percent <= last:
+            return last
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except (subprocess.TimeoutExpired, OSError):
-            try:
-                proc.kill()
-                proc.wait(timeout=2)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+            on_progress(percent)
+        except Exception:
+            pass
+        return percent
+
+    @staticmethod
+    def _leftover_note(direction, measure, fresh) -> str:
+        """After a push or pull that was ended early: remove the one file a
+        pull created (*fresh*: nothing was at *measure* before), since a
+        cut-off video looks just like a whole one.  Anything else is left —
+        a folder may hold files that were copied whole, and a file that was
+        overwritten is gone either way — and the returned note says so."""
+        if direction == "push":
+            return "; a partial copy may remain on the device"
+        if fresh and os.path.isfile(measure):
+            for _attempt in range(10):
+                try:
+                    os.remove(measure)
+                    return "; the unfinished file was removed"
+                except FileNotFoundError:
+                    return ""
+                except OSError:
+                    time.sleep(0.1)  # Windows: adb's handle may close a moment later
+        if os.path.lexists(measure):
+            return f"; a partial copy may remain at {measure}"
+        return ""
 
     def _transfer(self, direction, a, b, on_progress, timeout, cancel_event) -> TransferResult:
         # direction push: a=local, b=remote ; pull: a=remote, b=local
@@ -3710,12 +4680,19 @@ class ADBHandler:
             # that, not the size/count of everything already in the directory.
             name = posixpath.basename(str(a).rstrip("/"))
             measure = os.path.join(lp, name) if name and os.path.isdir(lp) else lp
+        # A stall limit, not a deadline: a big copy over a slow link may take
+        # an hour, as long as it keeps moving.
+        eff_timeout = timeout if timeout is not None else self.config.transfer_timeout
+        fresh = direction == "pull" and not os.path.lexists(measure)
+        watch = _TransferWatch(self, direction, measure, remote, window=eff_timeout,
+                               percent=on_progress is not None)
         cmd = self._base(target=True) + args
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
         self._emit(logging.INFO, f"{direction} {a} -> {b}")
         start = time.monotonic()
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
@@ -3725,7 +4702,9 @@ class ADBHandler:
             encoding="utf-8",
             errors="replace",
             creationflags=NO_WINDOW,
+            start_new_session=_OWN_SESSION,
         )
+        _track_child(proc, lambda: self._leftover_note(direction, measure, fresh))
         lines = queue.Queue()
 
         def _read_output():
@@ -3737,24 +4716,31 @@ class ADBHandler:
             finally:
                 lines.put(None)
 
-        reader = threading.Thread(target=_read_output, daemon=True)
-        reader.start()
-        eff_timeout = timeout if timeout is not None else self.config.transfer_timeout
-        deadline = time.monotonic() + eff_timeout if eff_timeout is not None else None
+        def _give_up(error, what):
+            self._stop_process(proc)
+            return error(f"adb {direction} {what}{self._leftover_note(direction, measure, fresh)}")
+
+        reader = None
         last = -1
+        moved = start
         tail = ""
         stream_closed = False
         try:
+            reader = threading.Thread(target=_read_output, daemon=True)
+            reader.start()
+            watch.start()
             while True:
                 if cancel_event is not None and cancel_event.is_set():
-                    self._stop_process(proc)
-                    raise ADBTransferError(f"adb {direction} cancelled")
-                if deadline is not None and time.monotonic() >= deadline:
-                    self._stop_process(proc)
-                    raise ADBTimeoutError(f"adb {direction} timed out after {eff_timeout}s")
+                    raise _give_up(ADBTransferError, "cancelled")
+                if watch.moved_at is not None:
+                    moved = max(moved, watch.moved_at)
+                if eff_timeout is not None and time.monotonic() - moved >= eff_timeout:
+                    raise _give_up(ADBTimeoutError,
+                                   f"timed out: nothing was copied for {eff_timeout:g} s")
                 try:
                     line = lines.get(timeout=0.2)
                 except queue.Empty:
+                    last = self._report_progress(on_progress, watch.percent(), last)
                     if stream_closed and proc.poll() is not None:
                         break
                     continue
@@ -3763,16 +4749,11 @@ class ADBHandler:
                     if proc.poll() is not None:
                         break
                     continue
+                moved = time.monotonic()  # adb said something: it is still going
                 tail = line.strip()
                 m = self._PCT_RE.search(line)
-                if m and on_progress:
-                    pct = int(m.group(1))
-                    if pct != last:
-                        last = pct
-                        try:
-                            on_progress(pct)
-                        except Exception:
-                            pass
+                if m:
+                    last = self._report_progress(on_progress, int(m.group(1)), last)
             try:
                 rc = proc.wait(timeout=2)
             except subprocess.TimeoutExpired as exc:
@@ -3781,9 +4762,13 @@ class ADBHandler:
                     f"adb {direction} did not exit after finishing"
                 ) from exc
         finally:
-            if proc.poll() is None:
+            watch.stop()
+            _untrack_child(proc)
+            if proc.poll() is None:  # an error of our own, or Ctrl+C: never leave adb running
                 self._stop_process(proc)
-            reader.join(timeout=2.0)
+                self._leftover_note(direction, measure, fresh)
+            if reader is not None:
+                reader.join(timeout=2.0)
             try:
                 if proc.stdout:
                     proc.stdout.close()
@@ -3816,6 +4801,12 @@ class ADBHandler:
     # ------------------------------------------------------------------ #
     # App management
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _install_flags(replace, downgrade, grant_perms, allow_test) -> list:
+        """The ``adb install`` / ``install-multiple`` options for these switches."""
+        flags = (("-r", replace), ("-d", downgrade), ("-g", grant_perms), ("-t", allow_test))
+        return [flag for flag, wanted in flags if wanted]
+
     def install(
         self,
         apk: str,
@@ -3830,15 +4821,7 @@ class ADBHandler:
         """Install a single APK (``adb install``)."""
 
         def _do():
-            args = ["install"]
-            if replace:
-                args.append("-r")
-            if downgrade:
-                args.append("-d")
-            if grant_perms:
-                args.append("-g")
-            if allow_test:
-                args.append("-t")
+            args = ["install"] + self._install_flags(replace, downgrade, grant_perms, allow_test)
             args += list(extra_args or [])
             args.append(os.path.expanduser(apk))
             self._emit(logging.INFO, f"Installing {apk}…")
@@ -3865,15 +4848,8 @@ class ADBHandler:
         """Install split APKs together (``adb install-multiple``)."""
 
         def _do():
-            args = ["install-multiple"]
-            if replace:
-                args.append("-r")
-            if downgrade:
-                args.append("-d")
-            if grant_perms:
-                args.append("-g")
-            if allow_test:
-                args.append("-t")
+            args = ["install-multiple"] + self._install_flags(
+                replace, downgrade, grant_perms, allow_test)
             args += [os.path.expanduser(a) for a in apks]
             self._emit(logging.INFO, f"Installing {len(apks)} split APK(s)…")
             res = self._run(args, timeout=600)
@@ -4398,153 +5374,195 @@ class ADBHandler:
         is tried next when the device rejects the physical one at once.
         """
 
-        def _record(record_display):
-            limit = int(time_limit or 0)
-            if limit < 0:
-                raise ValueError("time_limit must be 0 or a positive number of seconds")
-            if limit > 180:
-                self._emit(logging.WARNING, f"screenrecord allows at most 180 s; clamping {limit} s")
-                limit = 180
-            token = _unique_token()
-            remote_path = remote_tmp or f"/sdcard/turboadb_rec_{token}.mp4"
-            pid_path = f"/data/local/tmp/turboadb_screenrecord_{token}.pid"
-            record_args = ["screenrecord"]
-            if limit:
-                record_args += ["--time-limit", str(limit)]
-            if size:
-                record_args += ["--size", size]
-            if bit_rate:
-                record_args += ["--bit-rate", bit_rate]
-            if record_display is not None:
-                record_args += ["--display-id", str(record_display)]
-            record_args.append(remote_path)
-            self._run(
-                self._shell_args("rm", "-f", remote_path, pid_path),
-                check=False,
-                timeout=15,
-            )
-            shell_command = (
-                " ".join(shlex.quote(part) for part in record_args)
-                + f" & recorder=$!; echo $recorder > {shlex.quote(pid_path)}; wait $recorder"
-            )
-            cmd = self._base(target=True) + ["shell", shell_command]
-            self._emit(logging.INFO, f"Recording screen -> {remote_path} (limit {limit or 180}s)…")
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW
-            )
-            stage = "record"
-            try:
-                start = time.monotonic()
-                stopped_by_user = False
-                while proc.poll() is None:
-                    if stop_event is not None and stop_event.is_set():
-                        stopped_by_user = True
-                        # Signal only the PID owned by this invocation. The old
-                        # pidof loop interrupted every recorder on the device.
-                        stop_script = (
-                            f"pid=$(cat {shlex.quote(pid_path)} 2>/dev/null) || exit 1; "
-                            "case $pid in ''|*[!0-9]*) exit 1;; esac; "
-                            'kill -INT "$pid"'
-                        )
-                        for _attempt in range(5):
-                            try:
-                                result = self._run(
-                                    ["shell", stop_script],
-                                    check=False,
-                                    timeout=5,
-                                )
-                                if getattr(result, "exit_code", 1) == 0:
-                                    break
-                            except Exception:
-                                pass
-                            time.sleep(0.1)
-                        break
-                    if time.monotonic() - start > ((limit or 180) + 5):
-                        break
-                    time.sleep(0.2)
-                if stopped_by_user:
-                    # Let the remote shell observe the interrupt and exit;
-                    # terminate adb only when it remains stuck afterwards.
-                    deadline = time.monotonic() + 5.0
-                    while proc.poll() is None and time.monotonic() < deadline:
-                        time.sleep(0.1)
-                forced = False
-                if proc.poll() is None:
-                    forced = True
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                # ``stop_event`` is already set when a user stops recording;
-                # it must not cancel the *subsequent* pull of that final clip.
-                exit_code = proc.poll()
-                # A recorder we had to terminate exits non-zero by definition —
-                # that is not a recording failure.
-                if not stopped_by_user and not forced and exit_code not in (None, 0):
-                    output = ""
-                    try:
-                        output = (proc.stdout.read() if proc.stdout else b"") or b""
-                        if isinstance(output, bytes):
-                            output = output.decode("utf-8", errors="replace")
-                    except Exception:
-                        pass
-                    result = CommandResult(" ".join(cmd), int(exit_code), "", str(output), 0.0)
-                    raise ADBCommandError(" ".join(cmd), result)
-                if forced:
-                    # the device may still be finalising the MP4 index
-                    self._wait_remote_file_stable(remote_path)
-                stage = "pull"
-                saved_path = self._prepare_local_path(local_path)
-                self._transfer("pull", remote_path, saved_path, None, None, None)
-                if not os.path.isfile(saved_path) or os.path.getsize(saved_path) <= 0:
-                    raise ADBTransferError(
-                        f"adb reported success but the recording is empty; "
-                        f"the device copy remains at {remote_path}"
-                    )
-                self._run(self._shell_args("rm", "-f", remote_path), check=False, timeout=15)
-                self._emit(logging.INFO, f"Recording saved: {saved_path}")
-                return saved_path
-            finally:
-                cleanup = [pid_path]
-                if stage == "record" and not remote_tmp:
-                    # interrupted/failed before the pull (e.g. Ctrl+C): don't
-                    # leave our partial temp MP4 behind on the device
-                    cleanup.append(remote_path)
-                try:
-                    self._run(self._shell_args("rm", "-f", *cleanup), check=False, timeout=15)
-                except Exception:
-                    pass
-                try:
-                    if proc.poll() is None:
-                        proc.terminate()
-                    if proc.stdout:
-                        proc.stdout.close()
-                    proc.wait(timeout=3.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                    except Exception:
-                        pass
-
         def _do():
-            candidates = self._screencap_candidates(display_id)
-            for index, candidate in enumerate(candidates):
-                started = time.monotonic()
-                try:
-                    return _record(candidate)
-                except ADBCommandError:
-                    stopped = stop_event is not None and stop_event.is_set()
-                    if index + 1 >= len(candidates) or stopped or time.monotonic() - started > 8.0:
-                        raise
-                    self._emit(
-                        logging.INFO,
-                        f"screenrecord rejected display id {candidate}; "
-                        f"trying {candidates[index + 1]}",
-                    )
+            clip = self._record_clip(
+                time_limit, size=size, bit_rate=bit_rate, display_id=display_id,
+                remote_tmp=remote_tmp, stop_event=stop_event,
+            )
+            return self._save_clip(clip, local_path)
 
         return self._guard("screen_record", _do, safe=safe)
+
+    def _record_clip(self, time_limit, *, size, bit_rate, display_id, remote_tmp,
+                     stop_event, on_tick=None) -> _Clip:
+        """Record one clip on the device and leave it there for
+        :meth:`_save_clip`, trying the display-id candidates of
+        :meth:`screen_record` in turn. *on_tick()* is called from the waiting
+        loop, about five times a second."""
+        limit = int(time_limit or 0)
+        if limit < 0:
+            raise ValueError("time_limit must be 0 or a positive number of seconds")
+        if limit > 180:
+            self._emit(logging.WARNING, f"screenrecord allows at most 180 s; clamping {limit} s")
+            limit = 180
+        candidates = self._screencap_candidates(display_id)
+        for index, candidate in enumerate(candidates):
+            started = time.monotonic()
+            try:
+                return self._record_on(
+                    candidate, limit, size=size, bit_rate=bit_rate, remote_tmp=remote_tmp,
+                    stop_event=stop_event, on_tick=on_tick,
+                )
+            except ADBCommandError:
+                stopped = stop_event is not None and stop_event.is_set()
+                if index + 1 >= len(candidates) or stopped or time.monotonic() - started > 8.0:
+                    raise
+                self._emit(
+                    logging.INFO,
+                    f"screenrecord rejected display id {candidate}; "
+                    f"trying {candidates[index + 1]}",
+                )
+
+    def _record_on(self, record_display, limit, *, size, bit_rate, remote_tmp,
+                   stop_event, on_tick=None) -> _Clip:
+        """One ``screenrecord`` on *record_display*, until its time limit or
+        *stop_event*. Raises ADBCommandError when it fails; the partial file
+        (unless it is the caller's *remote_tmp*) is removed then."""
+        token = _unique_token()
+        remote_path = remote_tmp or f"/sdcard/turboadb_rec_{token}.mp4"
+        pid_path = f"/data/local/tmp/turboadb_screenrecord_{token}.pid"
+        record_args = ["screenrecord"]
+        if limit:
+            record_args += ["--time-limit", str(limit)]
+        if size:
+            record_args += ["--size", size]
+        if bit_rate:
+            record_args += ["--bit-rate", bit_rate]
+        if record_display is not None:
+            record_args += ["--display-id", str(record_display)]
+        record_args.append(remote_path)
+        self._run(
+            self._shell_args("rm", "-f", remote_path, pid_path),
+            check=False,
+            timeout=15,
+        )
+        shell_command = (
+            " ".join(shlex.quote(part) for part in record_args)
+            + f" & recorder=$!; echo $recorder > {shlex.quote(pid_path)}; wait $recorder"
+        )
+        cmd = self._base(target=True) + ["shell", shell_command]
+        self._emit(logging.INFO, f"Recording screen -> {remote_path} (limit {limit or 180}s)…")
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW, start_new_session=_OWN_SESSION,
+        )
+        # interrupted or failed (e.g. Ctrl+C): don't leave our partial temp MP4
+        # behind on the device; a caller's remote_tmp is theirs to keep
+        partial = [pid_path] + ([] if remote_tmp else [remote_path])
+
+        def _abandoned():
+            # The program exits before the recording ended: nothing will pull
+            # it. (Only through a server that is still up: any adb command
+            # would start a local one again, and leave it running.)
+            if self._server_answers():
+                self._run(self._shell_args("rm", "-f", *partial), check=False, timeout=5)
+
+        _track_child(proc, _abandoned)
+        recorded = False
+        try:
+            start = time.monotonic()
+            stopped_by_user = False
+            while proc.poll() is None:
+                if stop_event is not None and stop_event.is_set():
+                    stopped_by_user = True
+                    self._interrupt_recorder(pid_path)
+                    break
+                if time.monotonic() - start > ((limit or 180) + 5):
+                    break
+                if on_tick is not None:
+                    on_tick()
+                time.sleep(0.2)
+            if stopped_by_user:
+                # Let the remote shell observe the interrupt and exit;
+                # terminate adb only when it remains stuck afterwards.
+                deadline = time.monotonic() + 5.0
+                while proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.1)
+            forced = False
+            if proc.poll() is None:
+                forced = True
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            # ``stop_event`` is already set when a user stops recording;
+            # it must not cancel the *subsequent* pull of that final clip.
+            exit_code = proc.poll()
+            if (not stopped_by_user and exit_code is not None and exit_code < 0
+                    and stop_event is not None and stop_event.is_set()):
+                # a signal ended adb just as the stop came: a stop all the
+                # same, so make sure the recorder got it and the file settles
+                stopped_by_user = forced = True
+                self._interrupt_recorder(pid_path)
+            # A recorder we had to terminate exits non-zero by definition —
+            # that is not a recording failure.
+            if not stopped_by_user and not forced and exit_code not in (None, 0):
+                output = ""
+                try:
+                    output = (proc.stdout.read() if proc.stdout else b"") or b""
+                    if isinstance(output, bytes):
+                        output = output.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                result = CommandResult(" ".join(cmd), int(exit_code), "", str(output), 0.0)
+                raise ADBCommandError(" ".join(cmd), result)
+            recorded = True
+            return _Clip(remote_path, forced)
+        finally:
+            _untrack_child(proc)
+            try:
+                self._run(self._shell_args("rm", "-f", *(partial if not recorded else [pid_path])),
+                          check=False, timeout=15)
+            except Exception:
+                pass
+            self._stop_process(proc, close_pipes=True, grace=3.0)
+
+    def _server_answers(self) -> bool:
+        """Whether this handler's adb server answers now (a socket probe that,
+        unlike an adb command, never starts one)."""
+        host = self.config.adb_server_host or "127.0.0.1"
+        return is_adb_server_alive(host, self.config.adb_server_port, timeout=0.5)
+
+    def _interrupt_recorder(self, pid_path: str) -> None:
+        """SIGINT to the screenrecord whose PID is in *pid_path*: it writes the
+        MP4 index and exits. Only the PID owned by this recording is signalled
+        (the old pidof loop interrupted every recorder on the device)."""
+        stop_script = (
+            f"pid=$(cat {shlex.quote(pid_path)} 2>/dev/null) || exit 1; "
+            "case $pid in ''|*[!0-9]*) exit 1;; esac; "
+            'kill -INT "$pid"'
+        )
+        for _attempt in range(5):
+            try:
+                result = self._run(["shell", stop_script], check=False, timeout=5)
+                if getattr(result, "exit_code", 1) == 0:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    def _save_clip(self, clip: _Clip, local_path: str) -> str:
+        """Pull a recorded clip to *local_path* (``~`` expanded, its folder
+        created) and remove it from the device. A clip that could not be
+        pulled stays on the device (the log says where)."""
+        if clip.forced:
+            # the device may still be finalising the MP4 index
+            self._wait_remote_file_stable(clip.remote_path)
+        saved_path = self._prepare_local_path(local_path)
+        try:
+            self._transfer("pull", clip.remote_path, saved_path, None, None, None)
+        except ADBError:
+            self._emit(logging.WARNING, f"the recording remains on the device at {clip.remote_path}")
+            raise
+        if not os.path.isfile(saved_path) or os.path.getsize(saved_path) <= 0:
+            raise ADBTransferError(
+                f"adb reported success but the recording is empty; "
+                f"the device copy remains at {clip.remote_path}"
+            )
+        self._run(self._shell_args("rm", "-f", clip.remote_path), check=False, timeout=15)
+        self._emit(logging.INFO, f"Recording saved: {saved_path}")
+        return saved_path
 
     def screen_record_continuous(
         self,
@@ -4562,46 +5580,86 @@ class ADBHandler:
         run past ``screenrecord``'s three-minute cap.
 
         Parts are named after *local_path*: ``drive.mp4``, ``drive-part02.mp4``,
-        ``drive-part03.mp4`` … Each one is pulled and handed to *on_part* as
-        soon as it is saved, so a long recording is never lost to a later
-        failure. Returns the list of saved paths.
+        ``drive-part03.mp4`` … The next part starts the moment one ends, and
+        that one is pulled meanwhile, so pulling leaves no gap in the
+        recording. Each part is handed to *on_part* (on the calling thread, in
+        order) as soon as it is saved, so a long recording is never lost to a
+        later failure. Returns the list of saved paths once every part is saved.
 
         Without a *stop_event* this records exactly one part. A failure in the
-        FIRST part is raised as-is; a later one stops the recording and is
-        re-raised after the parts already saved have been reported.
+        FIRST part is raised as-is; a later one (or a part that could not be
+        pulled) stops the recording and is re-raised after the parts saved by
+        then have been reported.
         """
 
         def _do():
             base, ext = os.path.splitext(self._prepare_local_path(local_path))
             ext = ext or ".mp4"
-            paths = []
-            while True:
-                part = len(paths)
-                target = local_path if part == 0 else f"{base}-part{part + 1:02d}{ext}"
-                try:
-                    saved = self.screen_record(
-                        target,
-                        time_limit=part_seconds,
-                        size=size,
-                        bit_rate=bit_rate,
-                        display_id=display_id,
-                        stop_event=stop_event,
-                        safe=False,
-                    )
-                except Exception:
-                    if paths:
-                        # the earlier parts are already reported through on_part
-                        self._emit(
-                            logging.ERROR,
-                            f"recording stopped after part {part} of "
-                            f"{local_path}; {len(paths)} part(s) were saved",
+            paths, errors = [], []
+            clips = queue.Queue()  # (local path, clip) to pull, in order; None: no more
+            saved = queue.Queue()  # (path, error) for each of them, in the same order
+            pull_failed = threading.Event()
+
+            def _pull_parts():
+                while True:
+                    job = clips.get()
+                    if job is None:
+                        return
+                    target, clip = job
+                    try:
+                        saved.put((self._save_clip(clip, target), None))
+                    except Exception as exc:
+                        pull_failed.set()  # record no further
+                        saved.put((None, exc))
+
+            def _report():
+                while True:
+                    try:
+                        path, error = saved.get_nowait()
+                    except queue.Empty:
+                        return
+                    if error is not None:
+                        errors.append(error)
+                        continue
+                    paths.append(path)
+                    if on_part:
+                        on_part(path)
+
+            puller = threading.Thread(target=_pull_parts, name="turboadb-record-pull", daemon=True)
+            puller.start()
+            stop = _AnyOf(stop_event, pull_failed)
+            part = 0
+            try:
+                while True:
+                    target = local_path if part == 0 else f"{base}-part{part + 1:02d}{ext}"
+                    try:
+                        clip = self._record_clip(
+                            part_seconds, size=size, bit_rate=bit_rate, display_id=display_id,
+                            remote_tmp=None, stop_event=stop, on_tick=_report,
                         )
-                    raise
-                paths.append(saved)
-                if on_part:
-                    on_part(saved)
-                if stop_event is None or stop_event.is_set():
-                    return paths
+                    except Exception as exc:
+                        errors.append(exc)
+                        break
+                    clips.put((target, clip))
+                    part += 1
+                    if stop_event is None or stop.is_set():
+                        break
+            except BaseException:
+                clips.put(None)  # Ctrl+C in a script: don't wait for the pulls
+                raise
+            clips.put(None)
+            puller.join()  # every part recorded is pulled before this returns
+            _report()
+            if errors:
+                if paths:
+                    # the saved parts are already reported through on_part
+                    self._emit(
+                        logging.ERROR,
+                        f"recording stopped after part {part} of "
+                        f"{local_path}; {len(paths)} part(s) were saved",
+                    )
+                raise errors[0]
+            return paths
 
         return self._guard("screen_record_continuous", _do, safe=safe)
 
@@ -4626,32 +5684,46 @@ class ADBHandler:
     # ------------------------------------------------------------------ #
     # Port forwarding
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _bound_spec(spec: str, res) -> str:
+        """*spec*, or ``tcp:PORT`` when it was ``tcp:0`` and adb printed the
+        port it picked: the rule can only be removed by its real port."""
+        if str(spec).strip().lower() != "tcp:0":
+            return spec
+        port = (res.text or "").strip()
+        return f"tcp:{int(port)}" if port.isdigit() and 0 < int(port) < 65536 else spec
+
     def forward(self, local: str, remote: str, *, safe: Optional[bool] = None):
         """``adb forward`` — expose a device socket on the host. Specs look like
         ``tcp:8080`` / ``localabstract:name``. Returns a stoppable ForwardHandle.
+        With ``tcp:0`` adb picks a free port: the handle's ``local`` is then
+        ``tcp:PORT`` with the port it picked.
 
         >>> fwd = dev.forward("tcp:9222", "localabstract:chrome_devtools_remote")
         >>> ...; fwd.close()
         """
 
         def _do():
-            self._run(["forward", local, remote], timeout=15, check=True)
-            self._emit(logging.INFO, f"forward {local} -> {remote}")
-            return ForwardHandle(self, "forward", local, remote)
+            res = self._run(["forward", local, remote], timeout=15, check=True)
+            bound = self._bound_spec(local, res)
+            self._emit(logging.INFO, f"forward {bound} -> {remote}")
+            return ForwardHandle(self, "forward", bound, remote)
 
         return self._guard("forward", _do, safe=safe)
 
     def reverse(self, remote: str, local: str, *, safe: Optional[bool] = None):
         """``adb reverse`` — expose a host socket on the device. Returns a
-        stoppable ForwardHandle.
+        stoppable ForwardHandle. With ``tcp:0`` the device picks a free port:
+        the handle's ``remote`` is then ``tcp:PORT`` with that port.
 
         >>> rev = dev.reverse("tcp:8000", "tcp:8000")   # device reaches your PC
         """
 
         def _do():
-            self._run(["reverse", remote, local], timeout=15, check=True)
-            self._emit(logging.INFO, f"reverse {remote} <- {local}")
-            return ForwardHandle(self, "reverse", local, remote)
+            res = self._run(["reverse", remote, local], timeout=15, check=True)
+            bound = self._bound_spec(remote, res)
+            self._emit(logging.INFO, f"reverse {bound} <- {local}")
+            return ForwardHandle(self, "reverse", local, bound)
 
         return self._guard("reverse", _do, safe=safe)
 
@@ -4863,42 +5935,42 @@ class ADBHandler:
             # screen launch by up to ten seconds and could race scrcpy's own
             # server startup.  scrcpy is launched immediately with that exact
             # same bundled adb binary and reports any genuine connection error.
-            # If the "remote" adb server is actually THIS machine (device is local,
-            # just addressed by its LAN IP), run scrcpy LOCALLY — no network video
-            # tunnel — which is exactly how running scrcpy directly there works.
-            from .scrcpy import is_local_host, resolve_host, TUNNEL_PORT_FIREWALL_RANGE
+            from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 
-            server_host = self.config.adb_server_host
-            if server_host and is_local_host(server_host):
-                self._emit(
-                    logging.INFO,
-                    f"adb server {server_host} is THIS machine → running "
-                    f"scrcpy locally (no network tunnel)",
-                )
-                server_host = None
-            elif server_host:
-                ip = resolve_host(server_host)
-                self._emit(
-                    logging.INFO,
-                    f"scrcpy will stream the device's video over the "
-                    f"network from {ip} via tunnel ports TCP "
-                    f"{TUNNEL_PORT_FIREWALL_RANGE} — that range must be "
-                    f"open in {ip}'s firewall",
-                )
             self._emit(
                 logging.INFO,
                 f"Launching scrcpy for {self._serial or '(only device)'}"
                 f"{' (compat mode)' if compat else ''} with adb={adb}…",
             )
-            return launch_scrcpy(
+            session = launch_scrcpy(
                 self._serial,
                 opts,
                 scrcpy_path=self.config.scrcpy_path,
-                adb_server_host=server_host,
+                adb_server_host=self.config.adb_server_host,
                 adb_server_port=self.config.adb_server_port,
                 log_path=log_path,
                 adb_path=adb,
             )
+            # launch_scrcpy decided, from one lookup, whether the "remote" adb
+            # server is really THIS machine (the device is local, just addressed
+            # by its LAN IP): then scrcpy runs LOCALLY, with no network video
+            # tunnel, exactly as running scrcpy directly there does.
+            server_host = self.config.adb_server_host
+            tunnel = getattr(session, "tunnel_host", None)
+            if tunnel:
+                self._emit(
+                    logging.INFO,
+                    f"scrcpy streams the device's video over the network from "
+                    f"{tunnel} via tunnel ports TCP {TUNNEL_PORT_FIREWALL_RANGE} — "
+                    f"that range must be open in {tunnel}'s firewall",
+                )
+            elif server_host:
+                self._emit(
+                    logging.INFO,
+                    f"adb server {server_host} is THIS machine → scrcpy runs "
+                    f"locally (no network tunnel)",
+                )
+            return session
 
         return self._guard("mirror", _do, safe=safe)
 
@@ -4915,7 +5987,7 @@ class ADBHandler:
         """Release the handler. A network target is disconnected only when THIS
         handler created the connection; one that was already connected (by the
         GUI, another script, or a previous session) stays connected."""
-        if self._owned_target and self._owned_target == self._serial:
+        if self.owns_connection:
             self.disconnect()
         self._connected = False
 

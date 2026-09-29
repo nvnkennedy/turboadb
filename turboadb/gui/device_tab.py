@@ -9,6 +9,8 @@ import queue
 import shlex
 import threading
 import time
+import weakref
+from collections import deque
 
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QEvent, QSize, QTimer
 from PyQt5.QtWidgets import (
@@ -98,72 +100,6 @@ def _str_width(s: str) -> int:
     return sum(_char_width(c) for c in clean)
 
 
-def _render_mobaxterm_banner(
-    header_title: str,
-    header_sub: str,
-    session_title: str,
-    items: list[tuple[str, str, bool]],
-    min_width: int = 61,
-    cwd: str = "/",
-    include_prompt_bar: bool = False,
-) -> str:
-    """Render the original framed terminal welcome banner.
-
-    ``include_prompt_bar`` is off for normal sessions: the real PowerShell/CMD
-    prompt, or the concise synthetic ADB prompt, already shows the path without
-    duplicating it in a large date-and-time bar.
-    """
-    max_lbl_len = max(len(lbl) for lbl, _, _ in items) if items else 0
-    formatted_items = []
-    for lbl, val, has_check in items:
-        pad_lbl = lbl.ljust(max_lbl_len)
-        chk = "\x1b[1;92m✔\x1b[0m" if has_check else " "
-        val_str = f" \x1b[37m{val}\x1b[0m" if val else ""
-        formatted_items.append(f"\x1b[37m{pad_lbl} :  {chk}{val_str}")
-
-    all_content = [header_title, header_sub, f" ➤ {session_title}"] + [f"   {it}" for it in formatted_items]
-    max_c = max(_str_width(x) for x in all_content)
-    width = max(min_width, max_c + 4)
-    inner_w = width - 2
-
-    top = "\x1b[37m┌" + ("─" * inner_w) + "┐\x1b[0m"
-    bot = "\x1b[37m└" + ("─" * inner_w) + "┘\x1b[0m"
-    blank = "\x1b[37m│" + (" " * inner_w) + "│\x1b[0m"
-
-    def center(s):
-        sw = _str_width(s)
-        pad = max(0, inner_w - sw)
-        left = pad // 2
-        right = pad - left
-        return "\x1b[37m│\x1b[0m" + (" " * left) + s + (" " * right) + "\x1b[37m│\x1b[0m"
-
-    def left_row(s, indent=1):
-        sw = _str_width(s)
-        rem = max(0, inner_w - indent - sw)
-        return "\x1b[37m│\x1b[0m" + (" " * indent) + s + (" " * rem) + "\x1b[37m│\x1b[0m"
-
-    lines = [top, center(header_title), center(header_sub), blank]
-    lines.append(left_row(f"➤ {session_title}", indent=1))
-    lines.extend(left_row(it, indent=3) for it in formatted_items)
-    lines.append(bot)
-    banner = "\n" + "\n".join(lines) + "\n\n"
-    if not include_prompt_bar:
-        return banner
-
-    import datetime
-    now = datetime.datetime.now()
-    d_s = now.strftime("%m-%d")
-    t_s = now.strftime("%H:%M")
-    return banner + (
-        f"\x1b[30;46m 📅 {d_s} "
-        f"\x1b[36;42m▶"
-        f"\x1b[30;42m 🕒 {t_s} "
-        f"\x1b[32;43m▶"
-        f"\x1b[30;43m 📁 {cwd or '/'} "
-        f"\x1b[33;49m▶\x1b[0m "
-    )
-
-
 def _boxed_banner(lines) -> str:
     """Short welcome lines inside a thin frame, set apart from terminal output.
 
@@ -179,48 +115,6 @@ def _boxed_banner(lines) -> str:
     top = f"{edge}┌{'─' * (width + 2)}┐{reset}"
     bottom = f"{edge}└{'─' * (width + 2)}┘{reset}"
     return "\n" + "\n".join([top, *rows, bottom]) + "\n\n"
-
-
-def _render_box_banner(title: str, lines: list[str], min_width: int = 74) -> str:
-    """Render a clean, fully enclosed ASCII box banner with ANSI styling."""
-    all_content = [title] + [f"  {line}" for line in lines]
-    max_c = max(_str_width(x) for x in all_content)
-    width = max(min_width, max_c + 4)
-    inner_w = width - 2
-
-    top = "\x1b[90m┌" + ("─" * inner_w) + "┐\x1b[0m"
-    bot = "\x1b[90m└" + ("─" * inner_w) + "┘\x1b[0m"
-    blank = "\x1b[90m│" + (" " * inner_w) + "│\x1b[0m"
-
-    def center(s):
-        sw = _str_width(s)
-        pad = max(0, inner_w - sw)
-        left = pad // 2
-        right = pad - left
-        return "\x1b[90m│\x1b[0m" + (" " * left) + s + (" " * right) + "\x1b[90m│\x1b[0m"
-
-    def left_row(s, indent=2):
-        sw = _str_width(s)
-        rem = max(0, inner_w - indent - sw)
-        return "\x1b[90m│\x1b[0m" + (" " * indent) + s + (" " * rem) + "\x1b[90m│\x1b[0m"
-
-    body = [center(title), blank] + [left_row(line, indent=2) for line in lines]
-    return "\n" + "\n".join([top] + body + [bot]) + "\n"
-
-
-def _session_banner(header_sub: str, session_title: str, items, cwd: str = "/") -> str:
-    """The TurboADB welcome banner shared by the Android and local terminals."""
-    from .. import __version__
-
-    header_title = f"\x1b[1;92m•  TurboADB Professional v{__version__}  •\x1b[0m"
-    return _render_mobaxterm_banner(header_title, header_sub, session_title, items, cwd=cwd)
-
-
-# PowerShell and Command Prompt advertise the same local capabilities.
-_LOCAL_BANNER_ITEMS = [
-    ("Platform-tools", "", True),
-    ("Local-terminal", "(ANSI cooked mode is enabled)", True),
-]
 
 
 def config_from_session(s: dict) -> ADBConfig:
@@ -301,10 +195,156 @@ class _AdbGate:
             self._cond.notify_all()
 
 
+class _Connections:
+    """Which open device tabs use which network connection, and which of those
+    connections an ``adb connect`` of this app made.
+
+    Closing a tab used to run ``adb disconnect host:port`` whatever the
+    connection was to anyone else: it cut the device off from another tab on
+    it (a terminal-only session), from other tools (Android Studio's wireless
+    debugging) and, through a remote adb server, from every user of that
+    server.  A connection is now dropped only once the last open tab using it
+    lets go, only when this app made it, and never on a remote server.  Keys
+    are ``(adb server host or "", adb server port, serial)``.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()  # the connect worker lets go off the UI thread
+        self._users = {}  # key -> WeakSet of the DeviceTabs using it
+        # key -> a handler whose `adb connect` made that connection (and can
+        # drop it), kept until the last tab using it lets go
+        self._made_here = {}
+
+    @staticmethod
+    def key(config, serial):
+        if config is None or not serial:
+            return None
+        return (config.adb_server_host or "", config.adb_server_port, str(serial))
+
+    def use(self, key, user) -> None:
+        if key is None:
+            return
+        with self._lock:
+            self._users.setdefault(key, weakref.WeakSet()).add(user)
+
+    def leave(self, key, user=None, handler=None):
+        """*user* (a DeviceTab; None for a handler no tab took) no longer uses
+        *key*, through *handler*. Returns the handler to drop the connection
+        with once this app made it and no open tab uses it, else None."""
+        if key is None:
+            return None
+        with self._lock:
+            users = self._users.get(key)
+            if users is not None:
+                if user is not None:
+                    users.discard(user)
+                if not users:
+                    del self._users[key]
+            if key[0]:  # a remote server: its other users may rely on it
+                return None
+            if getattr(handler, "owns_connection", False):
+                self._made_here[key] = handler
+            if key in self._users:
+                return None
+            return self._made_here.pop(key, None)
+
+
+_CONNECTIONS = _Connections()
+
+
+def _connection_key(handler):
+    """*handler*'s ``_Connections`` key, or None (no target, or a stand-in)."""
+    return _Connections.key(getattr(handler, "config", None), getattr(handler, "serial", None))
+
+
+def _disconnect_unless_shared(handler) -> None:
+    """``adb disconnect`` *handler*'s target (blocking). A local server shared
+    with other machines (``turboadb serve``) keeps it: they may be using it.
+
+    Only while the local server answers, and under the lock its one stopper
+    (``tools.kill_adb_server``) holds: ``adb disconnect`` starts a server when
+    none answers, so one that ran just after the exit (or a restart) stopped
+    the server started a new one, and that adb.exe outlived TurboADB.  A
+    server that is down has no connection left to drop anyway."""
+    try:
+        from .. import tools
+
+        config = handler.config
+        if config.adb_server_host:
+            return  # never on a remote server: its other users rely on it
+        port = config.adb_server_port
+        lock = tools.adb_server_lock()
+    except Exception:
+        return
+    try:
+        getattr(handler, "adb_path", None)  # resolved now, never under the lock
+    except Exception:
+        pass
+    with lock:
+        try:
+            if not tools.is_adb_server_alive(port=port):
+                return
+        except Exception:
+            return
+        try:
+            from ..devices import server_is_shared
+
+            if server_is_shared(port):
+                return
+        except Exception:
+            pass
+        try:
+            handler.disconnect()
+        except Exception:
+            pass
+
+
+def _drop_connection_later(handler, after=()) -> None:
+    """Disconnect *handler*'s target once the QThreads in *after* have finished
+    (they may still use the connection, and a reconnect among them could make
+    it again). With *after*, call it on the UI thread.
+
+    Never on the UI thread: against a server that stopped answering it froze
+    the window.  A daemon thread, not a QThread: a QThread still running when
+    the app exits aborts it.  The workers are waited for through their
+    ``finished`` signals, never ``QThread.wait()`` from another thread, which
+    raced their deleteLater."""
+    from .qtutil import thread_running
+
+    waiting = [worker for worker in after if thread_running(worker)]
+    started = []
+
+    def start():
+        if not started:
+            started.append(True)
+            threading.Thread(target=_disconnect_unless_shared, args=(handler,),
+                             name="turboadb-disconnect", daemon=True).start()
+
+    def finished(worker):
+        if worker in waiting:
+            waiting.remove(worker)
+        if not waiting:
+            start()
+
+    for worker in list(waiting):
+        worker.finished.connect(lambda w=worker: finished(w))
+    for worker in list(waiting):  # ended before its signal was connected
+        if not thread_running(worker):
+            finished(worker)
+    if not waiting:
+        start()
+
+
+def _release_connection(handler) -> None:
+    """Let go of a handler no tab took (a cancelled or superseded connect)."""
+    drop = _CONNECTIONS.leave(_connection_key(handler), None, handler)
+    if drop is not None:
+        _drop_connection_later(drop)
+
+
 class _ConnectThread(QThread):
     ok = pyqtSignal(object, object)
     fail = pyqtSignal(str)
-    log = pyqtSignal(str)  # this worker's own progress and outcome lines
     # The handler's engine diagnostics ("[DEBUG] $ adb …", "… failed: …" from
     # ADBHandler._guard): log panel only, never a notification — the panel
     # that ran a failing command reports it itself.
@@ -314,23 +354,30 @@ class _ConnectThread(QThread):
 
     IDENTITY_TIMEOUT = 1.5
 
-    def __init__(self, cfg, *, fetch_identity: bool = True, gate=None):
+    def __init__(self, cfg, *, fetch_identity: bool = True, gate=None, known_state=None):
         super().__init__()
         self.cfg = cfg
         self.fetch_identity = bool(fetch_identity)
         self.gate = gate
+        # The main window's device tracker on the target (DeviceTab.start_connect):
+        # "device" spares the connect its wait-for-device and get-state.
+        self.known_state = known_state
         self._probe = None
         self._cancelled = False
+        # Set by cancel(): the engine kills an `adb connect` or `wait-for-device`
+        # still waiting, instead of it running on behind a closed tab.
+        self._cancel_event = threading.Event()
 
     def cancel(self):
         self._cancelled = True
+        self._cancel_event.set()
         probe = self._probe
         if probe is not None:
             probe.close()  # never leave the probe's adb shell behind a closed tab
 
     def _make_handler(self):
-        """The tab's handler. Its engine log lines go to ``trace`` (the log
-        panel), never ``log`` (notifications)."""
+        """The tab's handler. Its engine log lines go to ``trace``: the log
+        panel, never a notification."""
         return ADBHandler(
             self.cfg,
             safe=True,
@@ -342,12 +389,9 @@ class _ConnectThread(QThread):
             if self._cancelled:
                 return
             h = self._make_handler()
-            res = h.connect()
+            res = h.connect(known_state=self.known_state, cancel=self._cancel_event)
             if self._cancelled:
-                try:
-                    h.disconnect()
-                except Exception:
-                    pass
+                _release_connection(h)  # only a connection it made, that no tab uses
                 return
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error))
@@ -393,38 +437,16 @@ class _ConnectThread(QThread):
             result = {"info": None, "prompt": None, "displays": None,
                       "error": f"{type(exc).__name__}: {exc}"}
         if self._cancelled:
-            if not emitted:
-                try:
-                    handler.disconnect()
-                except Exception:
-                    pass
+            if not emitted:  # the tab never got this handler
+                _release_connection(handler)
             return
         self.details.emit(handler, result)
 
 
-class _DeviceInfoThread(QThread):
-    """Fetch nonessential build identity after the device tab is usable."""
-
-    done = pyqtSignal(object)
-
-    def __init__(self, handler):
-        super().__init__()
-        self.handler = handler
-
-    def run(self):
-        # Raw mode inside our own try: the details are optional, so a failure
-        # is reported to the tab (as an [INFO] line) instead of the engine's
-        # ERROR log, which the GUI turns into a red error popup.
-        try:
-            info = self.handler.device_info(safe=False)
-            self.done.emit(OperationResult(True, "device_info", value=info))
-        except Exception as exc:
-            self.done.emit(OperationResult(False, "device_info", error=exc))
-
-
 class _ProbeThread(QThread):
     """Run the connect-time :class:`_DeviceProbe` for a tab that was handed a
-    handler directly (not through its own connect worker)."""
+    handler directly (not through its own connect worker), or again when the
+    first probe got no device profile."""
 
     details = pyqtSignal(object)
 
@@ -439,7 +461,15 @@ class _ProbeThread(QThread):
         self.probe.close()
 
     def run(self):
-        result = self.probe.run(gate=self.gate)
+        # The details are optional: a failure is a result like any other (as
+        # in _ConnectThread._probe_and_emit), never an exception that reaches
+        # the global error popup while the tab waits for details forever.
+        try:
+            result = self.probe.run(gate=self.gate)
+        except Exception as exc:
+            self.probe.close()
+            result = {"info": None, "prompt": None, "displays": None,
+                      "error": f"{type(exc).__name__}: {exc}"}
         if not self._cancelled:
             self.details.emit(result)
 
@@ -632,18 +662,22 @@ class _DeviceProbe:
         *on_identity(payload)* is called exactly once: when the prompt and
         property sections are complete, after *identity_timeout* seconds, or
         at once when the probe can't run (so a caller never waits on it).
+
+        Whatever happens on the way, even an error in the first read, the
+        probe's adb process ends and the tab's adb slot is given back: a slot
+        kept by a failed probe held up every later background command.
         """
         slot = started = False
         try:
-            if gate is not None:
-                gate.acquire()
-                slot = True
-            started = self.start()
-            if started:
-                self.read_until("kind", identity_timeout)
-        except _GateClosed as exc:
-            self.error = str(exc)
-        try:
+            try:
+                if gate is not None:
+                    gate.acquire()
+                    slot = True
+                started = self.start()
+                if started:
+                    self.read_until("kind", identity_timeout)
+            except _GateClosed as exc:
+                self.error = str(exc)
             if on_identity is not None:
                 on_identity(self.identity_payload())
             if started:
@@ -733,20 +767,15 @@ class _DeviceProbe:
                 proc.wait(timeout=wait)
             except Exception:
                 pass
-        self._kill(proc)
+        # the probe's own worker (it waited) can afford to reap it as well
+        self._kill(proc, reap=bool(wait))
 
     @staticmethod
-    def _kill(proc) -> None:
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
-        try:
-            if proc.stdout is not None:
-                proc.stdout.close()
-        except Exception:
-            pass
+    def _kill(proc, reap: bool = False) -> None:
+        """Kill the probe's adb and close its output, so the pump returns."""
+        from ..proctree import stop_process
+
+        stop_process(proc, grace=0, close_pipes=True, reap=reap)
 
     # ---- parsing ----
     def props(self) -> dict:
@@ -854,6 +883,22 @@ class _TerminalWidgetBase(QWidget):
         self._closing = False
         self._completion_thread = None
         self._access_notice_at = 0.0
+        self._break_drawn_at = 0.0  # see _drop_drawn_break
+
+    # how long the line break after an Enter for a program's prompt may take
+    _BREAK_WAIT_S = 2.0
+
+    def _drop_drawn_break(self, data: bytes) -> bytes:
+        """The console drew the line end for an empty answer (see _send): the
+        program's own line break right after it is the same line end."""
+        if time.monotonic() - self._break_drawn_at > self._BREAK_WAIT_S:
+            self._break_drawn_at = 0.0
+            return data
+        rest = data.lstrip(b"\r")
+        if not rest:
+            return b""  # only CRs yet: the LF decides
+        self._break_drawn_at = 0.0
+        return rest[1:] if rest[:1] == b"\n" else data
 
     def _notice_refusal(self, data) -> None:
         """Emit :attr:`access_refused` for a line where the device refused access."""
@@ -877,6 +922,7 @@ class _TerminalWidgetBase(QWidget):
         stop.setProperty("role", "danger")
         stop.setToolTip("Stop the active command and open a fresh shell (Ctrl+C)")
         stop.clicked.connect(self.interrupt)
+        self.btn_stop = stop
 
         clr = QPushButton("Clear")
         clr.setProperty("role", "ghost")
@@ -977,6 +1023,26 @@ class _TerminalWidgetBase(QWidget):
     def _sync_font_size(self):
         self.lbl_font_size.setText(f"{self.term.font_size()} pt")
 
+    def _console_columns(self) -> int:
+        """How many characters fit on one line of the terminal: whole cells,
+        margins and scroll bar left out (see AnsiConsole.cell_size)."""
+        return self._cell_size()[0]
+
+    def _console_rows(self) -> int:
+        """How many lines fit in the terminal (see :meth:`_console_columns`)."""
+        return self._cell_size()[1]
+
+    def _cell_size(self):
+        """``(columns, rows)`` of the terminal.  The page is laid out first:
+        one just switched to (or not shown yet) may not be."""
+        try:
+            layout = self.layout()
+            if layout is not None and layout.geometry() != self.rect():
+                layout.setGeometry(self.rect())
+            return self.term.cell_size()
+        except Exception:
+            return 0, 0
+
     def _change_font_size(self, delta):
         self.term.bump_font(delta)
         self._sync_font_size()
@@ -1027,9 +1093,13 @@ class _TerminalWidgetBase(QWidget):
         head = line[: len(line) - len(token)]
         first_word = " " not in line.strip()
         try:
+            # Each Tab press is an `adb shell` one-shot: it waits for one of the
+            # device tab's adb slots (DeviceTab sets adb_gate) like every other.
+            gate = getattr(self, "adb_gate", None)
+            shell = gate.wrap(handler.shell) if gate is not None else handler.shell
             if first_word:
                 globs = " ".join(f"{path}/{quote(token)}*" for path in self._BIN_DIRS)
-                result = handler.shell(f"ls -d {globs} 2>/dev/null", timeout=1.5, safe=True)
+                result = shell(f"ls -d {globs} 2>/dev/null", timeout=1.5, safe=True)
                 if not isinstance(result, OperationResult) or not result.success:
                     return None, []
                 names = sorted({
@@ -1044,7 +1114,7 @@ class _TerminalWidgetBase(QWidget):
                 prefix = os.path.commonprefix(names)
                 return (head + prefix if len(prefix) > len(token) else None), names
 
-            result = handler.shell(
+            result = shell(
                 f"cd {quote(cwd)} 2>/dev/null; "
                 f"ls -dp {quote(token)}* 2>/dev/null",
                 timeout=1.5,
@@ -1075,14 +1145,168 @@ class _TerminalWidgetBase(QWidget):
         """Hook for a terminal that echoes the restart before it happens."""
 
 
+# ---- the local PowerShell / CMD terminals ---------------------------------
+# cmd.exe and powershell.exe exist on Windows only: elsewhere their terminals
+# are not offered (they could only fail to start).
+_LOCAL_SHELLS = os.name == "nt"
+# Shells an `adb shell` starts on the device when it names no other command:
+# they need a device terminal (-t -t) for their prompt and echo.
+_DEVICE_SHELLS = ("su", "sh", "mksh", "bash")
+# Full-screen programs, which need one for their keys and their screen.
+_FULL_SCREEN_PROGRAMS = ("top", "htop", "vi", "vim", "less", "more", "nano", "watch")
+# A findstr/find search word that means the same as a literal string.
+_PLAIN_WORD = re.compile(r"[\w@#%+=:,\-]+\Z")
+
+
+def _split_command_line(line: str, quotes: str = '"'):
+    """Split *line* at whitespace outside quotes into ``(text, start, end)``:
+    *text* without its quote characters, ``line[start:end]`` the token as
+    typed.  Backslashes are ordinary characters, as in Windows paths."""
+    tokens = []
+    text, start, quote = [], None, None
+    for index, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                text.append(ch)
+            continue
+        if ch in quotes:
+            quote = ch
+        elif ch.isspace():
+            if start is not None:
+                tokens.append(("".join(text), start, index))
+                text, start = [], None
+            continue
+        else:
+            text.append(ch)
+        if start is None:
+            start = index
+    if start is not None:
+        tokens.append(("".join(text), start, len(line)))
+    return tokens
+
+
+def _unquoted_positions(line: str, chars: str, quotes: str = '"'):
+    """Indexes in *line* of the characters in *chars* that are outside quotes."""
+    found, quote = [], None
+    for index, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in quotes:
+            quote = ch
+        elif ch in chars:
+            found.append(index)
+    return found
+
+
+def _adb_invocation(words):
+    """``(options, index)`` of an adb command line given as *words*: its global
+    options (lower-case flag -> value, or True) and the index of its
+    subcommand; None when *words* is not an adb command with a subcommand."""
+    if not words or re.split(r"[\\/]", words[0])[-1].lower() not in ("adb", "adb.exe"):
+        return None
+    options = {}
+    index = 1
+    while index < len(words) and words[index].startswith("-"):
+        flag = words[index].lower()
+        if flag in ("-s", "-t", "-h", "-p", "-l", "--one-device"):
+            if index + 1 >= len(words):
+                return None
+            options[flag] = words[index + 1]
+            index += 2
+        else:
+            options[flag] = True
+            index += 1
+    if index >= len(words):
+        return None
+    return options, index
+
+
+def _last_argument(line: str):
+    """``(start, text)`` of the argument being typed at the end of *line*: a
+    double-quoted part may hold spaces, and *text* has the quotes removed
+    (``cd "My Folder"\\su`` -> ``My Folder\\su``)."""
+    start, quoted = 0, False
+    for index, ch in enumerate(line):
+        if ch == '"':
+            quoted = not quoted
+        elif ch.isspace() and not quoted:
+            start = index + 1
+    return start, line[start:].replace('"', "")
+
+
+_NETWORK_DRIVES = {}  # "Z:" -> (is a network drive, when that was checked)
+
+
+def _is_network_drive(drive: str) -> bool:
+    """Whether *drive* (``"Z:"``) is a mapped share or another redirector.  Asks
+    the object manager only (QueryDosDevice), which never waits on a server."""
+    drive = drive.upper()
+    now = time.monotonic()
+    cached = _NETWORK_DRIVES.get(drive)
+    if cached is not None and now - cached[1] < 60.0:
+        return cached[0]
+    remote = False
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.QueryDosDeviceW(drive, buf, len(buf)):
+            target = buf.value.lower()
+            local = target.startswith("\\device\\harddisk") or (
+                target.startswith("\\??\\") and not target.startswith("\\??\\unc\\")
+            )
+            remote = not local
+    except Exception:
+        pass
+    _NETWORK_DRIVES[drive] = (remote, now)
+    return remote
+
+
+def _quick_isdir(path: str) -> bool:
+    """``os.path.isdir`` that never waits on the network.
+
+    A share or a mapped network drive is taken as it is: checking a folder on
+    a server that no longer answers stalled the whole window for seconds, and
+    this runs for every prompt the shell prints."""
+    if not path:
+        return False
+    if os.name == "nt":
+        if path.startswith(("\\\\", "//")):
+            return True
+        if len(path) >= 2 and path[1] == ":" and _is_network_drive(path[:2]):
+            return True
+    return os.path.isdir(path)
+
+
 class _LocalShellWidget(_TerminalWidgetBase):
-    """Dedicated interactive terminal tab for local PowerShell or CMD."""
+    """Dedicated interactive terminal tab for local PowerShell or CMD.
+
+    The widget follows whether the shell waits at its own prompt (the prompt
+    mark :data:`local_terminal.PROMPT_MARK_RE`, or a prompt-looking last
+    line).  Only a line typed there is a command: the conveniences below
+    (``ls``, ``clear``, ``where``, ``python``, an ``adb shell`` on a device
+    terminal, streaming filters) apply to it; anything typed while a command
+    runs is input for that command and goes out exactly as typed."""
     adb_reboot_requested = pyqtSignal(object)
     # "root" / "unroot" typed here for this device: adbd restarts
     adbd_restart_requested = pyqtSignal(str)
+    # (session, CommandStop) from the thread that ended a stopped command
+    _command_stopped = pyqtSignal(object, object)
+    # (session, CtrlC) from the thread that raised Stop's Ctrl+C
+    _ctrl_c_done = pyqtSignal(object, object)
 
     # how long after the device is back an adb shell may still be ending
     ADB_RESUME_WAIT_S = 30.0
+    # Stop on a local command: how long the shell gets to show its prompt again
+    # before it is replaced by a fresh one, and when a shell that stays quiet
+    # is asked for its prompt (an empty line)
+    LOCAL_STOP_WAIT_MS = 1500
+    LOCAL_STOP_PROBE_MS = 400
+    # Hint shown (once a session) for a filter that holds its output back
+    _HINT_COLOR = theme.ANSI_FG[90]
 
     def __init__(self, shell_type: str = "powershell", serial: str = None, handler=None, parent=None):
         # The same handler backs the device tab, so completion requests use the
@@ -1102,26 +1326,34 @@ class _LocalShellWidget(_TerminalWidgetBase):
             restart_slot=self.reopen,
             info_text=f"{lbl} • ANDROID_SERIAL={serial or 'auto'}",
         )
+        self.btn_stop.setToolTip(
+            "Stop the running command (Ctrl+C); the shell keeps its folder and variables"
+        )
 
         self._shell_cwd = os.path.expanduser("~")
 
         self.term = AnsiConsole(send_fn=self._send)
         self.term.set_emulate_prompt(False)
-        self.term.set_completion_fn(self._local_complete)
+        self.term.set_completion_fn(self._complete_local_async)
         self.term.set_prompt_provider_fn(self._get_prompt)
         self.term.set_interrupt_fn(self.interrupt)
+        self.term.set_send_key_fn(self._send_key)
+        self.term.set_key_offered_fn(self._key_offered)
         self._attach_terminal(lay)
 
         self._started = False
         self._in_adb_shell = False
         self._adb_shell_cwd = "/"
         self._adb_shell_command = ""  # the adb shell command as sent, to reopen it
+        self._adb_shell_foreign = False  # that adb shell is another device's
         # the adb shell printed its prompt or an adb error, so a local prompt
         # after that means it ended (not an earlier prompt still arriving)
         self._adb_answered = False
         self._adb_reentry_cwd = None  # device folder to cd into once reopened
         self._adb_interrupt_pending = False  # Ctrl+C sent, device prompt not back yet
         self._adb_interrupt_heard = False
+        self._prompt_to_mark = False  # a device prompt (or the end of an adb shell) was seen
+        self._adb_shell_ended = False  # ... the end, in the output being fed (see _feed_from)
         self._adb_interrupt_timer = QTimer(self)
         self._adb_interrupt_timer.setSingleShot(True)
         self._adb_interrupt_timer.timeout.connect(self._on_adb_interrupt_timeout)
@@ -1129,7 +1361,35 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._adb_resume = None
         self._adb_resume_until = 0.0  # set when the device is back; monotonic
         self._strip_startup_banner = False  # set for each new CMD session
+        self._banner_chunks = 0
         self._prompt_tail = ""
+        self._tail_end = 0        # characters of output tracked so far (the tail's end)
+        self._echo_scan_to = 0    # ... and up to where prompts were checked for an echo
+        # The shell waits at its own prompt: set when its prompt ends the
+        # output, cleared by every line sent.  A fresh shell reads its first
+        # line as a command too.
+        self._own_prompt = True
+        self._prompt_seen = False  # this shell has shown its prompt
+        self._break_drawn_at = 0.0  # see _drop_drawn_break
+        self._pipe_hint_shown = False
+        self._refused_at = 0.0
+        self._ps_width = None  # PowerShell's buffer width as last set
+        self._grep_probe = {}  # {"gnu": bool} once the session's grep is known
+        # Stop on a local command (see interrupt)
+        self._stop_pending = False
+        self._stop_phase = ""      # "ctrl-c": a console Ctrl+C; "kill": ending processes
+        self._ctrl_c_sent = False  # that Ctrl+C reached the shell's console
+        self._stop_heard = False   # ... and output came after it
+        self._stop_marked = False  # a "^C" is on screen for this stop
+        self._batch_answered = False
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setSingleShot(True)
+        self._stop_timer.timeout.connect(self._on_local_stop_timeout)
+        self._stop_probe_timer = QTimer(self)
+        self._stop_probe_timer.setSingleShot(True)
+        self._stop_probe_timer.timeout.connect(self._probe_local_prompt)
+        self._command_stopped.connect(self._on_command_stopped)
+        self._ctrl_c_done.connect(self._on_ctrl_c_sent)
 
     def _get_prompt(self) -> str:
         if self._in_adb_shell:
@@ -1210,7 +1470,26 @@ class _LocalShellWidget(_TerminalWidgetBase):
         cls._PATH_CACHE_TIME = now
         return cmds
 
-    def _local_complete(self, line: str):
+    def _complete_local_async(self, line: str):
+        """Tab: complete on a worker thread, like the Android completion.
+
+        Completion reads folders (the current one, every PATH entry); on a
+        share whose server stopped answering each read stalled for seconds,
+        which froze the whole window.  The folder and environment are taken
+        now, so the worker never reads the widget."""
+        cwd = self._shell_cwd
+        env = getattr(self.session, "env", None)
+        return self._start_async_completion(
+            line, lambda text: self._local_complete(text, cwd=cwd, env=env)
+        )
+
+    def _local_complete(self, line: str, *, cwd: str = None, env=None):
+        """``(completed line or None, options)`` for *line* (blocking: it reads
+        folders).  *cwd* and *env* default to the shell's current ones."""
+        if cwd is None:
+            cwd = self._shell_cwd
+        if env is None:
+            env = getattr(self.session, "env", None)
         builtins = self._PS_BUILTINS if self.shell_type == "powershell" else self._CMD_BUILTINS
         if not line or not line.strip():
             # If line is empty or whitespace, show common default commands
@@ -1236,18 +1515,18 @@ class _LocalShellWidget(_TerminalWidgetBase):
             matches = {c for c in builtins if c.lower().startswith(prefix)}
 
             # Look in the shell's own PATH (cached)
-            path_cmds = self._get_path_commands(getattr(self.session, "env", None))
+            path_cmds = self._get_path_commands(env)
             for cmd_name in path_cmds:
                 if cmd_name.startswith(prefix):
                     matches.add(cmd_name)
 
             # Look in current working directory
-            if os.path.isdir(self._shell_cwd):
+            if os.path.isdir(cwd):
                 try:
                     pathext = tuple(e.lower() for e in os.environ.get("PATHEXT", ".exe;.bat;.cmd;.ps1").split(";") if e)
                     if self.shell_type == "powershell":
                         pathext += (".ps1",)
-                    with os.scandir(self._shell_cwd) as it:
+                    with os.scandir(cwd) as it:
                         for entry in it:
                             if entry.name.lower().startswith(prefix) and entry.is_file():
                                 base, ext = os.path.splitext(entry.name)
@@ -1310,13 +1589,18 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     return line[:idx] + c_pref, matches
             return None, matches
 
-        # 5. Directory / file path completion
+        # 5. Directory / file path completion.  The argument may be quoted
+        # anywhere (completion itself quotes names with spaces): `cd "My
+        # Folder"\su` is `My Folder\su`, and it is replaced from where it starts.
         dirs_only = first in ("cd", "chdir", "pushd", "set-location")
-        if trailing_space:
-            prefix = ""
-        else:
-            raw_last = tokens[-1]
-            prefix = raw_last.strip('"\'')
+        arg_start, prefix = _last_argument(line)
+        prefix = prefix.strip("'")
+        if (
+            prefix and line.endswith('"') and not prefix.endswith(("\\", "/"))
+            and os.path.isdir(prefix if os.path.isabs(prefix) else os.path.join(cwd, prefix))
+        ):
+            # a folder completion closed with its quote: Tab goes into it
+            prefix += "\\"
 
         # ``/name`` is an Android/Unix-style path, not an absolute Windows
         # path. Treat it as relative in a local PowerShell/CMD session so Tab
@@ -1325,14 +1609,14 @@ class _LocalShellWidget(_TerminalWidgetBase):
         if os.name == "nt" and prefix.startswith("/") and not prefix.startswith("//"):
             prefix = prefix.lstrip("/")
             if not trailing_space:
-                normalized_line = line[:line.rfind(tokens[-1])] + prefix
+                normalized_line = line[:arg_start] + prefix
 
         if os.path.isabs(prefix):
             search_dir = os.path.dirname(prefix) or prefix
             base = os.path.basename(prefix)
         else:
             rel_dir = os.path.dirname(prefix)
-            search_dir = os.path.join(self._shell_cwd, rel_dir) if rel_dir else self._shell_cwd
+            search_dir = os.path.join(cwd, rel_dir) if rel_dir else cwd
             base = os.path.basename(prefix)
 
         real_dir = os.path.abspath(search_dir)
@@ -1370,14 +1654,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
         formatted_matches = [_format_cand(m) for m in matches]
 
         if len(matches) == 1:
-            completed = formatted_matches[0]
-            if not trailing_space:
-                last_token = tokens[-1]
-                idx = line.rfind(last_token)
-                new_line = line[:idx] + completed
-            else:
-                new_line = line + completed
-            return new_line, []
+            return line[:arg_start] + formatted_matches[0], []
         elif matches:
             c_pref = os.path.commonprefix(matches)
             if len(c_pref) > len(base):
@@ -1388,13 +1665,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     completed = os.path.join(rel_dir, c_pref) if rel_dir else c_pref
                 if " " in completed or any(c in completed for c in "&()"):
                     completed = f'"{completed.rstrip(chr(92))}"'
-                if not trailing_space:
-                    last_token = tokens[-1]
-                    idx = line.rfind(last_token)
-                    new_line = line[:idx] + completed
-                else:
-                    new_line = line + completed
-                return new_line, formatted_matches
+                return line[:arg_start] + completed, formatted_matches
             # Even if the names have no longer common prefix, remove an
             # accidental Unix slash before presenting the choices. Otherwise
             # Enter would send `cd /name` to PowerShell as `C:\\name`.
@@ -1403,6 +1674,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
     def _adb_shell_complete(self, line: str):
         """Schedule Android completion and immediately return to Qt's event loop."""
+        if self._adb_shell_foreign:
+            return None, []  # another device's shell: this tab's device can't answer
         return self._start_async_completion(line, self._query_adb_shell_complete)
 
     def _query_adb_shell_complete(self, line: str):
@@ -1415,22 +1688,19 @@ class _LocalShellWidget(_TerminalWidgetBase):
         """
         return self._query_android_completion(line, self._adb_shell_cwd)
 
-    def _track_adb_shell_directory(self, line: str) -> None:
-        """Keep completion rooted at the last requested Android directory."""
-        import posixpath
+    def _track_adb_shell_cd(self, line: str) -> None:
+        """A ``cd`` typed in the adb shell moves completion there at once.
 
-        parts = line.strip().split(maxsplit=1)
+        The console's own parser follows ``cd -``, ``~``, quotes and a compound
+        line (``cd /sdcard && ls``), and takes a cd back when the device says
+        it failed; the device prompt (``host:/path $``) then has the last word
+        (see :meth:`_track_adb_shell_output`)."""
+        parts = line.split(maxsplit=1)
         if not parts or parts[0] != "cd":
             return
-        if len(parts) == 1:
-            self._adb_shell_cwd = "/"
-        else:
-            target = parts[1].strip().strip("'\"")
-            if target and target not in ("-", "~"):
-                self._adb_shell_cwd = posixpath.normpath(
-                    target if target.startswith("/") else posixpath.join(self._adb_shell_cwd, target)
-                )
         self.term._cwd = self._adb_shell_cwd
+        self.term._apply_cd(line)
+        self._adb_shell_cwd = self.term._cwd
 
     def reset_adb_shell_context(self) -> None:
         """Return completion/prompt bookkeeping to the local host shell.
@@ -1442,47 +1712,119 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._in_adb_shell = False
         self._adb_shell_cwd = "/"
         self._adb_shell_command = ""
+        self._adb_shell_foreign = False
         self._adb_answered = False
         self._adb_reentry_cwd = None
         self._clear_adb_interrupt()
         self.term._cwd = self._shell_cwd
-        self.term.set_completion_fn(self._local_complete)
+        self.term.set_completion_fn(self._complete_local_async)
+        self.term.set_shell_at_prompt(self._own_prompt)
+        self.term.set_typing_ahead(not self._prompt_seen)
+        self.term.set_screen_input(None)  # the shell reads a pipe again
+        if self.session is not None:
+            self.session.utf8_input = False  # ... in its console code page (CMD)
 
-    def _enter_adb_shell(self, command: str) -> bytes:
-        """Follow an interactive adb shell started here; returns the line to send."""
+    def _enter_adb_shell(self, command: str, *, foreign: bool = False, one_shot: bool = False) -> bytes:
+        """Follow an interactive adb shell started here; returns the line to send.
+
+        It runs on a device terminal, which echoes every line typed, also
+        while a device command runs: the console is left to expect that echo
+        (``set_shell_at_prompt(None)``) for as long as the adb shell lasts,
+        and a full-screen program in it gets the console's screen.
+        *one_shot*: a full-screen program started straight from ``adb shell``
+        (``adb shell top``): no device prompt comes, the local one ends it,
+        and Stop never starts it again."""
         self._in_adb_shell = True
-        self._adb_shell_command = command
+        self._own_prompt = False
+        self._adb_shell_command = "" if one_shot else command
+        self._adb_shell_foreign = foreign
         self._adb_shell_cwd = "/"
-        self._adb_answered = False
+        self._adb_answered = one_shot
         self._adb_reentry_cwd = None
         self._prompt_tail = ""
         self._clear_adb_interrupt()
         self.term._cwd = self._adb_shell_cwd
         self.term.set_completion_fn(self._adb_shell_complete)
+        self.term.set_shell_at_prompt(None)
+        # until the device prompt shows, a line typed is echoed after it
+        self.term.set_typing_ahead(True)
+        self.term.set_screen_input(self._screen_write)
         return (command + "\r\n").encode("utf-8")
+
+    def _screen_write(self, data: bytes) -> bool:
+        """Keys and answers for a program on the adb shell's device terminal
+        (see AnsiConsole.set_screen_input): as they are, through adb."""
+        if not (self.session and self.session.running):
+            return False
+        self._clear_adb_interrupt()  # the program is being used: a Stop starts over
+        return self.session.send(data) is not False
 
     def _local_adb_command(self, tokens: list[str]):
         """``(subcommand, arguments)`` of an adb command line aimed at this
         terminal's device (``adb -s OTHER …`` is not), else None."""
-        if not tokens or os.path.basename(tokens[0]).lower() not in ("adb", "adb.exe"):
+        parsed = _adb_invocation(tokens)
+        if parsed is None:
             return None
-        index = 1
-        selected_serial = None
-        while index < len(tokens) and tokens[index].startswith("-"):
-            flag = tokens[index].lower()
-            if flag in ("-s", "-t", "-h", "-p"):
-                if index + 1 >= len(tokens):
-                    return None
-                if flag == "-s":
-                    selected_serial = tokens[index + 1]
-                index += 2
-            else:
-                index += 1
-        if index >= len(tokens):
-            return None
-        if selected_serial and self.serial and selected_serial != self.serial:
+        options, index = parsed
+        selected_serial = options.get("-s")
+        if selected_serial and selected_serial != self.serial:
+            # another device, or one this terminal can't tell is its own: a
+            # reboot of it must not put this tab into its reboot recovery
             return None
         return tokens[index].lower(), tokens[index + 1:]
+
+    def _typed_adb_shell(self, line: str):
+        """``(line to send, foreign, one_shot)`` for an interactive ``adb …
+        shell`` typed at the PC prompt, else None.
+
+        adb gives a shell a device terminal only when its own input is one, so
+        from these pipes the device showed no prompt and no echo, its stdio
+        held output back and Ctrl+C could not reach it.  ``-t -t`` forces the
+        terminal: added right after ``shell`` for the interactive forms (no
+        device command, or a bare su/sh/mksh/bash) of any adb (``adb.exe``, a
+        full path, ``-s``/``-t``/``-H``/``-P``/``-d``/``-e``), and for a
+        full-screen program (``adb shell top``: *one_shot*).  Not for another
+        one-shot command or a line with host-side ``|``, ``<``, ``>``, ``&``
+        or ``;``: a terminal would merge stderr into stdout and turn line ends
+        into CR LF in a redirected file.  An explicit ``-t``/``-T``/``-x``/
+        ``-n`` is kept as typed (a shell with ``-t -t`` is still followed).
+        *foreign*: the shell is another device's (``-s OTHER``, another server)."""
+        powershell = self.shell_type == "powershell"
+        quotes = "\"'" if powershell else '"'
+        tokens = _split_command_line(line, quotes)
+        if powershell and tokens and tokens[0][0] == "&":
+            tokens = tokens[1:]  # the call operator: & "C:\pt\adb.exe" shell
+        words = [token[0] for token in tokens]
+        parsed = _adb_invocation(words)
+        if parsed is None or words[parsed[1]].lower() != "shell":
+            return None
+        options, index = parsed
+        leading_call = 1 if powershell and line.lstrip().startswith("&") else 0
+        if len(_unquoted_positions(line, "|<>&;", quotes)) > leading_call:
+            return None
+        flags = ""
+        rest = index + 1
+        while rest < len(words) and words[rest].startswith("-") and len(words[rest]) > 1:
+            flag = words[rest]
+            rest += 1
+            if flag == "-e":
+                rest += 1  # the escape character
+            else:
+                flags += flag[1:]
+        command = words[rest:]
+        one_shot = bool(command) and re.split(r"[\\/]", command[0])[-1].lower() in _FULL_SCREEN_PROGRAMS
+        if command and not one_shot and not (len(command) == 1 and command[0].lower() in _DEVICE_SHELLS):
+            return None
+        serial = options.get("-s")
+        foreign = bool(serial and self.serial and serial != self.serial) or any(
+            flag in options for flag in ("-h", "-p", "-l")
+        )
+        if any(flag in flags for flag in "tTxn"):
+            if flags.count("t") >= 2 and not any(flag in flags for flag in "Tn"):
+                return line, foreign, one_shot  # a device terminal already: followed as typed
+            return None
+        shell_end = tokens[index][2]
+        return line[:shell_end] + " -t -t" + line[shell_end:], foreign, one_shot
 
     def _local_adb_reboot_mode(self, tokens: list[str]):
         """Return the requested reboot mode for this terminal's device, if any."""
@@ -1507,18 +1849,47 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self.ensure_started()
         self.term.setFocus(Qt.OtherFocusReason)
 
+    def _adb_server(self):
+        """``(host, port)`` of the adb server the device tab's handler uses:
+        typed adb commands go there too (``adb -H``/``-P`` in the engine)."""
+        config = getattr(self.handler, "config", None)
+        host = getattr(config, "adb_server_host", None)
+        port = getattr(config, "adb_server_port", None)
+        return (
+            host if isinstance(host, str) and host else None,
+            port if isinstance(port, int) and not isinstance(port, bool) else None,
+        )
+
     def _start_session(self, *, show_banner=True):
         from .local_terminal import LocalShellSession
+        from ..config import format_host_port
+        from ..tools import DEFAULT_ADB_SERVER_PORT
 
+        from .local_terminal import ps_buffer_width
+
+        host, port = self._adb_server()
+        columns = self._console_columns()
         try:
-            self.session = LocalShellSession(self.shell_type, serial=self.serial, cwd=self._shell_cwd)
+            self.session = LocalShellSession(
+                self.shell_type, serial=self.serial, cwd=self._shell_cwd,
+                adb_server_host=host, adb_server_port=port,
+                columns=columns,
+            )
+            # the buffer width PowerShell's startup gave it (see _with_new_width)
+            self._ps_width = ps_buffer_width(columns)
             # CMD's copyright banner, also after Stop reopens the shell
             self._strip_startup_banner = True
+            self._banner_chunks = 0
             if show_banner:
                 from .. import __version__
 
                 name = "PowerShell" if self.shell_type == "powershell" else "Command Prompt"
                 target = f"  ·  ANDROID_SERIAL={self.serial}" if self.serial else ""
+                if host:
+                    server = format_host_port(host, port or DEFAULT_ADB_SERVER_PORT)
+                    target += f"  ·  adb server {server}"
+                elif port and port != DEFAULT_ADB_SERVER_PORT:
+                    target += f"  ·  adb server port {port}"
                 # Two framed lines, like the Android terminal's banner.
                 self.term.banner(
                     _boxed_banner(
@@ -1530,10 +1901,21 @@ class _LocalShellWidget(_TerminalWidgetBase):
                     )
                 )
         except Exception as exc:
-            self.term.feed(f"\n[Could not start local {self.shell_type}: {exc}]\n".encode("utf-8"))
+            self.term.notice(f"[Could not start local {self.shell_type}: {exc}]", theme.ECHO_ERROR)
             return
 
         sess = self.session
+        # a fresh shell reads its first line as a command, once its prompt is
+        # out: it echoes a line typed before that after the prompt
+        self._own_prompt = True
+        self._prompt_seen = False
+        self._break_drawn_at = 0.0
+        self._prompt_tail = ""
+        self._pipe_hint_shown = False
+        self.term.set_shell_at_prompt(True)
+        self.term.set_typing_ahead(True)
+        self.term.drop_typed_ahead()
+        self._start_probes(sess)
 
         def read_fn():
             if not sess.running:
@@ -1548,32 +1930,111 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self.reader.start()
         self.term.set_alive(True)
 
+    def _start_probes(self, session) -> None:
+        """Off the UI thread, for a new session: warm the PATH command list for
+        the first Tab, and (CMD) learn whether its ``grep`` is GNU grep, which
+        takes ``--line-buffered`` (see :meth:`_pipeline_rewrite`)."""
+        env = getattr(session, "env", None)
+        self._grep_probe = probe = {}
+        if not isinstance(env, dict) or not env:
+            return  # a stand-in session
+
+        def run():
+            try:
+                type(self)._get_path_commands(env)
+            except Exception:
+                pass
+            if self.shell_type == "cmd":
+                from .local_terminal import gnu_grep
+
+                probe["gnu"] = gnu_grep(env)
+
+        threading.Thread(target=run, name="turboadb-local-shell-probe", daemon=True).start()
+
+    # cmd's copyright banner, which it may write in several pieces
+    _CMD_BANNER = re.compile(
+        r"(?:\s*(?:Microsoft Windows \[Version [^\]\r\n]*\]?|\(c\)[^\r\n]*))*\s*"
+    )
+
+    def _strip_cmd_banner(self, data: bytes) -> bytes:
+        """Drop cmd's startup banner and the blank line after it, however the
+        pipe splits it (a banner written in two reads stayed on screen)."""
+        self._banner_chunks += 1
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            return data
+        clean = text[self._CMD_BANNER.match(text).end():]
+        if clean or self._banner_chunks >= 8:
+            self._strip_startup_banner = False
+        return clean.encode("utf-8")
+
     def _feed_from(self, reader, data):
-        if reader is self.reader:
-            if getattr(self, "_strip_startup_banner", False) and self.shell_type == "cmd":
-                self._strip_startup_banner = False
-                try:
-                    text = data.decode("utf-8", errors="replace")
-                    clean = re.sub(
-                        r"^Microsoft Windows \[Version [^\]]+\]\r?\n(?:\(c\)[^\n]*\r?\n+)*\s*",
-                        "",
-                        text,
-                    )
-                    data = clean.encode("utf-8")
-                except Exception:
-                    pass
-            if self._adb_interrupt_pending:
-                self._adb_interrupt_heard = True
-            if self._in_adb_shell:
-                self._notice_refusal(data)
-            self._track_prompt_cwd(data)
-            self.term.feed(data)
+        if reader is not self.reader:
+            return
+        if self._strip_startup_banner and self.shell_type == "cmd":
+            data = self._strip_cmd_banner(data)
+            if not data:
+                return
+        if self._break_drawn_at:
+            data = self._drop_drawn_break(data)
+            if not data:
+                return
+        if self._adb_interrupt_pending:
+            self._adb_interrupt_heard = True
+        if self._in_adb_shell:
+            self._notice_refusal(data)
+        self._track_prompt_cwd(data)
+        if self._adb_shell_ended:
+            # The adb shell ended with this output: a program's screen left
+            # behind goes before what adb and the local shell printed after
+            # it, or vi's frame stayed up after the device went away, with
+            # the local prompt drawn on it where no key reached anything.
+            self._adb_shell_ended = False
+            end = self._adb_shell_words(data)
+            self.term.feed(data[:end])
+            self.term.end_screen()
+            data = data[end:]
+        self.term.feed(data)
+        if self._prompt_to_mark:
+            self._prompt_to_mark = False
+            self.term.mark_prompt()
+        if self.term.typing_ahead() and (
+            self._adb_answered if self._in_adb_shell else self._prompt_seen
+        ):
+            self.term.set_typing_ahead(False)  # the shell reads what is typed now
+        if self.term.has_typed_ahead() and not self._in_adb_shell:
+            self._retract_echoed_lines()
+        if self._in_adb_shell:
+            # a cd the device refused was taken back by the console
+            self._adb_shell_cwd = self.term._cwd
+            self.term.set_shell_at_prompt(None)
+        else:
+            # A continuation prompt (PowerShell's ">>", cmd's "More?") reads
+            # the rest of a command: the shell echoes that line, as it does a
+            # command, but it gets no conveniences of its own.
+            continued = bool(self._CONTINUATION_TAIL.search(self._prompt_tail))
+            self.term.set_shell_at_prompt(self._own_prompt or continued)
+            if self._stop_pending:
+                if self._ctrl_c_sent:
+                    self._stop_heard = True  # the command answered the Ctrl+C
+                self._follow_local_stop()
 
     _PS_PROMPT_TAIL = re.compile(r"(?:^|[\r\n])PS ([^\r\n>]+)> ?$")
     _CMD_PROMPT_TAIL = re.compile(r"(?:^|[\r\n])([A-Za-z]:\\[^\r\n<>|*?\"]*)>$")
+    _CONTINUATION_TAIL = re.compile(r"(?:^|[\r\n])(?:>> ?|More\? ?)$")
     # an Android shell prompt ("PD2318:/sdcard $ ", "/ # ") ending the output
     _DEVICE_PROMPT_TAIL = re.compile(r"[:/][^\r\n]* [$#] ?$")
+    # ... and the folder in it ("130|PD2318:/sdcard $ " -> /sdcard)
+    _DEVICE_PROMPT_CWD = re.compile(
+        r"(?:^|\n|[$#] )(?:\d+\|)?(?:[^\s:/]*:)?(/(?:(?! [$#] )[^\n])*?) [$#] ?$"
+    )
     _ADB_ERROR_LINE = re.compile(r"(?:^|[\r\n])(?:adb(?:\.exe)?|error): ")
+    # ... where one starts, in the output
+    _ADB_ERROR_START = re.compile(rb"(?:^|(?<=[\r\n]))(?:adb(?:\.exe)?|error): ")
+    # cmd after a batch file's command was stopped (English "Terminate batch
+    # job (Y/N)? ", German "(J/N)?", French "(O/N) ?"): group 1 answers yes
+    _BATCH_QUESTION = re.compile(r"\^C[^\r\n]*\((\w)/\w\) ?\? ?$")
 
     def _track_prompt_cwd(self, data) -> None:
         """Follow the folder the shell reports in its own prompt.
@@ -1586,25 +2047,80 @@ class _LocalShellWidget(_TerminalWidgetBase):
             data = data.decode("utf-8", "replace")
         tail = (getattr(self, "_prompt_tail", "") + data)[-1024:]
         self._prompt_tail = tail
+        self._tail_end += len(data)  # where the tail ends in the whole output
         if self._in_adb_shell:
             self._track_adb_shell_output(tail)
             return
-        match = self._local_prompt_match(tail)
-        if match:
-            self._shell_cwd = match.group(1)
+        folder = self._local_prompt_match(tail)
+        if folder is not None:
+            self._own_prompt = True
+            self._prompt_seen = True
+            self._take_prompt_folder(folder)
+
+    def _retract_echoed_lines(self) -> None:
+        """A line typed while a command ran was drawn at once, as input for
+        that command.  When the shell reads it as a command after all (the
+        command ended without reading it), it echoes it after its prompt: the
+        early copy then goes, so the line shows once, where it ran."""
+        from .local_terminal import PROMPT_MARK_RE
+
+        tail = self._prompt_tail
+        base = self._tail_end - len(tail)
+        for mark in PROMPT_MARK_RE.finditer(tail):
+            at = base + mark.end()
+            if at <= self._echo_scan_to:
+                continue
+            rest = tail[mark.end():]
+            end = rest.find("\n")
+            if end < 0:
+                return  # the echo is not complete yet
+            self._echo_scan_to = at
+            line = strip_ansi(rest[:end]).strip()
+            if line:
+                self.term.forget_typed_line(line)
 
     def _local_prompt_match(self, tail: str):
-        pattern = self._PS_PROMPT_TAIL if self.shell_type == "powershell" else self._CMD_PROMPT_TAIL
-        match = pattern.search(tail)
-        return match if match and os.path.isdir(match.group(1)) else None
+        """The folder of the shell prompt that ends *tail* (``""`` when it names
+        none), or None when the shell is not at its prompt.
+
+        The prompt mark says so for any prompt.  Without it (a nested shell,
+        a prompt redefined later) a default prompt of either shell counts
+        (``cmd`` typed in PowerShell prints cmd's), when its folder exists."""
+        from .local_terminal import PROMPT_MARK_RE
+
+        mark = None
+        for mark in PROMPT_MARK_RE.finditer(tail, max(0, len(tail) - 600)):
+            pass
+        if mark is not None and mark.end() == len(tail):
+            return mark.group(1)
+        for pattern in (self._PS_PROMPT_TAIL, self._CMD_PROMPT_TAIL):
+            match = pattern.search(tail)
+            if match and _quick_isdir(match.group(1)):
+                return match.group(1)
+        return None
+
+    def _take_prompt_folder(self, folder: str) -> None:
+        """The prompt shows *folder*: Tab completion and a restart use it."""
+        if folder and folder != self._shell_cwd and _quick_isdir(folder):
+            self._shell_cwd = folder
+        if not self._in_adb_shell:
+            self.term._cwd = self._shell_cwd
+
+    def _at_idle_prompt(self) -> bool:
+        """The shell waits at its prompt and nothing was printed since."""
+        return (
+            self._own_prompt and not self._in_adb_shell
+            and self._local_prompt_match(self._prompt_tail) is not None
+        )
 
     def _track_adb_shell_output(self, tail: str) -> None:
         """Follow an adb shell started here from its output.
 
-        The device prompt settles a pending Ctrl+C and, after a reopen, moves
-        back to the device folder. PowerShell's or CMD's own prompt after the
-        adb shell answered means it ended by itself (``exit`` in a script, the
-        device unplugged), so Tab completion and Stop act locally again."""
+        The device prompt settles a pending Ctrl+C, names the device folder
+        and, after a reopen, moves back to the old one. PowerShell's or CMD's
+        own prompt after the adb shell answered means it ended by itself
+        (``exit`` in a script, the device unplugged), so Tab completion and
+        Stop act locally again."""
         text = strip_ansi(tail)
         if self._DEVICE_PROMPT_TAIL.search(text):
             self._adb_answered = True
@@ -1612,123 +2128,351 @@ class _LocalShellWidget(_TerminalWidgetBase):
             cwd, self._adb_reentry_cwd = self._adb_reentry_cwd, None
             if cwd and self.session and self.session.running:
                 self.session.send(("cd " + shlex.quote(cwd) + "\r\n").encode("utf-8"))
+                return  # the prompt after that cd names the folder
+            match = self._DEVICE_PROMPT_CWD.search(text)
+            if match:
+                self._adb_shell_cwd = self.term._cwd = match.group(1)
+                self.term._cd_revert = None  # the device said where it is
+            self._prompt_to_mark = True  # its colours, once this output is fed
             return
         if self._ADB_ERROR_LINE.search(text):
             self._adb_answered = True
         if not self._adb_answered:
             return
-        match = self._local_prompt_match(tail)
-        if match:
+        folder = self._local_prompt_match(tail)
+        if folder is not None:
             self.reset_adb_shell_context()
-            self._shell_cwd = match.group(1)
-            self.term._cwd = self._shell_cwd
+            self._own_prompt = True
+            self._take_prompt_folder(folder)
+            self.term.set_shell_at_prompt(True)
+            self._prompt_to_mark = True  # its colours
+            self._adb_shell_ended = True  # a screen the adb shell had goes before it
             if self._adb_resume is not None and time.monotonic() < self._adb_resume_until:
                 self._resume_adb_shell_now()  # adbd restarted and the device is back
 
+    def _adb_shell_words(self, data: bytes) -> int:
+        """Where the last words of an adb shell that ended start in *data*
+        (the output its end came with): the error adb printed, or the line
+        of the local prompt that ends *data*.  What comes before is still
+        its program's."""
+        line = data.rfind(b"\n") + 1
+        error = self._ADB_ERROR_START.search(data, 0, line)
+        return line if error is None else error.start()
+
     def _on_closed(self):
         if not self._closing:
-            self.term.set_alive(False)
-            self.term.feed(b"\r\n[Process terminated]\r\n")
+            # one notice, after the shell's last output
+            self.term.set_alive(False, show_disconnect_notice=False)
+            self.term.notice("[Process terminated]", theme.ECHO_ERROR)
 
     def _send(self, data: bytes):
+        """A submitted line.  At the shell's own prompt it is a command and
+        gets the conveniences of :meth:`_shell_command`; while a command runs
+        it is input for that command and goes out exactly as typed (an answer
+        ``ls`` to ``set /p`` used to arrive as ``dir``).  Inside an adb shell
+        started here it belongs to the device."""
         self.ensure_started()
         if not (self.session and self.session.running):
             return
-
-        # Track directory changes and handle shell conveniences
+        adbd_restart = None
+        self._break_drawn_at = 0.0
+        if self._stop_pending and self._stop_heard:
+            # input for a program that answered Stop's Ctrl+C and runs on (a
+            # REPL): that Stop is over, and the next one starts with Ctrl+C
+            self._clear_local_stop()
         try:
             line = data.decode("utf-8", "replace").strip()
-            parts = line.split(maxsplit=1)
             # typing takes over: an adb shell waiting to reopen stays closed
             self._adb_resume = None
-            # Once `adb shell` is interactive, its commands and paths belong
-            # to Android. Never apply Windows path completion to them.
-            was_in_adb_shell = self._in_adb_shell
-            if was_in_adb_shell:
-                self._track_adb_shell_directory(line)
-                # input after a Ctrl+C: the next Stop sends Ctrl+C again
-                self._clear_adb_interrupt()
-            if not was_in_adb_shell and parts and parts[0].lower() in ("cd", "chdir"):
-                if len(parts) > 1:
-                    target = parts[1].strip().strip('"\'')
-                    if target.lower().startswith("/d "):
-                        target = target[3:].strip().strip('"\'')
-                    if target == "~":
-                        new_cwd = os.path.expanduser("~")
-                    else:
-                        new_cwd = os.path.normpath(os.path.join(self._shell_cwd, target))
-                    if os.path.isdir(new_cwd):
-                        self._shell_cwd = new_cwd
-                elif self.shell_type == "powershell":
-                    self._shell_cwd = os.path.expanduser("~")
-            elif (not was_in_adb_shell and parts
-                  and parts[0].lower() == "set-location" and len(parts) > 1):
-                target = parts[1].strip().strip('"\'')
-                new_cwd = os.path.normpath(os.path.join(self._shell_cwd, target))
-                if os.path.isdir(new_cwd):
-                    self._shell_cwd = new_cwd
-
-            # Track entry and exit from interactive adb shell
-            if was_in_adb_shell and line.lower() in ("exit", "exit 0", "logout"):
-                self.reset_adb_shell_context()
-
-            tokens = line.split()
-            local_reboot_mode = (
-                self._local_adb_reboot_mode(tokens) if not was_in_adb_shell else None
-            )
-            adbd_restart = (
-                self._local_adbd_restart_verb(tokens) if not was_in_adb_shell else None
-            )
-            adb_shell = None
-            if len(tokens) == 2 and tokens[0].lower() == "adb" and tokens[1].lower() == "shell":
-                adb_shell = "adb shell -t -t"
-            elif len(tokens) == 4 and tokens[0].lower() == "adb" and tokens[1].lower() in ("-s", "-t") and tokens[3].lower() == "shell":
-                adb_shell = f"adb {tokens[1]} {tokens[2]} shell -t -t"
-            if adb_shell is not None:
-                data = self._enter_adb_shell(adb_shell)
-                if hasattr(self.term, "_pending_echo"):
-                    self.term._pending_echo = adb_shell
-
-            if not getattr(self, "_in_adb_shell", False):
-                rewritten = self._interactive_rewrite(line)
-                if rewritten is not None:
-                    if hasattr(self.term, "_pending_echo"):
-                        self.term._pending_echo = rewritten
-                    data = (rewritten + "\r\n").encode("utf-8")
-
-            # In CMD when at top-level prompt, provide ls -> dir convenience
-            if self.shell_type == "cmd" and not getattr(self, "_in_adb_shell", False):
-                if line.lower() == "ls":
-                    if hasattr(self.term, "_pending_echo"):
-                        self.term._pending_echo = "dir"
-                    data = b"dir\r\n"
-                elif line.lower().startswith("ls "):
-                    rest = line[3:].strip()
-                    if rest in ("-la", "-al", "-l", "-a"):
-                        if hasattr(self.term, "_pending_echo"):
-                            self.term._pending_echo = "dir /a" if "a" in rest else "dir"
-                        data = b"dir /a\r\n" if "a" in rest else b"dir\r\n"
-                    else:
-                        if hasattr(self.term, "_pending_echo"):
-                            self.term._pending_echo = f"dir {rest}"
-                        data = f"dir {rest}\r\n".encode("utf-8")
-                elif line.lower() == "clear":
-                    if hasattr(self.term, "_pending_echo"):
-                        self.term._pending_echo = "cls"
-                    data = b"cls\r\n"
-            if local_reboot_mode is not None:
-                # The command itself is still sent to PowerShell/CMD below.
-                # This only tells DeviceTab to preserve input and reconnect the
-                # Android stream after an explicit local `adb reboot`.
-                self.adb_reboot_requested.emit(local_reboot_mode or None)
+            if self._in_adb_shell:
+                self._adb_shell_line(line)
+            elif self._own_prompt:
+                if self._prompt_seen:
+                    # it waited at its prompt: it has read every line typed before
+                    self.term.drop_typed_ahead()
+                data, adbd_restart = self._shell_command(line, data)
+            elif line:
+                # input for the running command; an echo of it after a prompt
+                # from now on means the shell read it (see _retract_echoed_lines)
+                self._echo_scan_to = self._tail_end
+            elif (strip_ansi(self._prompt_tail.rsplit("\n", 1)[-1]).strip()
+                  and not self._CONTINUATION_TAIL.search(self._prompt_tail)):
+                # Enter for a program's own prompt: the console ends that line
+                # at once, and pause, choice (or `cmd /c pause`) end it again
+                # after reading the key, which left a blank line behind
+                self._break_drawn_at = time.monotonic()
         except Exception:
             adbd_restart = None
-
-        self.session.send(data)
+        if not self._in_adb_shell:
+            # the shell, or the command it runs, has a line to work on now
+            self._own_prompt = False
+            self.term.set_shell_at_prompt(False)
+        if self.session.send(data) is False:
+            self._input_refused()
+        if self._in_adb_shell:
+            # adb reads what is typed now (not the line that started it, which
+            # was cmd's): it hands every byte to the device, which reads UTF-8
+            self.session.utf8_input = True
         if adbd_restart:
             # After the command is on its way: the device tab holds the other
             # terminals and brings them back once adbd has restarted.
             self.adbd_restart_requested.emit(adbd_restart)
+
+    def _adb_shell_line(self, line: str) -> None:
+        """A line for the adb shell started here: follow ``cd`` and ``exit``."""
+        # input after a Ctrl+C: the next Stop sends Ctrl+C again
+        self._clear_adb_interrupt()
+        if line.lower() in ("exit", "exit 0", "logout"):
+            self.reset_adb_shell_context()
+            return
+        self._track_adb_shell_cd(line)
+
+    def _shell_command(self, line: str, data: bytes):
+        """``(bytes to send, adbd restart verb)`` for *line* typed at the shell's
+        own prompt, with its conveniences applied."""
+        quotes = "\"'" if self.shell_type == "powershell" else '"'
+        words = [token[0] for token in _split_command_line(line, quotes)]
+        if self.shell_type == "powershell" and words[:1] == ["&"]:
+            words = words[1:]
+        reboot_mode = self._local_adb_reboot_mode(words)
+        adbd_restart = self._local_adbd_restart_verb(words)
+        typed_shell = self._typed_adb_shell(line)
+        if typed_shell is not None:
+            command, foreign, one_shot = typed_shell
+            data = self._enter_adb_shell(command, foreign=foreign, one_shot=one_shot)
+            self._expect_echo(command)
+        else:
+            rewritten = self._interactive_rewrite(line)
+            if rewritten is None and self.shell_type == "cmd":
+                rewritten = self._cmd_rewrite(line)
+            if rewritten is None:
+                rewritten = self._prompt_rewrite(line)
+            if rewritten is None:
+                rewritten = self._pipeline_rewrite(line)
+            if rewritten is not None:
+                self._expect_echo(rewritten)
+                data = (rewritten + "\r\n").encode("utf-8")
+            if self.shell_type == "powershell" and line:
+                data = self._with_new_width(rewritten or line, data)
+            if self.shell_type == "powershell" and line.lower() in ("cls", "clear", "clear-host"):
+                # Clear-Host clears only a console: nothing reaches the pipe
+                self.term.clear_screen()
+        if reboot_mode is not None:
+            # The command itself is still sent to PowerShell/CMD.  This only
+            # tells DeviceTab to preserve input and reconnect the Android
+            # stream after an explicit local `adb reboot`.
+            self.adb_reboot_requested.emit(reboot_mode or None)
+        return data, adbd_restart
+
+    def _expect_echo(self, text: str) -> None:
+        """The shell will echo *text* (a rewritten command): hide it, not the
+        line as typed."""
+        self.term._pending_echo = text
+        self.term._pending_echo_at = time.monotonic()
+
+    # statements that must come first on their line
+    _PS_FIRST_ONLY = re.compile(r"\s*(?:using\s|param\s*\()", re.IGNORECASE)
+    # A command reading the status of the one before it: the width statement
+    # in front of it would be that one (`$?` said True after a failure).
+    _PS_READS_STATUS = re.compile(r"\$\{?\?")
+
+    def _with_new_width(self, command: str, data: bytes) -> bytes:
+        """*data*, *command* typed at PowerShell's own prompt, with the buffer
+        width for the view in front when that changed since PowerShell last
+        heard it (the window or the font was resized): PowerShell formats
+        tables and Select-String matches to it.  At its prompt nothing runs,
+        so nothing is ever typed into a running command; the echo of the
+        whole line stays hidden.  A command that reads ``$?`` goes as typed
+        and the next one takes the width."""
+        from .local_terminal import ps_buffer_width, ps_resize_command
+
+        width = ps_buffer_width(self._console_columns())
+        if (self._ps_width is None or width == self._ps_width
+                or self._PS_FIRST_ONLY.match(command) or self._PS_READS_STATUS.search(command)
+                or self.term.typing_ahead()):
+            return data  # (typed ahead, the echo shows: the next command takes it)
+        self._ps_width = width
+        command = ps_resize_command(width) + command
+        self._expect_echo(command)
+        return (command + "\r\n").encode("utf-8")
+
+    # cmd's `prompt [text]` and `set prompt=[text]`; PowerShell defining its
+    # prompt function in one line
+    _CMD_PROMPT_COMMAND = re.compile(r"(\s*prompt)(?:\s+(.*?))?\s*\Z", re.IGNORECASE)
+    _CMD_PROMPT_VARIABLE = re.compile(r'(\s*set\s+)("?)(prompt=)(.*?)\2\s*\Z', re.IGNORECASE)
+    _PS_PROMPT_FUNCTION = re.compile(r"\bfunction\s+(?:global:|script:)?prompt\b", re.IGNORECASE)
+
+    def _prompt_rewrite(self, line: str):
+        """A prompt the user sets keeps the invisible mark at its end.
+
+        Without it the terminal no longer knew the shell waits for a command:
+        each command showed twice (the shell's echo was not expected), the
+        conveniences stopped, and Stop at the prompt replaced the shell.  cmd
+        gets the mark added to the new prompt text; PowerShell wraps the new
+        prompt function again, as at startup (a definition spread over several
+        lines is left alone)."""
+        from .local_terminal import _CMD_PROMPT_MARK, _PS_PROMPT_MARK
+
+        if self.shell_type == "cmd":
+            if _unquoted_positions(line, "&|<>"):
+                return None  # more than the prompt command
+            match = self._CMD_PROMPT_COMMAND.match(line)
+            if match:
+                text = match.group(2) or "$P$G"  # a bare `prompt` restores the default
+                if text.endswith(_CMD_PROMPT_MARK):
+                    return None
+                return f"{match.group(1)} {text}{_CMD_PROMPT_MARK}"
+            match = self._CMD_PROMPT_VARIABLE.match(line)
+            if match:
+                head, quote, name, text = match.groups()
+                text = text or "$P$G"  # an empty PROMPT means the default one
+                if text.endswith(_CMD_PROMPT_MARK):
+                    return None
+                return f"{head}{quote}{name}{text}{_CMD_PROMPT_MARK}{quote}"
+            return None
+        if not self._PS_PROMPT_FUNCTION.search(line) or line.count("{") != line.count("}"):
+            return None
+        return (line.rstrip().rstrip(";") + ";if($ExecutionContext.SessionState.LanguageMode"
+                " -eq 'FullLanguage'){try{" + _PS_PROMPT_MARK + "}catch{}}")
+
+    @staticmethod
+    def _cmd_rewrite(line: str):
+        """CMD: ``ls`` runs ``dir`` and ``clear`` runs ``cls``."""
+        low = line.lower()
+        if low == "ls":
+            return "dir"
+        if low.startswith("ls "):
+            rest = line[3:].strip()
+            if rest in ("-la", "-al", "-l", "-a"):
+                return "dir /a" if "a" in rest else "dir"
+            return f"dir {rest}"
+        if low == "clear":
+            return "cls"
+        return None
+
+    def _pipeline_rewrite(self, line: str):
+        """A command line whose filter shows its matches as they come, or None.
+
+        Over these pipes a filter's output is a pipe too, and findstr or GNU
+        grep hold it back until 4 KB have gathered or the command ends: ``adb
+        logcat | findstr X`` showed nothing for minutes.  CMD: ``| grep`` gets
+        ``--line-buffered`` (GNU grep only, :meth:`_start_probes`) and a plain
+        ``| findstr [/i] [/v] word`` shown on screen runs Windows' find.exe,
+        which writes every line at once (it cuts a line after 4 KB, which only
+        the longest logcat lines reach; output sent to a file keeps findstr).
+        PowerShell passes a program's output on to another program only when
+        the first one ends, whatever the filter, but streams into
+        Select-String: the plain findstr form runs that.  Other forms get a
+        one-time hint instead."""
+        powershell = self.shell_type == "powershell"
+        quotes = "\"'" if powershell else '"'
+        bars = [
+            index for index in _unquoted_positions(line, "|", quotes)
+            if line[index - 1:index] != "|" and line[index + 1:index + 2] != "|"
+        ]
+        if not bars:
+            return None
+        bounds = [0] + [index + 1 for index in bars] + [len(line) + 1]
+        stages = [line[bounds[i]:bounds[i + 1] - 1] for i in range(len(bounds) - 1)]
+        names = []
+        for stage in stages[1:]:
+            words = stage.split()
+            names.append(re.split(r"[\\/]", words[0])[-1].lower() if words else "")
+        rewritten, hint = None, False
+        if not powershell and self._grep_probe.get("gnu"):
+            changed = False
+            for number, (stage, name) in enumerate(zip(stages[1:], names), 1):
+                if name in ("grep", "grep.exe") and "--line-buffered" not in stage:
+                    head = len(stage) - len(stage.lstrip()) + len(stage.split()[0])
+                    stages[number] = stage[:head] + " --line-buffered" + stage[head:]
+                    changed = True
+            if changed:
+                rewritten = "|".join(stages)
+        if names[-1] in ("findstr", "findstr.exe"):
+            plain = self._plain_findstr(stages[-1]) if len(stages) == 2 else None
+            if plain is None:
+                hint = True
+            else:
+                flags, word = plain
+                if powershell:
+                    tail = (" Select-String -SimpleMatch"
+                            + ("" if "i" in flags else " -CaseSensitive")
+                            + (" -NotMatch" if "v" in flags else "")
+                            + f" '{word}' | ForEach-Object Line")
+                else:
+                    from .local_terminal import _system_exe
+
+                    tail = (f" {_system_exe('find.exe')}"
+                            + "".join(f" /{flag.upper()}" for flag in flags)
+                            + f' "{word}"')
+                rewritten = (rewritten or line)[: len(rewritten or line) - len(stages[-1])] + tail
+        elif powershell and any(name in ("grep", "grep.exe", "find", "find.exe") for name in names):
+            hint = True
+        if hint and _unquoted_positions(line, "<>", quotes):
+            hint = False  # the matches go to a file anyway
+        if hint and not self._pipe_hint_shown:
+            self._pipe_hint_shown = True
+            if powershell:
+                text = ("PowerShell hands a program's output to another program only when "
+                        "it ends; `| Select-String text` shows matches as they come.")
+            else:
+                text = ("findstr holds its output back here until the command ends; "
+                        '`| find "text"` shows matches as they come.')
+            self.term.notice(text, self._HINT_COLOR, new_stream=False)
+        return rewritten
+
+    @staticmethod
+    def _plain_findstr(stage: str):
+        """``(flags, word)`` of ``findstr [/i] [/v] word`` searching one literal
+        word, else None (a regex, several words, a file, other options)."""
+        words = stage.split()[1:]
+        flags, rest = "", []
+        for word in words:
+            if word.startswith("/") and len(word) == 2 and word[1].lower() in "iv":
+                flags += word[1].lower()
+            elif word.startswith("/"):
+                return None
+            else:
+                rest.append(word)
+        if len(rest) != 1:
+            return None
+        word = rest[0]
+        if len(word) > 2 and word[0] == word[-1] and word[0] in "\"'":
+            word = word[1:-1]
+        if not _PLAIN_WORD.match(word):
+            return None
+        return "".join(sorted(set(flags), key=flags.index)), word
+
+    def _key_offered(self, data: bytes) -> bool:
+        """What *Send key* offers: inside an adb shell here the keys reach a
+        device terminal; the local shell reads a pipe, where only Enter and
+        Ctrl+Z (end of input, e.g. for a Python prompt) mean anything."""
+        return self._in_adb_shell or data in (b"\n", b"\x1a")
+
+    def _send_key(self, data: bytes) -> bool:
+        """The console's *Send key* menu: raw bytes for the shell, not a line."""
+        if data == b"\x1a" and self._in_adb_shell:
+            # adb.exe reads its input in text mode: Ctrl+Z is end of file to it,
+            # and the adb shell would never take another key
+            self.term.notice(
+                "Ctrl+Z is not sent: adb would stop reading input for good (type exit to leave)",
+                theme.ECHO_WARN, new_stream=False,
+            )
+            return False
+        self.ensure_started()
+        if not (self.session and self.session.running):
+            return False
+        return self.session.send(data) is not False
+
+    def _input_refused(self) -> None:
+        """The session refused input: the running command reads none of it."""
+        now = time.monotonic()
+        if now - self._refused_at > 10.0:
+            self._refused_at = now
+            self.term.notice(
+                "Input not sent: the running command is not reading it (Stop ends it)",
+                theme.ECHO_WARN, new_stream=False,
+            )
 
     # Interpreters that show their prompt only on a real console. Their input
     # here is a pipe, so a bare `python` or `node` waited silently and looked
@@ -1804,14 +2548,30 @@ class _LocalShellWidget(_TerminalWidgetBase):
     ADB_INTERRUPT_WAIT_MS = 3000
 
     def interrupt(self):
-        """Stop the running command.
+        """Stop the running command (Stop, Ctrl+C).
 
         Inside an adb shell started here, Ctrl+C goes to the device: the shell
         runs on a device terminal (``-t -t``), so only the device command stops
         and the adb shell stays. If the adb shell doesn't answer, or Stop is
         pressed again before its prompt is back, the same adb shell is reopened
-        in the same device folder. A local command is hard-stopped, since over
-        pipes a Ctrl+C byte is only input."""
+        in the same device folder.
+
+        A local command gets a real Ctrl+C in the shell's (hidden) console
+        (``send_ctrl_c``), as in a console window: ``ping`` prints its
+        summary, a REPL its KeyboardInterrupt, and the shell abandons the rest
+        of the command line, script or batch file (cmd's "Terminate batch
+        job" question is answered yes).  The shell stays with its folder,
+        variables and history.  A command that ignores Ctrl+C without a word
+        for :attr:`LOCAL_STOP_WAIT_MS`, or Stop pressed again, has its
+        processes ended (``kill_command``); if the prompt is still not back
+        after another :attr:`LOCAL_STOP_WAIT_MS` (a loop inside PowerShell
+        itself), or Stop is pressed once more, a fresh shell replaces it in
+        the same folder.  So does a shell that waits for a line itself
+        (``pause``, ``set /p``, ``Read-Host``, a ``-Confirm`` question, the
+        rest of a ``>>`` block): it notices Ctrl+C only after reading one,
+        and Stop never types an answer for the user.  At an idle prompt
+        Ctrl+C only starts a new prompt line: it used to replace the whole
+        shell, and its background jobs with it."""
         if self._closing or not (self.session and self.session.running):
             return
         if self._in_adb_shell:
@@ -1821,13 +2581,182 @@ class _LocalShellWidget(_TerminalWidgetBase):
                 self._adb_interrupt_pending = True
                 self._adb_interrupt_heard = False
                 self.session.send(b"\x03")
+                # the device command's output stops at once (Save keeps it)
+                self.term.interrupt_output()
                 self._adb_interrupt_timer.start(self.ADB_INTERRUPT_WAIT_MS)
                 self.term.setFocus(Qt.OtherFocusReason)
             return
+        self.term.setFocus(Qt.OtherFocusReason)
+        if self._stop_pending:
+            # Stop again: don't wait any longer
+            if self._stop_phase == "ctrl-c":
+                self._end_local_command(self.session)
+            else:
+                self._restart_local_shell("Stopped")
+            return
+        if self._at_idle_prompt():
+            # nothing runs: a new prompt line, as Ctrl+C gives in a console
+            self.term._echo("^C")
+            self.session.send(b"\n")  # its echo ends the line, the prompt follows
+            return
+        session = self.session
+        self._stop_pending = True
+        self._stop_marked = False
+        self._batch_answered = False
+        self._ctrl_c_sent = False
+        self._stop_heard = False
+        # what the command printed and is not drawn yet goes (Save keeps it)
+        self.term.interrupt_output(until_echo=False)
+        if self.shell_type == "powershell":
+            self._stop_marked = True
+            self.term.notice("^C", theme.ECHO_ERROR)
+        else:
+            # cmd prints ^C itself when the command it waits for ends as by
+            # Ctrl+C; the stream may still hold the command's half sequence
+            self.term.reset_stream()
+        ctrl_c = getattr(session, "send_ctrl_c", None)
+        if ctrl_c is not None:
+            self._stop_phase = "ctrl-c"
+            self._stop_timer.start(self.LOCAL_STOP_WAIT_MS)
+            if ctrl_c(lambda result, s=session: self._emit_ctrl_c_sent(s, result)):
+                return
+        self._end_local_command(session)
+
+    def _end_local_command(self, session) -> None:
+        """End the processes the shell runs (``kill_command``): Stop without a
+        console Ctrl+C, or for a command that ignored one."""
+        self._stop_phase = "kill"
+        kill = getattr(session, "kill_command", None)
+        if kill is None:
+            self._restart_local_shell()
+            return
+        self._stop_timer.start(self.LOCAL_STOP_WAIT_MS)
+        if not kill(lambda result, s=session: self._emit_command_stopped(s, result)):
+            self._restart_local_shell()
+
+    def _emit_ctrl_c_sent(self, session, result) -> None:
+        """From the Ctrl+C thread: hand the result to the UI thread."""
+        try:
+            self._ctrl_c_done.emit(session, result)
+        except RuntimeError:
+            pass  # the terminal closed meanwhile
+
+    def _on_ctrl_c_sent(self, session, result) -> None:
+        """Stop's Ctrl+C was raised in the shell's console (``send_ctrl_c``)."""
+        if session is not self.session or not self._stop_pending or self._stop_phase != "ctrl-c":
+            return
+        sent, programs = result
+        if not sent:
+            self._end_local_command(session)  # no console to reach: end the processes
+            return
+        self._ctrl_c_sent = True
+        if self._own_prompt:
+            # the shell waits at its prompt (it was a background job): it
+            # prints no new one by itself
+            self._stop_probe_timer.start(self.LOCAL_STOP_PROBE_MS)
+        elif programs is False:
+            # Nothing runs but the shell itself.  Its own work (Start-Sleep, a
+            # loop) ends at once; but waiting for a line (pause, set /p,
+            # Read-Host, a -Confirm question, the rest of a ">>" block) it
+            # notices the Ctrl+C only once it has read one, and any line could
+            # answer the question (Enter confirms -Confirm, ends a ">>" block
+            # and runs it).  If its prompt is not back soon, only a fresh
+            # shell stops it without answering for the user.
+            self._stop_phase = "blocked"
+            self._stop_timer.start(self.LOCAL_STOP_PROBE_MS)
+
+    def _emit_command_stopped(self, session, result) -> None:
+        """From the stop thread: hand the result to the UI thread."""
+        try:
+            self._command_stopped.emit(session, result)
+        except RuntimeError:
+            pass  # the terminal closed meanwhile
+
+    def _on_command_stopped(self, session, result) -> None:
+        """The stopped command's processes are gone (``kill_command``)."""
+        if session is not self.session or not self._stop_pending:
+            return
+        killed, foreground = result
+        if killed is None:
+            self._restart_local_shell("Stopped")  # the processes could not be listed
+            return
+        if not self._stop_marked:
+            self._stop_marked = True
+            if not (self.shell_type == "cmd" and foreground):
+                self.term.notice("^C", theme.ECHO_ERROR)
+        if self._at_idle_prompt():
+            self._clear_local_stop()
+            return
+        # A shell that runs nothing prints no prompt of its own (a background
+        # job was ended): ask for one.
+        self._stop_probe_timer.start(0 if not killed else self.LOCAL_STOP_PROBE_MS)
+
+    def _probe_local_prompt(self) -> None:
+        """Send the shell an empty line for a new prompt, only when it waits
+        at its prompt already (a background job was ended).  Anywhere else a
+        line can answer a question: pause, set /p or Read-Host in a script
+        went on as if the user had pressed Enter, a -Confirm question took
+        it for "Yes" and deleted, and a PowerShell ">>" block ran."""
+        if not self._stop_pending or self._batch_answered or self._at_idle_prompt():
+            return
+        if not self._own_prompt:
+            return
+        if self.session and self.session.running:
+            self.term._pending_echo = "\n"  # read as a command: its echo is only a line break
+            self.term._pending_echo_at = time.monotonic()
+            self.session.send(b"\n")
+
+    def _follow_local_stop(self) -> None:
+        """Output after Stop: the prompt settles it; cmd's batch-file question
+        is answered yes (Ctrl+C in a batch file ends it)."""
+        if self._at_idle_prompt():
+            self._clear_local_stop()
+            return
+        if self.shell_type != "cmd" or self._batch_answered:
+            return
+        match = self._BATCH_QUESTION.search(strip_ansi(self._prompt_tail))
+        if match and self.session and self.session.running:
+            self._batch_answered = True
+            answer = match.group(1)
+            self.term._echo(answer)  # as if typed; cmd's echo of it is hidden
+            self._expect_echo(answer)
+            self.session.send((answer + "\n").encode("ascii", "replace"))
+
+    def _on_local_stop_timeout(self) -> None:
+        if not self._stop_pending or self._closing or self._at_idle_prompt():
+            return
+        if self._stop_phase == "blocked":
+            self._restart_local_shell("Stopped")  # the shell waits for a line (see _on_ctrl_c_sent)
+            return
+        if self._stop_phase == "ctrl-c" and self.session is not None:
+            if not self._stop_heard:
+                self._end_local_command(self.session)  # it ignored the Ctrl+C
+            # else it answered and runs on (a REPL's KeyboardInterrupt and its
+            # prompt): ending it now would kill it under the user; Stop again does
+            return
+        self._restart_local_shell("Still running")
+
+    def _clear_local_stop(self) -> None:
+        self._stop_pending = False
+        self._stop_phase = ""
+        self._ctrl_c_sent = False
+        self._stop_heard = False
+        self._stop_timer.stop()
+        self._stop_probe_timer.stop()
+
+    def _restart_local_shell(self, why: str = "") -> None:
+        """Replace the local shell with a fresh one in the same folder.  *why*
+        starts the notice when a ``^C`` is on screen for this stop already."""
+        marked = self._stop_pending and self._stop_marked
+        self._clear_local_stop()
         self._stop_session(interrupt=True)
         self.reset_adb_shell_context()
         self._started = True
-        self.term._echo("\n^C  — stopped; fresh local shell ready\n", theme.ECHO_ERROR)
+        self.term.notice(
+            f"{why} — fresh local shell ready" if marked and why
+            else "^C  — stopped; fresh local shell ready",
+            theme.ECHO_ERROR,
+        )
         self._start_session(show_banner=False)
         self.term.set_alive(True)
         self.term.setFocus(Qt.OtherFocusReason)
@@ -1850,10 +2779,10 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._clear_adb_interrupt()
         self._started = True
         if command:
-            self.term._echo(f"\n^C  — stopped; reopening adb shell in {cwd}\n", theme.ECHO_ERROR)
+            self.term.notice(f"^C  — stopped; reopening adb shell in {cwd}", theme.ECHO_ERROR)
         else:
             self.reset_adb_shell_context()
-            self.term._echo("\n^C  — stopped; fresh local shell ready\n", theme.ECHO_ERROR)
+            self.term.notice("^C  — stopped; fresh local shell ready", theme.ECHO_ERROR)
         self._start_session(show_banner=False)
         if not (self.session and self.session.running):
             self.reset_adb_shell_context()  # _start_session has shown why
@@ -1866,10 +2795,12 @@ class _LocalShellWidget(_TerminalWidgetBase):
     def _send_adb_shell(self, command: str, cwd: str) -> None:
         """Start *command* (an adb shell) in this session and go back to *cwd*
         on the device once its prompt shows."""
-        line = self._enter_adb_shell(command)
+        typed = self._typed_adb_shell(command)
+        line = self._enter_adb_shell(command, foreign=bool(typed and typed[1]))
         self._adb_shell_cwd = self.term._cwd = cwd
         self._adb_reentry_cwd = cwd if cwd != "/" else None
         self.session.send(line)
+        self.session.utf8_input = True  # adb reads the input from now on (see _send)
 
     def hold_adb_shell(self) -> None:
         """adbd is about to restart (adb root / unroot, a reboot): remember an
@@ -1877,6 +2808,16 @@ class _LocalShellWidget(_TerminalWidgetBase):
         if self._in_adb_shell and self._adb_shell_command:
             self._adb_resume = (self._adb_shell_command, self._adb_shell_cwd)
             self._adb_resume_until = 0.0
+
+    def expect_adb_shell_end(self) -> None:
+        """The device is going away (a reboot): an adb shell started here ends
+        with it.  The terminal stays in that adb shell until PowerShell's or
+        CMD's own prompt shows it has ended (even one that never answered):
+        until then Stop still sends Ctrl+C to the device, and the device
+        coming back never types into an adb shell that is still running (a
+        reboot that failed, or one slow to drop the device)."""
+        if self._in_adb_shell:
+            self._adb_answered = True
 
     def resume_adb_shell(self) -> None:
         """The device is back: reopen the remembered adb shell in its folder.
@@ -1899,12 +2840,13 @@ class _LocalShellWidget(_TerminalWidgetBase):
         (command, cwd), self._adb_resume = self._adb_resume, None
         if not (self.session and self.session.running):
             return
-        self.term._echo(f"\n↻  device back — reopening adb shell in {cwd}\n", theme.ECHO_WARN)
+        self.term.notice(f"↻  device back — reopening adb shell in {cwd}", theme.ECHO_WARN)
         self._send_adb_shell(command, cwd)
 
     def reopen(self):
+        self._clear_local_stop()
         self._stop_session()
-        self.term.clear()
+        self.term.clear(keep_prompt=False)  # the old shell's prompt goes with it
         self._closing = False
         self._adb_resume = None
         self.reset_adb_shell_context()
@@ -1912,11 +2854,13 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self.ensure_started()
 
     def _announce_adb_restart(self) -> None:
-        self.term._echo("\nRestarting shared ADB server…\n", theme.ECHO_WARN)
+        # the local shell itself carries on: not a new stream
+        self.term.notice("Restarting shared ADB server…", theme.ECHO_WARN, new_stream=False)
 
     def close_panel(self):
         self._closing = True
         self._adb_interrupt_timer.stop()
+        self._clear_local_stop()
         self._park_completion_thread()
         self._stop_session()
         try:
@@ -1925,9 +2869,195 @@ class _LocalShellWidget(_TerminalWidgetBase):
             pass
 
 
+# ---- the Android shell --------------------------------------------------------
+# A run of CRs before a line feed: a device terminal ends its lines with CR LF,
+# and adb.exe (its stdout is in text mode on Windows) writes CR CR LF.
+_CR_RUN_LF = re.compile(rb"\r+\n")
+# adb saying the device itself is out of reach, not that it gave no terminal:
+# the shell is lost, and one over plain pipes would fail the same way.
+_DEVICE_GONE_RE = re.compile(
+    r"device (?:'[^']*' )?(?:offline|not found|unauthorized|still authorizing)"
+    r"|no devices|no emulators|more than one (?:device|emulator)"
+    r"|cannot connect|failed to (?:check server version|connect)|connection reset",
+    re.IGNORECASE,
+)
+# adb's error line ("error: closed", "adb: error: …"), not its warnings
+_ADB_ERROR_RE = re.compile(r"(?:^|[\r\n])(?:adb(?:\.exe)?: )?error: ")
+# a bare device prompt: "$ " or "# " (after mksh's "N|" exit status)
+_BARE_PROMPT = re.compile(r"(?:\d+\|)?[$#] ?")
+# what a device terminal echoes for a Ctrl+C by itself ("^C", a line break)
+_CTRL_C_ECHO_RE = re.compile(r"\^C|\s+")
+
+
+def _fold_crs(data: bytes, carry: bytes = b""):
+    """``(data, carry)``: *data* with every run of CRs before a LF made one CR,
+    and the CRs it ends with held back as *carry* for the next read, where
+    their LF may be.  adb.exe writes a device terminal's CR LF as CR CR LF,
+    which also put a blank line after every line of a saved log."""
+    data = carry + data
+    body = data.rstrip(b"\r")
+    return _CR_RUN_LF.sub(b"\r\n", body), data[len(body):]
+
+
+class _ShellInput:
+    """Writes one adb shell's input on a thread of its own, in order.
+
+    A write blocks once adb.exe stops reading its input (the device terminal
+    is full: a command that reads none of it, a long paste), and written on
+    the UI thread it froze the whole window until then.  :meth:`send` hands
+    the bytes to the thread and waits a moment for them, so an ordinary line
+    goes out at once and a shell that has ended answers False; it never
+    waits longer than :attr:`WAIT_S`, and never while earlier input is still
+    on its way (that input is what is stuck)."""
+
+    WAIT_S = 0.2
+    # Input queued behind a stuck write: more than this is refused.
+    QUEUE_MAX = 1 << 20
+
+    def __init__(self, session):
+        self._session = session
+        self._cond = threading.Condition()
+        self._items = deque()     # (ticket, bytes) not handed to the shell yet
+        self._queued = 0          # ... and their size
+        self._taken = 0           # tickets given out
+        self._done = 0            # the last ticket written (or failed)
+        self._busy = False        # a write is in progress
+        self._failed = False      # a write failed: the shell is gone
+        self._closed = False
+        self._thread = None
+
+    def send(self, data: bytes) -> bool:
+        """Queue *data* for the shell; False when it was refused (the shell
+        is gone, or input is stuck behind :attr:`QUEUE_MAX` bytes already)."""
+        with self._cond:
+            if self._closed or self._failed or self._queued + len(data) > self.QUEUE_MAX:
+                return False
+            idle = not self._items and not self._busy
+            self._taken += 1
+            ticket = self._taken
+            self._items.append((ticket, data))
+            self._queued += len(data)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._write_all, name="turboadb-shell-input", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+            if not idle:
+                return True
+            self._cond.wait_for(
+                lambda: self._done >= ticket or self._closed or self._failed, self.WAIT_S
+            )
+            return not self._failed
+
+    def discard(self) -> None:
+        """Forget input not handed to the shell yet (Ctrl+C: as a terminal
+        drops what was typed ahead)."""
+        with self._cond:
+            self._items.clear()
+            self._queued = 0
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._items.clear()
+            self._queued = 0
+            self._cond.notify_all()
+
+    def _write_all(self) -> None:
+        while True:
+            with self._cond:
+                while not self._items and not self._closed:
+                    self._cond.wait()
+                if self._closed:
+                    return
+                ticket, data = self._items.popleft()
+                self._queued -= len(data)
+                self._busy = True
+            try:
+                ok = self._session.send(data) is not False
+            except Exception:
+                ok = False
+            with self._cond:
+                self._busy = False
+                self._done = ticket
+                if not ok:
+                    self._failed = True
+                    self._items.clear()
+                    self._queued = 0
+                self._cond.notify_all()
+            if not ok:
+                return
+
+
 class _AndroidShellWidget(_TerminalWidgetBase):
-    """A native interactive ``adb shell`` with local prompt emulation and auto-completion."""
+    """The device's interactive ``adb shell``, with Tab completion.
+
+    It runs on a device terminal (``adb shell -t -t``, a PTY) by default: the
+    device prints its own prompt and echo, programs write their output as it
+    comes (``logcat | grep``, ``sed``, ``awk``), programs that wait for input
+    work (``read``, ``su``), and Stop sends a real Ctrl+C, so ``ping`` prints
+    its summary and the shell stays.  Full-screen programs (``top``,
+    ``watch``, ``vi``) get the console's screen, with every key going to
+    them; a view resized meanwhile resizes the device terminal too
+    (``resize_terminal``, so the program redraws).  A hidden first line
+    switches mksh's line editor off (adb gives the terminal no size, so the
+    editor scrolled every line longer than 80 columns sideways and garbled
+    its echo), gives the terminal this view's size, makes ``ls`` and
+    ``grep`` colour their output where the device's tools can, and reports
+    the terminal's name; nothing is shown until it ran.
+    The console keeps its cooked mode: one Enter sends one line (a LF), the
+    device's echo of it is hidden, and the device prompt tells when the shell
+    is ready (for the next pasted line, a Ctrl+C that was answered, the
+    folder Tab completion looks in).
+
+    Over plain pipes (the ``android_shell_pty`` setting off, or a device or
+    adb that gives no terminal: an adb without ``-t``, a locked-down build)
+    the console draws the prompt itself and Stop reopens the shell.  A device
+    without shell_v2 (Android 6 and older) gives every adb shell a terminal:
+    over pipes its first prompt shows that, and it is handled as one."""
     disconnected = pyqtSignal()
+
+    # printed by the hidden first line, with the terminal's name (``tty``);
+    # the output before it is not shown
+    _INIT_MARK = re.compile(rb"\x1b\]7718;ready(?:;([^\x07\x1b]*))?\x07")
+    # toybox 0.8.12 (Android 16) turned ls --color around: it colours what
+    # does not go to a terminal (--color=never too) and never a terminal.
+    # There ls is this function: a listing for the terminal goes through
+    # cat, in the columns and escaping ls gives a terminal and with its exit
+    # status; output to a pipe or file, or a --color of the user's, runs ls
+    # as typed.  Its variables are local: the user's own stay as they were.
+    _LS_THROUGH_CAT = (
+        "ls() { [ -t 1 ] || { command ls \"$@\"; return; }; local _tc=-C _tb=-b _ta; "
+        "for _ta; do case $_ta in --) break;; --color*) command ls \"$@\"; return;; "
+        "--show-control-chars) _tb=;; --full-time) _tc=;; --*) ;; -*[lnog1xm]*) _tc=;; esac; done; "
+        "(set -o pipefail; command ls $_tc $_tb --color=auto \"$@\" | cat); }"
+    )
+    # ls and grep in colour where the device's tools take the option
+    # (toybox's do; an older toolbox ls refuses it and stays as it was)
+    _COLOR_ALIASES = (
+        "case $(ls --color=never -d / 2>/dev/null) in *\"$(printf '\\033')\"*) " + _LS_THROUGH_CAT + ";; "
+        "*) ls --color=auto / >/dev/null 2>&1 && alias ls='ls --color=auto';; esac",
+        "echo x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'",
+    )
+    # how long the view's size must stay put before the device terminal
+    # hears it while a program has the screen
+    RESIZE_DELAY_MS = 250
+    # how long that output may be held back before all of it is shown
+    INIT_WAIT_MS = 3000
+    # A terminal shell that ends (or adb reports an error) this soon, before
+    # its first prompt, got no terminal: the shell falls back to pipes.
+    PTY_CHECK_S = 3.0
+    # how long Ctrl+C gets to bring the prompt back before the shell reopens
+    INTERRUPT_WAIT_MS = 3000
+    # the longest line a device terminal takes (canonical mode: 4095
+    # characters and the line feed); a longer one would be cut and run
+    _LINE_MAX = 4095
+    # more output than this before the first line ran: show it after all
+    _HOLD_MAX = 64 * 1024
+    _PROMPT_TAIL = _LocalShellWidget._DEVICE_PROMPT_TAIL
+    _PROMPT_CWD = _LocalShellWidget._DEVICE_PROMPT_CWD
 
     def __init__(self, handler, device_name="", info=None, parent=None, *, autostart=True):
         """*autostart=False* opens the ``adb shell`` only when the widget is
@@ -1943,11 +3073,46 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         self._banner_pending = False
         self._banner_waited = False
         self._adb_restart_paused = False
+        self._pause_reason = ""
         # "unknown": the next shell open asks the device for user@host;
         # "pending": the tab's connect-time probe will deliver it;
         # "known": delivered, so reopening after Stop asks nothing.
         self._prompt_state = "unknown"
         self._prompt_root = False
+        # the shell that runs (see the class docstring)
+        self._input = None               # its input, written off the UI thread (_ShellInput)
+        self._prompt_seen = False        # it has shown its prompt
+        self._early_lines = deque()      # lines typed before that, sent one per prompt
+        self._first_prompt = False       # the output due next is that prompt (see _show)
+        self._pty = False                # on a device terminal
+        self._tty_requested = False      # opened with -t -t
+        self._pty_fallback = False       # this device gave no terminal: pipes from now on
+        self._opened_by_fallback = False
+        self._open_cwd = None
+        self._opened_at = 0.0
+        self._ready = False              # its first line ran, or its prompt showed
+        self._hold = None                # output held back until the first line ran
+        self._hold_marked = False        # ... which it has; the banner goes first
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._release_hold)
+        self._tail = ""                  # the end of the output
+        self._tty_size = None            # (columns, rows) the device terminal was told
+        self._tty_name = None            # its device (/dev/pts/N), from the first line
+        self._jobs = []                  # resize_terminal calls under way
+        self._resizing = False           # ... one of them for this view (one at a time)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(self.RESIZE_DELAY_MS)
+        self._resize_timer.timeout.connect(self._resize_device)
+        self._lines_sent = 0             # lines sent since the shell opened
+        self._at_device_prompt = False
+        self._device_prompt = ""         # the last device prompt, for Tab's list
+        self._interrupt_pending = False  # Ctrl+C sent, the prompt not back yet
+        self._interrupt_heard = b""      # ... and the output since (its end)
+        self._interrupt_timer = QTimer(self)
+        self._interrupt_timer.setSingleShot(True)
+        self._interrupt_timer.timeout.connect(self._on_interrupt_timeout)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1957,10 +3122,20 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             restart_slot=self.restart_shell,
             info_text="Tab completes • right-click Copy/Paste",
         )
+        self.btn_stop.setToolTip(
+            "Stop the running command (Ctrl+C); the shell stays, or reopens in the "
+            "same folder when the command does not stop"
+        )
 
         self.term = AnsiConsole(send_fn=self._send)
         self.term.set_completion_fn(self._complete)
         self.term.set_interrupt_fn(self.interrupt)
+        self.term.set_send_key_fn(self._send_key)
+        # over pipes the keys would only be typed into the next command line
+        self.term.set_key_offered_fn(lambda data: self._pty or data == b"\n")
+        self.term.set_prompt_provider_fn(self._completion_prompt)
+        self.term.screen_resized.connect(lambda *_size: self._resize_timer.start())
+        self.term.screen_changed.connect(lambda on: self._resize_timer.start() if on else None)
         self._attach_terminal(lay)
         if autostart:
             self.ensure_started()
@@ -1981,33 +3156,86 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     def _query_complete(self, line):
         return self._query_android_completion(line, getattr(self.term, "_cwd", "/"))
 
-    def _open(self, *, focus=True):
+    def _completion_prompt(self) -> str:
+        """The prompt drawn again below a Tab completion list: the device's
+        own on a terminal (over pipes the console draws its own)."""
+        return self._device_prompt if self._pty and self._at_device_prompt else ""
+
+    def _open(self, *, focus=True, cwd=None, fallback=False) -> bool:
+        """Open the interactive adb shell (in folder *cwd*); False when none runs.
+
+        A failed open leaves no prompt behind, where typing would go nowhere:
+        the terminal says so and tells the device tab (:attr:`disconnected`),
+        which brings the shell back as after a lost connection.  *fallback*:
+        the pipes that replace a terminal the device did not give (see
+        :meth:`_shell_ended`)."""
         if not self.handler:
-            return
+            return False
         self._started = True
-        res = self.handler.open_shell(tty=False)
+        if self._adb_restart_paused:
+            # adbd or the adb server is restarting: reconnect() opens the
+            # shell once that is over
+            self.term.set_alive(False, show_disconnect_notice=False)
+            self._pause_notice()
+            return False
+        pty = not self._pty_fallback and bool(settings_mod.get("android_shell_pty"))
+        res = self.handler.open_shell(tty=pty)
         self.session = res.value if isinstance(res, OperationResult) else res
         if self.session is None:
-            self.term.feed(b"\n[could not open adb shell]\n")
-            return
+            error = res.error if isinstance(res, OperationResult) else None
+            self.term.notice(
+                "[could not open adb shell" + (f": {error}" if error else "") + "]",
+                theme.ECHO_ERROR,
+            )
+            self.term.set_alive(False, show_disconnect_notice=False)
+            if not self._closing:
+                self.disconnected.emit()
+            return False
 
         sess = self.session
+        self._input = _ShellInput(sess)
+        self._set_mode(pty)
+        self._tty_requested = pty
+        self._opened_by_fallback = fallback
+        self._open_cwd = cwd
+        self._opened_at = time.monotonic()
+        self._ready = False
+        self._tail = ""
+        self._lines_sent = 0
+        self._tty_size = None
+        self._tty_name = None
+        carry = [b""]
 
         def read_fn():
-            if not sess.running:
-                data = sess.read(65536)
-                return data or None
-            return sess.read(65536)
+            running = sess.running
+            data = sess.read(65536)
+            if data:
+                data, carry[0] = _fold_crs(data, carry[0])
+                if self._pty:
+                    # a form feed only moves down a line on a terminal; the
+                    # console would clear the screen for it (cmd's cls)
+                    data = data.replace(b"\x0c", b"\n")
+                return data
+            if running:
+                return b""
+            rest, carry[0] = carry[0], b""
+            return rest or None
 
         self.reader = ReaderThread(read_fn, decode=False)
         rd = self.reader
         self.reader.data.connect(lambda d: self._feed_from(rd, d))
         self.reader.closed.connect(self._on_reader_closed)
         self.reader.start()
+        if pty:
+            self._start_terminal(cwd)
+        elif cwd and cwd != "/":
+            self._write(("cd " + shlex.quote(cwd) + "\n").encode("utf-8"))
         if focus:
             self.term.setFocus(Qt.OtherFocusReason)
 
         self.term.set_prompt(self._prompt_identity(self._prompt_root), root=self._prompt_root)
+        if not self.term._alive:
+            self.term.set_alive(True)  # before the banner, which needs a live terminal
         if not self._banner_shown and self.term._alive and not (
             self._info.get("kind") or self._banner_waited
         ):
@@ -2017,8 +3245,53 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             QTimer.singleShot(2500, self._flush_pending_banner)
         else:
             self._show_banner_and_prompt()
-        if self._prompt_state == "unknown":
-            self._start_prompt_probe()
+        if self._prompt_state == "unknown" and not pty:
+            self._start_prompt_probe()  # for the prompt the console draws over pipes
+        return True
+
+    def _set_mode(self, pty: bool) -> None:
+        """Leave the prompt and the echo to the device (a terminal), or draw
+        the prompt and expect no echo (pipes).
+
+        On a terminal a line typed before the shell's first prompt waits for
+        that prompt (see :meth:`_send`): the device echoes it after the
+        prompt, where the console leaves it to be shown."""
+        self._pty = pty
+        self._at_device_prompt = False
+        self._prompt_seen = False
+        self._early_lines.clear()
+        self._first_prompt = False
+        self.term.set_emulate_prompt(not pty)
+        self.term.set_shell_at_prompt(None)
+        self.term.set_typing_ahead(pty)
+        # a terminal's programs may take the screen, keys and all
+        self.term.set_screen_input(self._screen_write if pty else None)
+
+    def _terminal_size(self):
+        """``(columns, rows)`` of this view for ``stty``, or None when it is
+        not laid out yet (too small to mean anything)."""
+        cols, rows = self._console_columns(), self._console_rows()
+        return (cols, rows) if cols >= 20 and rows >= 2 else None
+
+    def _start_terminal(self, cwd=None, held=b""):
+        """Send a terminal shell's hidden first line; its output is held back
+        until the line has run (see :meth:`_through_hold`)."""
+        size = self._terminal_size()
+        steps = []
+        if size is not None:
+            steps.append("stty cols {} rows {}".format(*size))
+        self._tty_size = size
+        steps += ["set +o emacs", "set +o vi"]  # mksh's line editor (see the class docstring)
+        steps += self._COLOR_ALIASES
+        if cwd and cwd != "/":
+            steps.append("cd " + shlex.quote(cwd))
+        # The leading space keeps it out of a shell history that honours that.
+        line = " " + "; ".join(step + " 2>/dev/null" for step in steps)
+        line += "; printf '\\033]7718;ready;%s\\007' \"$(tty 2>/dev/null)\"\n"
+        self._hold = held
+        self._hold_marked = False
+        self._hold_timer.start(self.INIT_WAIT_MS)
+        self._write(line.encode("utf-8"))
 
     def _show_banner_and_prompt(self):
         self._banner_pending = False
@@ -2029,7 +3302,9 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             except Exception:
                 pass
         if self.term._alive:
-            self.term.show_prompt()
+            self.term.show_prompt()  # none on a terminal: the device prints its own
+        if self._hold is not None and self._hold_marked:
+            self._show(self._take_hold())  # the device's first prompt, below the banner
 
     def _flush_pending_banner(self):
         if self._banner_pending and not self._closing:
@@ -2065,7 +3340,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if self._prompt_state != "pending":
             return
         self._prompt_state = "unknown"
-        if self.session is not None and not self._closing:
+        if self.session is not None and not self._closing and not self._pty:
             self._start_prompt_probe()  # the shell is already open
 
     def _start_prompt_probe(self):
@@ -2119,16 +3394,208 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         second = "\x1b[37m" + "  ·  ".join(part for part in facts if part) + "\x1b[0m"
         return _boxed_banner([first, second])
 
+    # ---- output ----
     def _feed_from(self, reader, data):
-        if reader is self.reader:
-            self._notice_refusal(data)
-            self.term.feed(data)
+        if reader is not self.reader:
+            return
+        if self._hold is not None:
+            data = self._through_hold(data)
+        elif not (self._pty or self._lines_sent) and self._is_prompt(
+            self._last_line(self._tail + data[-2048:].decode("utf-8", "replace"))
+        ):
+            self._adopt_terminal(data)
+            return
+        if data:
+            self._show(data)
+
+    def _show(self, data: bytes) -> None:
+        """Draw shell output, and follow what it says about the shell."""
+        if self._break_drawn_at:
+            data = self._drop_drawn_break(data)
+            if not data:
+                return
+        self._notice_refusal(data)
+        self.term.feed(data)
+        # only the end matters (a flood's chunk can be a megabyte)
+        self._tail = (self._tail + data[-2048:].decode("utf-8", "replace"))[-1024:]
+        if self._interrupt_pending:
+            self._interrupt_heard = (self._interrupt_heard + data[-4096:])[-4096:]
+        if self._pty:
+            self._follow_prompt()
+            if self._first_prompt and data:
+                self._first_prompt = False
+                if not self._prompt_seen:
+                    self._first_prompt_shown()
+
+    def _first_prompt_shown(self) -> None:
+        """What the shell printed after its hidden first line is its first
+        prompt, also one that does not look like one here (a device's own
+        PS1, ``[shell@PD2318 /]$ ``; waiting for one that did, no line was
+        ever sent): a line typed now goes at once, and those typed before go
+        now, all together, since no later prompt will look like one either.
+        The device echoes them after this one."""
+        self._prompt_seen = True
+        self.term.set_typing_ahead(False)
+        while self._early_lines:
+            self._write(self._terminal_input(self._early_lines.popleft(), sized=False))
+
+    @staticmethod
+    def _last_line(text: str) -> str:
+        """The line *text* ends with, as shown (a CR starts it again)."""
+        return strip_ansi(text.rsplit("\n", 1)[-1]).rsplit("\r", 1)[-1]
+
+    def _is_prompt(self, line: str) -> bool:
+        """Whether *line* is a device shell prompt waiting for input: mksh's
+        ``[N|]HOST:/path $ `` (``#`` as root), busybox's ``/path # ``, a bare
+        ``$ ``.  su, sh and exec start a new shell, which prints its own."""
+        return bool(line) and bool(self._PROMPT_TAIL.search(line) or _BARE_PROMPT.fullmatch(line))
+
+    def _follow_prompt(self) -> None:
+        """At the device prompt the shell waits for a command: the console
+        takes the next line as one, a pasted line may run, a Ctrl+C has been
+        answered, and the prompt names the folder Tab completion looks in.
+        Otherwise a command runs, and a line typed now is its input, which
+        the terminal echoes all the same: the console is told "unknown"
+        (None), never "no", or it would show that line twice."""
+        prompt = self._last_line(self._tail)
+        if not self._is_prompt(prompt):
+            self._at_device_prompt = False
+            self.term.set_shell_at_prompt(None)
+            return
+        self._ready = True
+        self._at_device_prompt = True
+        self._device_prompt = prompt
+        self._clear_interrupt()
+        self.term.set_shell_at_prompt(True)
+        self.term.mark_prompt()  # its colours; a program's screen that was showing goes
+        match = self._PROMPT_CWD.search(prompt)
+        if match:
+            self.term._cwd = match.group(1)
+            self.term._cd_revert = None  # the device said where it is
+        if not self._prompt_seen:
+            self._prompt_seen = True
+            self.term.set_typing_ahead(False)
+        if self._early_lines:
+            # a line typed before the first prompt: its turn now (the device
+            # echoes it after this prompt; the console never drew it)
+            self._write(self._terminal_input(self._early_lines.popleft(), sized=False))
+
+    def _through_hold(self, data: bytes) -> bytes:
+        """Output while a terminal shell's first line runs: b"" while it is held
+        back, else what to show now."""
+        held = self._hold + data
+        if not self._hold_marked:
+            mark = self._INIT_MARK.search(held)
+            if mark is None:
+                if self._pty_starting() and _ADB_ERROR_RE.search(
+                    held.decode("utf-8", "replace")
+                ):
+                    self._hold = held
+                    self._on_early_error()
+                    return b""
+                if len(held) > self._HOLD_MAX:
+                    self._end_hold()
+                    return held
+                self._hold = held
+                return b""
+            self._hold_marked = True
+            self._ready = True
+            self._first_prompt = True  # what follows the mark is the shell's prompt
+            name = (mark.group(1) or b"").decode("utf-8", "replace").strip()
+            self._tty_name = name if re.fullmatch(r"/dev/pts/\d+", name) else None
+            held = held[mark.end():]
+        if self._banner_pending:
+            self._hold = held  # the banner goes first
+            return b""
+        self._end_hold()
+        return held
+
+    def _release_hold(self):
+        """The first line's mark did not come in time: show what the shell
+        printed, which by now ends with its prompt."""
+        if self._hold is None or self._closing:
+            return
+        self._first_prompt = True
+        if self._banner_pending:
+            self._show_banner_and_prompt()  # which shows a marked hold itself
+        held = self._take_hold()
+        if held:
+            self._show(held)
+
+    def _take_hold(self) -> bytes:
+        held = self._hold or b""
+        self._end_hold()
+        return held
+
+    def _end_hold(self) -> None:
+        self._hold = None
+        self._hold_marked = False
+        self._hold_timer.stop()
+
+    def _adopt_terminal(self, data: bytes) -> None:
+        """A shell over pipes printed a prompt before any command: the device
+        gave it a terminal after all (no shell_v2: Android 6 and older), with
+        its own prompt and echo.  It is set up like one opened with ``-t``, and
+        this first prompt waits with the first line's output."""
+        self._set_mode(True)
+        self._start_terminal(held=data)
+
+    def _pty_starting(self) -> bool:
+        """A terminal shell that has not shown its first prompt, opened moments ago."""
+        return self._tty_requested and self._starting()
+
+    def _starting(self) -> bool:
+        return not self._ready and time.monotonic() - self._opened_at < self.PTY_CHECK_S
 
     def _on_reader_closed(self):
         if self._closing or self._adb_restart_paused:
             return
+        self._shell_ended(self._take_hold())
+
+    def _on_early_error(self):
+        """adb reported an error before the terminal shell's first prompt."""
+        held = self._take_hold()
+        self._close_stream()
+        self._shell_ended(held)
+
+    def _shell_ended(self, held: bytes) -> None:
+        """The shell ended (or adb failed to start it); *held*: its output that
+        was held back.
+
+        A terminal shell that ended before its first prompt, for another
+        reason than the device being out of reach, got no terminal: it is
+        opened again over pipes.  If that fails at once too, the device was
+        the problem after all, and the next open tries a terminal again."""
+        self._clear_interrupt()
+        early = self._starting()
+        text = strip_ansi(held.decode("utf-8", "replace") if held else self._tail)
+        if early and self._tty_requested and not _DEVICE_GONE_RE.search(text):
+            self._fall_back_to_pipe(text)
+            return
+        if early and self._opened_by_fallback:
+            self._pty_fallback = False
+        self._opened_by_fallback = False
+        if held:
+            self.term.feed(held)  # what the shell printed before it ended
         self.term.set_alive(False)
         self.disconnected.emit()
+
+    def _fall_back_to_pipe(self, text: str) -> None:
+        """The device (or its adb) gave no terminal: an adb without ``-t``, a
+        build that allows none.  This tab's Android shell runs over pipes from
+        now on."""
+        cwd = self._open_cwd
+        self._pty_fallback = True
+        self._close_stream()
+        detail = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        self.term.notice(
+            "No device terminal" + (f" ({detail[:160]})" if detail else "")
+            + " — the Android shell runs over plain pipes: TurboADB draws its prompt,"
+            " and Stop reopens it",
+            theme.ECHO_WARN,
+        )
+        if self._open(focus=False, cwd=cwd, fallback=True):
+            self.term.set_alive(True)
 
     def _close_stream(self, wait_ms=300):
         """Close this widget's adb shell and its reader thread.
@@ -2138,11 +3605,19 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         """
         reader, self.reader = self.reader, None
         session, self.session = self.session, None
+        writer, self._input = self._input, None
+        self._early_lines.clear()  # typed for this shell, which never showed its prompt
+        self._end_hold()
+        self._clear_interrupt()
+        self._break_drawn_at = 0.0
+        self._at_device_prompt = False
         if reader is not None:
             try:
                 reader.closed.disconnect(self._on_reader_closed)
             except Exception:
                 pass
+        if writer is not None:
+            writer.close()  # input still queued was for this shell
         if session is not None:
             try:
                 session.close()
@@ -2155,6 +3630,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
 
                 park_thread(reader)
 
+    # ---- the device goes away and comes back ----
     def reconnect(self, *, focus=True):
         self._adb_restart_paused = False
         # adbd may have restarted (reboot, adb root): ask for user@host again.
@@ -2162,9 +3638,10 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if not self._started:
             return  # never shown: the shell opens when the Terminal first is
         self._close_stream()
-        self.term.feed(b"\n")
-        self._open(focus=focus)
-        self.term.set_alive(True)
+        self.term.reset_stream()  # the new shell starts on a fresh line
+        self.term._cwd = self.term._prev_cwd = "/"  # where a new adb shell starts
+        if self._open(focus=focus):
+            self.term.set_alive(True)
         if focus:
             self.focus_terminal()
 
@@ -2181,15 +3658,34 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         self._pause_stream("ADB server restarting")
 
     def _pause_stream(self, reason):
-        if self._closing or not self._started:
+        """Close the shell until :meth:`reconnect`.  A terminal never opened yet
+        waits too: opened now, it would only die with adbd."""
+        if self._closing:
             return
         self._adb_restart_paused = True
+        self._pause_reason = reason
+        if not self._started:
+            return
         self._close_stream()
         self.term.set_alive(False, show_disconnect_notice=False)
-        self.term._echo(
-            f"\n  ↻  {reason} — this shell will reconnect automatically.\n\n",
+        self._pause_notice()
+
+    def _pause_notice(self):
+        self.term.notice(
+            f"  ↻  {self._pause_reason} — this shell will reconnect automatically.",
             theme.ECHO_WARN,
         )
+
+    def adb_restart_failed(self):
+        """Restart ADB failed, so nothing reconnects this shell by itself: say
+        so, and let Stop or Restart shell open it again."""
+        if self._closing or not self._adb_restart_paused:
+            return
+        self._adb_restart_paused = False
+        if self._started:
+            self.term.notice(
+                "ADB restart failed — press Reconnect or Restart shell", theme.ECHO_ERROR
+            )
 
     def _on_prompt(self, is_root, identity=""):
         # The prompt copies the device's own user@host (root@adelegg), not the
@@ -2208,9 +3704,149 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         host = (self._info or {}).get("device") or "android"
         return f"{'root' if root else 'shell'}@{host}"
 
+    # ---- input ----
+    def _write(self, data: bytes) -> bool:
+        """Hand *data* to the shell (see :class:`_ShellInput`); False when it
+        was refused."""
+        writer = self._input
+        return writer is not None and writer.send(data)
+
     def _send(self, data: bytes):
-        if self.session and self.session.running:
-            self.session.send(data)
+        if not (self.session and self.session.running):
+            return
+        # Ctrl+Z is end of input to adb.exe: it would never pass on another key
+        data = data.replace(b"\x1a", b"")
+        if not data:
+            return
+        self._lines_sent += 1
+        if self._pty and not self._prompt_seen:
+            # Before its first prompt the terminal would echo the line in the
+            # middle of the shell's start (or it went with the hidden first
+            # line); from its prompt on it is echoed where it runs.
+            self._early_lines.append(data)
+            return
+        if self._pty:
+            data = self._terminal_input(data)
+        self._write(data)
+
+    def _terminal_input(self, data: bytes, *, sized=True) -> bytes:
+        """A submitted line, as the device terminal gets it.  *sized*: it may
+        carry the view's new size (see :meth:`_with_new_size`); not a line the
+        console left for the device's echo to show."""
+        # One Enter is one LF: Linux adb hands a CR to the terminal as it is (a
+        # second Enter), and adb.exe holds a trailing bare CR until more comes.
+        if data.endswith(b"\r\n"):
+            data = data[:-2] + b"\n"
+        elif data.endswith(b"\r"):
+            data = data[:-1] + b"\n"
+        line = data[:-1] if data.endswith(b"\n") else data
+        self._clear_interrupt()  # input after a Ctrl+C: the next Stop sends another
+        at_prompt, self._at_device_prompt = self._at_device_prompt, False
+        # A command runs now, and the terminal echoes a line typed meanwhile
+        # too: "unknown" (not "no", which the console just set) until the
+        # output says more (see _follow_prompt).
+        self.term.set_shell_at_prompt(None)
+        if len(line) > self._LINE_MAX:
+            self.term.notice(
+                f"Not sent: a device terminal takes at most {self._LINE_MAX} characters "
+                f"on one line (this one has {len(line)}); run it from a script file",
+                theme.ECHO_WARN, new_stream=False,
+            )
+            self.term._pending_echo = "\r\n"  # the Enter sent instead is echoed
+            self.term._pending_echo_at = time.monotonic()
+            return b"\n"
+        text = line.decode("utf-8", "replace")
+        if at_prompt:
+            if text.split(maxsplit=1)[:1] == ["cd"]:
+                self.term._apply_cd(text)  # Tab follows at once; the prompt confirms it
+            if text.strip() and sized:
+                data = self._with_new_size(text, data)
+        elif not text and self.term._pending_echo is None and self._last_line(self._tail):
+            # Enter for a program's own prompt ("Continue? "): the console
+            # ended that line already, and the device echoes the Enter as well
+            self._break_drawn_at = time.monotonic()
+        return data
+
+    # A command reading what the one before it left ($?, $_, PIPESTATUS):
+    # stty in front of it would be that one (`echo $?` said 0 after a failure).
+    _READS_STATUS = re.compile(r"\$\{?[?_]|PIPESTATUS")
+
+    def _with_new_size(self, text: str, data: bytes) -> bytes:
+        """*data*, a command typed at the device prompt, with ``stty`` for the
+        view's size in front when its width changed since the terminal last
+        heard it (the window or the font was resized; a row more or less, as
+        a scroll bar comes and goes, only matters to full-screen programs).
+        At the prompt nothing runs, so the size is in place for this command
+        and never typed into a running program; the echo of the whole line
+        stays hidden.  A command that reads ``$?`` (or ``$_``, ``PIPESTATUS``)
+        goes as typed and the next one takes the size."""
+        size = self._terminal_size()
+        if size is None or (self._tty_size is not None and size[0] == self._tty_size[0]):
+            return data
+        if self._READS_STATUS.search(text):
+            return data
+        setting = " stty cols {} rows {} 2>/dev/null; ".format(*size)
+        if len(setting.encode("utf-8")) + len(data) - 1 > self._LINE_MAX:
+            return data  # no room on this line: the next command takes it
+        self._tty_size = size
+        self.term._pending_echo = setting + text
+        self.term._pending_echo_at = time.monotonic()
+        return setting.encode("utf-8") + data
+
+    def _send_key(self, data: bytes) -> bool:
+        """The console's *Send key* menu: raw bytes for the device."""
+        if data == b"\x1a":
+            self.term.notice(
+                "Ctrl+Z is not sent: adb would stop reading this shell's input for good",
+                theme.ECHO_WARN, new_stream=False,
+            )
+            return False
+        if not (self.session and self.session.running):
+            return False
+        return self._write(data)
+
+    def _screen_write(self, data: bytes) -> bool:
+        """Keys and answers for a program that has the console's screen
+        (see AnsiConsole.set_screen_input): to the device as they are."""
+        if not (self.session and self.session.running):
+            return False
+        self._clear_interrupt()  # the program is being used: a Stop starts over
+        return self._write(data)
+
+    def _resize_device(self):
+        """A program has the screen and the view's size is not the device
+        terminal's any more: tell the terminal, which tells the program
+        (see ADBHandler.resize_terminal).  Without the terminal's name the
+        next command at the prompt carries the size as usual.
+
+        One size at a time: two in flight (the tab's adb gate lets two
+        calls run) could reach the device in either order, and the size
+        recorded was then not the terminal's.  The view's size when one is
+        done goes next if it is another."""
+        screen = self.term.screen()
+        if (self._closing or self._resizing or screen is None or not self._tty_name
+                or not self.handler):
+            return
+        size = (screen.cols, screen.rows)
+        if size == self._tty_size:
+            return
+        handler, name = self.handler, self._tty_name
+        gate = getattr(self, "adb_gate", None)
+        resize = gate.wrap(handler.resize_terminal) if gate is not None else handler.resize_terminal
+
+        def told(result, size=size, name=name):
+            self._resizing = False
+            if name != self._tty_name:
+                self._resize_device()  # the shell was reopened meanwhile: its terminal
+            elif isinstance(result, OperationResult) and result.success:
+                self._tty_size = size
+                self._resize_device()  # the view may have changed size meanwhile
+
+        def failed(_message):
+            self._resizing = False
+
+        self._resizing = True
+        run_job(self._jobs, lambda: resize(name, size[0], size[1], safe=True), told, failed)
 
     def focus_terminal(self):
         try:
@@ -2218,45 +3854,93 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         except Exception:
             pass
 
+    # ---- Stop and Restart shell ----
     def interrupt(self):
-        if self._closing or not self.handler:
-            return
-        cwd = getattr(self.term, "_cwd", "/")
-        try:
-            self.term._inq.clear()
-            self.term._inq_len = 0
-            self.term._drain.stop()
-        except Exception:
-            pass
+        """Stop the running command (Stop, Ctrl+C).
+
+        On a device terminal Ctrl+C goes to the device: only the command stops
+        (``ping`` prints its summary) and the shell stays.  If the command
+        ignores it (within :attr:`INTERRUPT_WAIT_MS` neither the prompt nor
+        anything but the terminal's own ``^C`` came back), or Stop is pressed
+        again before the prompt is back, the shell is reopened in the same
+        folder.  A program that answers the Ctrl+C and carries on (sqlite3's
+        or a Python prompt, a shell whose prompt looks different) keeps the
+        shell.  Over pipes a Ctrl+C cannot reach the device: the shell is
+        reopened at once."""
+        if self._closing or not self.handler or self._adb_restart_paused:
+            return  # paused: the shell comes back by itself
+        self.term._cancel_paste()  # the pasted lines were for the stopped command
+        live = self.session is not None and self.session.running
+        if self._pty and live and self._hold is None:
+            if self._interrupt_pending:
+                self._hard_reopen(self._reopened("Stopped"))
+                return
+            if self._input is not None:
+                self._input.discard()  # what was typed ahead goes, as on a terminal
+            if self._write(b"\x03"):
+                # what the command printed before it stopped is not drawn any
+                # more (Save still has it): the output stops at once
+                self.term.interrupt_output()
+                self._interrupt_pending = True
+                self._interrupt_heard = b""
+                self._interrupt_timer.start(self.INTERRUPT_WAIT_MS)
+                self.term.setFocus(Qt.OtherFocusReason)
+                return
+        self._hard_reopen("^C  — stopped")
+
+    def _interrupt_answered(self) -> bool:
+        """Whether the device answered the Ctrl+C with more than the
+        terminal's own ``^C``.  Output from before the terminal echoed it
+        (the command's last lines, the echo of the line typed) is no answer."""
+        text = strip_ansi(self._interrupt_heard.decode("utf-8", "replace"))
+        return bool(_CTRL_C_ECHO_RE.sub("", text.rsplit("^C", 1)[-1]))
+
+    def _on_interrupt_timeout(self):
+        # A device that answered is alive: reopening would kill the program
+        # that handled the Ctrl+C (and the shell's state) under the user.
+        if self._interrupt_pending and not self._closing and not self._interrupt_answered():
+            self._hard_reopen(self._reopened("Still running"))
+
+    def _clear_interrupt(self):
+        self._interrupt_pending = False
+        self._interrupt_heard = b""
+        self._interrupt_timer.stop()
+
+    def _reopened(self, why: str) -> str:
+        cwd = getattr(self.term, "_cwd", "/") or "/"
+        return f"{why} — Android shell reopened" + (f" in {cwd}" if cwd != "/" else "")
+
+    def _hard_reopen(self, notice, color=theme.ECHO_ERROR):
+        """Close this adb shell and open a fresh one in the same folder."""
+        cwd = getattr(self.term, "_cwd", "/") or "/"
+        self.term.discard_output()  # queued notices stay
 
         # Closing this adb shell ends its own device-side process group (the
         # command being stopped).  Never kill processes device-wide: that also
         # killed the Logcat tab and any other tool's logcat/top.
         self._close_stream(wait_ms=800)
 
-        self.term._echo("\n^C  — stopped\n", theme.ECHO_ERROR)
+        self.term.notice(notice, color)
         self.term._last_feed = 0.0
         self.term._cwd = cwd
-        self._open()
-        self.term.set_alive(True)
-
-        if cwd and cwd not in ("", "/") and self.session:
-            try:
-                self.session.send(("cd " + shlex.quote(cwd) + "\n").encode("utf-8"))
-            except Exception:
-                pass
+        if self._open(cwd=cwd):
+            self.term.set_alive(True)
 
     def restart_shell(self):
+        """Close and reopen the shell, whatever runs in it (Restart shell).  It
+        also ends a pause that nothing else will (a failed ADB restart)."""
         if self._closing:
             return
-        self.term._echo("\nRestarting Android shell…\n", theme.ECHO_WARN)
-        self.interrupt()
+        self._adb_restart_paused = False
+        self._hard_reopen("Restarting Android shell…", theme.ECHO_WARN)
 
     def close_panel(self):
         from .qtutil import park_thread, thread_running
 
         self._closing = True
         self._adb_restart_paused = True
+        self._resize_timer.stop()
+        close_jobs(self._jobs)
         self._park_completion_thread()
         self._close_stream(wait_ms=700)
         prompt, self._pt = self._pt, None
@@ -2328,9 +4012,15 @@ class ShellPanel(QWidget):
 
     def _install_switchers(self):
         """Replace the separate shell tab row with a segmented switcher at the
-        start of every shell's toolbar (the tab bar keeps the page order)."""
+        start of every shell's toolbar (the tab bar keeps the page order).
+
+        Without Windows there is no PowerShell or CMD to start: no switcher is
+        shown, so only the Android shell can be picked (the local pages stay
+        for the code that addresses them, but never start)."""
         self.subtabs.tabBar().hide()
         self._switch_groups = []
+        if not _LOCAL_SHELLS:
+            return
         for page in (self.android_widget, self.ps_widget, self.cmd_widget):
             group = []
             for index, (glyph, tone, label) in enumerate(self._SHELLS):
@@ -2404,7 +4094,11 @@ class ShellPanel(QWidget):
         self.android_widget.pause_for_device_reboot()
         for local in (self.ps_widget, self.cmd_widget):
             local.hold_adb_shell()  # reopened by resume_adb_shells once it is back
-            local.reset_adb_shell_context()
+            local.expect_adb_shell_end()
+
+    def adb_restart_failed(self) -> None:
+        """Restart ADB failed: the Android shell will not come back by itself."""
+        self.android_widget.adb_restart_failed()
 
     def hold_for_adbd_restart(self, reason: str) -> None:
         """adbd restarts (adb root / unroot, making files writable): the Android
@@ -2781,10 +4475,16 @@ class DeviceTab(QWidget):
         self._adbd_busy = False
         self._access_declined = {}  # device folder -> when its write-access offer was declined
         self.access_step.connect(self._on_access_step)
-        self._info_thread = None
         self._probe_thread = None
+        self._fail_box = None  # the "Connect failed" message (see _show_connect_failure)
+        # A probe that got no device profile is run once more (see _on_probe_details).
+        self._probe_retried = False
+        self._probe_retry_timer = QTimer(self)
+        self._probe_retry_timer.setSingleShot(True)
+        self._probe_retry_timer.timeout.connect(self._retry_probe)
         self._lazy_pages = {}
         self._adb_gate = _AdbGate(self.ADB_SLOTS)
+        self._conn_key = None  # the network connection this tab uses (_Connections)
         self._device_dispatcher = None
         self._session_closed = False
         self._announced_connected = False
@@ -3006,7 +4706,7 @@ class DeviceTab(QWidget):
 
         previous = self._ct
         if previous is not None:
-            for sig in ("ok", "details", "fail", "log", "trace"):
+            for sig in ("ok", "details", "fail", "trace"):
                 try:
                     getattr(previous, sig).disconnect()
                 except Exception:
@@ -3021,7 +4721,6 @@ class DeviceTab(QWidget):
         self._ct.ok.connect(self._on_connected)
         self._ct.details.connect(self._on_probe_details)
         self._ct.fail.connect(self._on_fail)
-        self._ct.log.connect(self.log)
         self._ct.trace.connect(self.trace)
         self._started_connect = False
 
@@ -3035,7 +4734,48 @@ class DeviceTab(QWidget):
             and not self._started_connect
         ):
             self._started_connect = True
+            cfg = self._ct.cfg
+            self._ct.known_state = self._tracked_state(cfg)
+            # a tab still connecting counts as a user too: another tab closing
+            # meanwhile must not disconnect the device under it
+            self._use_connection(_Connections.key(cfg, cfg.target))
             self._ct.start()
+
+    def _tracked_state(self, cfg):
+        """What the main window's device tracker last saw of *cfg*'s target
+        ("device", "unauthorized", ...), or None. The tracker watches this PC's
+        adb server, so a remote-server target never has one."""
+        from ..tools import DEFAULT_ADB_SERVER_PORT
+
+        if (
+            cfg is None
+            or not cfg.target
+            or cfg.is_remote_server
+            or cfg.adb_server_port != DEFAULT_ADB_SERVER_PORT
+        ):
+            return None
+        for device in getattr(self.window(), "_live_devices", None) or ():
+            if getattr(device, "serial", None) == cfg.target:
+                return getattr(device, "state", None)
+        return None
+
+    def _use_connection(self, key) -> None:
+        """This tab now uses *key*'s connection (see :class:`_Connections`)."""
+        if key is None or key == self._conn_key:
+            return
+        _CONNECTIONS.leave(self._conn_key, self)
+        _CONNECTIONS.use(key, self)
+        self._conn_key = key
+
+    def _leave_connection(self, handler):
+        """The tab closes: stop using its connection. Returns the handler to
+        drop that connection with, or None to leave it connected."""
+        key, registered = _connection_key(handler), self._conn_key
+        self._conn_key = None
+        drop = _CONNECTIONS.leave(key, self, handler)
+        if registered is not None and registered != key:
+            drop = _CONNECTIONS.leave(registered, self) or drop
+        return drop
 
     def _auto_start_connect(self):
         if not self._session_closed and not self._started_connect:
@@ -3046,6 +4786,7 @@ class DeviceTab(QWidget):
         if self._session_closed or self._reconnecting:
             return
         self.btn_reconnect.hide()
+        self._close_connect_failure()
         if self.handler is None:
             self.status.setText("Connecting…")
             self._new_connect_thread()
@@ -3063,14 +4804,10 @@ class DeviceTab(QWidget):
 
     @staticmethod
     def _release_handler(handler):
-        """Disconnect a handler this tab will not use, off the UI thread."""
-        if handler is None:
-            return
-        from .qtutil import park_thread
-
-        worker = _ActionThread(handler.disconnect)
-        park_thread(worker)
-        worker.start()
+        """Let go of a handler this tab will not use. Its connection is dropped
+        (off the UI thread) only if it made it and no open tab uses it."""
+        if handler is not None:
+            _release_connection(handler)
 
     def _enable_actions(self, on):
         for w in (self.btn_mirror, self.btn_shot, self.btn_reboot, self.btn_more):
@@ -3114,6 +4851,10 @@ class DeviceTab(QWidget):
             # replacement daemon is confirmed.  Retrying here races USB
             # enumeration and produces repeated "device not found" output.
             return
+        if self._adbd_busy:
+            # adbd restarts on purpose (adb root, making files writable):
+            # _release_terminals brings every terminal back once it is done.
+            return
         if self._session_closed or not self.handler:
             return
         import time
@@ -3143,6 +4884,7 @@ class DeviceTab(QWidget):
             or handler is not self.handler
             or self._reboot_in_progress
             or self._adb_restart_in_progress
+            or self._adbd_busy
         ):
             return
         if state == "device" and hasattr(self, "shell"):
@@ -3151,6 +4893,10 @@ class DeviceTab(QWidget):
                 self.shell.reconnect()
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
+            # The device is back as far as the Logcat page is concerned too: a
+            # capture that ended with the shell (the adb server went away)
+            # waits for this to resume; one still running is left alone.
+            self._logcat_recovery("resume_after_reconnect")
             return
         self._wait_and_reconnect()
 
@@ -3184,6 +4930,17 @@ class DeviceTab(QWidget):
         self._rc.done.connect(self._on_reconnected)
         self._rc.start()
 
+    def _logcat_recovery(self, action, **kwargs):
+        """Tell a built Logcat page the device is going or back (a live capture
+        pauses and resumes with it); a page never shown is left unbuilt."""
+        page = self._built_page("logcat")
+        if page is None:
+            return
+        try:
+            getattr(page, action)(**kwargs)
+        except Exception as exc:
+            self.log.emit(f"[WARNING] logcat: {exc}")
+
     def prepare_for_adb_restart(self):
         """Suspend retrying shell streams before their shared daemon is killed."""
         if not self.handler:
@@ -3195,6 +4952,7 @@ class DeviceTab(QWidget):
             self.shell.pause_for_adb_restart()
         except Exception:
             pass
+        self._logcat_recovery("suspend_for_device_loss")
 
     def finish_adb_restart(self, success: bool):
         """Recover a paused shell once MainWindow has restarted the daemon."""
@@ -3206,6 +4964,12 @@ class DeviceTab(QWidget):
             return
         self.status.setText("ADB restart failed — try Restart ADB again")
         self._enable_actions(True)
+        # Nothing reconnects by itself now: Reconnect is the way back (after
+        # _enable_actions, which hides it), and the paused shell says so.
+        self._offer_reconnect()
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            shell.adb_restart_failed()
 
     def _on_reconnected(self, ok):
         self._reconnecting = False
@@ -3215,13 +4979,18 @@ class DeviceTab(QWidget):
         if ok:
             name = self.handler.serial or self.session.get("name")
             self.status.setText(f"Connected — {name}")
-            self._enable_actions(True)
             self.log.emit("[OK] device back online — reconnected")
+            if self._adbd_busy:
+                # adbd is still being restarted on purpose: _release_terminals
+                # enables the actions and brings the terminals back after it.
+                return
+            self._enable_actions(True)
             try:
                 self.shell.reconnect()
                 self.shell.resume_adb_shells()
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
+            self._logcat_recovery("resume_after_reconnect")
         else:
             self.status.setText("Device didn't come back (timed out)")
             self._offer_reconnect()
@@ -3291,9 +5060,10 @@ class DeviceTab(QWidget):
             shell.hold_for_adbd_restart(reason)
 
     def _release_terminals(self) -> None:
-        """adbd is back (as root or not): the Android shell reconnects and asks
-        for its prompt again (``#`` as root), PowerShell/CMD reopen their adb
-        shells, and a built Files page lists its folder again."""
+        """adbd is back (as root or not): the Android shell reconnects (its
+        prompt shows ``#`` as root), PowerShell/CMD reopen their adb shells, a
+        Logcat capture that ended with adbd resumes, and a built Files page
+        lists its folder again."""
         self._adbd_busy = False
         if self._session_closed:
             return
@@ -3305,6 +5075,8 @@ class DeviceTab(QWidget):
                 shell.resume_adb_shells()
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
+        # the shell-lost path, which resumes it otherwise, waits while adbd is held
+        self._logcat_recovery("resume_after_reconnect")
         for page in self._files_pages():
             page.refresh_remote()
 
@@ -3478,7 +5250,9 @@ class DeviceTab(QWidget):
             self._release_handler(handler)
             return
         self.handler = handler
+        self._use_connection(_connection_key(handler))
         self.btn_reconnect.hide()
+        self._close_connect_failure()  # an earlier attempt's message is out of date
         payload = dict(info) if isinstance(info, dict) else {}
         # The connect worker's probe (_DeviceProbe) sends the rest of the
         # device profile and the display list later, from the same adb shell.
@@ -3512,6 +5286,8 @@ class DeviceTab(QWidget):
             self.shell.cmd_widget.term,
         ):
             terminal.installEventFilter(self)
+        for widget in (self.shell.android_widget, self.shell.ps_widget, self.shell.cmd_widget):
+            widget.adb_gate = self._adb_gate  # Tab completion's `adb shell ls` takes a slot
         # Connected without the connect worker (and not handed full details):
         # this tab runs the probe itself, below.
         runs_probe = not (self._terminal_only or probe_pending) and (info is None or bool(quick))
@@ -3787,7 +5563,7 @@ class DeviceTab(QWidget):
         return page
 
     def _build_phone(self):
-        page = PhonePanel(self.handler)
+        page = PhonePanel(self.handler, adb_gate=self._adb_gate)
         page.log.connect(self.log)
         return page
 
@@ -3796,8 +5572,17 @@ class DeviceTab(QWidget):
         page.log.connect(self.log)
         return page
 
-    def _on_probe_details(self, handler, result) -> None:
-        """The connect-time probe finished: device profile, prompt and displays."""
+    # A probe that got no device profile (adbd refused a second shell right
+    # after connecting, the device served its properties slowly) runs once
+    # more after this long.  Without it a head unit whose first probe failed
+    # was a phone for the whole session: no IVI Displays tab, the phone
+    # defaults in Apps and Device Control, no automotive reboot warning.
+    PROBE_RETRY_MS = 2500
+
+    def _on_probe_details(self, handler, result, *, retried=False) -> None:
+        """The connect-time probe finished: device profile, prompt and displays.
+
+        *retried*: the result of the one repeat of a probe that got no profile."""
         if self._session_closed or handler is not self.handler:
             return
         result = result if isinstance(result, dict) else {}
@@ -3820,14 +5605,47 @@ class DeviceTab(QWidget):
             displays = result.get("displays")
             if displays is not None:
                 mirror.set_displays(displays, quiet=True)
-            else:
-                # The probe did not get that far: the panel's own quiet adb scan.
+            elif not retried:
+                # The probe did not get that far: the panel's own quiet adb
+                # scan (once: the repeated probe does not start another).
                 mirror.refresh_displays(quiet=True)
         info = result.get("info")
         if info is None:
             error = result.get("error") or "no reply"
+            if not retried and not self._probe_retried:
+                self._probe_retried = True
+                self._probe_retry_timer.start(self.PROBE_RETRY_MS)
+                self.log.emit(
+                    f"[INFO] Device details are still unavailable: {error} "
+                    "(asking the device again in a moment)"
+                )
+                return
             info = OperationResult(False, "device_info", error=error)
         self._on_device_info(handler, info)
+
+    def _retry_probe(self) -> None:
+        """Run the connect-time probe once more (see :attr:`PROBE_RETRY_MS`),
+        through the tab's adb slots like the first one."""
+        handler = self.handler
+        if self._session_closed or handler is None:
+            return
+        if (self._reconnecting or self._reboot_in_progress
+                or self._adb_restart_in_progress or self._adbd_busy):
+            # The device is away or adbd restarts: ask once it is back.
+            self._probe_retry_timer.start(self.PROBE_RETRY_MS)
+            return
+        from .qtutil import park_thread, thread_running
+
+        previous = self._probe_thread
+        if thread_running(previous):
+            park_thread(previous)
+        thread = _ProbeThread(handler, gate=self._adb_gate)
+        thread.details.connect(
+            lambda result, h=handler: self._on_probe_details(h, result, retried=True)
+        )
+        thread.finished.connect(thread.deleteLater)
+        self._probe_thread = thread
+        thread.start()
 
     def _on_device_info(self, handler, info) -> None:
         """Apply optional build identity without affecting transport readiness."""
@@ -3894,7 +5712,8 @@ class DeviceTab(QWidget):
 
     def _add_ivi_tab(self) -> None:
         """Show every display of a multi-display device (an IVI head unit's centre
-        stack, cluster, passenger screen…) live, side by side, in its own tab."""
+        stack, cluster, passenger screen…) side by side, in its own tab. Every
+        display starts stopped: the user starts one, or Start all."""
         mirror = getattr(self, "mirror_tab", None)
         if mirror is None or self.handler is None:
             return
@@ -3925,14 +5744,19 @@ class DeviceTab(QWidget):
     def _on_displays_found(self, displays) -> None:
         """A display scan finished: several displays (or a car) get the displays tab."""
         displays = list(displays or [])
+        had_wall = getattr(self, "display_wall", None) is not None
         if len(displays) > 1 or self._automotive:
             self._add_ivi_tab()
         wall = getattr(self, "display_wall", None)
-        if wall is not None:
-            wall.set_displays(displays)
+        if wall is None or (displays and not had_wall):
+            # (a wall created just now was built from mirror_tab._displays,
+            # which is this very scan: _got_displays sets it before emitting)
+            return
+        wall.set_displays(displays)
 
     def _show_all_displays(self) -> None:
-        """Options → All displays: open the displays tab (it starts every display)."""
+        """Options → All displays: open the displays tab. It only navigates —
+        every display stays stopped until the user starts it (or Start all)."""
         self._add_ivi_tab()
         wall = getattr(self, "display_wall", None)
         if wall is None:
@@ -4290,7 +6114,30 @@ class DeviceTab(QWidget):
         self.btn_reconnect.show()
         self.status.setText("Connect failed")
         self.log.emit(f"[ERROR] {self.session.get('name')}: {msg}")
-        QMessageBox.warning(self, "Connect failed", msg)
+        self._show_connect_failure(msg)
+
+    def _show_connect_failure(self, msg) -> None:
+        """Say why the connect failed, without blocking anything.
+
+        The failure arrives from the connect worker, maybe for a tab in the
+        background.  A modal message box ran an event loop of its own: every
+        other tab waited for it, and quitting (or closing this tab) meanwhile
+        destroyed the box under that loop, which crashed.  This one belongs to
+        the tab and goes with it; a newer failure replaces it."""
+        self._close_connect_failure()
+        box = QMessageBox(QMessageBox.Warning, "Connect failed", str(msg), QMessageBox.Ok, self)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setWindowModality(Qt.NonModal)
+        self._fail_box = box
+        box.show()
+
+    def _close_connect_failure(self) -> None:
+        box, self._fail_box = getattr(self, "_fail_box", None), None
+        if box is not None:
+            try:
+                box.done(0)  # closes (and deletes) it without asking it first
+            except RuntimeError:
+                pass  # already closed (and deleted) by the user
 
     def save_active_output(self):
         if not self.handler:
@@ -4617,6 +6464,7 @@ class DeviceTab(QWidget):
             self.shell.pause_for_device_reboot()
         except Exception as exc:
             self.log.emit(f"[WARNING] could not pause Android shell cleanly: {exc}")
+        self._logcat_recovery("suspend_for_device_loss", reboot=True)
 
         if mode is None:
             # Give adbd time to actually leave before considering the device
@@ -4645,6 +6493,8 @@ class DeviceTab(QWidget):
         # Background jobs still waiting for an adb slot give up now: nothing
         # may start adb for this tab once it is closing.
         self._adb_gate.close()
+        self._probe_retry_timer.stop()
+        self._close_connect_failure()
 
         # Nothing may start while the tab is torn down.  Leaving split view
         # below puts the pages back in the tab strip and shows the current one:
@@ -4664,7 +6514,7 @@ class DeviceTab(QWidget):
         # These workers may have already finished and deleted themselves
         # (finished -> deleteLater), so every Qt call is guarded; one stale
         # wrapper must not abort the rest of the teardown.
-        for attr in ("_ct", "_rc", "_info_thread", "_probe_thread"):
+        for attr in ("_ct", "_rc", "_probe_thread"):
             t = getattr(self, attr, None)
             if t is None:
                 continue
@@ -4673,7 +6523,7 @@ class DeviceTab(QWidget):
                     t.cancel()
             except RuntimeError:
                 pass
-            for sig in ("ok", "details", "fail", "log", "done"):
+            for sig in ("ok", "details", "fail", "done"):
                 try:
                     getattr(t, sig).disconnect()
                 except Exception:
@@ -4712,37 +6562,34 @@ class DeviceTab(QWidget):
                 pending_workers.extend(mirror.shutdown_threads())
             except RuntimeError:
                 pass
-        wall = getattr(self, "display_wall", None)
-        if wall is not None:
-            try:
-                pending_workers.extend(wall.shutdown_threads())
-            except RuntimeError:
-                pass
+        for panel in (getattr(self, "display_wall", None), self.__dict__.get("controls")):
+            if panel is not None:
+                try:
+                    pending_workers.extend(panel.shutdown_threads())
+                except RuntimeError:
+                    pass
         if self._device_dispatcher is not None:
             self._device_dispatcher.stop()
             if thread_running(self._device_dispatcher):
                 park_thread(self._device_dispatcher)
                 pending_workers.append(self._device_dispatcher)
-        if self.handler:
-            handler = self.handler
-            pending_workers = list(dict.fromkeys(pending_workers))
-            if pending_workers:
-                def disconnect_after_workers():
-                    for worker in pending_workers:
-                        try:
-                            worker.wait()
-                        except RuntimeError:
-                            pass
-                    return handler.disconnect()
+        # Only a network connection this app made and no other open tab uses
+        # is dropped, after the workers still using it (see _Connections);
+        # anything else stays connected for its other users.  So does one a
+        # separate screen window uses that the exit leaves open (Settings →
+        # Startup): dropped, it cut that window off its device.
+        drop = self._leave_connection(self.handler)
+        if drop is not None and not self._keeps_a_screen():
+            _drop_connection_later(drop, after=list(dict.fromkeys(pending_workers)))
 
-                disconnect_thread = _ActionThread(disconnect_after_workers)
-                park_thread(disconnect_thread)
-                disconnect_thread.start()
-            else:
-                try:
-                    handler.disconnect()
-                except Exception:
-                    pass
+    def _keeps_a_screen(self) -> bool:
+        """True when a separate scrcpy window of this tab outlives it (see
+        MirrorPanel.keep_window_open)."""
+        try:
+            return any(getattr(panel, "_window_kept", False)
+                       for panel in self.findChildren(MirrorPanel))
+        except RuntimeError:
+            return False
 
     def closeEvent(self, event):
         self.close_session()

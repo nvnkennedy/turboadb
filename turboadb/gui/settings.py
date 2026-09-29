@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import os
 import json
+import shutil
 import tempfile
 import threading
 import time
@@ -52,6 +53,10 @@ DEFAULTS = {
     "theme_last_light": "light",
     "term_font": "Consolas",
     "term_font_size": 12,
+    # The Android shell runs on a device terminal (`adb shell -t -t`): the
+    # device's own prompt and echo, streaming output and a real Ctrl+C.  Off:
+    # plain pipes with a TurboADB prompt, where Stop reopens the shell.
+    "android_shell_pty": True,
     "adb_path": "",  # blank = auto-detect
     "scrcpy_path": "",  # blank = auto-detect
     "ffmpeg_path": "",  # blank = auto (cache/PATH); for the Webcam tab
@@ -71,9 +76,6 @@ DEFAULTS = {
     # How a device screen is shown: "scrcpy" (fast video) or "screencap"
     # (periodic `adb screencap` frames for builds where scrcpy doesn't work).
     "screen_backend": "scrcpy",
-    # ribbon density: icons-only (True, default — fits without maximizing) vs
-    # icons + text (False, "standard"). Toggle with the 🗜 ribbon button / View menu.
-    "compact_ribbon": True,
     "make_shortcut_first_run": True,
     "auto_update": True,  # check PyPI for a newer TurboADB at launch
     # Ask whether a second open of the same device should create a terminal-only
@@ -105,6 +107,9 @@ DEFAULTS = {
 _LOCK = threading.RLock()
 # (path, (mtime_ns, size), data) of the last parsed/written file.
 _cache = None
+# (path, (mtime_ns, size), error, not opened) of a settings file that exists but
+# could not be read, so the next save keeps a copy of it (see keep_unreadable).
+_unreadable = None
 # lock-file path -> [depth, handle] for the locks this process currently holds.
 _held: dict = {}
 
@@ -173,7 +178,7 @@ def add_recent(key: str, value: str, cap: int = 10) -> None:
     if not value:
         return
     with _LOCK, _file_lock(settings_file()):
-        data = load()
+        data = _load_for_change()
         lst = [x for x in (data.get(key) or []) if x != value]
         lst.insert(0, value)
         data[key] = lst[:cap]
@@ -242,10 +247,62 @@ def _signature(path: str):
     return (st.st_mtime_ns, st.st_size)
 
 
+def keep_unreadable(path: str, error: str):
+    """Copy a settings or targets file that can't be read to
+    ``<file>.corrupt-<time>`` before it is rewritten, and say so.
+
+    A trailing comma typed by hand used to cost every saved setting (or
+    target) at the next save, because the unreadable file was replaced by the
+    defaults.  Returns the copy's path, or None when there is no file or the
+    copy failed — the caller must then leave the file alone."""
+    if not os.path.exists(path):
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup, number = f"{path}.corrupt-{stamp}", 2
+    while os.path.exists(backup):
+        backup, number = f"{path}.corrupt-{stamp}-{number}", number + 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        return None
+    warnings.warn(
+        f"TurboADB could not read {path} ({error}); it kept a copy as {backup} "
+        "before writing the file again.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return backup
+
+
+def load_problem():
+    """Why settings.json could not be read (defaults are in use), or None."""
+    with _LOCK:
+        _load_cached()
+        bad = _unreadable
+        if bad is not None and bad[0] == settings_file():
+            return bad[2]
+    return None
+
+
+def _cached_if_current():
+    """The cached settings when settings.json has not changed since they were
+    read, else None. Needs no lock: ``_cache`` is one tuple, replaced whole.
+
+    :func:`get` and :func:`load` answer from here without ``_LOCK``, which a
+    write holds across the cross-process file lock (up to 5 s while another
+    TurboADB has it), an fsync and the replace retries; a settings read on the
+    UI thread used to wait out all of that behind a debounced zoom save."""
+    path = settings_file()
+    cached = _cache
+    if cached is not None and cached[0] == path and cached[1] == _signature(path):
+        return cached[2]
+    return None
+
+
 def _load_cached() -> dict:
     """The parsed settings (shared, do not mutate) — re-read only when the
     file's mtime/size changed, so frequent get() calls don't hit the disk."""
-    global _cache
+    global _cache, _unreadable
     path = settings_file()
     sig = _signature(path)
     cached = _cache
@@ -275,22 +332,59 @@ def _load_cached() -> dict:
                 # Record the upgrade so the next save stores the current version
                 # and a value chosen afterwards is never reset again.
                 data["settings_version"] = DEFAULTS["settings_version"]
+        _unreadable = None
     except FileNotFoundError:
-        pass
+        _unreadable = None
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        # Remembered so the next save copies the file aside first instead of
+        # replacing the user's settings with these defaults.  The last item
+        # says the file could not be opened or read at all (maybe only for a
+        # moment), as opposed to holding text that does not parse.
+        _unreadable = (path, sig, str(exc), isinstance(exc, OSError))
         warnings.warn(
             f"TurboADB could not load settings from {path}: {exc}. Using defaults.",
             RuntimeWarning,
             stacklevel=3,
         )
+        if isinstance(exc, OSError):
+            return data  # maybe a passing sharing violation: read again next time
     _cache = (path, sig, data)
     return data
 
 
 def load() -> dict:
     """A fresh, mutable copy of all settings (defaults filled in)."""
-    with _LOCK:
-        return _copy(_load_cached())
+    loaded = _cached_if_current()
+    if loaded is None:
+        with _LOCK:
+            loaded = _load_cached()
+    return _copy(loaded)
+
+
+# A read-modify-write tries a read that failed this often before giving up.
+_READ_ATTEMPTS = 6
+
+
+def _retry_pause(attempt: int) -> None:
+    time.sleep(0.05 * (attempt + 1))
+
+
+def _load_for_change() -> dict:
+    """:func:`load` for a read-modify-write (:func:`update`, :func:`add_recent`).
+
+    A read that could not open the file at all (Windows reports a sharing
+    violation while an antivirus scanner or indexer has it open) gives the
+    defaults, and writing those back replaced every setting the user had
+    chosen.  Such a read is tried again; one that keeps failing raises
+    OSError, so nothing is written.  Call with ``_LOCK`` held."""
+    for attempt in range(_READ_ATTEMPTS):
+        data = load()
+        bad = _unreadable
+        if bad is None or bad[0] != settings_file() or not bad[3]:
+            return data
+        if attempt < _READ_ATTEMPTS - 1:
+            _retry_pause(attempt)
+    raise OSError(f"{bad[0]} could not be read ({bad[2]}); the change was not saved")
 
 
 def _lock_acquire(path: str, timeout: float):
@@ -414,7 +508,7 @@ def _atomic_write_json(path: str, value) -> None:
 
 
 def save(data: dict) -> None:
-    global _cache
+    global _cache, _unreadable
     if not isinstance(data, dict):
         raise ValueError("settings must be a dictionary")
     merged = dict(DEFAULTS)
@@ -422,15 +516,25 @@ def save(data: dict) -> None:
         merged[key] = _coerce(key, value) if key in DEFAULTS else value
     path = settings_file()
     with _LOCK, _file_lock(path):
+        _load_cached()  # notices a file that stopped parsing since it was read
+        bad = _unreadable
+        if bad is not None and bad[0] == path and os.path.exists(path):
+            if keep_unreadable(path, bad[2]) is None:
+                raise ValueError(
+                    f"{path} could not be read ({bad[2]}) or copied aside; "
+                    "it was left untouched")
         _atomic_write_json(path, merged)
         _cache = (path, _signature(path), _copy(merged))
+        _unreadable = None
 
 
 def get(key: str, default=None):
-    with _LOCK:
-        loaded = _load_cached()
-        if key in loaded:
-            return _copy_value(loaded[key])
+    loaded = _cached_if_current()
+    if loaded is None:
+        with _LOCK:
+            loaded = _load_cached()
+    if key in loaded:
+        return _copy_value(loaded[key])
     if default is not None:
         return default
     return _copy_value(DEFAULTS.get(key))
@@ -446,7 +550,7 @@ def update(changes: dict) -> None:
     if not changes:
         return
     with _LOCK, _file_lock(settings_file()):
-        data = load()
+        data = _load_for_change()
         data.update(changes)
         save(data)
 

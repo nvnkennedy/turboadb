@@ -45,6 +45,10 @@ _HOST_MARGINS = (12, 6, 12, 16)  # left, top, right, bottom around the sections
 # Explanations some connectivity toggles return when every method was refused
 # by the device (rather than raising); surface them as warnings, not success.
 _REFUSED_MARKERS = ("can't be", "permission-denied")
+# A key, the typed text or a toggle that comes back False was refused by adb
+# or the device (offline, unauthorized, a timeout), not missing from it: the
+# "app may not be installed" hint is for the launchers only.
+_NOT_ACCEPTED = "the device did not accept the command (see the log for adb's output)"
 
 
 class _Surface(QWidget):
@@ -239,10 +243,18 @@ class ControlsPanel(QWidget):
     log = pyqtSignal(str)
 
     def __init__(self, handler, compact=False, on_reboot=None, parent=None, dispatcher=None,
-                 display_provider=None):
+                 display_provider=None, slow_dispatcher=None):
         """*compact=True* (the Control + Mirror side pane) allows a narrower
         minimum width so the mirror keeps most of the space — the sections
-        simply reflow into a single column there."""
+        simply reflow into a single column there.
+
+        *dispatcher* runs keys, text and the other quick controls in order,
+        shared with the device screen's taps and keys.  The app and web
+        launchers and the Battery report run on *slow_dispatcher* instead
+        (by default one of this panel's own, started when first needed): an
+        app missing on a head unit walks the package list and several ways to
+        start it, and every tap, swipe and key on the device screen waited
+        behind that."""
         super().__init__(parent)
         self.handler = handler
         self._compact = compact
@@ -251,6 +263,8 @@ class ControlsPanel(QWidget):
         # Which logical display keys and typing go to (None = the default one).
         self._display_provider = display_provider
         self._dispatcher = dispatcher or DeviceCommandDispatcher()
+        self._owns_slow = slow_dispatcher is None
+        self._slow_dispatcher = slow_dispatcher
         self._ncols = -1
         self._strip = False  # True: laid out as a wide strip under the screen
         self._ready = False          # guard: resizeEvent fires during construction
@@ -452,10 +466,11 @@ class ControlsPanel(QWidget):
 
     # ---- result / run plumbing ----
     @staticmethod
-    def _result_msg(label, r):
+    def _result_msg(label, r, refused=None):
         """Turn a handler result into an honest log line: a failed operation is
         an error, and a falsy result means the action had no effect (e.g. the
-        app isn't installed)."""
+        app isn't installed).  *refused*: what a False result means instead,
+        for an action that has no app to miss (a key, typed text)."""
         if isinstance(r, OperationResult):
             if not r.success:
                 return f"[ERROR] {label}: {r.error or 'failed'}"
@@ -466,6 +481,8 @@ class ControlsPanel(QWidget):
                 return f"[ERROR] {label}: {detail}"
             r = r.text
         if r is False or (isinstance(r, str) and r.strip() == "False"):
+            if refused:
+                return f"[ERROR] {label}: {refused}"
             return (f"[WARNING] {label}: nothing happened — not available on this "
                     f"device (on an IVI the app may not be installed; try the "
                     f"Apps tab to launch what IS installed)")
@@ -476,16 +493,34 @@ class ControlsPanel(QWidget):
             return f"[WARNING] {label}: {text}"
         return f"[OK] {label}: {text}"
 
-    def _run(self, label, fn):
-        self._dispatcher.submit(
-            lambda: fn(self.handler),
-            on_done=lambda result: self.log.emit(self._result_msg(label, result)),
-            on_fail=lambda message: self.log.emit(f"[ERROR] {label}: {message}"),
-        )
+    def _slow_queue(self):
+        """The dispatcher for launchers and reports (see ``__init__``)."""
+        if self._slow_dispatcher is None:
+            self._slow_dispatcher = DeviceCommandDispatcher()
+        return self._slow_dispatcher
+
+    def _run(self, label, fn, *, refused=None, slow=False, failed=None):
+        """Run ``fn(handler)`` in order with the other commands of its queue
+        (*slow*: the launchers' queue) and log the outcome.  *failed* is called
+        when it did not succeed, including when the queue refused it."""
+
+        def done(result):
+            message = self._result_msg(label, result, refused)
+            self.log.emit(message)
+            if failed is not None and not message.startswith("[OK]"):
+                failed()
+
+        def fail(message):
+            self.log.emit(f"[ERROR] {label}: {message}")
+            if failed is not None:
+                failed()
+
+        dispatcher = self._slow_queue() if slow else self._dispatcher
+        dispatcher.submit(lambda: fn(self.handler), on_done=done, on_fail=fail)
 
     def _run_info(self, label, fn):
         self.log.emit(f"[INFO] {label}…")
-        self._dispatcher.submit(
+        self._slow_queue().submit(
             lambda: fn(self.handler),
             on_done=lambda result: self._show_info_result(label, result),
             on_fail=lambda message: self.log.emit(f"[ERROR] {label}: {message}"),
@@ -533,9 +568,12 @@ class ControlsPanel(QWidget):
         b.setCursor(Qt.PointingHandCursor)
         return b
 
-    def _btn(self, text, icon_name, fn, tone=None, **kwargs):
+    def _btn(self, text, icon_name, fn, tone=None, *, slow=False, refused=None, **kwargs):
+        """A button that runs ``fn(handler)``; *slow* and *refused* as for :meth:`_run`."""
         b = self._button(text, icon_name, tone, **kwargs)
-        b.clicked.connect(lambda _=False, t=text, f=fn: self._run(t, f))
+        b.clicked.connect(
+            lambda _=False, t=text, f=fn: self._run(t, f, slow=slow, refused=refused)
+        )
         return b
 
     def _key_btn(self, text, icon_name, key, tone=None, **kwargs):
@@ -561,7 +599,7 @@ class ControlsPanel(QWidget):
 
     def _send_key(self, label, key):
         extra = self._display_kwargs()
-        self._run(label, lambda h: h.keyevent(key, safe=True, **extra))
+        self._run(label, lambda h: h.keyevent(key, safe=True, **extra), refused=_NOT_ACCEPTED)
 
     def _icon_key(self, text, icon_name, key, tone, *, kind, height, icon_size):
         """An icon-only device key (nav bar, media): the label stays as the
@@ -569,10 +607,11 @@ class ControlsPanel(QWidget):
         return self._key_btn(text, icon_name, key, tone, kind=kind, height=height,
                              style=Qt.ToolButtonIconOnly, icon_size=icon_size)
 
-    def _tile(self, text, icon_name, fn, tone, tip=None):
+    def _tile(self, text, icon_name, fn, tone, tip=None, refused=None):
         """An icon-over-label tile (launchers, Power/Notifications/Settings)."""
         return self._btn(text, icon_name, fn, tone, kind="ctlTile", height=_TILE_H,
-                         style=Qt.ToolButtonTextUnderIcon, icon_size=22, tip=tip)
+                         style=Qt.ToolButtonTextUnderIcon, icon_size=22, tip=tip,
+                         refused=refused)
 
     def _callback_btn(self, text, icon_name, callback, tone=None, **kwargs):
         """A button whose action is owned by the parent workflow."""
@@ -606,10 +645,10 @@ class ControlsPanel(QWidget):
 
     def _quick_tile(self, key, name, caption, icon_name, tone, setter):
         tile = _QuickTile(name, caption, icon_name, tone)
-        tile.btn_on.clicked.connect(
-            lambda _=False: self._run(f"{name} on", lambda h: setter(h, True)))
-        tile.btn_off.clicked.connect(
-            lambda _=False: self._run(f"{name} off", lambda h: setter(h, False)))
+        tile.btn_on.clicked.connect(lambda _=False: self._run(
+            f"{name} on", lambda h: setter(h, True), refused=_NOT_ACCEPTED))
+        tile.btn_off.clicked.connect(lambda _=False: self._run(
+            f"{name} off", lambda h: setter(h, False), refused=_NOT_ACCEPTED))
         self.quick_tiles[key] = tile
         return tile
 
@@ -663,6 +702,7 @@ class ControlsPanel(QWidget):
                 ),
                 "amber",
                 tip="Pull down the notification shade",
+                refused=_NOT_ACCEPTED,
             ),
             # The one "Settings" shortcut (it used to be repeated on three cards).
             self._tile("Settings", "settings", lambda h: h.open_settings(safe=True), "teal",
@@ -693,7 +733,8 @@ class ControlsPanel(QWidget):
                 else:
                     b = self._btn(text, name, lambda h, a=action: h.media(a, safe=True),
                                   tone, kind="ctlMedia", height=_BTN_H + 2,
-                                  style=Qt.ToolButtonIconOnly, icon_size=20)
+                                  style=Qt.ToolButtonIconOnly, icon_size=20,
+                                  refused=_NOT_ACCEPTED)
                 b.setMinimumWidth(34)
                 seg.addWidget(b, 1)
             row.addLayout(seg, 1)
@@ -764,7 +805,7 @@ class ControlsPanel(QWidget):
         # compact coloured launchers: 2x4 in the side pane, one row of 4 when wide
         v.addWidget(_TileGrid(
             [self._btn(text, name, fn, tone, height=_BTN_H + 2, icon_size=20,
-                       tip=f"Open {text}")
+                       tip=f"Open {text}", slow=True)
              for text, name, tone, fn in items],
             (4, 2)))
         return g
@@ -772,12 +813,12 @@ class ControlsPanel(QWidget):
     def _open_url(self):
         u = self.url.text().strip()
         if u:
-            self._run(f"open {u}", lambda h: h.open_url(u, safe=True))
+            self._run(f"open {u}", lambda h: h.open_url(u, safe=True), slow=True)
 
     def _search(self):
         q = self.url.text().strip()
         if q:
-            self._run(f"search {q!r}", lambda h: h.web_search(q, safe=True))
+            self._run(f"search {q!r}", lambda h: h.web_search(q, safe=True), slow=True)
 
     def _text_group(self):
         g, v = self._card("Keyboard", "keyboard")
@@ -806,13 +847,35 @@ class ControlsPanel(QWidget):
             return
         self.text.clear()
         extra = self._display_kwargs()
-        self._run(f"type {t!r}", lambda h: h.input_text(t, safe=True, **extra))
+
+        def restore():
+            # Not typed on the device: the text comes back to try again,
+            # unless something new was typed meanwhile.
+            if not self.text.text():
+                self.text.setText(t)
+
+        # This box is how a PIN or a password reaches a head unit's login
+        # field: the log (and its notifications) says how much was typed,
+        # never what.
+        label = f"type {len(t)} character{'' if len(t) == 1 else 's'}"
+        self._run(label, lambda h: h.input_text(t, safe=True, **extra),
+                  refused=_NOT_ACCEPTED, failed=restore)
+
+    def shutdown_threads(self):
+        """Stop this panel's own dispatchers; return those still finishing a
+        command (a shared dispatcher is stopped by its owner)."""
+        from .qtutil import park_thread, thread_running
+
+        running = []
+        own = [self._dispatcher] if self._owns_dispatcher else []
+        if self._owns_slow and self._slow_dispatcher is not None:
+            own.append(self._slow_dispatcher)
+        for dispatcher in own:
+            dispatcher.stop()
+            if thread_running(dispatcher):  # never started: nothing to wait for
+                park_thread(dispatcher)
+                running.append(dispatcher)
+        return running
 
     def close_panel(self):
-        # Commands go through the dispatcher; a shared (device-tab) dispatcher
-        # is stopped by its owner.
-        if self._owns_dispatcher:
-            from .qtutil import park_thread
-
-            self._dispatcher.stop()
-            park_thread(self._dispatcher)
+        self.shutdown_threads()

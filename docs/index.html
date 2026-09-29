@@ -71,34 +71,41 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
-          <h3><span class="ver">v2.5.0</span> Files, at scale</h3>
+          <h3><span class="ver">v3.0.0</span> Terminals that behave</h3>
           <ul>
-            <li><b>Transfer history</b> — overall progress, speed and time left, and
-            every file's size, progress and error, with Retry failed.</li>
-            <li><b>Several Files tabs</b> on one device, each with its own folders,
-            selection and transfers.</li>
-            <li><b>Native file icons</b> — the same icons your system's file manager
-            shows.</li>
+            <li><b>A real device terminal</b> for the Android shell: <code>ping</code>,
+            <code>logcat | grep</code> and prompts that wait for input just work, and
+            Stop sends Ctrl+C.</li>
+            <li><b>Full-screen programs and colour</b>: <code>top</code>,
+            <code>vi</code> and <code>less</code> redraw in place, and the prompt,
+            <code>ls</code>, <code>grep</code> and logcat lines are coloured.</li>
+            <li><b>Stop keeps your shell</b> in PowerShell and CMD, variables and
+            all.</li>
+            <li><b>No stray blank lines</b>, and typing never scrambles streaming
+            output.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.5.0</span> Always in the know</h3>
+          <h3><span class="ver">v3.0.0</span> Leaner and calmer</h3>
           <ul>
-            <li><b>A second terminal</b> for the same device in one click.</li>
-            <li><b>Every copy and paste confirmed</b> — clipboard copies, pastes on
-            the device screen and APK installs all say what happened.</li>
-            <li><b>One line per bulk job</b> — hundreds of files, one clear
-            result.</li>
+            <li><b>One adb server</b>: no duplicate adb processes, and only the
+            server TurboADB started is stopped on exit.</li>
+            <li><b>IVI displays start stopped</b>: start one, or all, when you need
+            them.</li>
+            <li><b>A hung scrcpy window</b> never freezes TurboADB.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v2.5.0</span> Sturdier underneath</h3>
+          <h3><span class="ver">v3.0.0</span> Logs and files you can trust</h3>
           <ul>
-            <li><b>No more frozen screencap view</b> when adb has a lot to say.</li>
-            <li><b>Clock-proof streams</b> — logcat and recordings ignore clock
-            changes.</li>
-            <li><b>Safer startup launchers</b>, bounded buffers, and a green CI on
-            Linux and Windows.</li>
+            <li><b>Logcat keeps every line</b>, even while hidden, and its filter
+            searches the whole capture.</li>
+            <li><b>Faster Files</b> for big folders, with real transfer
+            progress.</li>
+            <li><b>Open files in their apps</b>: a picture, video or text file on
+            the device opens on the PC, and your saves go back to the device.</li>
+            <li><b>Safer defaults</b>: drops never delete your originals, and
+            sharing opens the firewall on private networks only.</li>
           </ul>
         </div>
       </div>
@@ -117,16 +124,17 @@
         <div class="card">
           <div class="ic">🖥</div>
           <h3>Interactive shell</h3>
-          <p>A real <code>adb shell</code> terminal: history, tab-completion,
-          copy/paste, columnised <code>ls</code>, and a <strong>Stop</strong> button
-          that actually kills a runaway command like <code>logcat</code> — even over
-          a remote adb server.</p>
+          <p>A real <code>adb shell</code> on a device terminal: history,
+          tab-completion, copy/paste, programs that ask for input, and a
+          <strong>Stop</strong> button that sends a real Ctrl+C to a runaway command
+          like <code>logcat</code> and keeps the shell — even over a remote adb
+          server.</p>
         </div>
 
         <div class="card">
           <div class="ic">📜</div>
           <h3>Live logcat</h3>
-          <p>Filter by level, tag, or live regex; <strong>highlight</strong> keywords
+          <p>Filter by level, tag, app, or live regex; <strong>highlight</strong> keywords
           like <code>error|anr|crash</code> in-line; pause and clear. Under a flood the
           view stays responsive and <strong>nothing is lost</strong> — every line is
           archived to disk, so a save is the complete log.</p>
@@ -153,8 +161,9 @@
           <p>scrcpy in a window or embedded, with a compatibility mode for stubborn
           IVI units, and an <strong>ADB screencap</strong> renderer for builds where
           scrcpy can't run. The <strong>IVI Displays</strong> tab shows every display
-          of a head unit live at once — centre stack, cluster, passenger — each with
-          its own controls, or use the device <strong>camera</strong>.
+          of a head unit side by side — centre stack, cluster, passenger — each with
+          its own controls and started only when you want it, or use the device
+          <strong>camera</strong>.
           Screenshots and recording that work over RDP.</p>
         </div>
 
@@ -194,11 +203,12 @@
 
         <div class="card">
           <div class="ic">🎨</div>
-          <h3>Calm themes</h3>
-          <p>Graphite and Porcelain by default, plus Black / White, Slate / Mist,
-          Night / Paper and Mocha / Latte. Soft text, muted accents, one click
-          between your dark and light theme, and colour-coded icons for every
-          section.</p>
+          <h3>Themes for every room</h3>
+          <p>Graphite and Porcelain by default, plus Ocean / Sky, Dusk / Lavender,
+          Evergreen / Meadow, Black / White, Slate / Mist, Night / Paper, Mocha /
+          Latte and High contrast in dark and light. One click between your dark
+          and light theme, a status bar coloured by state, and colour-coded icons
+          for every section.</p>
         </div>
 
         <div class="card">
@@ -245,7 +255,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-2.5.0-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-3.0.0-win64.exe</code> from the latest release
           and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
           on first run and adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>

@@ -12,7 +12,7 @@ from __future__ import annotations
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import QHBoxLayout, QToolButton, QWidget
 
-from ..results import OperationResult
+from .device_commands import command_error
 from .icons import icon
 
 # (label, icon, key name from ADBHandler.KEYS, tone). Navigation is blue and
@@ -76,10 +76,6 @@ class DisplayControls(QWidget):
         button.setFocusPolicy(Qt.NoFocus)  # never pull the keyboard off the screen
         return button
 
-    def set_display_id(self, display_id) -> None:
-        self.display_id = int(display_id or 0)
-        self._sync_tips()
-
     def _sync_tips(self) -> None:
         for label, _icon_name, key, _tone in DISPLAY_KEYS:
             where = (
@@ -123,14 +119,7 @@ class DisplayControls(QWidget):
 
         def done(result):
             finished()
-            error = None
-            if isinstance(result, OperationResult):
-                if not result.success:
-                    error = result.error or "failed"
-                elif result.value is False:
-                    error = "the device rejected it"
-            elif result is False:
-                error = "the device rejected it"
+            error = command_error(result, "the device rejected it")
             if error:
                 self.log.emit(f"[WARNING] display {self.display_id} {label}: {error}")
 

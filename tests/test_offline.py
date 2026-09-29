@@ -34,7 +34,8 @@ assert T.__version__
 
 # ---- TransferResult math ----
 tr = TransferResult("a", "b", "push", 1048576, 2.0, 1)
-assert abs(tr.speed_bps - 524288) < 1 and tr.human_size == "1.0MB"
+assert abs(tr.speed_bps - 524288) < 1 and tr.human_size == "1.0 MB"
+assert tr.human_speed == "512.0 KB/s"  # sizes read the same in the CLI and the GUI
 assert "Pushed" in str(tr)
 print("TransferResult:", tr.human_speed, tr.human_size)
 

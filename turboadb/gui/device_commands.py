@@ -7,7 +7,23 @@ import queue
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from ..results import OperationResult
+
 _log = logging.getLogger(__name__)
+
+
+def command_error(result, rejected: str):
+    """Failure text for a device command's result, or None when it worked.
+
+    The one rule every screen control reports by (the keyboard, the screen's
+    taps and keys, a display's buttons): a safe-mode result that failed gives
+    its error, or *rejected* when it carries none, and a command that returned
+    False (the device refused it) gives *rejected*."""
+    if isinstance(result, OperationResult):
+        if not result.success:
+            return str(result.error or rejected)
+        result = result.value
+    return rejected if result is False else None
 
 
 class DeviceCommandDispatcher(QThread):

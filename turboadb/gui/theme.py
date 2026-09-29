@@ -2,8 +2,9 @@
 
 Themes come in dark/light pairs that share one set of tokens and one
 stylesheet. The default pair is Graphite / Porcelain (layered, neither near-black
-nor near-white); Black / White, Slate / Mist, Night / Paper and Mocha / Latte are
-extra pairs selectable in Settings. The ribbon toggle reads as "light mode / dark
+nor near-white); Ocean / Sky, Dusk / Lavender, Evergreen / Meadow, Black / White,
+Slate / Mist, Night / Paper, Mocha / Latte and High contrast (dark and light)
+are extra pairs selectable in Settings and the Themes menu. The ribbon toggle reads as "light mode / dark
 mode": it switches to the most recently chosen theme of the other kind (see
 :func:`toggle_target`). A retired theme name still found in a settings file
 resolves to the default of its kind (see :func:`resolve_name`).
@@ -22,7 +23,9 @@ dark background. Every colour the GUI paints should come from this module.
 
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import tempfile
 from functools import partial
 
@@ -140,12 +143,97 @@ _LATTE = dict(
     warn_text="#6b4600", ok_text="#345c25",
 )
 
+# Ocean / Sky: a navy night with a clear blue, and a crisp blue-white day.
+# Brighter and more colourful than the pairs above, still no pure black or white.
+_OCEAN = dict(
+    chrome="#121926", win="#172030", panel="#1c2639", raised="#232f45",
+    button="#2a3751", button_hover="#33425f", input="#111723", ribbon="#121926",
+    border="#2c3a55", frame="#7383a6", line="#7686a9",
+    text="#d8dfea", dim="#aab6cc", placeholder="#8290aa", sel="#2a4a78", sel_text="#f3f7fd",
+    accent="#5c9cff", accent_hover="#77adff", accent_text="#86b8ff", on_accent="#08101f",
+    section_text="#c8d5ec", danger="#b53f52", danger_text="#ff9fac", on_danger="#fff6f7",
+    warn_text="#f2c15e", ok_text="#86d49b",
+)
+_SKY = dict(
+    chrome="#dde6f2", win="#ebf1f8", panel="#f4f7fb", raised="#f9fbfd",
+    button="#dbe4f0", button_hover="#cdd9e8", input="#fbfcfe", ribbon="#dde6f2",
+    border="#c3d0e0", frame="#5f6f86", line="#64748b",
+    text="#1b283e", dim="#43536b", placeholder="#5f6e84", sel="#c5d9f5", sel_text="#0e1c32",
+    accent="#1c5ec2", accent_hover="#174fa5", accent_text="#1a57b3", on_accent="#f6f9ff",
+    section_text="#233452", danger="#b3261e", danger_text="#ad2419", on_danger="#fff7f6",
+    warn_text="#7a4f00", ok_text="#1c6a36",
+)
+# Dusk / Lavender: violet, with a lilac accent at night and a deep violet by day.
+_DUSK = dict(
+    chrome="#1b1926", win="#201e2d", panel="#272436", raised="#2f2b41",
+    button="#37324b", button_hover="#413b58", input="#191723", ribbon="#1b1926",
+    border="#3a3551", frame="#8078a3", line="#847ca6",
+    text="#e2ddec", dim="#b6aecd", placeholder="#8c84a6", sel="#453773", sel_text="#f8f5fe",
+    accent="#a488f5", accent_hover="#b69ff7", accent_text="#c0aafa", on_accent="#130f1f",
+    section_text="#d6ceec", danger="#ad435d", danger_text="#ff9fb3", on_danger="#fff5f8",
+    warn_text="#f3c56c", ok_text="#97d6a7",
+)
+_LAVENDER = dict(
+    chrome="#e3dff1", win="#efecf8", panel="#f6f4fb", raised="#fbfafd",
+    button="#e1dcf0", button_hover="#d5cfe9", input="#fcfbfe", ribbon="#e3dff1",
+    border="#cec7e2", frame="#675f86", line="#6b638a",
+    text="#272239", dim="#4d4568", placeholder="#686084", sel="#dccff7", sel_text="#1a1331",
+    accent="#6b43cc", accent_hover="#5b37b1", accent_text="#5e3abb", on_accent="#fbf9ff",
+    section_text="#332a50", danger="#b02a4a", danger_text="#a82745", on_danger="#fff6f8",
+    warn_text="#7a4d00", ok_text="#22693a",
+)
+# Evergreen / Meadow: calm greens with a mint (night) or leaf (day) accent.
+_EVERGREEN = dict(
+    chrome="#19211f", win="#1e2724", panel="#242e2b", raised="#2b3632",
+    button="#323e39", button_hover="#3b4843", input="#171e1c", ribbon="#19211f",
+    border="#34413c", frame="#768a81", line="#7a8e85",
+    text="#e4ede7", dim="#abbdb2", placeholder="#86978c", sel="#2f5040", sel_text="#f1f8f3",
+    accent="#5dbb88", accent_hover="#74c799", accent_text="#86d3a6", on_accent="#0c1812",
+    section_text="#c6d8cc", danger="#aa4642", danger_text="#f6a09a", on_danger="#fff6f5",
+    warn_text="#e8c268", ok_text="#90d6a3",
+)
+_MEADOW = dict(
+    chrome="#dce6df", win="#e9f0eb", panel="#f2f6f3", raised="#f8fbf8",
+    button="#dae4dc", button_hover="#ccd9cf", input="#fbfcfb", ribbon="#dce6df",
+    border="#c2d0c6", frame="#5c6f63", line="#617468",
+    text="#1b2921", dim="#42584a", placeholder="#5d7164", sel="#c6e1cf", sel_text="#0f2018",
+    accent="#277a4b", accent_hover="#206840", accent_text="#236e44", on_accent="#f5fbf7",
+    section_text="#263b2f", danger="#a83232", danger_text="#a12f2f", on_danger="#fff7f7",
+    warn_text="#6f4f00", ok_text="#1f6a39",
+)
+# High contrast: the most readable pair (text about 16:1), for bright rooms,
+# projectors and tired eyes; near-black / near-white pages with vivid accents.
+_CONTRAST_DARK = dict(
+    chrome="#07090c", win="#0b0e12", panel="#12161b", raised="#1a1f26",
+    button="#232a33", button_hover="#2d3541", input="#06080a", ribbon="#07090c",
+    border="#47505e", frame="#a4aebb", line="#a4aebb",
+    text="#f7f9fb", dim="#d3d9e1", placeholder="#aeb6c1", sel="#1553a8", sel_text="#ffffff",
+    accent="#4aa3ff", accent_hover="#6fb6ff", accent_text="#7dbdff", on_accent="#02060c",
+    section_text="#ffffff", danger="#d93a3a", danger_text="#ff9494", on_danger="#ffffff",
+    warn_text="#ffd35c", ok_text="#72e38a",
+)
+_CONTRAST_LIGHT = dict(
+    chrome="#e4e8ed", win="#f3f4f6", panel="#fefefe", raised="#f1f3f6",
+    button="#e2e6ec", button_hover="#d3d9e1", input="#fefefe", ribbon="#e4e8ed",
+    border="#8b95a3", frame="#3c4552", line="#3c4552",
+    text="#05080c", dim="#262e39", placeholder="#454e5b", sel="#b9d3ff", sel_text="#000610",
+    accent="#0b4fc4", accent_hover="#093f9e", accent_text="#0a47b0", on_accent="#ffffff",
+    section_text="#05080c", danger="#b00020", danger_text="#a3001e", on_danger="#ffffff",
+    warn_text="#5a3e00", ok_text="#0b5a26",
+)
+
 # (key, label, description, palette, pair) in the order shown in Settings.
 # Each description must fit on its Settings -> Themes card (about 36
 # characters; longer ones were cut off with "..." at the default dialog size).
 _THEME_TABLE = (
     ("dark", "Graphite", "Layered graphite, the default dark.", _DARK, "light"),
     ("light", "Porcelain", "Soft neutral grey, the default light.", _LIGHT, "dark"),
+    ("ocean-dark", "Ocean", "Deep navy with a clear blue accent.", _OCEAN, "ocean-light"),
+    ("ocean-light", "Sky", "Crisp blue-white, clear to read.", _SKY, "ocean-dark"),
+    ("dusk-dark", "Dusk", "Soft violet night, lilac accent.", _DUSK, "dusk-light"),
+    ("dusk-light", "Lavender", "Light lavender, violet accent.", _LAVENDER, "dusk-dark"),
+    ("evergreen-dark", "Evergreen", "Calm forest green, mint accent.", _EVERGREEN, "evergreen-light"),
+    ("evergreen-light", "Meadow", "Fresh meadow green, leaf accent.", _MEADOW, "evergreen-dark"),
     ("mono-dark", "Black", "Soft near-black with calm grey text.", _BLACK, "mono-light"),
     ("mono-light", "White", "Paper white with soft dark text.", _WHITE, "mono-dark"),
     ("slate-dark", "Slate", "Cool blue-grey with a frost accent.", _SLATE, "slate-light"),
@@ -154,6 +242,10 @@ _THEME_TABLE = (
     ("night-light", "Paper", "Sepia cream paper for easy reading.", _PAPER, "night-dark"),
     ("mocha-dark", "Mocha", "Espresso dark with a caramel accent.", _MOCHA, "mocha-light"),
     ("mocha-light", "Latte", "Warm tan light with a toffee accent.", _LATTE, "mocha-dark"),
+    ("contrast-dark", "High contrast", "Maximum readability, near black.", _CONTRAST_DARK,
+     "contrast-light"),
+    ("contrast-light", "High contrast light", "Maximum readability, bright white.",
+     _CONTRAST_LIGHT, "contrast-dark"),
 )
 THEMES = {key: pal for key, _label, _desc, pal, _pair in _THEME_TABLE}
 THEME_LABELS = {key: label for key, label, _desc, _pal, _pair in _THEME_TABLE}
@@ -187,6 +279,20 @@ ANSI_BG = {
     44: "#2f5f8f", 45: "#7a4a8f", 46: "#2f7a82", 47: "#9aa0a8",
     100: "#4a4d52", 101: "#b8505a", 102: "#62934a", 103: "#a8843d",
     104: "#3f76ad", 105: "#935cab", 106: "#3d939c", 107: "#c8cbd0",
+}
+
+# A device shell's own prompt, which the terminal colours (gui/shell_colors.py):
+# the parts of "130|user@host:/path $" as TurboADB draws its own prompt over
+# a pipe, as (colour, bold): the exit status and root's "#" red, the user
+# magenta, the host cyan, ":" grey, the path yellow and "$" green.
+TERM_PROMPT_COLORS = {
+    "status": (ANSI_FG[91], True),
+    "user": (ANSI_FG[95], True),
+    "host": (ANSI_FG[96], True),
+    "colon": (ANSI_FG[90], False),
+    "path": (ANSI_FG[93], True),
+    "mark": (ANSI_FG[92], True),
+    "root": (ANSI_FG[91], True),
 }
 
 # Messages TurboADB itself echoes into a terminal.
@@ -223,14 +329,6 @@ ACCENT_2 = _DARK["accent_hover"]
 ACCENT_DARK = _LIGHT["accent"]
 DANGER = "#c75c62"  # icon tint readable on both ribbons
 WARN = ECHO_WARN
-LOG_COLORS = {
-    "ERROR": LOG_LEVEL_STYLE["ERROR"][0],
-    "WARNING": LOG_LEVEL_STYLE["WARNING"][0],
-    "stderr": "#ef9b5f",
-    "OK": LOG_LEVEL_STYLE["OK"][0],
-    "INFO": LOG_LEVEL_STYLE["INFO"][0],
-    **{f" {level} ": colour for level, colour in LOGCAT_LEVELS.items()},
-}
 
 
 def theme_names() -> tuple[str, ...]:
@@ -614,6 +712,24 @@ def _camera_status_rules(name: str) -> str:
 
 # ---- small generated images for QSS sub-controls ---------------------------
 _PNG_CACHE = {}
+_PNG_DIR = None  # this process's own folder for them (see _png_dir)
+
+
+def _png_dir() -> str:
+    """A folder of this process's own for the stylesheet's small images,
+    made on first use and removed at exit.
+
+    They were written under fixed names straight into the system temp
+    folder. With a shared /tmp (a Linux machine several people log in to)
+    the next user could not replace the first one's files, and that user's
+    check marks and radio dots went missing while arrows and tab close
+    buttons fell back to Qt's own; anyone could also plant a file under such
+    a name. mkdtemp gives a new folder that only this user can write to."""
+    global _PNG_DIR
+    if _PNG_DIR is None or not os.path.isdir(_PNG_DIR):
+        _PNG_DIR = tempfile.mkdtemp(prefix="turboadb-qss-")
+        atexit.register(shutil.rmtree, _PNG_DIR, True)
+    return _PNG_DIR
 
 
 def _cached_png(kind: str, color: str, width: int, height: int, paint) -> str:
@@ -631,7 +747,10 @@ def _cached_png(kind: str, color: str, width: int, height: int, paint) -> str:
     p.setRenderHint(QPainter.Antialiasing)
     paint(p, color)
     p.end()
-    path = os.path.join(tempfile.gettempdir(), f"turboadb-{kind}-{color.lstrip('#')}.png")
+    try:
+        path = os.path.join(_png_dir(), f"turboadb-{kind}-{color.lstrip('#')}.png")
+    except OSError:  # no temp folder can be made: the rules go without images
+        return ""
     if not pm.save(path):
         return ""
     path = path.replace("\\", "/")
@@ -739,6 +858,9 @@ def stylesheet(name: str = "dark") -> str:
     # own fallback arrow/cross on top of the rule.
     close_image = f"image: url({close});" if close else ""
     arrow_image = f"image: url({arrow});" if arrow else ""
+    check_image = f"image: url({check});" if check else ""
+    menu_check_image = f"image: url({menu_check});" if menu_check else ""
+    dot_image = f"image: url({dot});" if dot else ""
     # Device and section tab headers are partitioned by a short hairline at
     # each header's right edge, a little firmer than ``border`` so it reads on
     # the tab row. The background shorthands of the :last, :next-selected,
@@ -791,7 +913,7 @@ def stylesheet(name: str = "dark") -> str:
     QMenu::item:disabled {{ color: {c["dim"]}; }}
     QMenu::separator {{ height: 1px; background: {c["border"]}; margin: 5px 10px; }}
     QMenu::indicator {{ width: 14px; height: 14px; left: 6px; }}
-    QMenu::indicator:checked {{ image: url({menu_check}); }}
+    QMenu::indicator:checked {{ {menu_check_image} }}
 
     QToolBar {{ background: {c["chrome"]}; border: none; border-bottom: 1px solid {c["border"]};
         spacing: 3px; padding: 4px 6px; }}
@@ -801,10 +923,6 @@ def stylesheet(name: str = "dark") -> str:
     QStatusBar {{ background: {c["chrome"]}; color: {c["dim"]}; border: none;
         border-top: 1px solid {c["border"]}; font-size: 8.5pt; }}
     QStatusBar::item {{ border: none; }}
-    QStatusBar QLabel#statusPill {{
-        background: {c["button"]}; color: {c["text"]}; border: none;
-        border-radius: 9px; padding: 2px 9px; margin: 3px; font-size: 8.5pt;
-    }}
 
     /* Soft filled buttons: separated from the surface by fill, never outlines. */
     QPushButton, QToolButton {{
@@ -888,7 +1006,7 @@ def stylesheet(name: str = "dark") -> str:
     QListView::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QListWidget::indicator:checked, QTreeWidget::indicator:checked,
     QListView::indicator:checked {{
-        background: {c["accent"]}; border-color: {c["accent"]}; image: url({check}); }}
+        background: {c["accent"]}; border-color: {c["accent"]}; {check_image} }}
     /* Tables: rows separated by shade only — no cell grid, no outer frame. */
     QTableWidget, QTableView {{
         background: {c["panel"]}; alternate-background-color: {c["raised"]};
@@ -973,14 +1091,14 @@ def stylesheet(name: str = "dark") -> str:
         border: 1px solid {c["line"]}; border-radius: 4px; background: {c["input"]}; }}
     QCheckBox::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QCheckBox::indicator:checked, QGroupBox::indicator:checked {{
-        background: {c["accent"]}; border-color: {c["accent"]}; image: url({check}); }}
+        background: {c["accent"]}; border-color: {c["accent"]}; {check_image} }}
     QCheckBox::indicator:disabled {{ border-color: {c["border"]}; }}
     QRadioButton {{ background: transparent; color: {c["text"]}; spacing: 6px; font-size: 9pt; }}
     QRadioButton::indicator {{ width: 15px; height: 15px;
         border: 1px solid {c["line"]}; border-radius: 8px; background: {c["input"]}; }}
     QRadioButton::indicator:hover {{ border-color: {c["accent_text"]}; }}
     QRadioButton::indicator:checked {{ background: {c["accent"]}; border-color: {c["accent"]};
-        image: url({dot}); }}
+        {dot_image} }}
     QRadioButton::indicator:disabled {{ border-color: {c["border"]}; }}
 
     QSplitter::handle {{ background: transparent; }}

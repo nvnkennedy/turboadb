@@ -1,12 +1,21 @@
-"""Every display of one device, live and controllable, in one tab.
+"""Every display of one device, side by side and controllable, in one tab.
 
 Multi-display devices (an Android Automotive head unit's centre stack,
 instrument cluster and passenger screen) get one screen tile per display. Each
 tile is a full MirrorPanel locked to its display: embedded screen, typing,
 screenshot and recording, plus a row of basic controls (Back, Home, Recents,
-volume, power, screenshot) aimed at that display. The tiles start one after
-another the first time the tab is shown, so the device never has to start
-several scrcpy servers at once, and they share one video budget: the wall as a
+volume, power, screenshot) aimed at that display. Off Windows, where scrcpy's
+window cannot be embedded, a tile shows its display with ADB screencap frames.
+
+Every display starts stopped, and only the user starts one: its own Start (or
+Separate window), or Start all. Showing or hiding the tab, a rescan and a
+newly found display never start a screen, so a display the user stopped stays
+stopped. Start all starts the displays one after another, so the device never
+has to start several scrcpy servers at once; it is the user's request, so it
+carries on while the tab is hidden, and only Stop all ends it early. A display
+the user starts (and maybe stops) by hand meanwhile is left to them. A display
+that fails while it can't be seen is not retried (see
+MirrorPanel._retries_on_hold). The tiles share one video budget: the wall as a
 whole asks the device for about what one full Device Control screen does.
 """
 
@@ -83,6 +92,13 @@ class _DisplayTile(QFrame):
             handler, session, automotive=automotive, prefer_embed=True, dispatcher=dispatcher
         )
         self.panel.set_fixed_display(display)
+        if not MirrorPanel.embeds_scrcpy():
+            # Only Windows can show scrcpy's window inside the tile. Elsewhere
+            # each started display opened a scrcpy window of its own outside
+            # TurboADB, so the tile draws its display from ADB screencap frames
+            # (and records it on the device). Its Separate window still opens
+            # scrcpy, when asked for.
+            self.panel.set_screen_backend("screencap")
         # The panel's own dispatcher when the wall has none: presses are still
         # queued in order, off the UI thread.
         self.controls = DisplayControls(
@@ -170,10 +186,8 @@ class DisplayWall(QWidget):
         self._dispatcher = dispatcher
         self._tiles = []
         self._retiring = []  # removed tiles, kept alive until their screen stops
-        self._queue = []
-        self._waiting = None
-        self._auto_started = False
-        self._stopped_by_user = False
+        self._queue = []  # the displays Start all has still to start
+        self._waiting = None  # the display Start all waits on to come up
         self._focused = None
         self._closing = False
         self._columns = 0
@@ -190,12 +204,16 @@ class DisplayWall(QWidget):
         bar.setContentsMargins(12, 8, 12, 8)
         self.summary = QLabel("Looking for displays…")
         self.summary.setObjectName("iviPreviewTitle")
+        self.summary.setToolTip(
+            "Every display starts stopped: start one with its own Start, or all "
+            "of them with Start all"
+        )
         bar.addWidget(self.summary)
         bar.addStretch()
         self.btn_start_all = QPushButton("Start all")
         self.btn_start_all.setProperty("role", "ok")
         self.btn_start_all.setIcon(icons.icon("play", "on-accent"))
-        self.btn_start_all.setToolTip("Show every display, one after another")
+        self.btn_start_all.setToolTip("Start every stopped display, one after another")
         self.btn_start_all.clicked.connect(lambda _checked=False: self.start_all())
         self.btn_stop_all = QPushButton("Stop all")
         self.btn_stop_all.setProperty("role", "danger")
@@ -245,7 +263,8 @@ class DisplayWall(QWidget):
 
     # ---- displays ----
     def set_displays(self, displays) -> None:
-        """Show these displays; tiles of displays that are still there keep running."""
+        """Show these displays. A new display arrives stopped, and a display
+        that is still there keeps its state: a scan never starts a screen."""
         if self._closing:
             return
         wanted = [dict(d) for d in (displays or []) if isinstance(d, dict) and "id" in d]
@@ -296,20 +315,13 @@ class DisplayWall(QWidget):
         self._apply_video_budget()
         self._set_tiles_paused(not self.isVisible())
         count = len(tiles)
-        if count:
-            self.summary.setText(f"{count} display{'s' if count != 1 else ''}")
-        else:
+        if not count:
             self.summary.setText("No displays found")
             self.empty.setText("No displays found — press Rescan to look again.")
         self.empty.setVisible(not count)
-        self._sync_buttons()
+        self._sync_buttons()  # (it words the summary while there are tiles)
         self._columns = 0
         self._relayout()
-        if self._auto_started:
-            if not self._stopped_by_user:
-                self.start_all()  # displays found later join the running wall
-        elif self.isVisible():
-            self._auto_start()
 
     def _remove_tile(self, tile) -> None:
         """Take a tile off the wall and close its screen.
@@ -325,7 +337,9 @@ class DisplayWall(QWidget):
         if tile in self._queue:
             self._queue.remove(tile)
         if tile is self._waiting:
+            # Start all was waiting on this display: go on after the usual gap
             self._waiting = None
+            self._next_timer.start(self.START_GAP_MS)
         self.grid.removeWidget(tile)
         tile.hide()
         self._retiring.append(tile)
@@ -369,22 +383,39 @@ class DisplayWall(QWidget):
 
     def _sync_buttons(self) -> None:
         """Start all / Stop all follow what the tiles are actually doing, so
-        neither stays enabled when it has nothing left to do."""
+        neither stays enabled when it has nothing left to do, and the summary
+        says how many displays run: a wall that is all stopped is idle, not
+        broken."""
         if self._closing:
             return
         tiles = self._tiles
+        count = len(tiles)
         active = sum(1 for tile in tiles if tile.panel.is_active())
-        self.btn_start_all.setEnabled(active < len(tiles))
+        self.btn_start_all.setEnabled(active < count)
         self.btn_stop_all.setEnabled(active > 0)
+        if not count:
+            return  # "Looking for displays…" or "No displays found" stays
+        if not active:
+            state = "all stopped" if count > 1 else "stopped"
+        elif active < count:
+            state = f"{active} running"
+        else:
+            state = "all running" if count > 1 else "running"
+        queued = len(self._queue)
+        if queued:
+            state += f", {queued} more to start"
+        self.summary.setText(f"{count} display{'s' if count != 1 else ''} — {state}")
 
     # ---- starting and stopping ----
     def showEvent(self, event):
+        # Showing the tab never starts a display: only Start and Start all do.
         super().showEvent(event)
         self._set_tiles_paused(False)
         self._schedule_layout()
-        self._auto_start()
 
     def hideEvent(self, event):
+        # Hiding the tab stops nothing either. Running displays keep running
+        # (slower upkeep), and a Start all the user pressed carries on.
         super().hideEvent(event)
         self._set_tiles_paused(True)
 
@@ -398,19 +429,11 @@ class DisplayWall(QWidget):
             except RuntimeError:  # the tile is being destroyed
                 pass
 
-    def _auto_start(self) -> None:
-        if self._auto_started or not self._tiles or self._closing:
-            return
-        self._auto_started = True
-        # let the tab paint and size its tiles before the first screen embeds
-        QTimer.singleShot(150, self.start_all)
-
     def start_all(self) -> None:
-        """Start every display that isn't showing yet, one after another."""
+        """Start all (the user's click): start every display that isn't
+        showing yet, one after another. Nothing else starts a display."""
         if self._closing:
             return
-        self._auto_started = True
-        self._stopped_by_user = False
         self._queue = [tile for tile in self._tiles if not tile.panel.is_active()]
         if self._waiting is None:
             self._start_next()
@@ -438,6 +461,11 @@ class DisplayWall(QWidget):
             self._next_timer.start(self.START_GAP_MS)
 
     def _on_tile_active_changed(self, tile, active) -> None:
+        if active and tile is not self._waiting and tile in self._queue:
+            # Started by hand while Start all waits on another display: it has
+            # nothing left to do for this one, so a Stop the user presses on it
+            # later is never undone by the chain.
+            self._queue.remove(tile)
         self._sync_buttons()
         if not active and tile is self._waiting and not self._closing:
             self._idle_check.start(0)
@@ -458,7 +486,7 @@ class DisplayWall(QWidget):
             self._next_timer.start(self.START_GAP_MS)
 
     def stop_all(self) -> None:
-        self._stopped_by_user = True
+        """Stop all: stop every display and drop what is left of Start all."""
         self._queue = []
         self._waiting = None
         self._next_timer.stop()

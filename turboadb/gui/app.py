@@ -9,24 +9,32 @@ import os
 import sys
 import traceback
 
-from PyQt5.QtCore import QLockFile
+from PyQt5.QtCore import QLockFile, QObject, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from ..config import user_path
 from .main_window import MainWindow, ICON_PATH
 
-_FLAG_DIR = user_path()
 _window = None  # set after creation, used by the exception hook
 _instance_lock = None  # kept alive for the lifetime of the GUI process
 _instance_mutex = None  # Windows' atomic duplicate-launch guard
-_adb_prewarm_thread = None  # keeps the early daemon warm-up alive
+
+
+def _flag_dir() -> str:
+    """``~/.turboadb``, resolved on every call like every other user file
+    (see :func:`turboadb.config.user_dir`): frozen at import, the crash log,
+    the log sweep and the instance lock kept using the profile the module
+    was first imported under."""
+    return user_path()
 
 
 def _crash_log(text: str):
+    """Append *text* to crash.log. Plain file I/O: safe from any thread."""
     try:
-        os.makedirs(_FLAG_DIR, exist_ok=True)
-        with open(os.path.join(_FLAG_DIR, "crash.log"), "a", encoding="utf-8") as fh:
+        folder = _flag_dir()
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "crash.log"), "a", encoding="utf-8") as fh:
             fh.write(text + "\n")
     except Exception:
         pass
@@ -42,9 +50,10 @@ def _install_app_logging():
     import threading
 
     try:
-        os.makedirs(_FLAG_DIR, exist_ok=True)
+        folder = _flag_dir()
+        os.makedirs(folder, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
-            os.path.join(_FLAG_DIR, "turboadb.log"),
+            os.path.join(folder, "turboadb.log"),
             maxBytes=1_000_000,
             backupCount=2,
             encoding="utf-8",
@@ -57,8 +66,10 @@ def _install_app_logging():
             root.addHandler(handler)
     except Exception:
         pass
-    # worker-thread exceptions -> crash.log too (the Qt excepthook only covers
-    # the UI thread)
+    # An exception in a Python thread (threading.Thread) never reaches
+    # sys.excepthook, so it is written to crash.log here. (One escaping a
+    # QThread's run() does reach sys.excepthook, on that worker thread: see
+    # _install_excepthook.)
     try:
 
         def _thread_hook(args):
@@ -78,6 +89,7 @@ def _install_app_logging():
 
 _error_box = None  # the one visible "unexpected error" popup, if any
 _suppressed_errors = 0  # errors raised while that popup was already open
+_error_relay = None  # takes uncaught errors to the GUI thread (see _ErrorRelay)
 
 
 def _on_error_box_closed(*_):
@@ -89,7 +101,7 @@ def _on_error_box_closed(*_):
 def _show_error_popup(exc_type, exc) -> None:
     """Show ONE non-modal error popup; further errors update it instead of
     stacking a new modal box per exception (a repeating timer error used to
-    bury the window under dialogs)."""
+    bury the window under dialogs). GUI thread only, like every widget."""
     global _error_box, _suppressed_errors
     from PyQt5.QtCore import Qt
 
@@ -120,35 +132,104 @@ def _show_error_popup(exc_type, exc) -> None:
     box.show()
 
 
+def _report_error(exc_type, text: str, details: str) -> None:
+    """Show an uncaught error in the log panel and in the one error popup.
+    GUI thread only: :class:`_ErrorRelay` brings every error here."""
+    if _window is not None:
+        try:
+            _window.log_panel.append(f"[ERROR] Unexpected error:\n{details.rstrip()}")
+        except Exception:
+            pass
+    try:
+        _show_error_popup(exc_type, text)
+    except Exception as popup_exc:  # never recurse into the hook
+        _crash_log(f"[excepthook] could not show the error popup: {popup_exc!r}")
+
+
+class _ErrorRelay(QObject):
+    """Hands an uncaught error to the GUI thread.
+
+    PyQt calls ``sys.excepthook`` on the thread the error happened on: the GUI
+    thread for a slot or an event handler, the worker for an error escaping a
+    ``QThread.run()``. The hook used to build the popup and write to the log
+    dock right there, and widgets touched from a worker crashed the whole app
+    (every shell, transfer and mirror with it) instead of keeping it open.
+
+    The relay lives on the GUI thread, so an error reported on a worker is
+    queued to it and one reported on the GUI thread is shown at once, as
+    before. Only text crosses threads: a traceback would keep the worker's
+    frames, and every object in them, alive until the GUI thread let go.
+    """
+
+    raised = pyqtSignal(object, str, str)  # exception type, its message, the traceback
+
+    def __init__(self):
+        super().__init__()
+        self.raised.connect(self._report)
+
+    @pyqtSlot(object, str, str)
+    def _report(self, exc_type, text, details):
+        _report_error(exc_type, text, details)
+
+
 def _install_excepthook():
-    """Uncaught GUI-thread errors -> log to the panel + a non-fatal popup,
-    instead of crashing the app."""
+    """Uncaught errors -> crash.log, the log panel and one non-fatal popup,
+    instead of crashing the app.
+
+    The hook itself only writes crash.log, which is safe on any thread; the
+    log panel and the popup are reached through :class:`_ErrorRelay`, on the
+    GUI thread. Without a QApplication there is nothing to show them in, and
+    crash.log is all there is.
+    """
+    global _error_relay
+    app = QApplication.instance()
+    if app is not None and _error_relay is None:
+        relay = _ErrorRelay()
+        if relay.thread() != app.thread():
+            relay.moveToThread(app.thread())
+        _error_relay = relay
 
     def hook(exc_type, exc, tb):
-        msg = "".join(traceback.format_exception(exc_type, exc, tb))
-        _crash_log(msg)
-        if _window is not None:
-            try:
-                _window.log_panel.append(f"[ERROR] Unexpected error:\n{msg.rstrip()}")
-            except Exception:
-                pass
+        details = "".join(traceback.format_exception(exc_type, exc, tb))
+        _crash_log(details)
+        relay = _error_relay
+        if relay is None or QApplication.instance() is None:
+            return
         try:
-            _show_error_popup(exc_type, exc)
-        except Exception as popup_exc:  # never recurse into the hook
-            _crash_log(f"[excepthook] could not show the error popup: {popup_exc!r}")
+            text = str(exc)
+        except Exception:  # an exception whose own __str__ fails
+            text = object.__repr__(exc)
+        try:
+            relay.raised.emit(exc_type, text, details)
+        except Exception as relay_exc:  # never recurse into the hook
+            _crash_log(f"[excepthook] could not report the error: {relay_exc!r}")
 
     sys.excepthook = hook
 
 
 def _sweep_stale_logs():
     """Scrollback temp files are removed on clean close; after a crash they
-    linger in ~/.turboadb/logs forever — drop old files and empty remnants."""
+    linger in ~/.turboadb/logs forever — drop old files and empty remnants.
+
+    Only files no running TurboADB owns (see ``scrollback.OWNER``): a second
+    instance started while the first runs used to delete the first one's live
+    history, an empty file (a history just started) or one idle for days."""
     import glob
     import time
 
     try:
+        from .scrollback import forget_owners, history_owner, owner_running
+
+        folder = os.path.join(_flag_dir(), "logs")
         cutoff = time.time() - 3 * 86400
-        for p in glob.glob(os.path.join(_FLAG_DIR, "logs", "turboadb-*.log")):
+        running = {}  # owner -> it still runs
+        for p in glob.glob(os.path.join(folder, "turboadb-*.log")):
+            owner = history_owner(p)
+            if owner is not None:
+                if owner not in running:
+                    running[owner] = owner_running(folder, owner)
+                if running[owner]:
+                    continue
             try:
                 # A zero-byte file has no user-visible history to preserve and
                 # is normally a remnant from an interrupted terminal startup.
@@ -156,6 +237,7 @@ def _sweep_stale_logs():
                     os.remove(p)
             except OSError:
                 pass
+        forget_owners(folder)
     except Exception:
         pass
 
@@ -171,8 +253,9 @@ def _first_run_tasks():
         from . import settings as settings_mod
 
         settings_mod.load()  # validate settings before recording first launch
-        os.makedirs(_FLAG_DIR, exist_ok=True)
-        flag = os.path.join(_FLAG_DIR, "first-run-done")
+        folder = _flag_dir()
+        os.makedirs(folder, exist_ok=True)
+        flag = os.path.join(folder, "first-run-done")
         if os.path.exists(flag):
             return
         with open(flag, "w") as fh:
@@ -198,39 +281,15 @@ def _set_app_user_model_id():
 def _prewarm_adb_server() -> None:
     """Ask ADB to start before constructing the (larger) main window.
 
-    This is deliberately a plain daemon thread: building the UI must never wait
-    for USB enumeration, and :func:`ensure_adb_server` already owns a process-
-    local lock so MainWindow's later verification joins the same launch rather
-    than racing it.
+    A plain daemon thread: building the UI must never wait for USB
+    enumeration.  It is the one early start of
+    :func:`adb_path.prewarm_adb_server`, which ``turboadb-gui`` may already
+    have made before PyQt was imported; MainWindow's startup check and the
+    device tabs then wait on the same ``adb start-server`` launcher.
     """
-    global _adb_prewarm_thread
-    if _adb_prewarm_thread is not None and _adb_prewarm_thread.is_alive():
-        return
+    from .adb_path import prewarm_adb_server
 
-    def run() -> None:
-        try:
-            from ..tools import ensure_adb_server
-            from .adb_path import gui_adb_path
-
-            # Do not let a system/PATH ADB win this race.  The rest of the GUI
-            # is pinned to this same adb (Settings path, else managed copy).
-            adb_path = gui_adb_path()
-            # A pre-warm is a latency optimisation, never a reason to leave a
-            # launch hint spinning for many seconds when the daemon is broken.
-            ensure_adb_server(adb_path, timeout=2.5)
-        except Exception:
-            # The normal GUI worker reports an actionable message after the
-            # window exists.  This early helper is only a latency optimisation.
-            pass
-
-    import threading
-
-    _adb_prewarm_thread = threading.Thread(
-        target=run,
-        name="TurboADB-early-server-start",
-        daemon=True,
-    )
-    _adb_prewarm_thread.start()
+    prewarm_adb_server()
 
 
 def _show_already_running() -> None:
@@ -272,8 +331,9 @@ def _acquire_instance_lock() -> bool:
             # QLockFile below remains a safe fallback on restrictive systems.
             _instance_mutex = None
     try:
-        os.makedirs(_FLAG_DIR, exist_ok=True)
-        lock = QLockFile(os.path.join(_FLAG_DIR, "turboadb-gui.lock"))
+        folder = _flag_dir()
+        os.makedirs(folder, exist_ok=True)
+        lock = QLockFile(os.path.join(folder, "turboadb-gui.lock"))
         lock.setStaleLockTime(10_000)
         if not lock.tryLock(100) and lock.removeStaleLockFile():
             lock.tryLock(100)
@@ -291,54 +351,97 @@ def _acquire_instance_lock() -> bool:
 
 def _stop_started_tools() -> None:
     """On the way out, close what TurboADB started: any scrcpy window it opened
-    and the adb server it uses.
+    and the adb server it started.
 
     A mirror window or an adb daemon left running keeps the device busy after
-    the app is gone. Settings → Startup turns this off, and a server shared
-    with other machines (``turboadb serve``) is never stopped: it exists for
-    them, not for this app.
+    the app is gone. Settings → Startup turns both off.  A server TurboADB did
+    not start (Android Studio's, a script's, one already running when it
+    opened) is never stopped, and neither is one shared with other machines
+    (``turboadb serve``): it exists for them, not for this app.  The
+    PowerShell / CMD terminals the closing tabs ended are waited for (briefly),
+    so no shell or command they ran outlives the app.
     """
     log = logging.getLogger("turboadb.gui")
     try:
-        from .. import scrcpy
+        from .local_terminal import join_closers
 
-        closed = scrcpy.stop_all()
-        if closed:
-            log.info("closed %d scrcpy window(s) on exit", closed)
-    except Exception as exc:
-        log.warning("could not close scrcpy on exit: %s", exc)
+        left = join_closers(3.0)
+        if left:
+            log.warning("%d local shell(s) were still being closed on exit", left)
+    except Exception:
+        pass
     try:
         from . import settings as settings_mod
 
-        if not settings_mod.get("stop_adb_on_exit", True):
-            return
-        _stop_adb_server(log)
-    except Exception as exc:
-        log.warning("could not stop the adb server on exit: %s", exc)
+        stop = settings_mod.get("stop_adb_on_exit", True)
+    except Exception:
+        stop = True
+    if stop:
+        try:
+            from .. import scrcpy
+
+            closed = scrcpy.stop_all()
+            if closed:
+                log.info("closed %d scrcpy window(s) on exit", closed)
+        except Exception as exc:
+            log.warning("could not close scrcpy on exit: %s", exc)
+        try:
+            _stop_adb_server(log)
+        except Exception as exc:
+            log.warning("could not stop the adb server on exit: %s", exc)
+    else:
+        log.info("left scrcpy and the adb server running (Settings → Startup)")
+    try:
+        from ..tools import end_server_launchers, server_lock_patience
+
+        with server_lock_patience(1.0):
+            end_server_launchers()  # a launcher still starting a server, never the server
+    except Exception:
+        pass
+
+
+# How long the way out waits on the adb server: another thread can hold its
+# lock across a blocking adb call (a kill waits up to 20 s, a shared-server
+# start 10 s more, a closing tab's disconnect about 10 s).  Past this the
+# server is left running rather than keeping a closed app alive.
+_EXIT_SERVER_WAIT_S = 4.0
 
 
 def _stop_adb_server(log) -> None:
+    from ..tools import server_lock_patience
+
+    with server_lock_patience(_EXIT_SERVER_WAIT_S):
+        _stop_owned_adb_server(log)
+
+
+def _stop_owned_adb_server(log) -> None:
+    from .. import tools
     from ..config import ADBConfig
     from ..core import ADBHandler
     from ..devices import server_is_shared
-    from ..tools import find_adb, is_adb_server_alive
     from .adb_path import gui_adb_path
 
-    if not is_adb_server_alive():
+    # A server this process is still starting is its own once it answers.
+    tools.settle_adb_server_start(timeout=3.0)
+    if not tools.is_adb_server_alive():
         return
     if server_is_shared():
         log.info("the adb server is shared with other machines — left running")
         return
-    adb = gui_adb_path()
-    if not adb or not os.path.exists(adb):
+    adb = tools.owned_adb_server()
+    if not adb:
+        log.info("the adb server was not started by TurboADB — left running")
+        return
+    if not os.path.exists(adb):
         # Never let a missing adb start the managed-tools download on the way
         # out; without a binary there is nothing of ours to stop anyway.
-        try:
-            adb = find_adb()
-        except Exception:
+        adb = gui_adb_path()
+        if not adb or not os.path.exists(adb):
             return
     result = ADBHandler(ADBConfig(adb_path=adb), quiet=True).stop_server(safe=True)
-    if not result.success or result.value is not True:
+    if not result.success:
+        log.warning("could not stop the adb server on exit: %s", result.error)
+    elif result.value is not True:
         log.warning("the adb server was still running after kill-server")
 
 

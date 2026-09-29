@@ -304,14 +304,16 @@ def _out(widget, text):
     widget._feed_from(widget.reader, text.encode("utf-8"))
 
 
-def test_typed_adb_root_for_this_device_asks_the_tab_to_follow(local_shell):
+def test_typed_adb_root_for_this_device_asks_the_tab_to_follow(local_shell, tmp_path):
     verbs = []
     local_shell.adbd_restart_requested.connect(verbs.append)
     local_shell._send(b"adb root\r\n")
     assert local_shell.session.sent[-1] == b"adb root\r\n" and verbs == ["root"]
-    local_shell._send(b"adb -s V2318 unroot\r\n")
-    local_shell._send(b"adb -s OTHER root\r\n")  # another device
-    local_shell._send(b"adb root now\r\n")  # not the adb root command
+    # each command runs at the PC prompt (a line typed while one runs is input
+    # for that command, not a command of its own)
+    for line in (b"adb -s V2318 unroot", b"adb -s OTHER root", b"adb root now"):
+        _out(local_shell, f"\r\nPS {tmp_path}> ")
+        local_shell._send(line + b"\r\n")  # another device, then not the root command
     assert verbs == ["root", "unroot"]
     assert local_shell._local_adb_reboot_mode(["adb", "-s", "V2318", "reboot", "bootloader"]) == \
         "bootloader"
@@ -360,16 +362,42 @@ def test_typing_or_no_hold_means_no_reopen(local_shell, tmp_path):
     assert shell.session.sent[-1] == b"dir\r\n"
 
 
-def test_a_device_reboot_reopens_the_adb_shell_once_the_device_is_back(qapp, local_shell):
+def test_a_device_reboot_reopens_the_adb_shell_once_the_device_is_back(qapp, local_shell,
+                                                                      tmp_path):
     shell = local_shell
     shell._send(b"adb shell\r\n")
     _out(shell, "PD2318:/ $ ")
     shell._send(b"cd /sdcard\r\n")
     # ShellPanel.pause_for_device_reboot does exactly this for PowerShell and CMD
     shell.hold_adb_shell()
-    shell.reset_adb_shell_context()
+    shell.expect_adb_shell_end()
+    _out(shell, f"\r\nPS {tmp_path}> ")  # the adb shell ended with the device
+    assert not shell._in_adb_shell and shell.session.sent[-1] == b"cd /sdcard\r\n"
     shell.resume_adb_shell()
     assert shell.session.sent[-1] == b"adb shell -t -t\r\n" and shell._adb_shell_cwd == "/sdcard"
+
+
+def test_a_reboot_that_failed_types_nothing_into_the_running_adb_shell(qapp, local_shell,
+                                                                       tmp_path):
+    """The device never went away (adb reboot failed, or it was slow to
+    drop): the adb shell still runs, so Stop still sends Ctrl+C to it and the
+    "device back" types nothing into it; it is reopened once it does end."""
+    shell = local_shell
+    shell._send(b"adb shell\r\n")
+    _out(shell, "PD2318:/ $ ")
+    shell._send(b"cd /sdcard\r\n")
+    _out(shell, "PD2318:/sdcard $ ")
+    shell.hold_adb_shell()
+    shell.expect_adb_shell_end()
+    assert shell._in_adb_shell
+    shell.interrupt()
+    assert shell.session.sent[-1] == b"\x03"  # to the device, not a new PC shell
+    _out(shell, "^C\r\nPD2318:/sdcard $ ")
+    sent = len(shell.session.sent)
+    shell.resume_adb_shell()
+    assert len(shell.session.sent) == sent and shell._in_adb_shell
+    _out(shell, f"\r\nPS {tmp_path}> ")  # it ends a moment later
+    assert shell.session.sent[-1] == b"adb shell -t -t\r\n"
 
 
 def test_a_refusal_inside_adb_shell_is_reported_once_a_minute(local_shell, monkeypatch):

@@ -13,6 +13,7 @@ again before they arrive.
 
 from __future__ import annotations
 
+import errno
 import html
 import json
 import mimetypes
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from itertools import accumulate
 from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect,
@@ -38,22 +40,23 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QAbstractItemView, QApplication, QDialog, QPlainTextEdit,
                              QRubberBand, QStyledItemDelegate, QToolButton)
 from PyQt5.QtGui import QColor, QCursor, QKeySequence, QFont, QPainter, QTextCursor, QDrag
-from . import theme
+from . import file_open, theme
 from .file_icons import file_icons
-from .fileutil import _alive, write_text_file
+from .fileutil import _alive, desktop_dir, download_dir, write_text_file
 from .icons import icon
 from .qtutil import (cached_icon, close_jobs, disconnect_signals, page_toolbar, park_thread,
                      run_job, thread_running)
-from .transfer_log import (CANCELLED, DONE, FAILED, TransferLog, measure_local,
+from .transfer_log import (CANCELLED, DONE, FAILED, TransferLog, _strip_merge, measure_local,
                            measure_remote, transfer_name)
 from .transfer_panel import TransferPanel
 from ..remotefs import (  # device file helpers, shared with the engine and CLI
-    # _cp_cmd/_ls_cmd/_mv_cmd/_rm_cmd/_parse_ls_listing are re-exported:
-    # the tests reach them as file_browser.<name>, so they are not dead.
-    _chmod_cmd, _copy_into_cmd, _cp_cmd, _edit_stat_cmd, _human_size, _list_remote_dir,  # noqa: F401
-    _ls_cmd, _mkdir_cmd, _mode_cmd, _mv_cmd, _normalize_remote_path, _output_lines,  # noqa: F401
-    _parse_edit_stat, _parse_ls_line, _parse_ls_listing, _probe_remote, _rename_check_cmd,  # noqa: F401
-    _rename_cmd, _result_error, _rm_cmd, _touch_cmd,  # noqa: F401
+    # _ls_cmd/_rm_cmd/_parse_ls_listing are re-exported: the tests reach them
+    # as file_browser.<name>, so they are not dead.
+    _chunks, _copy_decision, _copy_into_cmd, _human_size, _list_remote_dir,  # noqa: F401
+    _ls_cmd, _mkdir_cmd, _normalize_remote_path, _output_lines,  # noqa: F401
+    _parse_ls_line, _parse_ls_listing, _parse_stamp, _probe_remote,  # noqa: F401
+    _regular_file_cmd, _rename_check_cmd, _rename_cmd, _result_error, _rm_cmd,  # noqa: F401
+    _stamp_cmd, _touch_cmd,  # noqa: F401
 )
 
 
@@ -69,6 +72,8 @@ _LINE_ENDING_NAMES = {"\r\n": "CRLF", "\r": "CR", "\n": "LF"}
 
 # Editors that outlived their panel (unsaved or mid-save when the tab closed).
 _DETACHED_EDITORS = set()
+# Copies of opened device files are tidied once per run (file_open.forget_old_copies).
+_OLD_COPIES = {"tidied": False}
 
 
 # The name cell shows the plain name; its icon is the item's DecorationRole and
@@ -91,6 +96,8 @@ _TEXT_EXT = frozenset(
 _PANE_OP_ICONS = {
     "New folder": ("folder-plus", "amber"),
     "New file": ("file-plus", "blue"),
+    "Open": ("external", "blue"),
+    "Open with…": ("external", "teal"),
     "Edit": ("edit", "purple"),
     "Copy": ("copy", "blue"),
     "Paste": ("paste", "blue"),
@@ -100,6 +107,13 @@ _PANE_OP_ICONS = {
     "Select all": ("check", "accent"),
     "Push to device": ("arrow-right", "blue"),
     "Pull to this PC": ("arrow-left", "green"),
+}
+
+
+_PANE_OP_TIPS = {
+    "Open": ("Open in the app this PC has for it (Enter). A device file opens as a copy on "
+             "this PC, and saving it there sends it back to the device."),
+    "Edit": "Edit as text in TurboADB's editor (F4)",
 }
 
 
@@ -137,6 +151,36 @@ class _FileItem(QTableWidgetItem):
     Qt's own sorting disabled and reorders the rows itself, so an item never
     needs to compare against another one.
     """
+
+
+def _sort_key(value, text: str):
+    """How a cell sorts: a number (a size, a date) by its value, anything else
+    by its text, ignoring case."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (0, value, "")
+    return (1, 0, text.lower())
+
+
+# Where each column's text is in a listing row (see _list_local_dir).
+_ROW_TEXT = (0, 2, 3, 4, 5, 6)
+
+
+class _RowSummary:
+    """What a pane's status line needs, kept so it never walks the rows.
+
+    Per row, in display order: *kinds* is 0 for the '..' row or a status row,
+    1 for a folder and 2 for a file; *sizes* is a file's size (0 otherwise).
+    *entries* and *bytes* are running totals, so the files and folders in any
+    span of rows, and their size, are two subtractions each."""
+
+    __slots__ = ("kinds", "sizes", "entries", "bytes", "folders", "files")
+
+    def __init__(self, kinds, sizes):
+        self.kinds, self.sizes = list(kinds), list(sizes)
+        self.folders = self.kinds.count(1)
+        self.files = self.kinds.count(2)
+        self.entries = list(accumulate((1 if kind else 0 for kind in self.kinds), initial=0))
+        self.bytes = list(accumulate(self.sizes, initial=0))
 
 
 # ---- editor file helpers (pure; run on worker threads) ----------------------
@@ -206,6 +250,72 @@ def _text_for_save(text: str, newline: str) -> str:
     return text
 
 
+# Windows marks a new file would not keep (and a read-only file must fail as before).
+_KEEP_IN_PLACE_ATTRS = 0x1 | 0x2 | 0x4  # READONLY, HIDDEN, SYSTEM
+
+
+def _replace_keeps_the_file(path: str) -> bool:
+    """True when saving *path* by replacing it with a new file changes nothing
+    but its text: a plain file with no other hard link (they would keep the
+    old text), that the user owns and may write (a read-only file is never
+    replaced behind its back), and on Windows without the hidden, system or
+    read-only mark."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        return False
+    if os.name == "nt":
+        return not getattr(st, "st_file_attributes", 0) & _KEEP_IN_PLACE_ATTRS
+    return st.st_uid == os.geteuid() and os.access(path, os.W_OK)
+
+
+def _save_local_text(path: str, text: str) -> None:
+    """Worker: save the editor's text over the PC file *path*, never leaving it
+    cut short.
+
+    The text goes to a temporary file beside the real one (beside a symbolic
+    link's target, which stays a link), which then replaces it: a full disk,
+    a network drive that drops, or a character that can't be written fails
+    with the old file untouched.  A file that replacing would change in other
+    ways (see :func:`_replace_keeps_the_file`), or that another program holds
+    open, is written in place as before - but only when the disk has room for
+    the new text."""
+    data = text.encode("utf-8")  # before anything is touched
+    real = os.path.realpath(path)
+    if _replace_keeps_the_file(real):
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".turboadb-save-", suffix=".tmp",
+                                       dir=os.path.dirname(real))
+        except OSError:
+            tmp = None  # the folder takes no new files: in place below
+        if tmp is not None:
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                shutil.copymode(real, tmp)
+                os.replace(tmp, real)
+                return
+            except OSError:
+                pass  # e.g. open elsewhere without delete sharing: in place below
+            finally:
+                if os.path.lexists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+    try:
+        room = shutil.disk_usage(os.path.dirname(real) or ".").free + os.path.getsize(real)
+    except OSError:
+        room = None
+    if room is not None and room < len(data):
+        raise OSError(errno.ENOSPC, "Not enough free space on the drive to save the file")
+    write_text_file(path, text)
+
+
 def _edit_load_result(load):
     """Run *load* and turn a refusal into a result instead of an error."""
     try:
@@ -213,6 +323,26 @@ def _edit_load_result(load):
     except _EditRefused as exc:
         return ("refused", str(exc))
     return ("ok", text, newline, mixed)
+
+
+def _device_stamp(handler, path: str):
+    """Worker: ``(size, modified)`` of the device file *path*, None when the
+    device can't say (no ``stat``, no answer)."""
+    try:
+        res = handler.shell(_stamp_cmd(path), timeout=30, safe=False)
+    except Exception:
+        return None
+    return _parse_stamp(getattr(res, "stdout", "")) if getattr(res, "ok", True) else None
+
+
+def _links_to_a_file(handler, path: str) -> bool:
+    """Worker: True when the device *path* is, or links to, a regular file."""
+    try:
+        res = handler.shell(_regular_file_cmd(path), timeout=30, safe=False)
+    except Exception:
+        return False
+    lines = _output_lines(getattr(res, "stdout", ""))
+    return bool(lines) and lines[-1].strip() == "f"
 
 
 class _FileEditorDialog(QDialog):
@@ -452,6 +582,13 @@ class _FileTableWidget(QTableWidget):
         self._band_timer = QTimer(self)
         self._band_timer.setInterval(self.BAND_SCROLL_MS)
         self._band_timer.timeout.connect(self._band_autoscroll)
+        # The rows' kinds and sizes (see _RowSummary), set with each listing and
+        # forgotten whenever rows come or go without one.
+        self._summary = None
+        model = self.model()
+        for signal in (model.rowsInserted, model.rowsRemoved, model.modelReset,
+                       model.layoutChanged):
+            signal.connect(self._forget_rows)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -482,6 +619,96 @@ class _FileTableWidget(QTableWidget):
         whole = QItemSelection(self.model().index(first, 0),
                                self.model().index(last, self.columnCount() - 1))
         model.select(whole, QItemSelectionModel.ClearAndSelect)
+
+    # ---- what is listed and selected, without walking every row ----
+    def _forget_rows(self, *_args) -> None:
+        self._summary = None
+
+    def set_row_summary(self, kinds, sizes) -> None:
+        """Record the rows' kinds and sizes (see :class:`_RowSummary`)."""
+        self._summary = _RowSummary(kinds, sizes)
+
+    def row_summary(self) -> _RowSummary:
+        """The rows' kinds and sizes: kept from the listing, or read from the
+        rows once when they changed some other way."""
+        if self._summary is None or len(self._summary.kinds) != self.rowCount():
+            kinds, sizes = [], []
+            for row in range(self.rowCount()):
+                it = self.item(row, 0)
+                data = it.data(Qt.UserRole) if it is not None else None
+                if not isinstance(data, (tuple, list)) or len(data) < 2 or data[0] == "..":
+                    kinds.append(0)
+                    sizes.append(0)
+                elif data[1]:
+                    kinds.append(1)
+                    sizes.append(0)
+                else:
+                    size_item = self.item(row, 1) if self.columnCount() > 1 else None
+                    raw = size_item.data(Qt.UserRole) if size_item is not None else None
+                    kinds.append(2)
+                    sizes.append(raw if isinstance(raw, int) else 0)
+            self._summary = _RowSummary(kinds, sizes)
+        return self._summary
+
+    def selected_spans(self) -> List[Tuple[int, int]]:
+        """The selected rows as sorted, separate ``(first, last)`` spans.
+
+        Read from the selection's ranges: ``selectedIndexes()`` made an index
+        for every selected cell - 120,000 of them for 20,000 selected rows, on
+        each mouse move of a selection rectangle.  Ranges may overlap, so they
+        are merged first."""
+        model = self.selectionModel()
+        if model is None:
+            return []
+        spans = []
+        for top, bottom in sorted((rng.top(), rng.bottom()) for rng in model.selection()):
+            if spans and top <= spans[-1][1] + 1:
+                if bottom > spans[-1][1]:
+                    spans[-1] = (spans[-1][0], bottom)
+            else:
+                spans.append((top, bottom))
+        return spans
+
+    def selection_summary(self) -> Tuple[int, int]:
+        """``(selected files and folders, bytes of the selected files)``."""
+        summary = self.row_summary()
+        last = len(summary.kinds) - 1
+        count = size = 0
+        for top, bottom in self.selected_spans():
+            top, bottom = max(0, top), min(bottom, last)
+            if top <= bottom:
+                count += summary.entries[bottom + 1] - summary.entries[top]
+                size += summary.bytes[bottom + 1] - summary.bytes[top]
+        return count, size
+
+    def selected_entry_rows(self) -> List[int]:
+        """The rows of the selected files and folders, top to bottom."""
+        kinds = self.row_summary().kinds
+        last = len(kinds) - 1
+        return [row for top, bottom in self.selected_spans()
+                for row in range(max(0, top), min(bottom, last) + 1) if kinds[row]]
+
+    def sorted_listing(self, listing):
+        """*listing* - ``(row, date key)`` pairs, the rows shaped as
+        :func:`_list_local_dir` makes them - in the order the header asks for,
+        folders first: exactly how :meth:`sortByColumn` would order their rows.
+        A new listing is put in order before its rows are built, instead of
+        being built and then taken apart and built again."""
+        header = self.horizontalHeader()
+        col = header.sortIndicatorSection()
+        if not 0 <= col < min(self.columnCount(), len(_ROW_TEXT)):
+            col = 0
+        reverse = header.sortIndicatorOrder() == Qt.DescendingOrder
+        text_at = _ROW_TEXT[col]
+
+        def key(entry):
+            row, date_key = entry
+            value = row[1] if col == 1 else date_key if col == 3 else None
+            return _sort_key(value, str(row[text_at]))
+
+        folders = sorted((entry for entry in listing if entry[0][7]), key=key, reverse=reverse)
+        files = sorted((entry for entry in listing if not entry[0][7]), key=key, reverse=reverse)
+        return folders + files
 
     def _offset(self) -> QPoint:
         return QPoint(self.horizontalOffset(), self.verticalOffset())
@@ -607,10 +834,10 @@ class _FileTableWidget(QTableWidget):
         painter.end()
 
     def startDrag(self, supportedActions):
-        indexes = self.selectedIndexes()
-        if not indexes:
+        rows = [row for top, bottom in self.selected_spans() for row in range(top, bottom + 1)]
+        if not rows:
             return
-        items = [self.itemFromIndex(idx) for idx in indexes if idx.column() == 0]
+        items = [self.item(row, 0) for row in rows]
         mime = self.mimeData([it for it in items if it is not None])
         if not mime:
             return
@@ -626,11 +853,6 @@ class _FileTableWidget(QTableWidget):
         header.setSortIndicator(col, order)
         self.sortByColumn(col, order)
 
-    def apply_sort(self):
-        """Re-apply the header's current sort (called after every listing)."""
-        header = self.horizontalHeader()
-        self.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
-
     def sortByColumn(self, col: int, order: Qt.SortOrder = Qt.AscendingOrder):
         """Sort rows: '..' pinned first, then folders, then files; numeric columns
         (size, date) sort by their raw ``Qt.UserRole`` value."""
@@ -640,7 +862,10 @@ class _FileTableWidget(QTableWidget):
             return
         if not 0 <= col < n_cols:
             col = 0
-        dot_items = None
+        # the summary moves with the rows (setRowCount below forgets it)
+        summary = self._summary if self._summary is not None and \
+            len(self._summary.kinds) == n_rows else None
+        dot_items = dot_row = None
         rows_data = []
 
         for r in range(n_rows):
@@ -649,25 +874,23 @@ class _FileTableWidget(QTableWidget):
             is_pair = isinstance(data0, (tuple, list)) and len(data0) > 1
             row_items = [self.takeItem(r, c) for c in range(n_cols)]
             if is_pair and data0[0] == ".." and dot_items is None:
-                dot_items = row_items
+                dot_items, dot_row = row_items, r
                 continue
             is_dir = bool(data0[1]) if is_pair else False
             it_col = row_items[col]
-            raw_val = it_col.data(Qt.UserRole) if it_col is not None else None
-            if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
-                key = (0, raw_val, "")
-            elif col == 0 and is_pair:
-                key = (1, 0, str(data0[0]).lower())
+            if col == 0 and is_pair:
+                key = _sort_key(data0, str(data0[0]))
             elif it_col is not None:
-                key = (1, 0, it_col.text().lower())
+                key = _sort_key(it_col.data(Qt.UserRole), it_col.text())
             else:
-                key = (1, 0, it0.text().lower() if it0 else "")
-            rows_data.append((is_dir, key, row_items))
+                key = _sort_key(None, it0.text() if it0 else "")
+            rows_data.append((is_dir, key, r, row_items))
 
         reverse = (order == Qt.DescendingOrder)
         dirs = sorted((x for x in rows_data if x[0]), key=lambda x: x[1], reverse=reverse)
         files = sorted((x for x in rows_data if not x[0]), key=lambda x: x[1], reverse=reverse)
-        ordered = ([dot_items] if dot_items else []) + [items for _, _, items in dirs + files]
+        rows_before = ([dot_row] if dot_items else []) + [r for _, _, r, _ in dirs + files]
+        ordered = ([dot_items] if dot_items else []) + [items for _, _, _, items in dirs + files]
 
         self.setRowCount(0)
         self.setRowCount(len(ordered))
@@ -675,9 +898,9 @@ class _FileTableWidget(QTableWidget):
             for c, it in enumerate(items):
                 if it is not None:
                     self.setItem(r, c, it)
-
-    def sortItems(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder):
-        self.sortByColumn(column, order)
+        if summary is not None:
+            self.set_row_summary((summary.kinds[r] for r in rows_before),
+                                 (summary.sizes[r] for r in rows_before))
 
     def mimeTypes(self):
         return ["text/uri-list", _MIME]
@@ -706,17 +929,24 @@ class _FileTableWidget(QTableWidget):
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() or event.mimeData().hasFormat(_MIME):
-            event.acceptProposedAction()
+            _accept_as_copy(event)
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls() or event.mimeData().hasFormat(_MIME):
-            event.acceptProposedAction()
+            if self._drop_target(event.pos()) is None:
+                event.ignore()  # the cursor says so before the drop
+            else:
+                _accept_as_copy(event)
         else:
             super().dragMoveEvent(event)
 
-    def _drop_target(self, pos) -> str:
+    def _drop_target(self, pos) -> Optional[str]:
+        """The folder a drop at *pos* goes to: the folder row under it, else
+        the folder shown.  None for a folder whose name the listing could not
+        read exactly: its real path is unknown, and a push to the name shown
+        would create a new folder beside it."""
         target_folder = self.base_dir
         item = self.itemAt(pos)
         if item:
@@ -728,6 +958,8 @@ class _FileTableWidget(QTableWidget):
                         target_folder = posixpath.dirname(self.base_dir.rstrip("/")) or "/"
                     else:
                         target_folder = os.path.dirname(self.base_dir)
+                elif data[0] in self.unsafe_names:
+                    return None
                 elif self.is_remote:
                     target_folder = posixpath.join(self.base_dir, data[0])
                 else:
@@ -736,12 +968,22 @@ class _FileTableWidget(QTableWidget):
 
     def dropEvent(self, event):
         source = event.source()
-        if source is self:
+        if source is self or not _copy_possible(event):
             event.ignore()
             return
 
         mime = event.mimeData()
         target_folder = self._drop_target(event.pos())
+        if target_folder is None:
+            event.ignore()
+            item = self.itemAt(event.pos())
+            it0 = self.item(item.row(), 0) if item is not None else None
+            log = getattr(self.browser, "log", None)
+            if it0 is not None and log is not None:
+                log.emit(f"[ERROR] Drop: refused, the folder {it0.text()!r} could not be "
+                         "identified exactly (unusual characters in its name, or two "
+                         "entries that look the same)")
+            return
 
         if mime.hasFormat(_MIME):
             try:
@@ -757,14 +999,14 @@ class _FileTableWidget(QTableWidget):
                 if not payload_remote:
                     # Local paths (any tab's local pane): copy locally or push.
                     self.dropped.emit(paths, True, target_folder)
-                    event.acceptProposedAction()
+                    _accept_as_copy(event)
                     return
                 same_device = (source is not None and self.browser is not None
                                and getattr(source, "browser", None) is self.browser)
                 if not self.is_remote and same_device:
                     # This device's pane -> this local pane: pull.
                     self.dropped.emit(paths, False, target_folder)
-                    event.acceptProposedAction()
+                    _accept_as_copy(event)
                     return
                 # Device paths from another device tab (or onto a device pane)
                 # can't be pulled/pushed from here: refuse instead of guessing.
@@ -774,32 +1016,73 @@ class _FileTableWidget(QTableWidget):
             files = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
             if files:
                 self.dropped.emit(files, True, target_folder)
-                event.acceptProposedAction()
+                _accept_as_copy(event)
                 return
         super().dropEvent(event)
+
+
+def _copy_possible(event) -> bool:
+    return bool(event.possibleActions() & Qt.CopyAction)
+
+
+def _accept_as_copy(event) -> bool:
+    """Accept a drag or drop as a COPY, whatever the source proposed.
+
+    Holding Shift makes Explorer (and Linux file managers) propose a Move, and
+    accepting that tells the source to delete its originals once the drop
+    returns.  TurboADB never moves: it plans the copy or push on a worker and
+    runs it later, so the files would be gone before they were read.  A source
+    that offers no Copy at all (the Recycle Bin) is refused."""
+    if not _copy_possible(event):
+        event.ignore()
+        return False
+    event.setDropAction(Qt.CopyAction)
+    event.accept()
+    return True
 
 
 _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
+# "2026-09-02 21:40", toybox's full-iso "2026-09-02 21:40:05.123456789 +0200" and
+# the same with a "T"; the minute is all a sort needs.
+_ISO_MTIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:T|\s+)(\d{2}):(\d{2})")
+
 
 def _mtime_sort_key(mtime: str, now: Optional[float] = None) -> float:
-    """Sortable timestamp for ``2026-09-02 21:40``, ``Jan  5 12:34`` or ``Jan  5  2024``."""
-    parts = (mtime or "").split()
+    """Sortable timestamp for ``2026-09-02 21:40`` (also with a ``T``, seconds or
+    a zone), ``Jan  5 12:34``, ``Jan  5  2024``, or with the day first
+    (``5 Jan 2024``).  Month names other than English ones sort as 0.
+
+    A listing asks this for every row, so the ISO form does without
+    ``strptime``, which took a third of the time a big folder took to show."""
+    text = mtime or ""
     try:
-        if len(parts) >= 2 and "-" in parts[0]:
-            return time.mktime(time.strptime(f"{parts[0]} {parts[1][:5]}", "%Y-%m-%d %H:%M"))
-        if len(parts) == 3 and parts[0][:3].lower() in _MONTHS:
-            month, day = _MONTHS[parts[0][:3].lower()], int(parts[1])
-            if ":" in parts[2]:
-                hour, minute = (int(x) for x in parts[2].split(":", 1))
-                now = time.time() if now is None else now
-                year = time.localtime(now).tm_year
-                stamp = time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
-                if stamp > now + 86400:  # "Mon DD HH:MM" is used for the last ~6 months
-                    stamp = time.mktime((year - 1, month, day, hour, minute, 0, 0, 0, -1))
-                return stamp
-            return time.mktime((int(parts[2]), month, day, 0, 0, 0, 0, 0, -1))
+        iso = _ISO_MTIME_RE.match(text)
+        if iso:
+            year, month, day, hour, minute = (int(x) for x in iso.groups())
+            if 1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60:
+                return time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
+            return 0.0
+        parts = text.split()
+        if len(parts) != 3:
+            return 0.0
+        if parts[0][:3].lower() in _MONTHS:  # "Jan  5 12:34" / "Jan  5  2024"
+            month_word, day_word, last = parts
+        elif parts[1][:3].lower() in _MONTHS:  # "5 Jan 12:34" / "5 Jan 2024"
+            day_word, month_word, last = parts
+        else:
+            return 0.0
+        month, day = _MONTHS[month_word[:3].lower()], int(day_word)
+        if ":" in last:
+            hour, minute = (int(x) for x in last.split(":", 1))
+            now = time.time() if now is None else now
+            year = time.localtime(now).tm_year
+            stamp = time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
+            if stamp > now + 86400:  # "Mon DD HH:MM" is used for the last ~6 months
+                stamp = time.mktime((year - 1, month, day, hour, minute, 0, 0, 0, -1))
+            return stamp
+        return time.mktime((int(last), month, day, 0, 0, 0, 0, 0, -1))
     except (ValueError, OverflowError, OSError):
         pass
     return 0.0
@@ -872,12 +1155,54 @@ def _same_path(a: str, b: str) -> bool:
 
 
 def _find_local_collisions(sources, dst_dir: str) -> List[str]:
+    """Names in *dst_dir* a copy of *sources* would overwrite (a file) or merge
+    into (a folder).  A file and a folder of the same name are not asked
+    about: the copy refuses that pair and says so."""
     collisions = []
     for src in sources:
         dst = _local_dest(src, dst_dir)
-        if not _same_path(src, dst) and os.path.exists(dst):
+        if not _same_path(src, dst) and os.path.exists(dst) and \
+                os.path.isdir(src) == os.path.isdir(dst):
             collisions.append(os.path.basename(dst))
     return collisions
+
+
+def _loop_guard(root: str, skipped: List[str]):
+    """A ``copytree`` *ignore* hook for copying *root*: it leaves out every link
+    or junction that leads back to a folder the copy is inside (or above it),
+    and lists them in *skipped*.  Following one copied the tree into itself,
+    level after level, until the path grew too long."""
+    root = os.path.abspath(root)
+    above = set()
+    path = os.path.realpath(root)
+    while True:  # the folder copied and every folder above it
+        above.add(os.path.normcase(path))
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+
+    def ignore(folder, names):
+        inside = set(above)
+        current = root
+        relative = os.path.relpath(os.path.abspath(folder), root)
+        if relative != os.curdir:
+            for part in relative.split(os.sep):  # how the copy got here: links too
+                current = os.path.join(current, part)
+                inside.add(os.path.normcase(os.path.realpath(current)))
+        left_out = []
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if (os.path.islink(path) or _is_junction(path)) and os.path.isdir(path) and \
+                        os.path.normcase(os.path.realpath(path)) in inside:
+                    left_out.append(name)
+                    skipped.append(path)
+            except (OSError, ValueError):
+                continue
+        return left_out
+
+    return ignore
 
 
 def _copy_local_items(sources, dst_dir: str) -> List[str]:
@@ -892,7 +1217,15 @@ def _copy_local_items(sources, dst_dir: str) -> List[str]:
                 src_abs = os.path.normcase(os.path.abspath(src)).rstrip("\\/") + os.sep
                 if os.path.normcase(os.path.abspath(dst)).startswith(src_abs):
                     raise OSError("cannot copy a folder into itself")
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+                if os.path.lexists(dst) and not os.path.isdir(dst):
+                    raise OSError("a file with that name is already there")
+                skipped = []
+                shutil.copytree(src, dst, dirs_exist_ok=True, ignore=_loop_guard(src, skipped))
+                errors.extend(f"{path}: not copied - it links back into the folder being "
+                              "copied" for path in skipped)
+            elif os.path.isdir(dst):
+                # copy2 would put the file INSIDE the folder of its name
+                raise OSError("a folder with that name is already there")
             else:
                 shutil.copy2(src, dst)
         except OSError as exc:
@@ -1014,6 +1347,43 @@ def _create_empty_file(path: str) -> None:
         pass
 
 
+def _is_real_dir(path: str) -> bool:
+    return os.path.isdir(path) and not os.path.islink(path) and not _is_junction(path)
+
+
+def _local_rename_state(old: str, new: str) -> str:
+    """Worker: what renaming the PC item *old* to *new* would meet: ``free``,
+    ``same`` (*new* is *old* itself: a case-only rename on Windows or macOS),
+    ``dir`` (a folder is there), ``file`` (a file *old* would replace) or
+    ``taken`` (a file is there and *old* is a folder, which can't replace it)."""
+    if not os.path.lexists(new):
+        return "free"
+    try:
+        a, b = os.lstat(old), os.lstat(new)
+        same = bool(a.st_ino) and (a.st_ino, a.st_dev) == (b.st_ino, b.st_dev)
+    except OSError:
+        same = False
+    if (same and os.path.basename(old).lower() == os.path.basename(new).lower()) or \
+            os.path.normcase(os.path.abspath(old)) == os.path.normcase(os.path.abspath(new)):
+        return "same"
+    if _is_real_dir(new):
+        return "dir"
+    return "taken" if _is_real_dir(old) else "file"
+
+
+def _rename_local_item(old: str, new: str, replace: bool = False) -> List[str]:
+    """Worker: rename *old* to *new*.  *replace* (asked first) overwrites a file
+    at *new*; without it nothing that appeared there since the check is ever
+    replaced - ``os.rename`` replaces a file without a word on Linux and macOS."""
+    if replace:
+        os.replace(old, new)
+    else:
+        if _local_rename_state(old, new) not in ("free", "same"):
+            raise FileExistsError(f"{os.path.basename(new)!r} already exists")
+        os.rename(old, new)
+    return []
+
+
 _WIN_BAD_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WIN_RESERVED = ({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
                  | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
@@ -1035,9 +1405,20 @@ def _safe_local_name(name: str, windows: Optional[bool] = None) -> str:
     return safe or "_"
 
 
-# Display name of a transfer source (``folder/.`` merge sources included);
-# the transfer history labels its rows with the same function.
-_transfer_name = transfer_name
+# How the engine ends a transfer it stopped on request, with a note of what the
+# copy left behind (``ADBHandler._leftover_note``) when it left something.
+_CANCELLED_RE = re.compile(r"\badb (?:push|pull) cancelled(?:; (.+))?$", re.S)
+
+
+def _cancel_leftover(message: str) -> str:
+    """What a cancelled transfer left behind, as the engine's error says it
+    ("the unfinished file was removed", "a partial copy may remain at …"), or
+    "" when it left nothing.  A transfer that ended some other way while the
+    cancel was on its way may have left part of a copy, and that is said."""
+    m = _CANCELLED_RE.search(str(message or "").strip())
+    if m is None:
+        return "a partial copy may remain"
+    return (m.group(1) or "").strip()
 
 
 def _plan_push(handler, sources, dst_dir: str):
@@ -1121,12 +1502,22 @@ def _plan_pull(handler, sources, dst_dir: str, windows: Optional[bool] = None):
     return jobs, collisions, errors, notes
 
 
+_PASTE_PROBLEMS = {
+    "missing": "no longer exists on the device",
+    "same": "is already in this folder",
+    "inside": "a folder can't be copied into itself or its own subfolder",
+    "taken": "another selected item has the same name",
+    "different": "a different item with that name already exists here",
+}
+
+
 def _plan_remote_copy(handler, sources, dst_dir: str):
     """Worker: plan device -> device copies into *dst_dir*.
 
-    Returns ``(commands, collisions, errors)``.  A folder is never copied into
-    itself or its own subfolder, also not through a symlinked path (``cp -r``
-    would recurse until "Too many open files").
+    Returns ``(commands, collisions, errors)``.  What may be copied is decided
+    by :func:`remotefs._copy_decision`, as for ``turboadb cp``: a folder is never
+    copied into itself or its own subfolder, also not through a symlinked path
+    (``cp -r`` would recurse until "Too many open files").
     """
     dst_dir = _normalize_remote_path(dst_dir)
     dests = {src: posixpath.join(dst_dir, posixpath.basename(src.rstrip("/"))) for src in sources}
@@ -1134,41 +1525,96 @@ def _plan_remote_copy(handler, sources, dst_dir: str):
     commands, collisions, errors, targets = [], [], [], set()
     if info[dst_dir][0] != "d":
         return commands, collisions, [f"{dst_dir}: the destination folder no longer exists"]
-    dst_real = posixpath.normpath(info[dst_dir][2] or dst_dir)
     for src in sources:
         dst = dests[src]
         name = posixpath.basename(dst)
-        kind, is_link, resolved = info[src]
-        if kind == "n":
-            errors.append(f"{name}: no longer exists on the device")
+        problem, exists, merge = _copy_decision(src, dst, info, dst_dir, targets)
+        if problem:
+            errors.append(f"{name}: {_PASTE_PROBLEMS[problem]}")
             continue
-        n_src = posixpath.normpath(src)
-        if n_src == posixpath.normpath(dst):
-            errors.append(f"{name}: is already in this folder")
-            continue
-        if kind == "d" and not is_link:  # cp -r copies a symlink as a link: no recursion
-            real_src = posixpath.normpath(resolved or src)
-            if posixpath.join(dst_real, name) == real_src:
-                errors.append(f"{name}: is already in this folder")
-                continue
-            if any(b == a or b.startswith(a.rstrip("/") + "/")
-                   for a, b in ((n_src, dst_dir), (real_src, dst_real))):
-                errors.append(f"{name}: a folder can't be copied into itself or its own subfolder")
-                continue
-        if dst in targets:
-            errors.append(f"{name}: another selected item has the same name")
-            continue
-        targets.add(dst)
-        dkind = info[dst][0]
-        merge = False
-        if dkind != "n":
-            if is_link or dkind == "b" or (dkind == "d") != (kind == "d"):
-                errors.append(f"{name}: a different item with that name already exists here")
-                continue
+        if exists:
             collisions.append(name)
-            merge = kind == "d"
         commands.append((f"copy {name}", _copy_into_cmd(src, dst, merge)))
     return commands, collisions, errors
+
+
+_QUOTED_RE = re.compile(r"'([^']+)'")
+
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        path, root = (os.path.normcase(os.path.abspath(p)) for p in (path, root))
+    except (TypeError, ValueError):
+        return False
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _unreadable(path: str) -> bool:
+    """True when *path* is on this PC and can't be read."""
+    try:
+        if os.path.isdir(path):
+            with os.scandir(path):
+                pass
+        elif os.path.lexists(path):
+            with open(path, "rb"):
+                pass
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def _unwritable(path: str) -> bool:
+    """True when *path* can't be written on this PC: an existing file that
+    won't open for writing (read-only, or locked by another program), or a
+    folder - the nearest one that exists - that takes no new file.  A real
+    file is created to find out: on Windows ``os.access`` ignores folder
+    permissions, so it passes ``C:\\Program Files``."""
+    if os.path.isfile(path):
+        try:
+            with open(path, "ab"):
+                pass
+        except OSError:
+            return True
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    while folder and not os.path.isdir(folder):
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return False
+        folder = parent
+    if not folder:
+        return False
+    try:
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError:
+        return True
+    return False
+
+
+def _local_refusal(direction: str, a: str, b: str, error: str) -> str:
+    """Worker: the path on THIS PC that made a push or pull fail with *error*
+    (a permission error), or ``""`` when this PC's side is fine and the device
+    refused.
+
+    adb words a failure on the PC the way it words one on the device
+    ("cannot create 'C:\\Program Files\\x': Permission denied" for a pull,
+    a locked file for a push), and offering adb root for it restarted the
+    device's adbd for nothing.  So the PC's side is checked itself: a push's
+    source must be readable, a pull's destination writable - and so must any
+    path under them that adb names."""
+    local = _strip_merge(a if direction == "push" else b)
+    named = [path for path in _QUOTED_RE.findall(error or "")
+             if os.path.isabs(path) and _is_within(path, local)]
+    check = _unreadable if direction == "push" else _unwritable
+    for path in named + [local]:
+        try:
+            if check(path):
+                return path
+        except (OSError, ValueError):
+            continue
+    return ""
 
 
 class _TransferThread(QThread):
@@ -1183,12 +1629,39 @@ class _TransferThread(QThread):
         super().__init__()
         self.handler, self.direction, self.a, self.b = handler, direction, a, b
         self.cancel_event = threading.Event()
+        # After a permission error: the path on this PC that caused it ("" when
+        # the device refused).  Checked here, off the UI thread, before failed.
+        self.local_refusal = ""
 
     def stop(self):
         self.cancel_event.set()
 
+    def _merge_source(self):
+        """The source to hand adb, re-checked now that the job is about to run.
+
+        The plan copies a folder as ``src`` when its target does not exist yet.
+        A retry after a partial copy, or the same folder queued twice, finds the
+        target there by now, and adb then copies the folder INTO it
+        (``dst/name/name``): merge with ``src/.`` instead, as the plan does for
+        a target that already existed.  Best effort — on any error the job
+        runs as planned."""
+        a, b = self.a, self.b
+        try:
+            if os.path.basename(str(a).rstrip("/\\")) == ".":
+                return a  # already the merge form
+            if self.direction == "push":
+                if os.path.isdir(a) and _probe_remote(self.handler, [b])[b][0] == "d":
+                    return os.path.join(a, ".")
+            elif os.path.isdir(b) and _probe_remote(self.handler, [a])[a][0] == "d":
+                return a.rstrip("/") + "/."
+        except Exception:
+            pass
+        return a
+
     def run(self):
         try:
+            # Read by the GUI thread only after result/done, which come later.
+            self.a = self._merge_source()
             if self.direction == "push":
                 res = self.handler.push(self.a, self.b,
                                         on_progress=self.progress.emit,
@@ -1200,7 +1673,12 @@ class _TransferThread(QThread):
             self.result.emit(res)
             self.done.emit(str(res))
         except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            error = f"{type(exc).__name__}: {exc}"
+            from .device_access import is_permission_problem
+
+            if is_permission_problem(error):
+                self.local_refusal = _local_refusal(self.direction, self.a, self.b, error)
+            self.failed.emit(error)
 
 
 class FileBrowser(QWidget):
@@ -1236,6 +1714,12 @@ class FileBrowser(QWidget):
         self._jobs = []           # listing / file-op workers (detached on close)
         self._save_jobs = []      # editor saves: never detached, the editor needs the result
         self._editors = []
+        # Device files open in their apps on this PC (see file_open): each save
+        # there goes back to the device.  And what to do once the pull that
+        # copies one to this PC ends: (src, dst, "pull") -> (if done, if not).
+        self._copies = file_open.CopyWatcher(self)
+        self._copies.saved.connect(self._send_copy_back)
+        self._after_pull = {}
         self._queue = []          # pending transfers: (src, dst, direction)
         # Every queued transfer's history (what the Transfers panel shows), and
         # the history ids still waiting in the queue: per job, in queue order.
@@ -1244,6 +1728,7 @@ class FileBrowser(QWidget):
         self._summarised_batch = 0  # the batch whose summary toast was shown
         self._transfer = None     # the single active _TransferThread
         self._cancel = threading.Event()
+        self._cancels = 0         # Cancel presses: a plan made before one is dropped
         self._clipboard = []  # items in copy buffer
         self._clipboard_src = ""
         self._ls = None
@@ -1257,6 +1742,12 @@ class FileBrowser(QWidget):
         self._remote_failed = False       # the current device folder could not be listed
         self._cancelled_transfer = None
         self._refused_transfers = []  # (src, dst, direction, error) the device refused
+        # Selection changes arrive in bursts (a rectangle drag, an autoscroll
+        # tick): the pane status lines are redone once the burst is handled.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.setInterval(0)
+        self._status_timer.timeout.connect(self._update_pane_statuses)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1272,9 +1763,10 @@ class FileBrowser(QWidget):
         jump_pc.setObjectName("mutedHint")
         qbar.addWidget(jump_pc)
         home = os.path.expanduser("~")
+        # where the system keeps them: a Desktop that OneDrive backs up is not ~/Desktop
         for lbl, glyph, p in (("Home", "house", home),
-                              ("Desktop", "monitor", os.path.join(home, "Desktop")),
-                              ("Downloads", "download", os.path.join(home, "Downloads"))):
+                              ("Desktop", "monitor", desktop_dir()),
+                              ("Downloads", "download", download_dir())):
             b = self._flat_button(lbl)
             b.setIcon(icon(glyph, "blue"))
             b.setToolTip(f"Open {p}")
@@ -1357,6 +1849,7 @@ class FileBrowser(QWidget):
         left_lay.addLayout(self._pane_ops((
             ("New folder", self._local_mkdir),
             ("New file", self._local_newfile),
+            ("Open", self._local_open),
             ("Edit", self._local_edit),
             ("Copy", self._local_copy),
             ("Paste", self._local_paste),
@@ -1429,6 +1922,7 @@ class FileBrowser(QWidget):
         right_lay.addLayout(self._pane_ops((
             ("New folder", self._remote_mkdir),
             ("New file", self._remote_newfile),
+            ("Open", self._remote_open),
             ("Edit", self._remote_edit),
             ("Copy", self._remote_copy),
             ("Paste", self._remote_paste),
@@ -1490,7 +1984,10 @@ class FileBrowser(QWidget):
         # work after clicking Up, Refresh or a pane button too (and two
         # window-wide shortcuts on one key would be ambiguous: neither fires).
         # A focused path field keeps its own Ctrl+A / Delete / Backspace.
-        QShortcut(QKeySequence("F5"), self, activated=self._on_f5)
+        # F5 is scoped to this page for the same reason: two Files tabs side
+        # by side in a split view are two pages in one window.
+        QShortcut(QKeySequence("F5"), self, activated=self._on_f5,
+                  context=Qt.WidgetWithChildrenShortcut)
         for pane, table, actions in (
                 (left_w, self.local_table, (
                     (QKeySequence("F4"), self._local_edit),
@@ -1530,6 +2027,9 @@ class FileBrowser(QWidget):
         self._loaded_remote = False
         self._job(get_windows_drives, self._on_drives,
                   lambda msg: self.log.emit(f"[ERROR] drive list: {msg}"))
+        if not _OLD_COPIES["tidied"]:
+            _OLD_COPIES["tidied"] = True
+            self._job(file_open.forget_old_copies)
         self.refresh_local()
 
     def showEvent(self, event):
@@ -1579,6 +2079,8 @@ class FileBrowser(QWidget):
             b = FileBrowser._flat_button(text)
             glyph, tone = _PANE_OP_ICONS.get(text, ("file", "dim"))
             b.setIcon(icon(glyph, tone))
+            if text in _PANE_OP_TIPS:
+                b.setToolTip(_PANE_OP_TIPS[text])
             b.clicked.connect(fn)
             row.addWidget(b)
         row.addStretch(1)
@@ -1629,22 +2131,6 @@ class FileBrowser(QWidget):
         table.itemSelectionChanged.connect(self._on_selection_changed)
         return table
 
-    @property
-    def cwd(self) -> str:
-        return self.remote_cwd
-
-    @cwd.setter
-    def cwd(self, val: str):
-        self.remote_cwd = val
-
-    @property
-    def local_list(self):
-        return self.local_table
-
-    @property
-    def remote_list(self):
-        return self.remote_table
-
     # ---- Worker plumbing ----
     def _guarded(self, fn):
         """Wrap a job callback so it is skipped once the panel is closing/deleted."""
@@ -1692,63 +2178,72 @@ class FileBrowser(QWidget):
         table.setItem(0, 0, it)
 
     def _populate(self, table: QTableWidget, rows, parent_row: bool):
-        if isinstance(table, _FileTableWidget):
+        file_table = isinstance(table, _FileTableWidget)
+        if file_table:
             unsafe, seen = set(getattr(rows, "uncertain", ())), set()
             for row in rows:
                 if row[0] in seen:
                     unsafe.add(row[0])  # two rows share a name: can't tell them apart
                 seen.add(row[0])
             table.unsafe_names = frozenset(unsafe)
+        # (row, date as a number): worked out once, for the date cell and the sort
+        listing = [(row, row[8] if len(row) > 8 and row[8] is not None
+                    else _mtime_sort_key(row[4])) for row in rows]
+        if file_table:
+            # in the header's order before any cell exists: building every row
+            # and then taking them all apart to sort them doubled the work
+            listing = table.sorted_listing(listing)
+        if parent_row:
+            listing.insert(0, (("..", 0, "<DIR>", "Folder", "", "", "", True), 0.0))
         table.setUpdatesEnabled(False)
         try:
             table.setRowCount(0)
-            if parent_row:
-                self._add_row(table, "..", 0, "<DIR>", "Folder", "", "", "", is_dir=True)
-            for row in rows:
-                self._add_row(table, *row)
-            if isinstance(table, _FileTableWidget):
-                table.apply_sort()
+            table.setRowCount(len(listing))  # all rows in one go, not an insertRow each
+            local_dir = table.base_dir if table is self.local_table else ""
+            for index, (row, date_key) in enumerate(listing):
+                self._set_row(table, index, row[:8], date_key, local_dir)
+            if file_table:
+                kinds, sizes = [], []
+                for index, (row, _date_key) in enumerate(listing):
+                    kind = 0 if parent_row and index == 0 else 1 if row[7] else 2
+                    kinds.append(kind)
+                    sizes.append(row[1] if kind == 2 and isinstance(row[1], int) else 0)
+                table.set_row_summary(kinds, sizes)
                 table.empty_text = "This folder is empty"
         finally:
             table.setUpdatesEnabled(True)
         self._update_pane_status(table)
 
     def _on_selection_changed(self) -> None:
-        """The table that changed is the sender; see :meth:`_create_table`."""
-        table = self.sender()
-        if table is not None:
+        """A selection rectangle changes the selection on every mouse move and
+        autoscroll tick: the status lines follow once per pass of the event
+        loop, not once per change."""
+        self._status_timer.start()
+
+    def _update_pane_statuses(self) -> None:
+        for table in (self.local_table, self.remote_table):
             self._update_pane_status(table)
 
     def _update_pane_status(self, table) -> None:
-        """"3 folders, 12 files" and, with a selection, "2 selected · 1.4 MB"."""
+        """"3 folders, 12 files" and, with a selection, "2 selected · 1.4 MB".
+
+        Both come from the table's row summary and the selection's ranges, so
+        the line costs the same for three rows as for 20,000."""
         local = table is getattr(self, "local_table", None)
         label = getattr(self, "local_status" if local else "remote_status", None)
-        if label is None or self._closing:
+        if label is None or self._closing or not isinstance(table, _FileTableWidget):
             return
-        folders = files = 0
-        for row in range(table.rowCount()):
-            entry = self._row_entry(table, row)
-            if entry is not None:
-                if entry[1]:
-                    folders += 1
-                else:
-                    files += 1
+        summary = table.row_summary()
+        folders, files = summary.folders, summary.files
         parts = []
         if folders:
             parts.append(f"{folders} folder{'s' if folders != 1 else ''}")
         if files:
             parts.append(f"{files} file{'s' if files != 1 else ''}")
         text = ", ".join(parts)
-        selected = self._selected_rows(table)
+        selected, size = table.selection_summary()
         if selected:
-            size = 0
-            for row in selected:
-                entry = self._row_entry(table, row)
-                it = table.item(row, 1)
-                raw = it.data(Qt.UserRole) if it is not None else None
-                if entry and not entry[1] and isinstance(raw, int):
-                    size += raw
-            text += f"   ·   {len(selected)} selected"
+            text += f"   ·   {selected} selected"
             if size:
                 text += f" ({_human_size(size)})"
         label.setText(text)
@@ -1841,7 +2336,7 @@ class FileBrowser(QWidget):
             return
         name, is_dir = data
         if not is_dir:
-            self._local_edit_row(row)  # the clicked row, not the first selected one
+            self._local_open_row(row)  # the clicked row, not the first selected one
             return
         if name == "..":
             self._up_local()
@@ -1951,11 +2446,11 @@ class FileBrowser(QWidget):
             return
         name, is_dir = data
         if not is_dir:
-            self._remote_edit_row(row)  # the clicked row, not the first selected one
+            self._remote_open_row(row)  # the clicked row, not the first selected one
             return
         if name == "..":
             self._up_remote()
-        else:
+        elif not self._refuse_unsafe(self.remote_table, [name], "Open"):
             self.remote_cwd = posixpath.join(self.remote_cwd, name)
             self.refresh_remote()
 
@@ -1967,7 +2462,15 @@ class FileBrowser(QWidget):
                  ftype: str, mtime: str, perms: str, owner: str, is_dir: bool, raw_mtime: float = None):
         row = table.rowCount()
         table.insertRow(row)
+        local_dir = table.base_dir if table is self.local_table else ""
+        self._set_row(table, row, (name, raw_size, sz_str, ftype, mtime, perms, owner, is_dir),
+                      raw_mtime if raw_mtime is not None else _mtime_sort_key(mtime), local_dir)
 
+    @staticmethod
+    def _set_row(table: QTableWidget, row: int, entry, date_key: float, local_dir: str) -> None:
+        """Fill *row* with the six cells of a listing *entry*; *local_dir* is the
+        PC folder it is in ("" for the device)."""
+        name, raw_size, sz_str, ftype, mtime, perms, owner, is_dir = entry
         # The visible text is the exact name; the kind shows as the item's icon
         # (DecorationRole), so nothing that reads or sorts names sees a prefix.
         it_name = _FileItem(name)
@@ -1975,26 +2478,19 @@ class FileBrowser(QWidget):
         glyph, tone = _entry_icon_key(name, is_dir, ftype)
         # the system's own icon where it has one (a PC row by its real path, a
         # device row by its type); ICON_ROLE keeps the kind either way
-        local_dir = table.base_dir if table is self.local_table else ""
         it_name.setIcon(file_icons().row_icon(name, is_dir, ftype, glyph, tone, local_dir))
         it_name.setData(ICON_ROLE, glyph)
         it_size = _FileItem(sz_str)
         it_size.setData(Qt.UserRole, raw_size)
         it_size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        it_type = _FileItem(ftype)
         it_date = _FileItem(mtime)
-        if raw_mtime is not None:
-            it_date.setData(Qt.UserRole, raw_mtime)
-        else:
-            it_date.setData(Qt.UserRole, _mtime_sort_key(mtime))
-        it_perms = _FileItem(perms)
-        it_owner = _FileItem(owner)
+        it_date.setData(Qt.UserRole, date_key)
 
-        for col, it in enumerate((it_name, it_size, it_type, it_date, it_perms, it_owner)):
-            flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-            if not (is_dir and name == ".."):
-                flags |= Qt.ItemIsDragEnabled
-            flags |= Qt.ItemIsDropEnabled
+        flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
+        if not (is_dir and name == ".."):
+            flags |= Qt.ItemIsDragEnabled
+        for col, it in enumerate((it_name, it_size, _FileItem(ftype), it_date, _FileItem(perms),
+                                  _FileItem(owner))):
             it.setFlags(flags)
             table.setItem(row, col, it)
 
@@ -2023,6 +2519,8 @@ class FileBrowser(QWidget):
         return data[0], data[1]
 
     def _selected_rows(self, table) -> List[int]:
+        if isinstance(table, _FileTableWidget):
+            return table.selected_entry_rows()
         rows = sorted({idx.row() for idx in table.selectedIndexes()})
         return [r for r in rows if self._row_entry(table, r) is not None]
 
@@ -2116,9 +2614,11 @@ class FileBrowser(QWidget):
         if self._closing or not sources:
             return
         handler = self.handler
+        cancels = self._cancels
         self._job(lambda: _plan_push(handler, sources, dst_dir),
                   lambda plan: self._apply_transfer_plan(
-                      "Push", "Pushing", dst_dir, plan[0], plan[1], plan[2], (), "on the device"),
+                      "Push", "Pushing", dst_dir, plan[0], plan[1], plan[2], (), "on the device",
+                      cancels),
                   lambda msg: self._report_errors("Push", [msg]), device=True)
 
     def _start_pull(self, sources, dst_dir: str):
@@ -2127,12 +2627,22 @@ class FileBrowser(QWidget):
         if self._closing or not sources:
             return
         handler = self.handler
+        cancels = self._cancels
         self._job(lambda: _plan_pull(handler, sources, dst_dir),
                   lambda plan: self._apply_transfer_plan(
-                      "Pull", "Pulling", dst_dir, plan[0], plan[1], plan[2], plan[3], "on the PC"),
+                      "Pull", "Pulling", dst_dir, plan[0], plan[1], plan[2], plan[3], "on the PC",
+                      cancels),
                   lambda msg: self._report_errors("Pull", [msg]), device=True)
 
-    def _apply_transfer_plan(self, title, verb, dst_dir, jobs, collisions, errors, notes, where):
+    def _apply_transfer_plan(self, title, verb, dst_dir, jobs, collisions, errors, notes, where,
+                             cancels=None):
+        """*cancels*: :attr:`_cancels` when the plan was started.  Cancel stops
+        what is running and queued - and a plan still being made, which would
+        otherwise start copying right after the user stopped everything."""
+        if cancels is not None and cancels != self._cancels:
+            if jobs:
+                self.log.emit(f"[INFO] {title} cancelled: nothing was copied.")
+            return
         for note in notes:
             self.log.emit(note)
         if errors:
@@ -2251,7 +2761,7 @@ class FileBrowser(QWidget):
             return
 
         src, dst, direction = self._queue.pop(0)
-        name = _transfer_name(src)
+        name = transfer_name(src)
         waiting = f"  ({len(self._queue)} queued)" if self._queue else ""
         self.bar.setFormat(f"{direction} {name}: %p%{waiting}")
         self.bar.setValue(0)
@@ -2262,6 +2772,7 @@ class FileBrowser(QWidget):
         t = _TransferThread(self.handler, direction, src, dst)
         self._transfer = t
         t._transfer_id = self._take_transfer_id((src, dst, direction))
+        t._job = (src, dst, direction)  # as queued (the thread may rewrite its source)
         self.transfers.start(t._transfer_id)
         t.progress.connect(self.bar.setValue)
         t.progress.connect(lambda pct, t=t: self._on_transfer_progress(t, pct))
@@ -2300,18 +2811,26 @@ class FileBrowser(QWidget):
         if t is not self._transfer:
             return
         self._transfer = None
+        # The job as it was queued: a run may copy a folder as "dir/." (see
+        # _TransferThread._merge_source), which no longer matches its row.
+        job = getattr(t, "_job", (t.a, t.b, t.direction))
+        # a copy of a device file being opened in its app (see _pull_to_open)
+        after = self._after_pull.pop(job, None)
         if self._closing or not _alive(self):
+            if after is not None:
+                after[1](None)
             return
         item_id = getattr(t, "_transfer_id", None)
-        if self._cancelled_transfer is t:
+        cancelled = self._cancelled_transfer is t
+        if cancelled:
             self._cancelled_transfer = None
-            self.transfers.finish(item_id, CANCELLED,
-                                  error="" if ok else "cancelled - a partial copy may remain")
-            self.log.emit(f"[CANCELLED] {t.direction} {_transfer_name(t.a)}"
-                          + ("" if ok else " (a partial copy may remain)"))
+            left = "" if ok else _cancel_leftover(message)
+            self.transfers.finish(item_id, CANCELLED, error=f"cancelled - {left}" if left else "")
+            self.log.emit(f"[CANCELLED] {t.direction} {transfer_name(t.a)}"
+                          + (f" ({left})" if left else ""))
         elif ok:
             self.transfers.finish(item_id, DONE, duration=getattr(t, "_transfer_duration", None))
-            line = f"[OK] {t.direction}: {_transfer_name(t.a)}"
+            line = f"[OK] {t.direction}: {transfer_name(t.a)}"
             # one of many: keep it in the log, out of the toast
             (self.trace if self.transfers.batch_size() > 1 else self.log).emit(line)
         else:
@@ -2319,14 +2838,36 @@ class FileBrowser(QWidget):
             self.log.emit(f"[ERROR] {t.direction} {t.a}: {message}")
             from .device_access import is_permission_problem
 
-            if is_permission_problem(message):
-                self._refused_transfers.append((t.a, t.b, t.direction, message))
+            local = getattr(t, "local_refusal", "")
+            if local:
+                # this PC said no, not the device: adb root would change nothing
+                self.log.emit(f"[ERROR] {t.direction} {transfer_name(t.a)}: {local} can't be "
+                              f"{'read' if t.direction == 'push' else 'written'} on this PC "
+                              "(the device was not the problem)")
+            elif is_permission_problem(message) and after is None:
+                # (an opened file's copy is not offered again: its folder goes)
+                self._refused_transfers.append((*job, message))
+        if after is not None and (cancelled or not ok):
+            # an opened file's copy that failed: its folder is gone, so there
+            # is nothing a Retry could do (the error is in the log)
+            self.transfers.remove([item_id])
         self.transfer_panel.refresh()
-        self._process_queue()
+        self._process_queue()  # first: nothing an opened file does may hold up the queue
+        if after is not None:
+            if ok and not cancelled:
+                after[0]()
+            else:
+                after[1](None if cancelled else message)
 
     def cancel_transfers(self):
-        """Stop the running transfer and drop everything still queued."""
+        """Stop the running transfer and drop everything still queued (and any
+        push or pull still being planned)."""
+        self._cancels += 1
         dropped = len(self._queue)
+        for job in self._queue:
+            after = self._after_pull.pop(tuple(job), None)
+            if after is not None:
+                after[1](None)
         self._queue.clear()
         self._pending_ids.clear()
         self.transfers.cancel_queued()  # the history says what never ran
@@ -2345,7 +2886,7 @@ class FileBrowser(QWidget):
         self.bar.setFormat("Cancelling…")
         self.btn_cancel_transfer.setEnabled(False)
         extra = f" and {dropped} queued transfer(s)" if dropped else ""
-        self.log.emit(f"Cancelling {t.direction} {_transfer_name(t.a)}{extra}…")
+        self.log.emit(f"Cancelling {t.direction} {transfer_name(t.a)}{extra}…")
 
     # ---- Transfer history (the Transfers panel) ----
     def _measure_transfers(self, pairs) -> None:
@@ -2502,9 +3043,32 @@ class FileBrowser(QWidget):
         old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(self, "Rename Local Item", "New name:", text=old_name)
         new_name = new_name.strip() if ok else ""
-        if new_name and new_name != old_name:
-            new_path = os.path.join(os.path.dirname(old_path), new_name)
-            self._local_job(f"rename {old_name}", lambda: os.rename(old_path, new_path), "Error")
+        if not new_name or new_name == old_name:
+            return
+        # "..\a.txt" or "sub/a.txt" would move the item out of sight
+        if not self._valid_new_name(new_name, "Rename", local=True):
+            return
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        label = f"rename {old_name}"
+
+        def checked(state):
+            if state in ("dir", "taken"):
+                what = "folder" if state == "dir" else "file"
+                QMessageBox.warning(self, "Rename",
+                                    f"A {what} named {new_name!r} already exists here.")
+                return
+            replace = state == "file"
+            if replace and QMessageBox.question(
+                    self, "Rename",
+                    f"{new_name!r} already exists here. Replace it with {old_name!r}?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            self._local_job(label, lambda: _rename_local_item(old_path, new_path, replace),
+                            "Error")
+
+        # the check touches the disk (a network drive can stall): on a worker
+        self._job(lambda: _local_rename_state(old_path, new_path), checked,
+                  lambda msg: self.log.emit(f"[ERROR] {label}: {msg}"))
 
     def _local_delete(self):
         """Delete: to the Recycle Bin on Windows (Shift+Delete skips it)."""
@@ -2665,12 +3229,24 @@ class FileBrowser(QWidget):
             self._offer_write_access(folder, msg, f"deleting {len(targets)} item(s)",
                                      lambda: self._delete_remote_targets(targets))
 
+        cancel = self._cancel
+
+        def work():
+            removed = []
+            # The engine deletes one shell-sized group per `rm`; handing it
+            # the groups one by one lets a closed tab stop the rest.
+            for group in _chunks(targets):
+                if cancel.is_set():
+                    break
+                removed += handler.remove(group, recursive=True, safe=False)
+            return removed
+
         # Deletion belongs to the engine: it refuses '/', refuses a folder
-        # without recursive, and splits the paths into shell-sized `rm` calls.
-        # One unbounded `rm -rf` built here did none of that.  Like a paste
-        # batch it can run for minutes, so it takes no adb slot (device=False):
-        # listings keep working meanwhile.
-        self._job(lambda: handler.remove(targets, recursive=True, safe=False), done, fail)
+        # without recursive, and keeps each `rm` shell-sized.  One unbounded
+        # `rm -rf` built here did none of that.  Like a paste batch it can run
+        # for minutes, so it takes no adb slot (device=False): listings keep
+        # working meanwhile.
+        self._job(work, done, fail)
 
     def _run_shell(self, label, cmd):
         self._run_shell_batch([(label, cmd)])
@@ -2682,12 +3258,18 @@ class FileBrowser(QWidget):
         stay in the log, and *summary* (a past-tense verb such as "Pasted")
         names the single toast. Without it, pasting 200 files fired 200
         toasts that replaced each other and left a file name on screen
-        instead of a result. Failures always surface individually."""
+        instead of a result. Failures always surface individually.
+
+        Closing the tab stops the batch before its next command (the one
+        running finishes: a device shell call can't be interrupted)."""
         handler = self.handler
+        cancel = self._cancel
 
         def work():
             out = []
             for label, cmd in commands:
+                if cancel.is_set():
+                    break
                 try:
                     res = handler.shell(cmd, timeout=timeout, safe=False)
                 except Exception as exc:  # reported per command in done()
@@ -2738,6 +3320,8 @@ class FileBrowser(QWidget):
     # ---- Context Menus ----
     def _context_local(self, pos):
         menu = QMenu(self)
+        self._menu_action(menu, "Open\tEnter", self._local_open)
+        self._menu_action(menu, "Open with…", lambda: self._local_open(choose=True))
         self._menu_action(menu, "Push to device", self.push_selected)
         self._menu_action(menu, "Edit\tF4", self._local_edit)
         menu.addSeparator()
@@ -2757,6 +3341,8 @@ class FileBrowser(QWidget):
 
     def _context_remote(self, pos):
         menu = QMenu(self)
+        self._menu_action(menu, "Open\tEnter", self._remote_open)
+        self._menu_action(menu, "Open with…", lambda: self._remote_open(choose=True))
         self._menu_action(menu, "Pull to this PC", self.pull_selected)
         self._menu_action(menu, "Edit\tF4", self._remote_edit)
         menu.addSeparator()
@@ -2840,11 +3426,12 @@ class FileBrowser(QWidget):
                 dlg.done(QDialog.Rejected)
         self._editors.clear()
 
-    def _handle_edit_load(self, name: str, path: str, result, write, refresh):
+    def _handle_edit_load(self, name: str, path: str, result, write, refresh, hint: str = ""):
         if result is None:
             return  # cancelled
         if result[0] == "refused":
-            QMessageBox.information(self, "Edit File", f"{name} was not opened.\n\n{result[1]}")
+            QMessageBox.information(self, "Edit File", f"{name} was not opened.\n\n{result[1]}"
+                                    + (f"\n\n{hint}" if hint else ""))
             return
         _status, text, newline, mixed = result
         self._open_editor(name, path, text, newline, mixed, write, refresh)
@@ -2854,7 +3441,7 @@ class FileBrowser(QWidget):
         if rows:
             self._local_edit_row(rows[0])
 
-    def _local_edit_row(self, row: int):
+    def _local_edit_row(self, row: int, hint: str = ""):
         entry = self._row_entry(self.local_table, row)
         if not entry or entry[1]:
             return
@@ -2862,8 +3449,8 @@ class FileBrowser(QWidget):
         path = os.path.join(self.local_cwd, name)
         self._job(lambda: _edit_load_result(lambda: _read_for_edit(path)),
                   lambda result: self._handle_edit_load(
-                      name, path, result, lambda payload: write_text_file(path, payload),
-                      self.refresh_local),
+                      name, path, result, lambda payload: _save_local_text(path, payload),
+                      self.refresh_local, hint),
                   lambda msg: QMessageBox.critical(self, "Edit File", f"Could not read {name}:\n{msg}"))
 
     def _remote_edit(self):
@@ -2871,7 +3458,7 @@ class FileBrowser(QWidget):
         if rows:
             self._remote_edit_row(rows[0])
 
-    def _remote_edit_row(self, row: int):
+    def _remote_edit_row(self, row: int, hint: str = ""):
         table = self.remote_table
         entry = self._row_entry(table, row)
         if not entry or entry[1]:
@@ -2887,7 +3474,8 @@ class FileBrowser(QWidget):
         if kind != "l" and isinstance(size, int) and size > _EDIT_MAX_BYTES:
             QMessageBox.information(
                 self, "Edit File",
-                f"{name} was not opened.\n\n{_too_large_message(size)} Pull it to the PC instead.")
+                f"{name} was not opened.\n\n{_too_large_message(size)} Pull it to the PC instead."
+                + (f"\n\n{hint}" if hint else ""))
             return
         full_path = posixpath.join(self.remote_cwd, name)
         handler = self.handler
@@ -2898,20 +3486,23 @@ class FileBrowser(QWidget):
 
         def load():
             try:
-                res = handler.shell(_edit_stat_cmd(full_path), timeout=30, safe=False)
-                st = _parse_edit_stat(res.stdout, full_path) if res.ok else None
+                st = handler.stat_path(full_path, safe=False)
             except Exception:
                 st = None  # no usable stat: fall back to pulling the listed path
             if st is not None:
-                real_size, mode, ftype, real = st
+                ftype = str(st["type"])
                 if not ftype.startswith("regular"):
                     return ("refused", f"It is not a regular file ({ftype}), so it can't be "
                                        "edited as text.")
-                if real_size > _EDIT_MAX_BYTES:
-                    return ("refused", f"{_too_large_message(real_size)} Pull it to the PC instead.")
-                target["path"], target["mode"] = real, mode
+                if st["size"] > _EDIT_MAX_BYTES:
+                    return ("refused", f"{_too_large_message(st['size'])} Pull it to the PC instead.")
+                target["path"], target["mode"] = st["real_path"], st["mode"]
             elif kind in ("b", "c", "p", "s"):
                 return ("refused", "It is a device node, pipe or socket, so it can't be edited as text.")
+            elif kind == "l" and not _links_to_a_file(handler, full_path):
+                # pulling a link to a pipe never ends, and holds an adb slot meanwhile
+                return ("refused", "It is a link to something other than a regular file, so it "
+                                   "can't be edited as text.")
             fd, tmp_path = tempfile.mkstemp(prefix="turboadb-edit-")
             os.close(fd)
             try:
@@ -2926,38 +3517,262 @@ class FileBrowser(QWidget):
                     pass
 
         def write(payload):
-            real = target["path"]
-            mode = target["mode"]
-            try:  # the mode right before saving, in case it changed while editing
-                res = handler.shell(_mode_cmd(real), timeout=30, safe=False)
-                lines = _output_lines(res.stdout) if res.ok else []
-                if lines and re.fullmatch(r"[0-7]{3,4}", lines[0].strip()):
-                    mode = lines[0].strip()
-            except Exception:
-                pass
             fd, tmp_path = tempfile.mkstemp(prefix="turboadb-edit-")
             os.close(fd)
             try:
                 write_text_file(tmp_path, payload)  # newline="" keeps line endings exactly
-                handler.push(tmp_path, real, safe=False)
+                # the engine's save, as `turboadb edit` uses: adb push resets the
+                # mode (755 -> 666), so the mode the file has right now comes back
+                handler.replace_file(tmp_path, target["path"], mode=target["mode"], safe=False)
             finally:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            if mode:
-                # adb push resets the file mode (e.g. 755 -> 666): restore it.
-                res = handler.shell(_chmod_cmd(mode, real), timeout=30, safe=False)
-                if not res.ok:
-                    raise RuntimeError(f"The file was saved, but its permissions ({mode}) could "
-                                       f"not be restored: {_result_error(res)}")
 
         self._job(load,
                   lambda result: self._handle_edit_load(name, target["path"], result, write,
-                                                        self.refresh_remote),
+                                                        self.refresh_remote, hint),
                   lambda msg: QMessageBox.critical(
                       self, "Edit Remote File", f"Could not pull {name} from device:\n{msg}"),
                   device=True)  # at most _EDIT_MAX_BYTES (2 MB): a short job
+
+    # ---- Open in the app this PC has for the file (see file_open) ----
+    _NO_APP_HINT = ("No app on this PC opens this kind of file. To pick one, right-click it "
+                    "and choose Open with….")
+
+    def _how_to_open(self, name: str, choose: bool, *, device: bool):
+        """``("open", "")`` to open the file *name* in an app, ``("edit", hint)``
+        for TurboADB's editor, or ``(None, "")`` when it is refused (the user was
+        told why).  Programs never start from here, and scripts, which a double
+        click would run, open in the editor; with *choose* the user picks the
+        app for anything."""
+        if choose:
+            return "open", ""
+        kind = file_open.kind_of(name)
+        if kind == file_open.PROGRAM:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in file_open.APP_PACKAGE_EXTENSIONS:
+                why = "is an Android app package: install it from the Apps tab."
+            elif ext in (".lnk", ".url", ".website"):
+                why = "is a shortcut, so it is not followed from here."
+            elif device:
+                why = "is a program, so it is not started from here. Pull it to this PC to use it."
+            else:
+                why = ("is a program, so it is not started from here. Run it from File "
+                       "Explorer if you trust it.")
+            QMessageBox.information(self, "Open", f"{name} {why}")
+            return None, ""
+        if kind == file_open.SCRIPT:
+            self.log.emit(f"[INFO] {name} is a script: it opens in TurboADB's editor, so it "
+                          "can't run by accident. Use Open with… for another app.")
+            return "edit", ""
+        runner = file_open.runs_what_it_opens(name)
+        if runner == "itself":  # a type that is its own program on this PC
+            QMessageBox.information(self, "Open", f"{name} is a program on this PC, so it is "
+                                                  "not started from here.")
+            return None, ""
+        if runner:  # this PC would RUN it with that program, not show it
+            self.log.emit(f"[INFO] {name} would be run by {runner}: it opens in TurboADB's "
+                          "editor instead. Use Open with… for another app.")
+            return "edit", ""
+        if file_open.app_for(name) is None:
+            return "edit", self._NO_APP_HINT  # no app for it here: the editor, if it is text
+        return "open", ""
+
+    def _start_app(self, path: str, name: str, choose: bool) -> bool:
+        """Open the PC file *path* in its app, or in the one the user picks."""
+        try:
+            file_open.start(path, choose=choose)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            self.log.emit(f"[ERROR] Open {name}: {reason}")
+            QMessageBox.warning(self, "Open", f"{name} could not be opened:\n{reason}")
+            return False
+        return True
+
+    def _local_open(self, choose: bool = False):
+        rows = self._selected_rows(self.local_table)
+        if not rows:
+            return
+        entry = self._row_entry(self.local_table, rows[0])
+        if entry and entry[1]:
+            if not choose:
+                self._on_local_double_click(rows[0], 0)  # a folder: go into it
+            return
+        self._local_open_row(rows[0], choose)
+
+    def _local_open_row(self, row: int, choose: bool = False):
+        entry = self._row_entry(self.local_table, row)
+        if not entry or entry[1]:
+            return
+        name = entry[0]
+        how, hint = self._how_to_open(name, choose, device=False)
+        if how == "edit":
+            self._local_edit_row(row, hint)
+        elif how == "open":
+            self._start_app(os.path.join(self.local_cwd, name), name, choose)
+
+    def _remote_open(self, choose: bool = False):
+        rows = self._selected_rows(self.remote_table)
+        if not rows:
+            return
+        entry = self._row_entry(self.remote_table, rows[0])
+        if entry and entry[1]:
+            if not choose:
+                self._on_remote_double_click(rows[0], 0)  # a folder: go into it
+            return
+        self._remote_open_row(rows[0], choose)
+
+    def _remote_open_row(self, row: int, choose: bool = False):
+        """Open a device file in its app: it is copied to this PC first, and
+        each save of that copy goes back to the device (see _send_copy_back)."""
+        table = self.remote_table
+        entry = self._row_entry(table, row)
+        if not entry or entry[1] or self.handler is None:
+            return
+        name = entry[0]
+        if self._refuse_unsafe(table, [name], "Open"):
+            return
+        how, hint = self._how_to_open(name, choose, device=True)
+        if how == "edit":
+            self._remote_edit_row(row, hint)
+            return
+        if how != "open":
+            return
+        perms_item = table.item(row, 4)
+        kind = perms_item.text()[:1] if perms_item is not None else ""
+        full_path = posixpath.join(self.remote_cwd, name)
+        handler = self.handler
+        self.log.emit(f"Opening {name}…")
+
+        def look():
+            try:
+                info = handler.stat_path(full_path, safe=False)
+            except Exception:
+                # no usable stat (old devices): the listed path, if it is a file
+                if kind in ("b", "c", "p", "s") or (kind == "l" and not _links_to_a_file(
+                        handler, full_path)):
+                    return ("refused", "It is not a regular file, so it can't be opened.")
+                info = {"real_path": full_path, "mode": "", "type": "regular file"}
+            if not str(info["type"]).startswith("regular"):
+                return ("refused", f"It is not a regular file ({info['type']}), so it can't "
+                                   "be opened.")
+            stamp = _device_stamp(handler, info["real_path"])
+            return ("ok", info, stamp, file_open.new_copy_folder())
+
+        def looked(result):
+            if result[0] == "refused":
+                QMessageBox.information(self, "Open", f"{name} was not opened.\n\n{result[1]}")
+                return
+            _ok, info, stamp, folder = result
+            self._pull_to_open(name, info, stamp, folder, choose,
+                               listed=posixpath.dirname(full_path))
+
+        self._job(look, looked,
+                  lambda msg: QMessageBox.critical(self, "Open", f"Could not open {name}:\n{msg}"),
+                  device=True)
+
+    def _pull_to_open(self, name: str, info, stamp, folder: str, choose: bool, listed: str = ""):
+        """Copy the device file to *folder* through the transfer queue (a big
+        video shows its progress and can be cancelled), then open the copy in
+        its app and watch it for saves. *listed* is the device folder it was
+        opened from, as the listing shows it (a link like /sdcard or not)."""
+        if self._closing:
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+        remote = info["real_path"]
+        local = os.path.join(folder, _safe_local_name(name))
+        copy = file_open.DeviceCopy(name, local, remote, info.get("mode") or "", stamp,
+                                    folder=listed or posixpath.dirname(remote))
+        job = (remote, local, "pull")
+
+        def copied():
+            copy.synced = file_open.stat_key(local)
+            if self._start_app(local, name, choose):
+                self._copies.watch(copy)
+                self.log.emit(f"[INFO] Opened {name} from the device. Saving it in its app "
+                              f"sends it back to {remote}.")
+
+        def not_copied(message):
+            shutil.rmtree(folder, ignore_errors=True)
+            if message is not None:  # None: cancelled, or the tab closed
+                self.log.emit(f"[ERROR] {name} could not be copied from the device to open "
+                              f"it: {message}")
+
+        self._after_pull[job] = (copied, not_copied)
+        self._enqueue_transfers([job], f"Copying {name} to this PC to open it…")
+
+    def _send_copy_back(self, copy):
+        """An app saved the copy of a device file: send it to the device,
+        keeping the file's permissions — after asking, when the device file
+        changed since it was copied (another app, or a log that grew)."""
+        if self._closing or self.handler is None:
+            return
+        if copy.saving:
+            copy.again = True  # sent once more when this one is done
+            return
+        copy.saving = True
+        handler, force, expected = self.handler, copy.force, copy.stamp
+
+        def work():
+            key = file_open.stat_key(copy.local)  # what is sent, as the watcher sees it
+            if key is None:
+                raise OSError(f"{copy.local} can't be read right now")
+            if expected is not None and not force:
+                now = _device_stamp(handler, copy.remote)
+                if now is not None and now != expected:
+                    return ("changed", now, key)
+            handler.replace_file(copy.local, copy.remote, mode=copy.mode, safe=False)
+            return ("saved", _device_stamp(handler, copy.remote), key)
+
+        # Not in self._jobs: a save under way finishes even if the tab closes.
+        run_job(self._save_jobs, work, lambda result: self._copy_sent(copy, result),
+                lambda msg: self._copy_not_sent(copy, msg))
+
+    def _copy_sent(self, copy, result):
+        if not _alive(self) or self._closing:
+            copy.saving = False
+            return
+        status, stamp, key = result
+        if status == "changed":
+            # Still "saving" while the question is open: a save made meanwhile
+            # waits for the answer instead of asking a second time.
+            answer = QMessageBox.question(
+                self, "Save to device",
+                f"{copy.name} changed on the device since you opened it.\n\n"
+                f"Replace it on the device with the copy you saved?\n{copy.remote}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            copy.saving = False
+            if answer == QMessageBox.Yes:
+                copy.force = True
+                self._send_copy_back(copy)
+            else:
+                copy.synced, copy.again = key, False
+                self.log.emit(f"[INFO] {copy.name} was not saved to the device: it changed "
+                              "there since you opened it.")
+            return
+        copy.saving = False
+        copy.stamp, copy.synced, copy.force = stamp, key, False
+        self.log.emit(f"[OK] Saved {copy.name} to the device ({copy.remote})")
+        if posixpath.normpath(copy.folder) == posixpath.normpath(self.remote_cwd or "/"):
+            self.refresh_remote()
+        if copy.again:  # saved again while this was sent: look at it again
+            copy.again = False
+            self._copies.recheck(copy)
+
+    def _copy_not_sent(self, copy, msg):
+        copy.saving = copy.again = copy.force = False
+        if not _alive(self) or self._closing:
+            return
+        self.log.emit(f"[ERROR] Saving {copy.name} to the device: {msg}")
+        folder = posixpath.dirname(copy.remote) or "/"
+        if not self._offer_write_access(folder, msg, f"saving {copy.name}",
+                                        lambda c=copy: self._send_copy_back(c)):
+            QMessageBox.warning(self, "Save to device",
+                                f"{copy.name} could not be saved to the device:\n{msg}\n\n"
+                                "Your changes are still in the copy on this PC: save it "
+                                "again to try again.")
 
     # ---- Drag and drop ----
     def _on_local_dropped(self, paths: list, is_external: bool, target_dir: str = ""):
@@ -3020,6 +3835,17 @@ class FileBrowser(QWidget):
         close_jobs(self._jobs)
         self._ls = None
         self._release_editors()
+        # Device files open in apps: their saves no longer go back from a
+        # closed tab (said in the log), and copies still being made are dropped.
+        still_open = [copy.name for copy in self._copies.copies()]
+        if still_open:
+            names = ", ".join(still_open[:5]) + ("…" if len(still_open) > 5 else "")
+            self.log.emit(f"[WARNING] Saving {names} in its app no longer sends it to the "
+                          "device: the Files tab it was opened from was closed.")
+        self._copies.stop()
+        hooks, self._after_pull = list(self._after_pull.values()), {}
+        for _done, dropped in hooks:
+            dropped(None)
         # Listings of big folders are thousands of table items: free them now
         # rather than whenever the closed tab is finally deleted.
         self._clipboard = []

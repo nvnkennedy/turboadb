@@ -385,21 +385,21 @@ def test_vtuple():
 # --------------------------------------------------------------------------- #
 # device-keyboard bar mapping (the guaranteed embedded-typing path)
 # --------------------------------------------------------------------------- #
-def test_device_key_edit_mapping():
+def test_device_key_mapping():
     """Qt key events -> ('text', str) or ('key', android_keycode). Pure map, no
     Qt widgets / adb needed — this is what forwards typing to the device
     regardless of window focus."""
     pytest.importorskip("PyQt5")
     from PyQt5.QtCore import Qt
-    from turboadb.gui.mirror_panel import _DeviceKeyEdit as K
+    from turboadb.gui.mirror_panel import _map_device_key as map_key
 
-    assert K.map_event(Qt.Key_A, "a") == ("text", "a")
-    assert K.map_event(Qt.Key_5, "5") == ("text", "5")
-    assert K.map_event(Qt.Key_Return, "\r") == ("key", 66)  # ENTER
-    assert K.map_event(Qt.Key_Backspace, "\b") == ("key", 67)  # DEL
-    assert K.map_event(Qt.Key_Left, "") == ("key", 21)  # DPAD_LEFT
-    assert K.map_event(Qt.Key_Tab, "\t") == ("key", 61)
-    assert K.map_event(Qt.Key_Shift, "") == (None, None)  # modifier alone
+    assert map_key(Qt.Key_A, "a") == ("text", "a")
+    assert map_key(Qt.Key_5, "5") == ("text", "5")
+    assert map_key(Qt.Key_Return, "\r") == ("key", 66)  # ENTER
+    assert map_key(Qt.Key_Backspace, "\b") == ("key", 67)  # DEL
+    assert map_key(Qt.Key_Left, "") == ("key", 21)  # DPAD_LEFT
+    assert map_key(Qt.Key_Tab, "\t") == ("key", 61)
+    assert map_key(Qt.Key_Shift, "") == (None, None)  # modifier alone
 
 
 class _InlineDispatcher:
@@ -756,11 +756,10 @@ def test_file_browser_dual_pane(qapp):
     assert _human_size(1024) == "1.0 KB"
     assert _human_size(500) == "500 B"
     fb = FileBrowser(None, start="/sdcard")
-    assert fb.cwd == "/sdcard"
     assert fb.remote_cwd == "/sdcard"
     assert os.path.exists(fb.local_cwd)
     assert hasattr(fb, "btn_push") and hasattr(fb, "btn_pull")
-    assert hasattr(fb, "local_list") and hasattr(fb, "remote_list")
+    assert hasattr(fb, "local_table") and hasattr(fb, "remote_table")
 
 
 def test_controls_panel_compact_columns(qapp):
@@ -809,7 +808,7 @@ def test_local_terminal_session():
 
     sess = LocalShellSession("cmd", serial="device123")
     assert sess.running
-    sess.send_line("echo hello")
+    assert sess.send("echo hello\r\n")
     sess.close()
     assert not sess.running
 
@@ -929,7 +928,7 @@ def test_shell_panel_subtabs():
         sp.close_panel()
 
 
-def test_reconnect_preserves_local_terminal_and_resets_nested_adb_context(qapp):
+def test_reconnect_preserves_local_terminal_and_resets_nested_adb_context(qapp, tmp_path):
     from turboadb.gui.device_tab import ShellPanel
 
     panel = ShellPanel(None, "device123")
@@ -941,7 +940,15 @@ def test_reconnect_preserves_local_terminal_and_resets_nested_adb_context(qapp):
         panel.android_widget.reconnect = lambda **kwargs: called.append(kwargs)
 
         panel.pause_for_device_reboot()
+        # The adb shells end with the device; until PowerShell's (CMD's) own
+        # prompt says so the terminals stay in them (a reboot can fail), but
+        # that prompt ends them even if they never answered.
+        for local in (panel.ps_widget, panel.cmd_widget):
+            assert local._in_adb_shell and local._adb_answered
+        panel.ps_widget._track_adb_shell_output(f"\r\nPS {tmp_path}> ")
         assert not panel.ps_widget._in_adb_shell
+        assert panel.cmd_widget._in_adb_shell  # its own prompt has not shown yet
+        panel.cmd_widget._track_adb_shell_output(f"\r\n{tmp_path}>\x1b]7717;{tmp_path}\x1b\\")
         assert not panel.cmd_widget._in_adb_shell
 
         panel.reconnect()
@@ -1338,8 +1345,9 @@ def test_local_shell_completion_and_cwd_tracking(qapp, tmp_path, monkeypatch):
     completed, _ = widget._local_complete("git sta")
     assert completed is None  # ambiguous (status vs stash)
 
-    # CWD tracking on cd
+    # CWD tracking on cd: the folder the shell's prompt (and its mark) names
     widget._send(f'cd "{d1}"'.encode("utf-8"))
+    widget._feed_from(widget.reader, f'cd "{d1}"\r\n\r\n{d1}>\x1b]7717;{d1}\x1b\\'.encode("utf-8"))
     assert os.path.normpath(widget._shell_cwd) == os.path.normpath(str(d1))
 
     # Prompt text reflects current cwd
@@ -1370,13 +1378,25 @@ def test_local_terminal_tab_normalizes_slash_path_and_adb_completion(qapp, tmp_p
         pytest.skip("Windows path semantics")
     from turboadb.gui.device_tab import _LocalShellWidget
 
+    import time
+
     (tmp_path / "target-alpha").mkdir()
     (tmp_path / "target-beta").mkdir()
     widget = _LocalShellWidget("cmd")
+
+    def complete():
+        # local completion runs on a worker thread (it reads folders)
+        widget.term._do_complete()
+        deadline = time.monotonic() + 10
+        while widget._completion_thread is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        qapp.processEvents()
+
     try:
         widget._shell_cwd = str(tmp_path)
         widget.term._set_line("cd /t")
-        widget.term._do_complete()
+        complete()
         # The multiple-choice branch used to keep `/t` in the editor.  The
         # following Tab then inserted the candidate after the slash, producing
         # an invalid Windows path instead of cycling valid folders.
@@ -1386,7 +1406,7 @@ def test_local_terminal_tab_normalizes_slash_path_and_adb_completion(qapp, tmp_p
         # command; mirror that keypress boundary in this direct console test.
         widget.term._clear_tab_cycle()
         widget.term._set_line("adb dev")
-        widget.term._do_complete()
+        complete()
         assert widget.term._line == "adb devices "
     finally:
         widget.close_panel()

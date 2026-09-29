@@ -17,9 +17,10 @@ from __future__ import annotations
 import os
 import sys
 import subprocess
+import threading
 import time
 
-from .config import validate_port
+from .config import format_host_port, validate_port
 
 # Per-host WinRM budget, and the budget for a whole run. 20 unreachable hosts at
 # 120 s each used to mean ~40 minutes behind a modal dialog.
@@ -167,7 +168,8 @@ def _session(
     import winrm
 
     scheme = "https" if use_ssl else "http"
-    endpoint = f"{scheme}://{host}:{winrm_port}/wsman"
+    # an IPv6 literal in brackets, or its colons would be read as the port's
+    endpoint = f"{scheme}://{format_host_port(host, winrm_port)}/wsman"
     # Bound the timeouts so an unreachable / non-responding host fails in a known
     # time instead of hanging the (now modal) deploy popup. 120 s is plenty for a
     # dependency-free `pip install -U turboadb` + starting the server; read_timeout
@@ -190,7 +192,11 @@ def _session(
     )
 
 
-def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False, host_timeout=None):
+def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False, host_timeout=None,
+            strip=True):
+    """Run PowerShell *script* on *host* over WinRM: ``(status, stdout,
+    stderr)``, the text stripped unless *strip* is False (the remote webcam
+    reads its output line by line, as printed)."""
     session = _session(
         host,
         login,
@@ -200,8 +206,10 @@ def _run_ps(host, login, password, script, *, winrm_port, use_ssl=False, host_ti
         host_timeout=host_timeout,
     )
     r = session.run_ps(script)
-    out = (r.std_out or b"").decode("utf-8", "replace").strip()
-    err = (r.std_err or b"").decode("utf-8", "replace").strip()
+    out = (r.std_out or b"").decode("utf-8", "replace")
+    err = (r.std_err or b"").decode("utf-8", "replace")
+    if strip:
+        out, err = out.strip(), err.strip()
     return r.status_code, out, err
 
 
@@ -277,6 +285,45 @@ def _deploy_one(
         return False, lines
 
 
+def _run_on_daemon_threads(calls, workers: int) -> list:
+    """Run each ``(fn, args, kwargs)`` of *calls* on at most *workers* daemon
+    threads, in order; returns a Future for each.
+
+    Not a ThreadPoolExecutor: the interpreter joins its threads on the way
+    out, so ``turboadb deploy-serve`` sat after its summary for as long as
+    the WinRM calls still running took (up to their timeout each).  A daemon
+    thread cut off at exit ends only the WinRM call: the remote PowerShell it
+    started carries on either way."""
+    import queue
+    from concurrent.futures import Future
+
+    work = queue.Queue()
+    futures = []
+    for fn, args, kwargs in calls:
+        future = Future()
+        futures.append(future)
+        work.put((future, fn, args, kwargs))
+
+    def worker():
+        while True:
+            try:
+                future, fn, args, kwargs = work.get_nowait()
+            except queue.Empty:
+                return
+            if not future.set_running_or_notify_cancel():
+                continue  # cancelled before it started
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    for n in range(workers):
+        threading.Thread(target=worker, name=f"turboadb-deploy-{n + 1}", daemon=True).start()
+    return futures
+
+
 def deploy_serve(
     hosts,
     username,
@@ -297,13 +344,16 @@ def deploy_serve(
     lines to *on_status*. Returns 0 if every host succeeded, else 1.
 
     WinRM sessions are independent, so up to *max_workers* hosts are contacted
-    at once and the whole run is bounded by *total_timeout* seconds. Hosts that
-    the budget ran out for are reported as SKIPPED (and count as failures) —
+    at once and the whole run is bounded by *total_timeout* seconds —
     previously 20 unreachable hosts meant ~40 minutes of a frozen modal dialog.
-    Pass ``max_workers=1`` for the old strictly serial behaviour, or
-    ``total_timeout=None`` for no overall budget. Results are always reported in
-    the order the hosts were given."""
-    from concurrent.futures import ThreadPoolExecutor
+    When the budget runs out, a host that finished meanwhile is reported as it
+    ended, one not started yet is SKIPPED, and one still being deployed is
+    reported with its result unknown: it can still end up sharing its devices,
+    so it is not called skipped.  All of these count as failures.  Nothing
+    waits for a host still running, neither this call nor the interpreter's
+    exit.  Pass ``max_workers=1`` for the old strictly serial behaviour, or
+    ``total_timeout=None`` for no overall budget. Results are always reported
+    in the order the hosts were given."""
 
     def say(m):
         if on_status:
@@ -324,47 +374,52 @@ def deploy_serve(
         say(f"[INFO] {len(hosts)} host(s), {workers} at a time ({budget}).")
     deadline = (time.monotonic() + total_timeout) if total_timeout else None
 
+    options = dict(
+        update=update,
+        port=port,
+        test_only=test_only,
+        winrm_port=winrm_port,
+        use_ssl=use_ssl,
+        host_timeout=host_timeout,
+    )
+    futures = _run_on_daemon_threads(
+        [(_deploy_one, (h, username, password), options) for h in hosts], workers
+    )
+
+    def report(host, future) -> bool:
+        try:
+            ok, lines = future.result(timeout=0)
+        except Exception as exc:
+            ok, lines = False, [f"[ERROR] {host}: {exc}"]
+        for line in lines:
+            say(line)
+        return ok
+
     rc = 0
-    skipped = []
-    pool = ThreadPoolExecutor(max_workers=workers)
-    try:
-        futures = [
-            pool.submit(
-                _deploy_one,
-                h,
-                username,
-                password,
-                update=update,
-                port=port,
-                test_only=test_only,
-                winrm_port=winrm_port,
-                use_ssl=use_ssl,
-                host_timeout=host_timeout,
-            )
-            for h in hosts
-        ]
-        for index, (host, future) in enumerate(zip(hosts, futures)):
-            left = None if deadline is None else max(0.0, deadline - time.monotonic())
-            try:
-                if left == 0.0:
-                    raise TimeoutError
-                ok, lines = future.result(timeout=left)
-            except Exception:
-                # The budget is gone: drop every host that has not finished
-                # rather than waiting out one 120 s WinRM timeout after another.
-                skipped = hosts[index:]
-                for pending in futures[index:]:
-                    pending.cancel()
-                break
-            for line in lines:
-                say(line)
-            if not ok:
-                rc = 1
-    finally:
-        # never block the caller (a modal dialog) on a straggler's own timeout
-        pool.shutdown(wait=False)
-    if skipped:
+    cut = None
+    for index, (host, future) in enumerate(zip(hosts, futures)):
+        left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            future.exception(timeout=None if left is None else left)
+        except Exception:
+            # The budget is gone: rather than waiting out one 120 s WinRM
+            # timeout after another, settle the rest as they stand now.
+            cut = index
+            break
+        if not report(host, future):
+            rc = 1
+    if cut is not None:
         rc = 1
         budget = f"the {total_timeout:g}s budget ran out" if total_timeout else "the run was cut short"
-        say(f"[WARNING] Skipped {len(skipped)} host(s) — {budget}: {', '.join(skipped)}")
+        skipped = []
+        for host, future in zip(hosts[cut:], futures[cut:]):
+            if future.cancel():
+                skipped.append(host)
+            elif future.done():
+                report(host, future)  # it finished after all
+            else:
+                say(f"[ERROR] {host}: still running when {budget} — its result is "
+                    "unknown (serve may still be set up there)")
+        if skipped:
+            say(f"[WARNING] Skipped {len(skipped)} host(s) — {budget}: {', '.join(skipped)}")
     return rc

@@ -11,6 +11,9 @@ sidebar with a double-click."""
 
 from __future__ import annotations
 
+import logging
+import os
+
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog,
@@ -20,6 +23,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QComboBox,
     QLineEdit,
+    QMessageBox,
     QSpinBox,
     QPushButton,
     QListWidget,
@@ -31,6 +35,8 @@ from PyQt5.QtWidgets import (
     QFrame,
 )
 
+from ..config import format_host_port
+
 # The one shared endpoint parser: a host typed WITH a port ("10.0.0.5:5037") is
 # split here so it is never doubled downstream, and a bare IPv6 literal
 # ("fe80::1") is never mistaken for a host:port pair.
@@ -40,6 +46,8 @@ from . import settings as settings_mod
 from .adb_path import gui_adb_path
 from .icons import icon
 from .qtutil import disconnect_signals, park_thread, thread_running
+
+_log = logging.getLogger(__name__)
 
 # The three ways to reach a device, colour-coded the same everywhere
 # (Connect and the saved-target dialog): (icon, tone).
@@ -88,6 +96,22 @@ def _muted(text):
     return label
 
 
+def _endpoint_name(text, port, default_port=None):
+    """The endpoint a session built from *text* and the *port* box uses (a port
+    typed after the host wins, as in ``_build_session``), written as saved
+    targets name it; without the port when it is *default_port*.  "" when no
+    host is entered."""
+    host, port = _split_host_port(text, port)
+    if not host:
+        return ""
+    if port == default_port:
+        return host
+    try:
+        return format_host_port(host, port)
+    except ValueError:  # a typed port out of range: the connect says so
+        return (text or "").strip()
+
+
 class _ScanThread(QThread):
     done = pyqtSignal(list)
     fail = pyqtSignal(str)
@@ -119,22 +143,36 @@ class _ServeThread(QThread):
         super().__init__()
         self.port, self.install_login = port, install_login
         self.adb_path = adb_path
+        # whether the local adb server (the device tabs') answers afterwards
+        self.server_up = False
 
     def run(self):
         try:
             from ..devices import start_shared_server, install_startup, open_firewall
+            from ..tools import local_adb_port
 
             msg = "Restarting the local ADB server; active sessions may reconnect briefly.  ·  "
             msg += start_shared_server(port=self.port, adb_path=self.adb_path)
             # The engine's own firewall spelling of the scrcpy tunnel ports, so
-            # the rule can never drift from the ports scrcpy actually uses.
-            msg += "  ·  " + open_firewall((self.port, TUNNEL_PORT_FIREWALL_RANGE))
+            # the rule can never drift from the ports scrcpy actually uses; the
+            # adb port is the one the server listens on (ANDROID_ADB_SERVER_PORT
+            # moves the default, and start_shared_server follows it).
+            msg += "  ·  " + open_firewall(
+                (local_adb_port(self.port), TUNNEL_PORT_FIREWALL_RANGE))
             if self.install_login:
-                path = install_startup(port=self.port)
+                # the launcher runs the adb this server was started with
+                path = install_startup(port=self.port, adb_path=self.adb_path)
                 msg += f"  ·  auto-starts at login ({path})"
             self.done.emit(msg)
         except Exception as exc:
             self.fail.emit(str(exc))
+        finally:
+            try:
+                from ..tools import is_adb_server_alive
+
+                self.server_up = is_adb_server_alive()
+            except Exception:
+                self.server_up = False
 
 
 class ConnectDialog(QDialog):
@@ -143,7 +181,9 @@ class ConnectDialog(QDialog):
         self.setWindowTitle("Connect to a device")
         self.resize(560, 520)
         self._scan = None
-        self._pending_scan = None
+        # Scans asked for while one runs: one per page, keyed by its status
+        # line, run in turn (see _start_scan).
+        self._pending_scans = {}
         self._serve = None
         self._closing = False
         self._result = None  # the target chosen on Connect (computed once)
@@ -248,6 +288,7 @@ class ConnectDialog(QDialog):
         self.net_port = QSpinBox()
         self.net_port.setRange(1, 65535)
         self.net_port.setValue(5555)
+        self.net_port.valueChanged.connect(lambda *_: self._autoname())
         f.addRow("Device IP / hostname", self.net_host)
         f.addRow("Port", self.net_port)
         f.addRow(
@@ -274,6 +315,7 @@ class ConnectDialog(QDialog):
         self.rem_port = QSpinBox()
         self.rem_port.setRange(1, 65535)
         self.rem_port.setValue(5037)
+        self.rem_port.valueChanged.connect(lambda *_: self._autoname())
         f.addRow("That PC's IP / hostname", self.rem_host)
         f.addRow("adb server port", self.rem_port)
         v.addLayout(f)
@@ -301,6 +343,10 @@ class ConnectDialog(QDialog):
         )
         srv.addWidget(self.btn_serve)
         srv.addWidget(self.chk_login)
+        if os.name != "nt":
+            # The login auto-start is a launcher in the Windows Startup folder:
+            # elsewhere it could only fail, after the server had started.
+            self.chk_login.hide()
         srv.addStretch(1)
         v.addLayout(srv)
 
@@ -336,31 +382,68 @@ class ConnectDialog(QDialog):
             it = self.usb_list.currentItem()
             name = it.data(Qt.UserRole) if it else ""
         elif m == 1:
-            h = self.net_host.currentText().strip()
-            name = f"{h}:{self.net_port.value()}" if h else ""
+            # the endpoint it connects to: "10.0.0.7:5556" was saved as
+            # "10.0.0.7:5556:5555" while the connection went to 5556
+            name = _endpoint_name(self.net_host.currentText(), self.net_port.value())
         else:
             it = self.rem_list.currentItem()
-            h = self.rem_host.currentText().strip()
-            if it and h:
-                name = f"{it.data(Qt.UserRole)} @ {h}"
+            server = _endpoint_name(self.rem_host.currentText(), self.rem_port.value(), 5037)
+            if it and server:
+                name = f"{it.data(Qt.UserRole)} @ {server}"
         self.save_name.setText(name)
 
     # ---- shared server ----
+    def _confirm_share(self, port) -> bool:
+        from ..tools import local_adb_port
+
+        restarts = local_adb_port(port) == local_adb_port()
+        text = (
+            "Share the devices plugged into THIS PC with other machines?\n\n"
+            f"An adb server on port {port} starts listening on the network"
+            + (" (the local one restarts, so open device tabs reconnect)" if restarts else "")
+            + f", and TCP {port} + {TUNNEL_PORT_FIREWALL_RANGE} open in the Windows firewall "
+            "for Domain and Private networks (that needs Administrator)."
+            + (" It starts again at every Windows login." if self.chk_login.isChecked() else "")
+            + "\n\nThe adb server has no password: anyone who can reach this PC on "
+            "that port can control its devices. Share only on networks you trust."
+        )
+        return QMessageBox.question(
+            self, "Share this PC's devices", text,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) == QMessageBox.Yes
+
     def _start_shared(self):
         if thread_running(self._serve):
             return
+        window = self.parent()
+        busy = getattr(window, "server_busy", None)
+        if callable(busy) and busy():
+            self.rem_status.setText(
+                "The adb server is busy (a restart, a share or a tools download) — "
+                "try again once it has finished.")
+            return
+        port = self.rem_port.value()
+        # the main window's Share asks first as well; this one restarts the
+        # adb server and exposes the devices just the same
+        if not self._confirm_share(port):
+            return
         self.btn_serve.setEnabled(False)
         self.rem_status.setText("starting shared adb server here…")
-        self._serve = _ServeThread(
-            self.rem_port.value(), self.chk_login.isChecked(), self._adb_path
-        )
-        self._serve.done.connect(self._served)
-        self._serve.fail.connect(self._serve_failed)
-        self._serve.finished.connect(
-            lambda t=self._serve: self._clear_serve_thread(t)
-        )
-        park_thread(self._serve)
-        self._serve.start()
+        thread = _ServeThread(port, self.chk_login.isChecked(), self._adb_path)
+        self._serve = thread
+        thread.done.connect(self._served)
+        thread.fail.connect(self._serve_failed)
+        thread.finished.connect(lambda t=thread: self._clear_serve_thread(t))
+        park_thread(thread)
+        # The window runs it as its own Share (MainWindow.run_share_task): its
+        # poll pauses, and so do the device tabs' shells and logcats when the
+        # port is theirs.  It gives them back on `finished`, which outlives
+        # this dialog (closing it disconnects only done/fail).
+        run = getattr(window, "run_share_task", None)
+        if callable(run):
+            run(thread, port)
+        else:
+            thread.start()
 
     def _clear_serve_thread(self, thread) -> None:
         if self._serve is thread:
@@ -399,10 +482,11 @@ class ConnectDialog(QDialog):
     def _start_scan(self, host, port, on_done, status_label):
         request = (host, port, on_done, status_label)
         if thread_running(self._scan):
-            # A USB scan and a remote-server scan have different targets. Keep
-            # the newest request instead of silently leaving the new page at
+            # One scan runs at a time.  Each page keeps its newest request and
+            # they run in turn: with one request for both, a USB Refresh
+            # replaced the Remote page's queued scan, and that page stayed at
             # "scanning…" forever.
-            self._pending_scan = request
+            self._pending_scans[status_label] = request
             return
         self._launch_scan(*request)
 
@@ -428,16 +512,18 @@ class ConnectDialog(QDialog):
                 status_label.setText(f"{len(devices)} device(s)")
             else:
                 status_label.setText(error)
-        pending = self._pending_scan
-        self._pending_scan = None
-        if pending is not None and not self._closing:
+        if self._pending_scans and not self._closing:
+            # The page that asked first goes next.  Its line says "scanning…"
+            # again: a scan of that same page may have just shown its result.
+            pending = self._pending_scans.pop(next(iter(self._pending_scans)))
+            pending[3].setText("scanning…")
             self._launch_scan(*pending)
 
     def _release_threads(self):
         """Keep background QThreads alive after this short-lived dialog closes,
         but never let them call back into it."""
         self._closing = True
-        self._pending_scan = None
+        self._pending_scans.clear()
         for thread in (self._scan, self._serve):
             if thread is None:
                 continue
@@ -484,10 +570,16 @@ class ConnectDialog(QDialog):
             return
         # Remember the host once, on Connect — session() is also called by the
         # main window afterwards and must not write settings a second time.
-        if result["type"] == "network":
-            settings_mod.add_recent("recent_network_hosts", result["host"])
-        elif result["type"] == "remote":
-            settings_mod.add_recent("recent_remote_hosts", result["adb_host"])
+        try:
+            if result["type"] == "network":
+                settings_mod.add_recent("recent_network_hosts", result["host"])
+            elif result["type"] == "remote":
+                settings_mod.add_recent("recent_remote_hosts", result["adb_host"])
+        except (OSError, ValueError) as exc:
+            # Only the list of recent hosts is lost (a settings file another
+            # program keeps locked, or one that can't be read): the connection
+            # goes ahead.
+            _log.warning("could not remember the host in the recent list: %s", exc)
         self._result = result
         self.accept()
 

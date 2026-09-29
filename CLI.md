@@ -53,16 +53,20 @@ they don't need to be on your PATH.
 ## Global options
 
 These work on every device command, **before or after** the command name
-(`turboadb -s SERIAL info` and `turboadb info -s SERIAL` are the same).
+(`turboadb -s SERIAL info` and `turboadb info -s SERIAL` are the same) — but
+before the words of `shell`, `adb`, `text`, `search` and `send-sms`, which take
+everything after their first word as it is. `text`, `search` and `send-sms`
+refuse an option found among their words (it would be typed on the device);
+put `--` before the words to send them exactly as written.
 
 | Option | Meaning |
 |---|---|
 | `-s`, `--serial SERIAL` | The device: a USB serial, or `host:port` for a network device. Omit it when only one device is attached. `-s @NAME` uses a saved target (see [`targets`](#turboadb-targets)). |
 | `--adb-host HOST` | Use the adb server on another machine, to drive a device plugged into that PC (it must share its server — see [`serve`](#turboadb-serve)). |
 | `--adb-port PORT` | adb server port (default `5037`). |
-| `--adb-path PATH` | Use this adb executable. |
+| `--adb-path PATH` | Use this adb executable (or the folder that holds it). A path with no adb is an error (exit `3`); TurboADB never falls back to another adb or downloads one instead. |
 | `--scrcpy-path PATH` | Use this scrcpy executable. |
-| `--timeout SECONDS` | Timeout for each command, and for push, pull and `bugreport` too (defaults: 60 s for commands, 600 s for transfers). |
+| `--timeout SECONDS` | Timeout for each command (default 60 s) and for `bugreport` (default 15 minutes). A push or pull fails only when nothing has moved for this long (default 600 s), however long it takes in all. `0` means no limit. `shell -- COMMAND` and `adb -- ARGS` run as long as they take unless `--timeout` is given. |
 | `--json` | Machine-readable output (see below). |
 | `-V`, `--version` | Print the TurboADB version. |
 
@@ -79,21 +83,23 @@ works.
 Commands that return data print it as JSON (`devices`, `info`, `shell`, `adb`,
 `push`, `pull`, `ls`, `stat`, `packages`, `displays`, `getprop`, `battery`,
 `health`, `build-info`, `call-log`, `sms`, `phone-support`, `targets list`,
-`forward --list`, `doctor`, `fetch-tools`, `upgrade-tools` …). Actions print
-`{"ok": true, "message": "…"}`; commands that return a value (`pair`,
-`disconnect`, `restart-server`, `connect`, `scrcpy` → `{"pid": N}` …) print
-`{"ok": true, "result": …}`; commands that save a file print
-`{"ok": true, "path": "…"}`. `health --full` and `build-info --full` print
+`forward --list`, `doctor`, `fetch-tools`, `upgrade-tools`, `self-update` …).
+Actions print `{"ok": true, "message": "…"}` (so do the `targets` actions, and
+`forward` / `reverse` once Ctrl+C has removed the rule); commands that return a
+value (`pair`, `disconnect`, `restart-server`, `connect`, `scrcpy` →
+`{"pid": N}` …) print `{"ok": true, "result": …}`; commands that save a file
+print `{"ok": true, "path": "…"}`. `health --full` and `build-info --full` print
 `{"ok": true, "report": "…"}` unless `-o FILE` is given, `record` prints
-`{"ok": true, "paths": [...]}` (every part of a `--continuous` recording), and
-`logcat` streams plain lines.
+`{"ok": true, "paths": [...]}` (every part of a `--continuous` recording),
+`serve` prints `{"ok": …, "port": N, "messages": [...]}` (plus `"errors"` when a
+step failed), and `logcat` streams plain lines.
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Success. |
 | `1` | The action failed or the device refused it, an adb error, or invalid input (the reason is printed as one `ERROR:` line). |
 | `2` | Wrong command-line usage (for example a missing argument). |
-| `3` | adb could not be found — run `turboadb fetch-tools` or set `TURBOADB_ADB`. |
+| `3` | adb could not be found — run `turboadb fetch-tools` or set `TURBOADB_ADB` — or `--adb-path` / `TURBOADB_ADB` names no adb (correct it). |
 | `130` | Stopped with Ctrl+C. |
 
 `shell` and `adb` exit with the device command's own exit code.
@@ -102,9 +108,10 @@ Commands that return data print it as JSON (`devices`, `info`, `shell`, `adb`,
 
 | Variable | Effect |
 |---|---|
-| `TURBOADB_ADB` | Path to the adb executable to use. |
-| `TURBOADB_SCRCPY` | Path to the scrcpy executable to use. |
+| `TURBOADB_ADB` | Path to the adb executable to use. A path that names no adb is an error (exit 3), never a reason to use or download another one. |
+| `TURBOADB_SCRCPY` | Path to the scrcpy executable to use (the same rule). |
 | `TURBOADB_AUTO_FETCH=0` | Never download adb / scrcpy automatically (offline, CI or locked-down machines). |
+| `ANDROID_ADB_SERVER_PORT` | adb's own variable: moves the local adb server off port 5037. TurboADB follows it everywhere the default port applies (its server checks, the device list and `--adb-port 5037`). |
 | `VISUAL`, `EDITOR` | The editor `turboadb edit` opens. |
 
 ---
@@ -112,8 +119,15 @@ Commands that return data print it as JSON (`devices`, `info`, `shell`, `adb`,
 ## Setup and tools
 
 ### `turboadb doctor`
-Report whether adb and scrcpy were found, and where. With `--json` it prints the
-whole diagnosis as one object.
+Report whether adb and scrcpy were found, and where; the running adb server
+(its port, adb release, protocol and executable — asked without starting one),
+with a warning when it is another adb's that TurboADB's adb would keep
+restarting; and which TurboADB runs, with a warning when this Python has a
+different copy installed (the one shortcuts and `self-update` use). When
+`TURBOADB_ADB` or `TURBOADB_SCRCPY` names no executable it says so instead of
+pointing to a download. With `--json` it prints the whole diagnosis as one
+object (`adb_server` and `turboadb` hold the new parts; `adb_error` and
+`scrcpy_error` say why such a path is not used).
 ```bash
 turboadb doctor
 turboadb doctor --json
@@ -150,11 +164,17 @@ turboadb upgrade-tools --check --json
 ```
 
 ### `turboadb self-update`
-Upgrade TurboADB itself from PyPI, then adb and scrcpy.
+Upgrade TurboADB itself from PyPI, then adb and scrcpy. pip installs exactly
+the version PyPI offers; when pip's package index (a mirror or a proxy) doesn't
+have it yet, the update fails with that reason and nothing else changes. With
+nothing newer on PyPI it only refreshes adb and scrcpy ("already up to date").
+A source checkout, even one installed with `pip install -e`, is updated with
+`git pull` instead, and the standalone executable by installing the new one.
 
 | Option | Meaning |
 |---|---|
 | `--check` | Only report whether a newer TurboADB exists. |
+| `--json` | Print `{"ok": …, "old": …, "new": …, "adb": …, "scrcpy": …, "error": …}` (or the version check, with `--check`). |
 
 ```bash
 turboadb self-update --check
@@ -162,7 +182,12 @@ turboadb self-update
 ```
 
 ### `turboadb shortcut`
-Create Desktop and Start-menu shortcuts to the GUI (Windows).
+Create Desktop and Start-menu shortcuts to the GUI (Windows). A shortcut starts
+the TurboADB installed in this Python, so when another copy runs (a source
+checkout started with `python main.py` while an older release is installed)
+nothing is changed and the reason is printed, with the fix
+(`pip install -e <checkout>`). A shortcut that could not be refreshed is an
+error, not a success.
 
 | Option | Meaning |
 |---|---|
@@ -192,9 +217,9 @@ turboadb -s @lab-pc devices
 ```
 
 ### `turboadb info`
-Connect and print the device's identity and build: manufacturer, model, Android
-version, SDK, CPU, device type (`kind`: phone, tablet, tv, watch, automotive,
-headunit), telephony and display size.
+Connect and print the device's identity and build, one `key: value` line each:
+manufacturer, model, Android version, SDK, CPU, device type (`kind`: phone,
+tablet, tv, watch, automotive, headunit), telephony and display size.
 ```bash
 turboadb -s SERIAL info
 turboadb -s SERIAL info --json
@@ -254,7 +279,10 @@ turboadb -s SERIAL wireless
 ```
 
 ### `turboadb discover`
-Find Android 11+ devices with Wireless debugging on the network (adb mDNS).
+Find Android 11+ devices with Wireless debugging on the network (adb mDNS). The
+adb server does the discovery, so with `--adb-host` (or `-s @NAME` for a saved
+remote target) it lists the devices on *that* PC's network — the server
+`--connect` then connects them through.
 
 | Option | Meaning |
 |---|---|
@@ -263,6 +291,7 @@ Find Android 11+ devices with Wireless debugging on the network (adb mDNS).
 ```bash
 turboadb discover
 turboadb discover --connect
+turboadb --adb-host lab-pc-01 discover --connect
 ```
 
 ### `turboadb stop-server`
@@ -275,7 +304,9 @@ turboadb stop-server
 
 ### `turboadb restart-server`
 Kill and start the adb server. Fixes devices that don't show up after an adb
-version mismatch.
+version mismatch. It restarts this PC's server only: with `--adb-host` it
+refuses, because adb cannot start a server on another machine (restart it
+there, for example with `turboadb serve`).
 ```bash
 turboadb restart-server
 ```
@@ -315,6 +346,9 @@ turboadb -s SERIAL ip
 Saved device targets — the same list as the GUI sidebar. Use one anywhere with
 `-s @NAME`.
 
+Every action takes `--json`: `list` prints the targets, the others
+`{"ok": …, "message": "…"}`.
+
 | Subcommand | Meaning |
 |---|---|
 | `list` | Show the saved targets (`--json` for JSON). |
@@ -340,9 +374,18 @@ turboadb targets export targets.json
 Run a command on the device. Put `--` before the command so its own options
 aren't read as TurboADB options. With no command, it opens an interactive shell.
 
+The command runs as `adb shell` runs it: its output appears as the device
+writes it (a `ping`, `top` or `logcat` streams), it reads what you type, and
+there is no time limit unless you give `--timeout`. With `--json` the output is
+collected into the one JSON document instead (60 s limit by default), as it is
+for `--all` and `--batch`. A command that runs out of time (other than in a
+`--batch`) still gets its document, with what it printed until then,
+`"timed_out": true` and the error (with `--all`, after the devices it had
+finished), and exits `1`.
+
 | Option | Meaning |
 |---|---|
-| `--su` | Run it as root (`su -c`). |
+| `--su` | Run it as root: through the device's `su` (`su -c` for Magisk and SuperSU, `su 0 sh -c` for userdebug and eng builds), or as it is when adbd already runs as root. |
 | `--all` | Run the command on every online device, one after another — on the adb server `--adb-host` or `-s @NAME` selects. |
 | `--batch FILE` | Run each line of FILE as a command, in order (blank and `#` lines are skipped). Stops at the first failing command. |
 | `--keep-going` | With `--batch`: carry on after a failing command. |
@@ -351,17 +394,25 @@ aren't read as TurboADB options. With no command, it opens an interactive shell.
 ```bash
 turboadb -s SERIAL shell
 turboadb -s SERIAL shell -- getprop ro.build.version.release
+turboadb -s SERIAL shell -- ping 8.8.8.8
 turboadb -s SERIAL shell --su -- "cat /data/misc/file"
 turboadb shell --all -- getprop ro.product.model
 turboadb -s SERIAL shell --batch setup.txt --keep-going
 ```
 
 ### `turboadb adb`
-Run any adb command for the selected device, with `-s`, `--adb-host` and the
-timeout added for you. Everything after `--` goes to adb.
+Run any adb command for the selected device, with `-s` and `--adb-host` added
+for you. Everything after `--` goes to adb, which runs attached to your console
+as it does on its own: output streams (`logcat`, a long `install`,
+`wait-for-device`), `exec-out` output redirected to a file stays byte-exact, and
+`adb -- shell` is interactive. `--timeout` ends it after that many seconds;
+without it there is no limit. With `--json` the output is collected into one
+document instead; one that runs out of time keeps what it printed until then,
+with `"timed_out": true` and the error, and exits `1`.
 ```bash
 turboadb -s @bench adb -- get-devpath
 turboadb --adb-host lab-pc-01 -s DEVICE adb -- shell ls /sdcard
+turboadb -s SERIAL adb -- exec-out screencap -p > screen.png
 ```
 
 ### `turboadb logcat`
@@ -369,24 +420,33 @@ Stream logcat live, with filters, and save it to a file.
 
 | Option | Meaning |
 |---|---|
-| `--tag TAG` | Only this tag. |
+| `--tag TAG` | Only this tag, or several separated by commas (`ActivityManager,CarService`). Tags are matched exactly and are case-sensitive; every other tag is silenced. |
 | `--priority P` | Minimum level: `V`, `D`, `I`, `W`, `E` or `F`. |
-| `--filter TAG:LEVEL` | A logcat filter spec, for example `ActivityManager:I`; repeat for several. Replaces `--tag` and `--priority`. |
+| `--filter TAG:LEVEL` | A logcat filter spec, for example `ActivityManager:I`; repeat for several. Replaces `--tag` and `--priority`. As in logcat itself, specs don't silence the other tags: add `--filter '*:S'` to see only the tags you listed. |
 | `--buffer NAME` | Buffer to read (`main`, `system`, `crash`, `radio`, `events`); repeat for several. |
 | `--crashes` | Crashes and errors only: the `crash`, `main` and `system` buffers at level `E`. |
+| `--pid PID` | Only the lines of this process (Android 7 and later). |
+| `--package NAME` | Only the lines of this app. Its running process is looked up once, when the stream starts, so restart the command after the app restarts. |
 | `--format FORMAT` | Output format (default `threadtime`). |
-| `--grep REGEX` | Print only lines matching this regular expression (case-insensitive). |
-| `--match REGEX` | Count lines matching this regular expression, and report the total at the end. |
-| `--stop-on-match` | Stop at the first line matching `--match`. |
+| `--grep REGEX` | Print only lines matching this regular expression (case-insensitive). adb's own error messages are never hidden. |
+| `--match REGEX` | Count lines matching this regular expression (case-sensitive), and report the total at the end, after Ctrl+C too. |
+| `--stop-on-match` | Stop at the first line matching `--match` (needs `--match`). |
 | `--save FILE` | Also write the lines to a file. |
-| `--clear` | Clear the buffers first. |
+| `--clear` | Clear the buffers first (only once every option has been accepted). |
 | `--dump` | Print the current buffer and exit instead of streaming. |
-| `--tail N` | Only the last N lines: with `--dump` the last N buffered lines; otherwise the live stream starts there. |
+| `--tail N` | Only the last N lines (N is at least 1): with `--dump` the last N buffered lines; otherwise the live stream starts there. |
+
+Every line is written out as it arrives, so piping into `findstr`, `grep` or
+`tee`, or redirecting to a file, shows lines live; when the reader stops early
+(`| head`), `logcat` ends quietly. If adb or logcat itself fails (the device is
+offline, a buffer doesn't exist), `logcat` prints the reason as an `ERROR:` line
+and exits with `1`, even when `--grep` matched nothing.
 
 ```bash
 turboadb -s SERIAL logcat --tag ActivityManager --priority W
-turboadb -s SERIAL logcat --filter ActivityManager:I --filter CarService:D
+turboadb -s SERIAL logcat --filter ActivityManager:I --filter CarService:D --filter '*:S'
 turboadb -s SERIAL logcat --crashes --dump
+turboadb -s SERIAL logcat --package com.example.app --priority W
 turboadb -s SERIAL logcat --grep "bluetooth|a2dp" --save bt.log
 turboadb -s SERIAL logcat --match "ANR|FATAL" --stop-on-match
 turboadb -s SERIAL logcat --dump --tail 500
@@ -400,7 +460,7 @@ turboadb -s SERIAL logcat-clear
 
 ### `turboadb bugreport`
 Capture a full `adb bugreport`. It is slow — a few minutes is normal. `--timeout`
-sets how long it may take (default 15 minutes).
+sets how long it may take (default 15 minutes; `0` for no limit).
 
 | Argument | Meaning |
 |---|---|
@@ -483,8 +543,13 @@ turboadb -s SERIAL mv /sdcard/clip.mp4 /sdcard/Movies
 ```
 
 ### `turboadb cp`
-Copy a device file or folder. Into an existing folder, it merges; a folder is
-never copied into itself.
+Copy a device file or folder. When the destination is an existing folder, the
+item is copied into it: a folder of the same name there is merged into, and a
+file of the same name is replaced. A folder is never copied into itself (not
+through a symlinked path either). A symbolic link is copied as a link, not what
+it points to, and never over an item that is already there. An item of another
+kind is never overwritten: a file is not copied over a folder, nor a folder over
+a file.
 ```bash
 turboadb -s SERIAL cp /sdcard/config.xml /sdcard/config.bak
 turboadb -s SERIAL cp /sdcard/DCIM /sdcard/Backup
@@ -504,7 +569,7 @@ access to the file (for system files: `root` and `remount` first).
 
 | Option | Meaning |
 |---|---|
-| `--editor COMMAND` | The editor (default `$VISUAL`, then `$EDITOR`, else Notepad on Windows and `vi` elsewhere). The editor must wait until the file is closed (for VS Code: `"code --wait"`). |
+| `--editor COMMAND` | The editor (default `$VISUAL`, then `$EDITOR`, else Notepad on Windows and `vi` elsewhere). The editor must wait until the file is closed (for VS Code: `"code --wait"`). The program is found on PATH as a console finds it (on Windows `code` is `code.cmd`), and a quoted path may contain spaces (`"\"C:\Program Files\Sublime Text\subl.exe\" -w"`). An editor that can't be found is reported before the file is pulled. |
 
 ```bash
 turboadb -s SERIAL edit /data/local/tmp/config.ini
@@ -757,7 +822,9 @@ turboadb -s SERIAL key 26          # KEYCODE_POWER by number
 ```
 
 ### `turboadb text`
-Type text into the focused field.
+Type text into the focused field. Options go before the text: an option among
+the words (`text hello --display 2`) is refused rather than typed, and `--`
+before the text types it exactly as written.
 
 | Option | Meaning |
 |---|---|
@@ -765,6 +832,8 @@ Type text into the focused field.
 
 ```bash
 turboadb -s SERIAL text "hello world"
+turboadb -s SERIAL text --display 2 hello
+turboadb -s SERIAL text -- --verbose
 turboadb -s SERIAL key enter
 ```
 
@@ -801,7 +870,12 @@ loop **on the device**, so no tap waits for the PC.
 picks when the adb shell may write to it (`turboadb touch-device` says whether
 it may; `adb root` usually makes it writable). Otherwise the burst uses the
 device's `input` tool, which works everywhere but starts a JVM per tap — about
-ten taps a second.
+ten taps a second. A touchscreen keeps reporting in its own orientation, so on
+a turned display (a phone in landscape) `auto` uses `input`, and `events` turns
+the point the way Android turns the panel's reports.
+
+The burst keeps going as long as the device reports progress, however slow each
+tap is; `--timeout` caps the whole burst.
 
 ```bash
 turboadb -s SERIAL tap-burst 540 1200 --count 5000
@@ -927,7 +1001,8 @@ turboadb -s SERIAL open youtube
 ```
 
 ### `turboadb search`
-Search the web in the browser.
+Search the web in the browser. As for [`text`](#turboadb-text), options go
+before the query, and `--` sends it exactly as written.
 ```bash
 turboadb -s SERIAL search "nearest charger"
 ```
@@ -968,7 +1043,7 @@ A one-shot health snapshot: battery, temperature, memory, CPU and uptime.
 | Option | Meaning |
 |---|---|
 | `--full` | The detailed report, with the raw system dumps. |
-| `-o`, `--output FILE` | Save the `--full` report to a file. |
+| `-o`, `--output FILE` | Save the `--full` report to a file (only with `--full`). |
 | `--json` | The snapshot as data, or with `--full` the report as `{"ok": true, "report": "…"}` (or `{"ok": true, "path": "…"}` with `-o`). |
 
 ```bash
@@ -983,7 +1058,7 @@ Build and version properties.
 | Option | Meaning |
 |---|---|
 | `--full` | The detailed report, with every property. |
-| `-o`, `--output FILE` | Save the `--full` report to a file. |
+| `-o`, `--output FILE` | Save the `--full` report to a file (only with `--full`). |
 | `--json` | The properties as data, or with `--full` the report as `{"ok": true, "report": "…"}` (or `{"ok": true, "path": "…"}` with `-o`). |
 
 ```bash
@@ -1056,6 +1131,8 @@ turboadb -s SERIAL sms --limit 10 --json
 
 ### `turboadb send-sms`
 Open the Messages app with a draft to a number; you press Send on the device.
+As for [`text`](#turboadb-text), options go before the message, and `--` sends
+it exactly as written.
 ```bash
 turboadb -s SERIAL send-sms 1800123456 "on my way"
 ```
@@ -1174,7 +1251,8 @@ turboadb -s SERIAL reboot recovery
 
 ### `turboadb forward`
 `adb forward LOCAL REMOTE`. It stays active until you press Ctrl+C, which removes
-it; `--no-wait` leaves it in place and exits.
+it; `--no-wait` leaves it in place and exits. With `--json` the "active" notice
+goes to stderr and the one document is printed once the rule is removed.
 
 | Option | Meaning |
 |---|---|
@@ -1193,7 +1271,7 @@ turboadb -s SERIAL forward --remove tcp:9222
 
 ### `turboadb reverse`
 `adb reverse REMOTE LOCAL`. It stays active until you press Ctrl+C, which removes
-it; `--no-wait` leaves it in place and exits.
+it; `--no-wait` leaves it in place and exits. `--json` works as for `forward`.
 
 | Option | Meaning |
 |---|---|
@@ -1215,21 +1293,26 @@ turboadb -s SERIAL reverse --remove-all
 ### `turboadb serve`
 Share this PC's adb server on the network so other machines can drive its
 devices (`--adb-host` on their side). Opens the firewall ports, which needs
-Administrator; what it could not do is reported on stderr and exits `1`.
+Administrator; what it could not do is reported on stderr and exits `1`. The
+adb server has no password, so the firewall rules cover Domain and Private
+networks only.
 
 `serve` never downloads adb by itself: the startup task runs it as SYSTEM, where
 a download would put a second adb in another profile and bind port 5037 with it.
-Run `turboadb fetch-tools` (or set `TURBOADB_ADB`) if adb is missing there.
+Run `turboadb fetch-tools` (or set `TURBOADB_ADB`) if adb is missing there. The
+startup task and the login launcher run the same adb the server was started
+with (`--adb-path`, or the one TurboADB finds), so they never replace it with
+another version.
 
 | Option | Meaning |
 |---|---|
-| `--port PORT` | adb server port (default `5037`). |
+| `--port PORT` | adb server port (default: `--adb-port`, which is `5037` unless given). |
 | `--startup-task` | Keep sharing across reboots with a headless SYSTEM startup task. |
 | `--install-startup` | Start sharing at login instead. |
 | `--uninstall-startup` | Remove the auto-start again. |
 | `--status` | Report whether the adb server is shared. |
 | `--stop` | Stop sharing and go back to a local-only adb server. |
-| `--json` | With `--status`, print `{"port": …, "shared": …}`. |
+| `--json` | Print `{"ok": …, "port": …, "messages": [...]}` (and `"errors"` for a step that failed), or with `--status` `{"port": …, "shared": …}`. |
 
 ```bash
 turboadb serve

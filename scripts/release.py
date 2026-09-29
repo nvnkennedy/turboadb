@@ -16,7 +16,12 @@ Usage
 
 The wheel bundles the Windows GUI executable (turboadb/bin/turboadb-gui.exe). It
 is copied from dist/TurboADB-<version>-win64.exe, which scripts/build_exe.py
-builds first when dist/ has none for the release version.
+builds first when dist/ has none for the release version, or when the sources
+changed after it was built.
+
+CHANGELOG.md must have a ``## <version>`` section for the new version (the
+GitHub Release is written from it): without one the release stops before
+anything runs, and a --dry-run warns.
 
 The PyPI token is read from the environment, never hard-coded:
     TWINE_USERNAME=__token__   (default if unset)
@@ -82,26 +87,31 @@ def newest_source_mtime() -> float | None:
     return newest
 
 
-def exe_is_stale(exe: Path) -> bool:
+def exe_is_stale(exe: Path, newest: float | None = None) -> bool:
     """True when *exe* predates the sources it was built from.
 
     Matching only on the file NAME meant a rebuilt release could ship the binary
-    from an earlier build of the same version number."""
+    from an earlier build of the same version number. *newest* is the sources'
+    newest mtime (read now when not given); :func:`main` reads it BEFORE the
+    version bump, which rewrites turboadb/__init__.py and would otherwise make
+    every exe look stale — the exe that was built and tested was then always
+    thrown away and rebuilt."""
     try:
         built = exe.stat().st_mtime
     except OSError:
         return True
-    newest = newest_source_mtime()
+    if newest is None:
+        newest = newest_source_mtime()
     return newest is not None and newest > built
 
 
-def bundle_exe(version: str, rebuild: bool = False) -> Path:
+def bundle_exe(version: str, rebuild: bool = False, sources_mtime: float | None = None) -> Path:
     """Copy this version's Windows executable into the package so the wheel
     ships it, building the executable first when dist/ has none, when it is
     older than the sources under turboadb/ or scripts/ (or the spec file), or
-    when *rebuild* is set."""
+    when *rebuild* is set. *sources_mtime* is :func:`exe_is_stale`'s *newest*."""
     exe = release_exe(version)
-    if not rebuild and exe.is_file() and exe_is_stale(exe):
+    if not rebuild and exe.is_file() and exe_is_stale(exe, sources_mtime):
         print(f"  {exe.name} is older than the sources — rebuilding")
         rebuild = True
     if rebuild or not exe.is_file():
@@ -154,8 +164,35 @@ def set_version(path: Path, pattern: str, new: str, label: str) -> None:
     new_text, n = re.subn(pattern, lambda m: m.group(0).replace(m.group(1), new), text, count=1)
     if n != 1:
         sys.exit(f"Could not update version in {label}")
-    path.write_text(new_text, encoding="utf-8")
+    if new_text != text:  # an unchanged file keeps its mtime (see exe_is_stale)
+        path.write_text(new_text, encoding="utf-8")
     print(f"  {label}: -> {new}")
+
+
+def _release_notes_module():
+    """scripts/release_notes.py, loaded from beside this script (it is a script,
+    not an importable package)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("release_notes.py")
+    spec = importlib.util.spec_from_file_location("turboadb_release_notes", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def missing_release_notes(version: str) -> str | None:
+    """Why CHANGELOG.md has no ``## <version>`` section, or None when it has one.
+
+    The test suite runs before the bump, so it checks the OLD version's notes;
+    without this, a release with no notes reached PyPI and only then failed in
+    the Release workflow (whose GitHub Release is built from these notes)."""
+    try:
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        _release_notes_module().changelog_section(text, version)
+    except (OSError, ValueError) as exc:
+        return f"{exc}: add a '## {version}' section to CHANGELOG.md"
+    return None
 
 
 def main(argv=None) -> int:
@@ -184,6 +221,17 @@ def main(argv=None) -> int:
     cur = current_version()
     new = resolve_target(args.version, cur)
     print(f"Current version: {cur}\nNew version:     {new}")
+    # Checked before anything runs: a release without notes must not reach PyPI.
+    # A dry run only warns (at the start and again at the end), so it can still
+    # bump and build a version whose notes are yet to be written.
+    no_notes = missing_release_notes(new)
+    if no_notes and not args.dry_run:
+        sys.exit(no_notes)
+    if no_notes:
+        print(f"  WARNING: {no_notes} before the real release.")
+    # Read before the bump: rewriting the version makes turboadb/__init__.py the
+    # newest source, and the exe already built for this release looks stale.
+    sources_mtime = newest_source_mtime()
 
     if not args.skip_tests:
         run([sys.executable, "tests/test_offline.py"])
@@ -219,7 +267,7 @@ def main(argv=None) -> int:
         if args.no_exe:
             (ROOT / BUNDLED_EXE).unlink(missing_ok=True)
         else:
-            bundle_exe(new, rebuild=args.rebuild_exe)
+            bundle_exe(new, rebuild=args.rebuild_exe, sources_mtime=sources_mtime)
 
         run([sys.executable, "-m", "build"])
         artifacts = sorted((ROOT / "dist").glob("*.whl")) + sorted(
@@ -235,6 +283,8 @@ def main(argv=None) -> int:
 
         if args.dry_run:
             print("\n--dry-run: built and validated, skipping upload.")
+            if no_notes:
+                print(f"WARNING: {no_notes}; the real release stops until it has one.")
             return 0
 
         if "TWINE_PASSWORD" not in os.environ:
@@ -252,7 +302,8 @@ def main(argv=None) -> int:
         # SystemExit included: every sys.exit() above means nothing reached
         # PyPI, so the bump must be undone as well.
         for path, text in originals.items():
-            path.write_text(text, encoding="utf-8")
+            if path.read_text(encoding="utf-8") != text:
+                path.write_text(text, encoding="utf-8")
         print(f"\nRelease failed — version strings restored to {cur}.", file=sys.stderr)
         raise
 

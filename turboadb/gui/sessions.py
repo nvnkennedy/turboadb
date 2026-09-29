@@ -7,12 +7,14 @@ bad imported port must never make opening a device tab raise in the GUI.
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 import warnings
 from typing import Optional
 
-from ..config import user_dir, user_path
-from .settings import _atomic_write_json, _file_lock
+from ..config import user_dir, user_path, validate_port
+from .settings import _atomic_write_json, _file_lock, keep_unreadable
 
 _DIR = user_dir()
 _FILE = user_path("sessions.json")
@@ -43,17 +45,10 @@ def _text(value, field: str, *, required: bool = False) -> str:
 
 
 def _port(value, field: str, default: int) -> int:
+    """*value* checked as the engine checks every port; *default* when unset."""
     if value in (None, ""):
         return default
-    if isinstance(value, bool):
-        raise ValueError(f"{field} must be a port number")
-    try:
-        port = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a port number") from exc
-    if not 1 <= port <= 65535:
-        raise ValueError(f"{field} must be between 1 and 65535")
-    return port
+    return validate_port(value, field)
 
 
 def normalize_session(session: dict) -> dict:
@@ -111,25 +106,76 @@ def session_identity(session) -> Optional[tuple]:
     return ("usb", serial)
 
 
-def _read_file(path: str):
+def _read_file(path: str, *, io_errors: bool = False):
     """Parse the store file: ``(targets, error_text_or_None)``. Never raises —
-    an unreadable or invalid file yields no targets and a reason."""
+    an unreadable or invalid file yields no targets and a reason — except with
+    *io_errors*, when a file that could not be opened or read at all raises
+    its OSError (that says nothing about what the file holds)."""
+    sessions, unreadable, invalid = _read_parts(path, io_errors=io_errors)
+    return sessions, unreadable or invalid
+
+
+def _read_parts(path: str, *, io_errors: bool = False):
+    """:func:`_read_file` with its two kinds of error apart: ``(targets,
+    unreadable, invalid)``, where *unreadable* says why the file as a whole
+    is not a list of targets (None when it is) and *invalid* which of its
+    entries were left out (None when none was)."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw_sessions = json.load(fh)
         if not isinstance(raw_sessions, list):
             raise ValueError("sessions file must contain a list of objects")
     except FileNotFoundError:
-        return [], None
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return [], str(exc)
+        return [], None, None
+    except OSError as exc:
+        if io_errors:
+            raise
+        return [], str(exc), None
+    except (ValueError, json.JSONDecodeError) as exc:
+        return [], str(exc), None
     sessions, errors = [], []
     for index, session in enumerate(raw_sessions, start=1):
         try:
             sessions.append(normalize_session(session))
         except ValueError as exc:
             errors.append(f"entry {index}: {exc}")
-    return sessions, ("; ".join(errors) if errors else None)
+    return sessions, None, ("; ".join(errors) if errors else None)
+
+
+# A read-modify-write tries a file it could not open this often.
+_READ_ATTEMPTS = 6
+
+
+def _retry_pause(attempt: int) -> None:
+    time.sleep(0.05 * (attempt + 1))
+
+
+def _read_for_update(path: str):
+    """:func:`_read_parts` for a read-modify-write.  A file that could not be
+    opened or read at all is tried again: taken for "no targets", the write
+    after it replaced every saved target with the one being saved.  Raises
+    OSError (nothing is written) when it keeps failing."""
+    for attempt in range(_READ_ATTEMPTS):
+        try:
+            return _read_parts(path, io_errors=True)
+        except OSError as exc:
+            if attempt == _READ_ATTEMPTS - 1:
+                raise OSError(
+                    f"{path} could not be read ({exc}); the change was not saved") from exc
+            _retry_pause(attempt)
+
+
+def _keep_before_writing(path: str, error) -> None:
+    """Before *path* is written, copy it aside as ``.corrupt-<time>``
+    (:func:`keep_unreadable`) when it could not be read (*error*; None when
+    it could): the write would otherwise drop what it holds.  Raises
+    ValueError, and nothing may be written, when that copy failed."""
+    if not error:
+        return
+    backup = keep_unreadable(path, error)
+    if backup is None and os.path.exists(path):
+        raise ValueError(
+            f"{path} could not be read ({error}) or copied aside; it was left untouched")
 
 
 class SessionStore:
@@ -157,21 +203,26 @@ class SessionStore:
                 stacklevel=2,
             )
 
-    def _flush(self, removed=()):
-        """Write the store, keeping targets that appeared on disk meanwhile.
+    def _update(self, change) -> None:
+        """Apply *change* to the targets ON DISK, write them, and adopt them.
 
-        A long-running GUI holds the list it read at start-up; rewriting that
-        snapshot silently deleted every target the CLI or a second window had
-        added since. Names this store touched win, *removed* names stay deleted,
-        and everything else on disk is merged back in. The whole
-        read-merge-write runs under the same cross-process lock the settings
-        file uses."""
+        The file is the truth.  A long-running GUI holds the list it read at
+        start-up while the CLI or another window may have added, renamed or
+        deleted targets since; writing that snapshot back resurrected deleted
+        targets and reverted their edits.  *change* edits the freshly read list
+        in place, so only this call's own change is applied, and the whole
+        read-change-write runs under the cross-process lock the settings file
+        uses.  A file that can't be read is copied aside first
+        (:func:`keep_unreadable`): writing would otherwise drop what it holds.
+        One that can't even be opened (a sharing violation while a scanner has
+        it) is tried again, and never taken for "no targets"."""
         path = sessions_file()
         with _file_lock(path):
-            disk, _error = _read_file(path)
-            known = {s["name"] for s in self.sessions} | set(removed)
-            self.sessions = self.sessions + [s for s in disk if s["name"] not in known]
-            _atomic_write_json(path, self.sessions)
+            disk, unreadable, invalid = _read_for_update(path)
+            _keep_before_writing(path, unreadable or invalid)
+            change(disk)
+            _atomic_write_json(path, disk)
+            self.sessions = disk
 
     def names(self) -> list:
         return [s["name"] for s in self.sessions]
@@ -194,31 +245,28 @@ class SessionStore:
             previous_name = session.get("previous_name")
         session = normalize_session(session)
         name = session["name"]
-        if previous_name and previous_name != name:
-            old_index = next(
-                (i for i, s in enumerate(self.sessions) if s["name"] == previous_name), None
-            )
-            if old_index is not None:
-                self.sessions[old_index] = session
-                # A rename onto another existing name replaces that target.
-                self.sessions = [
-                    s for i, s in enumerate(self.sessions)
-                    if i == old_index or s["name"] != name
-                ]
-                # the old name is gone on purpose — don't merge it back in
-                self._flush(removed=(previous_name,))
-                return
-        for index, existing in enumerate(self.sessions):
-            if existing["name"] == name:
-                self.sessions[index] = session
-                self._flush()
-                return
-        self.sessions.append(session)
-        self._flush()
+        old = previous_name if previous_name and previous_name != name else None
+
+        def change(targets):
+            # The renamed entry keeps its place; when another window renamed
+            # or deleted it meanwhile, this saves under the new name instead.
+            index = next((i for i, s in enumerate(targets) if s["name"] == (old or name)), None)
+            if index is None and old:
+                index = next((i for i, s in enumerate(targets) if s["name"] == name), None)
+            if index is None:
+                targets.append(session)
+            else:
+                targets[index] = session
+            # A rename onto another existing name replaces that target.
+            targets[:] = [s for s in targets if s is session or s["name"] != name]
+
+        self._update(change)
 
     def delete(self, name: str):
-        self.sessions = [s for s in self.sessions if s["name"] != name]
-        self._flush(removed=(name,))
+        def change(targets):
+            targets[:] = [s for s in targets if s["name"] != name]
+
+        self._update(change)
 
     def find_identity(self, identity) -> Optional[dict]:
         """The first saved target pointing at *identity* (see
@@ -257,10 +305,15 @@ class SessionStore:
         Under the same lock as every save, the FILE is the truth: this store's
         own edits were all written when they were made, while another window
         or the CLI may have renamed or deleted targets since this list was
-        read — writing the old list back resurrected them.
+        read — writing the old list back resurrected them.  A file with some
+        invalid entries is handled as :meth:`save` handles it: a copy is kept
+        (``.corrupt-<time>``) and the valid targets are written back with the
+        new one.  Refusing it left every connect logging "could not be read"
+        and nothing was saved until the file was mended by hand.
 
         Raises ``ValueError`` for an invalid target, or when the file on disk
-        cannot be read: rewriting it would drop the targets it still holds.
+        is not a list of targets at all (a device that connected is no reason
+        to replace it), and OSError when it cannot be opened.
         """
         session = normalize_session(session)
         identity = session_identity(session)
@@ -268,10 +321,10 @@ class SessionStore:
         identities.update(item for item in also if item is not None)
         path = sessions_file()
         with _file_lock(path):
-            disk, error = _read_file(path)
-            if error:
+            disk, unreadable, invalid = _read_for_update(path)
+            if unreadable:
                 raise ValueError(
-                    f"{path} could not be read ({error}); it was left untouched"
+                    f"{path} could not be read ({unreadable}); it was left untouched"
                 )
             self.sessions = disk
             for existing in disk:
@@ -287,10 +340,12 @@ class SessionStore:
                         and session_identity(existing)[1] == identity[1]
                         and _NUMBERED.sub("", existing["name"]).casefold() == name
                     ):
+                        _keep_before_writing(path, invalid)
                         self.sessions[index] = dict(existing, port=session["port"])
                         _atomic_write_json(path, self.sessions)
                         return "updated", dict(self.sessions[index])
             session["name"] = self.unique_name(session["name"])
+            _keep_before_writing(path, invalid)
             self.sessions.append(session)
             _atomic_write_json(path, self.sessions)
         return "added", dict(session)
@@ -302,7 +357,13 @@ class SessionStore:
         return None if outcome == "known" else target
 
     def export_to(self, path: str) -> int:
-        """Write all saved targets to *path* as JSON. Returns the count."""
+        """Write all saved targets to *path* as JSON. Returns the count.
+
+        Exports what the file holds now (another window or the CLI may have
+        changed it since this store read it), unless it can't be read."""
+        disk, error = _read_file(sessions_file())
+        if not error:
+            self.sessions = disk
         _atomic_write_json(path, self.sessions)
         return len(self.sessions)
 
@@ -323,14 +384,15 @@ class SessionStore:
             except ValueError as exc:
                 raise ValueError(f"invalid target at entry {index}: {exc}") from exc
 
-        for session in validated:
-            name = session["name"]
-            for index, existing in enumerate(self.sessions):
-                if existing["name"] == name:
-                    self.sessions[index] = session
-                    break
-            else:
-                self.sessions.append(session)
+        def change(targets):
+            for session in validated:
+                for index, existing in enumerate(targets):
+                    if existing["name"] == session["name"]:
+                        targets[index] = session
+                        break
+                else:
+                    targets.append(session)
+
         if validated:
-            self._flush()
+            self._update(change)
         return len(validated)

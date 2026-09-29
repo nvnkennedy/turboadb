@@ -287,6 +287,19 @@ class SettingsDialog(QDialog):
         f.addRow(
             "", _hint("Choose colours in Themes. Terminal font applies to newly opened terminal tabs.")
         )
+        self.android_pty = QCheckBox("Run the Android shell on a device terminal (PTY)")
+        self.android_pty.setChecked(bool(self.cfg.get("android_shell_pty", True)))
+        f.addRow("Android shell", self.android_pty)
+        f.addRow(
+            "",
+            _hint(
+                "The device prints its own prompt, output such as ping or logcat | grep "
+                "shows as it comes, programs that wait for input work, and Stop sends "
+                "Ctrl+C. Untick for plain pipes with a TurboADB prompt, where Stop "
+                "reopens the shell. A device or adb that gives no terminal uses pipes "
+                "by itself. Applies to shells opened afterwards."
+            ),
+        )
         return w
 
     def _page_tools(self):
@@ -457,9 +470,11 @@ class SettingsDialog(QDialog):
             "Close ADB and scrcpy when TurboADB closes"
         )
         self.stop_adb_on_exit.setToolTip(
-            "On exit, close any scrcpy window TurboADB opened and stop the adb server, so "
-            "no adb daemon keeps running. A server shared with other machines "
-            "(turboadb serve) is left alone."
+            "On exit, close any scrcpy window TurboADB opened and stop the adb server "
+            "TurboADB started, so no adb daemon keeps running. A server it did not start "
+            "(Android Studio, a script, one already running) and one shared with other "
+            "machines (turboadb serve) are left alone. Untick to leave separate scrcpy "
+            "windows and the adb server running."
         )
         self.stop_adb_on_exit.setChecked(bool(self.cfg.get("stop_adb_on_exit", True)))
         v.addWidget(self.shortcut)
@@ -525,9 +540,9 @@ class SettingsDialog(QDialog):
 
     def result_settings(self) -> dict:
         """The full settings as they are now: the current file plus this
-        dialog's changes (keys it doesn't show — recent hosts, ribbon density,
-        remembered logins — are preserved, and unchanged controls never
-        overwrite newer values)."""
+        dialog's changes (keys it doesn't show — recent hosts, remembered
+        logins — are preserved, and unchanged controls never overwrite newer
+        values)."""
         out = settings_mod.load()
         out.update(self.changed_settings())
         return out
@@ -538,6 +553,7 @@ class SettingsDialog(QDialog):
                 "theme": self._selected_theme,
                 "term_font": self.font_combo.currentFont().family(),
                 "term_font_size": self.font_size.value(),
+                "android_shell_pty": self.android_pty.isChecked(),
                 "adb_path": self.adb_path.text().strip(),
                 "scrcpy_path": self.scrcpy_path.text().strip(),
                 "ffmpeg_path": self.ffmpeg_path.text().strip(),

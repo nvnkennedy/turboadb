@@ -6,13 +6,15 @@ the PC, then a JVM on the device), so the burst runs as ONE device-side loop,
 and — when the device lets the shell write to its touchscreen — sends the touch
 events themselves with ``sendevent`` instead of ``input``.
 
-Everything here is pure text/number work: parsing ``getevent -pl``, choosing the
-touchscreen, scaling PC-side pixels into the device's event units and building
-the shell loop. No adb runs from this module.
+Everything here is pure text/number work: parsing ``getevent -pl`` (and the
+panel's rotation from ``dumpsys input``), choosing the touchscreen, scaling
+PC-side pixels into the device's event units and building the shell loop. No adb
+runs from this module.
 """
 
 from __future__ import annotations
 
+import re
 from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 # Linux input event types and codes (see include/uapi/linux/input-event-codes.h)
@@ -101,16 +103,73 @@ def pick_touch_device(devices: Sequence[TouchDevice]) -> Optional[TouchDevice]:
     )[0]
 
 
-def scale_point(x: int, y: int, screen: Tuple[int, int], device: TouchDevice) -> Tuple[int, int]:
+def scale_point(x: int, y: int, screen: Tuple[int, int], device: TouchDevice,
+                rotation: int = 0) -> Tuple[int, int]:
     """Turn a point in display pixels into the touchscreen's own units.
 
     Most panels report exactly the display's resolution, but a digitiser with
     its own (often larger) grid needs the point scaled, or every tap would land
-    near the top-left corner."""
+    near the top-left corner.
+
+    *screen* is the display's current size, and *rotation* how many quarter
+    turns the input system rotates the panel's reports by (``dumpsys input``,
+    see :func:`input_rotation`). A panel reports in its own natural
+    orientation whichever way the display is turned, so a point on a rotated
+    display is turned back first — that is Android's own mapping, inverted."""
     width, height = (int(screen[0]), int(screen[1])) if screen else (0, 0)
+    turns = int(rotation or 0) % 4
+    if turns % 2:
+        width, height = height, width  # the panel's natural width and height
+    if turns == 1:
+        x, y = width - 1 - int(y), int(x)
+    elif turns == 2:
+        x, y = width - 1 - int(x), height - 1 - int(y)
+    elif turns == 3:
+        x, y = int(y), height - 1 - int(x)
     ev_x = round(x * (device.max_x + 1) / width) if width > 0 else int(x)
     ev_y = round(y * (device.max_y + 1) / height) if height > 0 else int(y)
     return (max(0, min(device.max_x, int(ev_x))), max(0, min(device.max_y, int(ev_y))))
+
+
+_ROTATION_RE = re.compile(
+    r"^\s*(?:SurfaceOrientation|InputDeviceOrientation):\s*(?:ROTATION_|Rotation)?(\d+)\s*$",
+    re.M,
+)
+
+
+def input_rotation(text: str, name: str) -> Optional[int]:
+    """How far the input system turns the touchscreen *name*'s reports, in
+    quarter turns (0-3), from ``dumpsys input``; None when it doesn't say.
+
+    This is the rotation Android itself applies to that panel's events: the
+    display's rotation, or 0 for a panel that doesn't follow it. Android 13
+    and older print ``SurfaceOrientation: 1``, Android 14 prints
+    ``InputDeviceOrientation: Rotation90``."""
+    for section in re.split(r"(?m)^\s*Device -?\d+: ", text or "")[1:]:
+        title, _sep, body = section.partition("\n")
+        if title.strip() != name:
+            continue
+        found = _ROTATION_RE.search(body)
+        if found is None:
+            return None
+        value = int(found.group(1))
+        if value in (0, 1, 2, 3):
+            return value
+        return value // 90 if value in (90, 180, 270) else None
+    return None
+
+
+def looks_rotated(screen: Tuple[int, int], device: TouchDevice) -> Optional[bool]:
+    """Whether a portrait panel sits under a landscape display (or the other
+    way round), which means the display is turned a quarter; None when the
+    panel's grid is too close to square to tell."""
+    width, height = (int(screen[0]), int(screen[1])) if screen else (0, 0)
+    panel_w, panel_h = device.max_x + 1, device.max_y + 1
+    if width <= 0 or height <= 0 or width == height:
+        return None
+    if max(panel_w, panel_h) < 1.2 * min(panel_w, panel_h):
+        return None  # a square digitiser grid says nothing about orientation
+    return (panel_w > panel_h) != (width > height)
 
 
 def tap_events(device: TouchDevice, x: int, y: int, *, tracking_id: int = 1):
@@ -167,8 +226,9 @@ def burst_script(tap_command: str, count: int, *, sleep_s: float = 0.0,
     count = max(1, int(count))
     # A tap the device refuses (no permission on the input node, a bad display
     # id) ends the burst there and then: running the whole loop out would report
-    # thousands of taps that never happened.
-    steps = [f'{tap_command} || {{ echo "tap failed"; exit 3; }}', "i=$((i+1))"]
+    # thousands of taps that never happened.  The line says how many taps were
+    # made before it (see refused_after).
+    steps = [f'{tap_command} || {{ echo "tap failed after $i taps"; exit 3; }}', "i=$((i+1))"]
     if progress_every > 0:
         steps.append(f'[ $((i % {int(progress_every)})) -eq 0 ] && echo "{marker}$i"')
     if sleep_s > 0:
@@ -186,3 +246,12 @@ def parse_progress(line: str, marker: str = "@@") -> Optional[int]:
         return int(text[len(marker):])
     except ValueError:
         return None
+
+
+_REFUSED_RE = re.compile(r"^tap failed after (\d+) taps$")
+
+
+def refused_after(line: str) -> Optional[int]:
+    """``"tap failed after 12 taps"`` (a burst's refused tap) -> 12, else None."""
+    found = _REFUSED_RE.match(line.strip())
+    return int(found.group(1)) if found else None

@@ -17,12 +17,23 @@ environment is built by the pure :func:`build_shell_env`:
   ``REG_EXPAND_SZ`` values expanded the way Windows does (``%NAME%`` only) and
   the user ``Path`` appended after the machine ``Path``.
 * ``NoDefaultCurrentDirectoryInExePath`` inherited from a launcher shell (some
-  IDE/agent terminals set it) is dropped unless the registry sets it, so
+  some IDE terminals set it) is dropped unless the registry sets it, so
   ``tool.exe`` in the current folder runs in cmd as in a normal window.
 
 Redirected pipes use the console code page, not UTF-8: PowerShell is switched to
 UTF-8 input/output at startup, cmd input is encoded in the OEM code page, and
 output is normalised to UTF-8 by :class:`OutputTranscoder`.
+
+With no console, the shells need a few stand-ins for what a console window
+gives them: Python tools run unbuffered, input lines end in LF (a CR left
+behind made ``pause`` show the prompt twice), PowerShell's ``Read-Host`` is
+replaced by one that shows its prompt, and every prompt ends with an invisible
+mark (:data:`PROMPT_MARK_RE`) that tells the terminal the shell waits for a
+command, and in which folder.  Input is written by a thread of its own, so a
+shell that does not read it never blocks the window.  Stop presses Ctrl+C in
+the shell's hidden console (:meth:`LocalShellSession.send_ctrl_c`), and ends
+the command's processes only when it ignores that
+(:meth:`LocalShellSession.kill_command`); the shell stays.
 """
 
 from __future__ import annotations
@@ -36,9 +47,12 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from collections import deque
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ..tools import find_adb, NO_WINDOW
+from .. import proctree
+from ..config import adb_server_address
+from ..tools import DEFAULT_ADB_SERVER_PORT, find_adb, NO_WINDOW
 
 # Hoisted out of the per-poll read path: ShellSession.read() runs many times
 # a second per open terminal, and re-importing these each time is wasted work.
@@ -77,6 +91,75 @@ _PS_UTF8_INIT = (
     "$global:OutputEncoding=$__tadbUtf8}catch{};"
     "Remove-Variable __tadbUtf8 -ErrorAction SilentlyContinue"
 )
+
+# Every prompt ends with this mark: an OSC string, which the console drops like
+# any other, carrying the shell's folder.  The terminal knows from it that the
+# shell waits for a command, whatever the prompt looks like (oh-my-posh, a
+# PROMPT variable).  cmd writes it through PROMPT ($E is ESC, $P the folder).
+PROMPT_MARK_RE = re.compile(r"\x1b\]7717;([^\x07\x1b]*)(?:\x07|\x1b\\)")
+_CMD_PROMPT_MARK = "$E]7717;$P$E\\"
+
+# The rest of the PowerShell init needs FullLanguage (method calls on .NET
+# types), so a ConstrainedLanguage session just keeps PowerShell's own.
+# * Read-Host: PowerShell's own never shows its prompt without a console and
+#   echoes the answer; this one writes the prompt, reads the line unechoed and
+#   still returns a SecureString for -AsSecureString.
+# * The prompt function is wrapped to end with the mark.
+_PS_READ_HOST = (
+    "function global:Read-Host{[CmdletBinding()]param("
+    "[Parameter(Position=0,ValueFromRemainingArguments=$true)]$Prompt,[switch]$AsSecureString)"
+    "if($null -ne $Prompt){[Console]::Out.Write(($Prompt -join ' ')+': ')};"
+    "[Console]::Out.Flush();$__line=[Console]::In.ReadLine();"
+    "if($AsSecureString){if($null -eq $__line){$__line=''};"
+    "ConvertTo-SecureString -String $__line -AsPlainText -Force}else{$__line}}"
+)
+_PS_PROMPT_MARK = (
+    "$global:__tadbPrompt=$function:prompt;"
+    "function global:prompt{$__p=& $global:__tadbPrompt;"
+    "([string]$__p)+[char]27+']7717;'+$PWD.ProviderPath+[char]7}"
+)
+# Width of the hidden console's buffer: PowerShell wraps formatted output
+# (Select-String matches, tables) at it, 120 columns by default.
+_PS_MIN_WIDTH = 120
+_PS_MAX_WIDTH = 1000
+
+
+def ps_buffer_width(columns: Optional[int]) -> int:
+    """The buffer width PowerShell formats to in a view *columns* wide: never
+    narrower than a console's own 120 columns, at most 1000."""
+    if columns and columns > _PS_MIN_WIDTH:
+        return min(int(columns), _PS_MAX_WIDTH)
+    return _PS_MIN_WIDTH
+
+
+def ps_resize_command(width: int) -> str:
+    """A PowerShell statement (ending in ``;``) that gives the buffer *width*
+    columns, for the terminal to put in front of the next command typed at
+    PowerShell's prompt once its view was resized."""
+    return (
+        "if($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage'){"
+        f"try{{$__tadbSize=$Host.UI.RawUI.BufferSize;$__tadbSize.Width={int(width)};"
+        "$Host.UI.RawUI.BufferSize=$__tadbSize}catch{};"
+        "Remove-Variable __tadbSize -ErrorAction SilentlyContinue};"
+    )
+
+
+def _ps_init(columns: Optional[int] = None) -> str:
+    """The script PowerShell runs at startup (after the user's profile)."""
+    full = []
+    if columns and columns > _PS_MIN_WIDTH:
+        width = min(int(columns), _PS_MAX_WIDTH)
+        full.append(
+            f"try{{$__tadbSize=$Host.UI.RawUI.BufferSize;if($__tadbSize.Width -lt {width})"
+            f"{{$__tadbSize.Width={width};$Host.UI.RawUI.BufferSize=$__tadbSize}}}}catch{{}};"
+            "Remove-Variable __tadbSize -ErrorAction SilentlyContinue;"
+        )
+    full.append("try{" + _PS_READ_HOST + "}catch{};try{" + _PS_PROMPT_MARK + "}catch{}")
+    return (
+        _PS_UTF8_INIT
+        + ";if($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage'){"
+        + "".join(full) + "}"
+    )
 
 
 def _expand(value: str, lookup_upper: Mapping[str, str]) -> str:
@@ -170,6 +253,9 @@ def build_shell_env(
     adb_exe: Optional[str] = None,
     system_root: Optional[str] = None,
     windows: bool = True,
+    adb_server_host: Optional[str] = None,
+    adb_server_port: Optional[int] = None,
+    mark_prompt: bool = False,
 ) -> Dict[str, str]:
     """Environment block for a local shell (pure; no process or registry access).
 
@@ -181,6 +267,17 @@ def build_shell_env(
     * ``PATH`` = *prepend_dirs* (ADB), the inherited ``PATH``, new registry
       entries, the Windows system folders if missing, then *append_dirs*
       (scrcpy); de-duplicated ignoring case, quotes and trailing slashes.
+    * ``PYTHONUNBUFFERED=1`` unless it is set: over a pipe Python holds its
+      output until it exits, where a console window shows every line.
+    * The device tab's adb server (*adb_server_host* / *adb_server_port*), so
+      a typed ``adb`` reaches the same server as TurboADB's own commands
+      (``ADBHandler._base`` passes ``-H``/``-P``); ``ADB_SERVER_SOCKET``, which
+      adb would prefer, is dropped then.  adb wraps
+      ``ANDROID_ADB_SERVER_ADDRESS`` into ``tcp:<host>:<port>`` itself, so it
+      gets the bare host, an IPv6 literal in brackets as for ``-H`` (see
+      ``scrcpy._server_env``).
+    * *mark_prompt*: cmd's ``PROMPT`` ends with the prompt mark
+      (:data:`PROMPT_MARK_RE`).
     """
     sep = ";" if windows else ":"
     pathmod = ntpath if windows else posixpath
@@ -213,6 +310,11 @@ def build_shell_env(
 
     def put(name: str, value: str) -> None:
         env[keys.setdefault(name.upper(), name)] = value
+
+    def drop(name: str) -> None:
+        key = keys.pop(name.upper(), None)
+        if key is not None:
+            del env[key]
 
     for name, value in base_env.items():
         upper = name.upper()
@@ -282,10 +384,23 @@ def build_shell_env(
     # console would print it.  Respect any explicit user choice.
     if get("PYTHONIOENCODING") is None and get("PYTHONUTF8") is None:
         put("PYTHONIOENCODING", "utf-8")
+    if get("PYTHONUNBUFFERED") is None:
+        put("PYTHONUNBUFFERED", "1")
+    if windows and mark_prompt:
+        prompt = get("PROMPT") or "$P$G"
+        if not prompt.endswith(_CMD_PROMPT_MARK):
+            put("PROMPT", prompt + _CMD_PROMPT_MARK)
     if serial:
         put("ANDROID_SERIAL", serial)
     if adb_exe:
         put("ADB", adb_exe)
+    if adb_server_host:
+        drop("ADB_SERVER_SOCKET")
+        put("ANDROID_ADB_SERVER_ADDRESS", adb_server_address(adb_server_host))
+        put("ANDROID_ADB_SERVER_PORT", str(adb_server_port or DEFAULT_ADB_SERVER_PORT))
+    elif adb_server_port and int(adb_server_port) != DEFAULT_ADB_SERVER_PORT:
+        drop("ADB_SERVER_SOCKET")
+        put("ANDROID_ADB_SERVER_PORT", str(adb_server_port))
     return env
 
 
@@ -327,29 +442,128 @@ def _console_codec() -> str:
     return "utf-8"
 
 
-def shell_argv(shell_type: str, system_root: Optional[str] = None) -> List[str]:
-    """Absolute shell path, so a ``cmd.exe`` beside TurboADB can't be picked."""
+def shell_argv(shell_type: str, system_root: Optional[str] = None,
+               columns: Optional[int] = None) -> List[str]:
+    """Absolute shell path, so a ``cmd.exe`` beside TurboADB can't be picked.
+
+    *columns*: the terminal's width, which PowerShell formats its output to.
+    PowerShell keeps the execution policy of this PC, as in a PowerShell
+    window: the startup script is passed with ``-Command``, which no policy
+    blocks, so ``-ExecutionPolicy Bypass`` would only have let scripts run
+    here that the policy stops everywhere else."""
     root = system_root or r"C:\Windows"
     if shell_type == "powershell":
         exe = ntpath.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         return [
             exe if os.path.isfile(exe) else "powershell.exe",
-            "-NoLogo", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", _PS_UTF8_INIT,
+            "-NoLogo", "-NoExit", "-Command", _ps_init(columns),
         ]
     exe = ntpath.join(root, "System32", "cmd.exe")
     return [exe if os.path.isfile(exe) else "cmd.exe"]
 
 
-_SPAWN_LOCK = threading.Lock()
+def _system_exe(name: str) -> str:
+    """*name* in System32 by absolute path (like the shells themselves), else
+    the bare name.  A same-named exe beside TurboADB is never picked."""
+    exe = ntpath.join(_system_root() or r"C:\Windows", "System32", name)
+    return exe if os.path.isfile(exe) else name
+
+
+def gnu_grep(env: Mapping[str, str]) -> bool:
+    """Whether the ``grep`` a shell with *env* runs is GNU grep (Git for
+    Windows, MSYS2, Cygwin), which takes ``--line-buffered``.  Runs ``grep
+    --version``: call it off the UI thread."""
+    import shutil
+
+    path = next((value for key, value in env.items() if key.upper() == "PATH"), "")
+    exe = shutil.which("grep", path=path) if path else None
+    if not exe:
+        return False
+    try:
+        out = subprocess.run(
+            [exe, "--version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=dict(env), creationflags=NO_WINDOW, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return b"GNU grep" in (out or b"")
+
+
+# Held while a shell is started and while this process is on a shell's console
+# to raise its Ctrl+C (see _console_ctrl_c).  It is the process's one console
+# lock, which scrcpy's Ctrl+Break takes too: this process can be on only one
+# other console at a time.
+_SPAWN_LOCK = proctree.CONSOLE_LOCK
+# This process ignores Ctrl+C: set once it raised one on a shell's console
+# from inside (the event reaches every process on that console, this one too).
+_ignoring_ctrl_c = False
+_CTRL_C_EVENT = 0
+_ERROR_ACCESS_DENIED = 5
+# Raises Ctrl+C on a shell's console from a short-lived helper, for a TurboADB
+# that has a console of its own (run from a terminal: AttachConsole refuses a
+# second one).  The helper ignores the Ctrl+C itself.
+_CTRL_C_HELPER = (
+    "import ctypes,sys\n"
+    "k=ctypes.windll.kernel32\n"
+    "k.FreeConsole()\n"
+    "ok=k.AttachConsole(int(sys.argv[1])) and k.SetConsoleCtrlHandler(None,1)"
+    " and k.GenerateConsoleCtrlEvent(0,0)\n"
+    "sys.exit(0 if ok else 1)\n"
+)
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+    kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    kernel32.AttachConsole.argtypes = (wintypes.DWORD,)
+    kernel32.AttachConsole.restype = wintypes.BOOL
+    kernel32.FreeConsole.restype = wintypes.BOOL
+    kernel32.GenerateConsoleCtrlEvent.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.GenerateConsoleCtrlEvent.restype = wintypes.BOOL
+    kernel32.GetStdHandle.argtypes = (wintypes.DWORD,)
+    kernel32.GetStdHandle.restype = wintypes.HANDLE
+    kernel32.SetStdHandle.argtypes = (wintypes.DWORD, wintypes.HANDLE)
+    kernel32.SetStdHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+# DLL folders kept for this process with AddDllDirectory (see _keep_dll_directory).
+_KEPT_DLL_DIRS = {}
+
+
+def _keep_dll_directory(path: str) -> None:
+    """Keep *path* on this process's DLL search path with AddDllDirectory,
+    once.  Python loads extension modules (and so their DLLs) searching those
+    folders too, so another thread that imports one while
+    :func:`_popen_clean_dll_path` has the ``SetDllDirectory`` path cleared
+    still finds TurboADB's bundled DLLs.  Unlike that path, it is not handed
+    to child processes."""
+    if path in _KEPT_DLL_DIRS:
+        return
+    add = getattr(os, "add_dll_directory", None)  # Windows, Python 3.8+
+    try:
+        _KEPT_DLL_DIRS[path] = add(path) if add is not None else None
+    except OSError:
+        _KEPT_DLL_DIRS[path] = None
 
 
 def _popen_clean_dll_path(argv, **kwargs) -> subprocess.Popen:
-    """``subprocess.Popen`` without passing on a ``SetDllDirectory`` path.
+    """``subprocess.Popen`` without passing on a ``SetDllDirectory`` path, and
+    with Ctrl+C handled normally in the child.
 
     PyInstaller's bootloader points the DLL search path at its ``_MEI…`` folder
     and Windows hands that to every child, which then loads TurboADB's bundled
     ucrtbase/VCRUNTIME140/libssl instead of its own.  The path is cleared only
-    for the duration of CreateProcess and restored for TurboADB itself.
+    for the duration of CreateProcess and restored for TurboADB itself; the
+    folder stays searchable meanwhile for other threads' imports
+    (:func:`_keep_dll_directory`).  A child also inherits "ignore Ctrl+C"
+    (from TurboADB's launcher, or set by :func:`_console_ctrl_c`), which would
+    make Stop's Ctrl+C miss the shell.
     """
     if os.name != "nt":
         return subprocess.Popen(argv, **kwargs)
@@ -357,7 +571,7 @@ def _popen_clean_dll_path(argv, **kwargs) -> subprocess.Popen:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         get_dir = kernel32.GetDllDirectoryW
         get_dir.argtypes = (wintypes.DWORD, wintypes.LPWSTR)
         get_dir.restype = wintypes.DWORD
@@ -367,15 +581,69 @@ def _popen_clean_dll_path(argv, **kwargs) -> subprocess.Popen:
         buf = ctypes.create_unicode_buffer(32768)
         saved = buf.value if get_dir(len(buf), buf) else ""
     except Exception:
-        saved = ""
-    if not saved:
         return subprocess.Popen(argv, **kwargs)
     with _SPAWN_LOCK:
-        set_dir(None)
+        if saved:
+            _keep_dll_directory(saved)
+            set_dir(None)
+        kernel32.SetConsoleCtrlHandler(None, False)
         try:
             return subprocess.Popen(argv, **kwargs)
         finally:
-            set_dir(saved)
+            if _ignoring_ctrl_c:
+                kernel32.SetConsoleCtrlHandler(None, True)
+            if saved:
+                set_dir(saved)
+
+
+def _console_ctrl_c(pid: int) -> bool:
+    """Raise Ctrl+C on the console of the shell *pid*, as pressing it in a
+    console window does: every process on that console gets it (the shell,
+    the command it runs, a pipeline's programs, a background job), never an
+    adb server (it has no console).  True when the event was raised.  Blocks
+    for a moment: call it off the UI thread.
+
+    The shells run on hidden consoles of their own (CREATE_NO_WINDOW).
+    Without a console of its own, TurboADB attaches to the shell's console
+    for the call, ignoring the Ctrl+C itself from then on; with one (a run
+    from a terminal) a helper process does it, when there is a Python to run
+    it (not in the one-file exe, which never has a console)."""
+    global _ignoring_ctrl_c
+    if os.name != "nt" or not pid:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = _kernel32()
+        with _SPAWN_LOCK:
+            std_ids = (0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4)  # STD_INPUT/OUTPUT/ERROR_HANDLE
+            saved = [kernel32.GetStdHandle(n) for n in std_ids]
+            if kernel32.AttachConsole(pid):
+                try:
+                    if not _ignoring_ctrl_c:
+                        _ignoring_ctrl_c = bool(kernel32.SetConsoleCtrlHandler(None, True))
+                    return _ignoring_ctrl_c and bool(kernel32.GenerateConsoleCtrlEvent(_CTRL_C_EVENT, 0))
+                finally:
+                    kernel32.FreeConsole()
+                    # AttachConsole may have replaced empty standard handles
+                    # with console handles that FreeConsole just invalidated.
+                    for n, handle in zip(std_ids, saved):
+                        kernel32.SetStdHandle(n, handle)
+                    # The event reaches this process too, a moment later: a
+                    # shell starting meanwhile clears "ignore" (above) only
+                    # once it has been handled.
+                    time.sleep(0.2)
+            error = ctypes.get_last_error()
+        if error != _ERROR_ACCESS_DENIED or getattr(sys, "frozen", False) or not sys.executable:
+            return False  # the shell is gone, or no helper can run
+        done = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _CTRL_C_HELPER, str(int(pid))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW, timeout=10,
+        )
+        return done.returncode == 0
+    except Exception:
+        return False
 
 
 def _incomplete_utf8_tail(buf: bytes) -> int:
@@ -452,10 +720,18 @@ class OutputTranscoder:
 class LocalShellSession:
     """Interactive subprocess session for local powershell.exe or cmd.exe."""
 
+    # Input waiting for a shell that does not read it (a command runs that
+    # never reads its input): more than this is refused, never queued forever.
+    INPUT_QUEUE_MAX = 1 << 20
+
     def __init__(self, shell_type: str = "powershell",
                  serial: Optional[str] = None,
                  cwd: Optional[str] = None,
-                 adb_path: Optional[str] = None):
+                 adb_path: Optional[str] = None,
+                 *,
+                 adb_server_host: Optional[str] = None,
+                 adb_server_port: Optional[int] = None,
+                 columns: Optional[int] = None):
         self.shell_type = shell_type.lower()
         self.serial = serial
         home = os.path.expanduser("~")
@@ -504,17 +780,29 @@ class LocalShellSession:
             adb_exe=adb_exe,
             system_root=system_root,
             windows=os.name == "nt",
+            adb_server_host=adb_server_host,
+            adb_server_port=adb_server_port,
+            mark_prompt=True,
         )
 
         console_codec = _console_codec()
         # cmd reads a pipe one byte at a time in the console code page, so
         # UTF-8 (even after chcp 65001) arrives as U+FFFD.
         self.input_encoding = "utf-8" if self.shell_type == "powershell" else console_codec
+        # Set by the owner while a program that reads UTF-8 has the input
+        # instead of the shell: an adb shell typed here, whose adb hands every
+        # byte to the device as it is (``echo café`` reached it as ``caf\x82``).
+        self.utf8_input = False
         self._transcoder = OutputTranscoder(console_codec)
 
         self._closed = False
+        # Input goes out on a writer thread of its own (see send()).
+        self._inbox = deque()
+        self._inbox_bytes = 0
+        self._inbox_cv = threading.Condition()
+        self._writer = None
         self._proc = _popen_clean_dll_path(
-            shell_argv(self.shell_type, system_root),
+            shell_argv(self.shell_type, system_root, columns=columns),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -533,23 +821,78 @@ class LocalShellSession:
         """True until :meth:`close` is called or the shell process exits."""
         return not self._closed and self._proc.poll() is None
 
-    def send(self, data: Union[str, bytes]) -> None:
-        """Write input; bytes are UTF-8 (as the console produces them)."""
-        if isinstance(data, str):
-            data = data.encode(self.input_encoding, "replace")
-        elif self.input_encoding != "utf-8" and not data.isascii():
-            data = data.decode("utf-8", "replace").encode(self.input_encoding, "replace")
-        try:
-            if self._proc and self._proc.stdin:
-                if data.endswith(b"\n") and not data.endswith(b"\r\n"):
-                    data = data[:-1] + b"\r\n"
-                self._proc.stdin.write(data)
-                self._proc.stdin.flush()
-        except Exception:
-            pass
+    def send(self, data: Union[str, bytes]) -> bool:
+        """Queue input for the shell; bytes are UTF-8 (as the console produces
+        them), and go out in :attr:`input_encoding` (UTF-8 while
+        :attr:`utf8_input` is set).  Returns at once, False when the input was
+        refused (the shell is closed, or it has not read
+        :attr:`INPUT_QUEUE_MAX` bytes queued already).
 
-    def send_line(self, line: str) -> None:
-        self.send(line + "\r\n")
+        Line breaks go out as LF.  ``pause`` or ``choice`` read one key: of a
+        CR LF the LF was left over, and cmd took it for an empty command and
+        printed its prompt twice.  Every shell and program reads a line ended
+        by LF alone (adb.exe turns CR LF into LF anyway).
+
+        A thread of this session writes the input, in order: a shell that is
+        busy with a command does not read it, and once the pipe was full a
+        write on the UI thread froze the window until the command ended."""
+        encoding = "utf-8" if self.utf8_input else self.input_encoding
+        if isinstance(data, str):
+            data = data.encode(encoding, "replace")
+        elif encoding != "utf-8" and not data.isascii():
+            data = data.decode("utf-8", "replace").encode(encoding, "replace")
+        data = data.replace(b"\r\n", b"\n")
+        proc = self._proc
+        if not data or self._closed or proc is None or proc.stdin is None:
+            return False
+        with self._inbox_cv:
+            if self._inbox_bytes + len(data) > self.INPUT_QUEUE_MAX:
+                return False
+            self._inbox.append(data)
+            self._inbox_bytes += len(data)
+            if self._writer is None:
+                self._writer = threading.Thread(
+                    target=self._write_input,
+                    args=(proc.stdin,),
+                    name="turboadb-local-shell-input",
+                    daemon=True,
+                )
+                self._writer.start()
+            self._inbox_cv.notify()
+        return True
+
+    def discard_pending_input(self) -> int:
+        """Forget input the shell has not been handed yet (Stop, close); returns
+        its size.  What is in the pipe already stays there."""
+        with self._inbox_cv:
+            dropped = self._inbox_bytes
+            self._inbox.clear()
+            self._inbox_bytes = 0
+            self._inbox_cv.notify()
+        return dropped
+
+    def _write_input(self, pipe) -> None:
+        """Writer thread: hand queued input to the shell, in order.  Ends with
+        the session, or once the shell is gone (its kill breaks a blocked write)."""
+        while True:
+            with self._inbox_cv:
+                while not self._inbox and not self._closed:
+                    self._inbox_cv.wait()
+                if not self._inbox:
+                    return
+                data = self._inbox.popleft()
+                self._inbox_bytes -= len(data)
+            try:
+                view = memoryview(data)
+                while view:
+                    written = pipe.write(view)
+                    if not written:
+                        raise OSError("the shell's input is closed")
+                    view = view[written:]
+                pipe.flush()
+            except (OSError, ValueError):
+                self.discard_pending_input()
+                return
 
     def read(self, size: int = 4096) -> bytes:
         """Available output as UTF-8, without hanging on Windows pipe buffers."""
@@ -581,56 +924,202 @@ class LocalShellSession:
         except Exception:
             return b""
 
+    def send_ctrl_c(self, on_done: Optional[Callable[["CtrlC"], None]] = None) -> bool:
+        """Press Ctrl+C in the shell's (hidden) console, without blocking.
+
+        As in a console window, the running command gets it (``ping`` prints
+        its summary), and the shell abandons the rest of the command line,
+        script or batch file (cmd then asks ``Terminate batch job (Y/N)?``).
+        Unsent input goes too.  *on_done* gets a :class:`CtrlC` on the worker
+        thread.  False when there is no running shell (or no console: not on
+        Windows)."""
+        proc = self._proc
+        if os.name != "nt" or self._closed or proc is None or proc.poll() is not None:
+            return False
+        self.discard_pending_input()
+
+        def run():
+            programs = _runs_programs(proc.pid)
+            result = CtrlC(_console_ctrl_c(proc.pid), programs)
+            if on_done is not None:
+                try:
+                    on_done(result)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, name="turboadb-local-shell-ctrl-c", daemon=True).start()
+        return True
+
+    def kill_command(self, on_done: Optional[Callable[["CommandStop"], None]] = None) -> bool:
+        """Stop the running command and keep the shell (its variables, folder
+        and history), without blocking.
+
+        Every process the shell started ends, as a console Ctrl+C would end
+        them, but never the shell, its console (``conhost.exe``) or an adb
+        server a typed ``adb`` command started (every device tab uses that
+        one).  They exit with STATUS_CONTROL_C_EXIT, so cmd prints ``^C`` and,
+        in a batch file, asks ``Terminate batch job (Y/N)?`` as for Ctrl+C.
+        Unsent input goes too.  *on_done* gets a :class:`CommandStop` on the
+        worker thread.  False when there is no running shell."""
+        proc = self._proc
+        if self._closed or proc is None or proc.poll() is not None:
+            return False
+        self.discard_pending_input()
+
+        def stop():
+            result = _kill_commands(proc.pid)
+            if on_done is not None:
+                try:
+                    on_done(result)
+                except Exception:
+                    pass
+
+        threading.Thread(target=stop, name="turboadb-local-shell-stop", daemon=True).start()
+        return True
+
     def close(self) -> None:
         """End the shell AND every command it started, without blocking.
 
         Terminating only powershell/cmd orphaned their children (``adb logcat``,
         ``ping -t`` …), which kept running invisibly.  The process-tree kill
-        runs on a daemon thread so closing a tab never waits on taskkill; the
-        pipes are closed only after the tree is gone (closing stdin first makes
-        cmd exit on EOF before its children can be enumerated).
+        runs on a daemon thread so closing a tab never waits on it; the pipes
+        are closed only after the tree is gone (closing stdin first makes cmd
+        exit on EOF before its children can be enumerated).  An adb server a
+        typed ``adb`` started lives on (see :func:`_kill_process_tree`).
         """
         if self._closed:
             return
         self._closed = True
-        threading.Thread(
-            target=_kill_process_tree,
-            args=(self._proc,),
-            name="turboadb-local-shell-close",
-            daemon=True,
-        ).start()
+        self.discard_pending_input()
+        _start_closer(_kill_process_tree, (self._proc,), "turboadb-local-shell-close")
 
-    def interrupt(self, on_done=None) -> None:
-        """Stop the local shell and every command it started, without blocking.
+    def interrupt(self) -> None:
+        """End the local shell and every command it started, without blocking:
+        Stop's last resort, when :meth:`kill_command` left the shell busy (a
+        loop inside PowerShell itself).  The widget opens a fresh shell.
 
         With redirected Windows pipes a literal Ctrl+C byte is only input; it
-        is not a console-control event.  The embedded terminal therefore ends
-        the shell process tree and its widget opens a clean replacement shell.
-
-        The tree kill (``taskkill`` plus its waits) runs on a daemon thread,
+        is not a console-control event.  The tree kill runs on a daemon thread,
         exactly like :meth:`close`: doing it inline froze the window for
-        seconds on every Ctrl+C.  *on_done* is called from that thread once the
-        kill has landed, for a widget that wants to reopen its shell only then.
+        seconds.
         """
         proc = self._proc
         if not proc or proc.poll() is not None:
-            if on_done is not None:
-                on_done()
             return
         self._closed = True
+        self.discard_pending_input()
+        _start_closer(_kill_process_tree, (proc, 1.0), "turboadb-local-shell-interrupt")
 
-        def kill():
-            try:
-                _kill_process_tree(proc, wait_s=1.0)
-            finally:
-                if on_done is not None:
-                    on_done()
 
-        threading.Thread(
-            target=kill,
-            name="turboadb-local-shell-interrupt",
-            daemon=True,
-        ).start()
+# Tree kills of closed shells still running (see join_closers).
+_CLOSERS = set()
+_CLOSERS_LOCK = threading.Lock()
+
+
+def _start_closer(target, args, name: str) -> None:
+    """Run a shell's tree kill on a daemon thread that :func:`join_closers`
+    can wait for."""
+
+    def run():
+        try:
+            target(*args)
+        finally:
+            with _CLOSERS_LOCK:
+                _CLOSERS.discard(thread)
+
+    thread = threading.Thread(target=run, name=name, daemon=True)
+    with _CLOSERS_LOCK:
+        _CLOSERS.add(thread)
+    thread.start()
+
+
+def join_closers(timeout: float = 3.0) -> int:
+    """Wait, *timeout* seconds at most in all, for the shells being closed to
+    be gone; returns how many are still going.  For the way out: a daemon
+    thread dies with the process, and a shell whose tree kill had not landed
+    yet (with its ``ping -t`` or ``adb logcat``) kept running invisibly after
+    TurboADB had closed."""
+    deadline = time.monotonic() + timeout
+    with _CLOSERS_LOCK:
+        threads = list(_CLOSERS)
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return sum(thread.is_alive() for thread in threads)
+
+
+# What a process ended by Ctrl+C exits with (0xC000013A): cmd then prints ^C
+# and, in a batch file, asks whether to end it.
+STATUS_CONTROL_C_EXIT = 0xC000013A
+
+
+class CommandStop(tuple):
+    """What :meth:`LocalShellSession.kill_command` did: :attr:`killed`, the
+    PIDs it ended (``None`` when the process table could not be read), and
+    :attr:`foreground`, whether one of them was the shell's own child."""
+
+    __slots__ = ()
+
+    def __new__(cls, killed: Optional[List[int]], foreground: bool):
+        return tuple.__new__(cls, (killed, bool(foreground)))
+
+    @property
+    def killed(self) -> Optional[List[int]]:
+        return self[0]
+
+    @property
+    def foreground(self) -> bool:
+        return self[1]
+
+
+class CtrlC(tuple):
+    """What :meth:`LocalShellSession.send_ctrl_c` did: :attr:`sent`, whether
+    the Ctrl+C was raised, and :attr:`programs`, whether the shell was
+    running programs at the time (False: the shell itself was busy, e.g.
+    waiting in ``pause``, ``set /p`` or ``Read-Host``; None: unknown)."""
+
+    __slots__ = ()
+
+    def __new__(cls, sent: bool, programs: Optional[bool]):
+        return tuple.__new__(cls, (bool(sent), programs))
+
+    @property
+    def sent(self) -> bool:
+        return self[0]
+
+    @property
+    def programs(self) -> Optional[bool]:
+        return self[1]
+
+
+def _runs_programs(pid: int) -> Optional[bool]:
+    """Whether the shell *pid* has child processes besides its console host."""
+    try:
+        procs = proctree.snapshot()
+        if procs is None:
+            return None
+        return any(info.ppid == pid and info.name != "conhost.exe"
+                   for info in proctree.descendants(pid, procs))
+    except Exception:
+        return None
+
+
+def _kill_commands(pid: int) -> CommandStop:
+    """End what the shell *pid* runs (see :meth:`LocalShellSession.kill_command`)."""
+    try:
+        procs = proctree.snapshot()
+        if procs is None:
+            return CommandStop(None, False)
+        children = {
+            info.pid for info in proctree.descendants(pid, procs)
+            if info.ppid == pid and info.name != "conhost.exe"
+        }
+        killed = proctree.kill_tree(
+            pid, include_root=False, skip_names=("conhost.exe",), procs=procs,
+            exit_code=STATUS_CONTROL_C_EXIT,
+        )
+    except Exception:
+        return CommandStop(None, False)
+    return CommandStop(killed, bool(children & set(killed or ())))
 
 
 def _close_pipes(proc) -> None:
@@ -644,24 +1133,34 @@ def _close_pipes(proc) -> None:
 
 
 def _kill_process_tree(proc, wait_s: float = 2.0) -> None:
-    """Kill *proc* and its descendants (``taskkill /T /F`` on Windows), then
-    reap it and close its pipes.  Never raises."""
+    """Kill *proc* and its descendants, then reap it and close its pipes.
+
+    An adb server that a typed ``adb`` command started is a descendant of the
+    shell; :func:`turboadb.proctree.kill_tree` spares it (``taskkill /T`` took
+    it down, and every device tab lost its shell and logcat at once).
+    taskkill, by absolute path, remains the fallback when the process table
+    can't be read.  Never raises."""
     try:
         if proc.poll() is None:
-            if os.name == "nt":
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=NO_WINDOW,
-                        timeout=max(2.0, wait_s * 1.5),
-                    )
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            else:
-                proc.terminate()
+            try:
+                killed = proctree.kill_tree(proc.pid)
+            except Exception:
+                killed = None
+            if killed is None:
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            [_system_exe("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=NO_WINDOW,
+                            timeout=max(2.0, wait_s * 1.5),
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                else:
+                    proc.terminate()
             try:
                 proc.wait(timeout=wait_s)
             except subprocess.TimeoutExpired:

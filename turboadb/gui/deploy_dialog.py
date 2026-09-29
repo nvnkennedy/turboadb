@@ -4,6 +4,8 @@ pre-flight so you can see WinRM/credential problems before deploying."""
 
 from __future__ import annotations
 
+import threading
+
 from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog,
@@ -16,12 +18,27 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QPushButton,
     QLabel,
+    QMenu,
+    QMessageBox,
     QToolButton,
     QWidget,
 )
 
 from . import settings as settings_mod
 from .icons import icon
+
+# The hosts of the last deploy: the only ones the Host(s) box starts with.
+_LAST_HOSTS = "recent_deploy_hosts"
+# A confirmation lists at most this many hosts.
+_LISTED_HOSTS = 15
+
+
+def _host_list(key: str) -> list:
+    """A list of host names from settings (a hand-edited file may hold anything)."""
+    value = settings_mod.get(key)
+    if not isinstance(value, list):
+        return []
+    return [h.strip() for h in value if isinstance(h, str) and h.strip()]
 
 
 class _TestThread(QThread):
@@ -58,6 +75,7 @@ class DeployDialog(QDialog):
         self.setWindowTitle("ADB Server — start on a remote machine")
         self.setMinimumWidth(560)
         self._test = None
+        self._pw_load = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -95,13 +113,30 @@ class DeployDialog(QDialog):
         grid.setColumnStretch(1, 1)
 
         grid.addWidget(self._lbl("Host(s)"), 0, 0, Qt.AlignRight | Qt.AlignTop)
+        hosts_row = QHBoxLayout()
+        hosts_row.setContentsMargins(0, 0, 0, 0)
+        hosts_row.setSpacing(8)
         self.hosts = QPlainTextEdit()
         self.hosts.setPlaceholderText("one per line  ·  e.g.  in-daimlerlab19")
         self.hosts.setFixedHeight(64)
-        recent = settings_mod.get("recent_remote_hosts") or []
-        if recent:
-            self.hosts.setPlainText("\n".join(recent))
-        grid.addWidget(self.hosts, 0, 1)
+        # Only the hosts of the last deploy.  The box used to start with every
+        # remote adb server ever opened from Connect, so one click on Deploy
+        # sent the admin password to all of them and installed a SYSTEM task
+        # on each; those hosts are one pick away under Recent instead.
+        last = _host_list(_LAST_HOSTS)
+        if last:
+            self.hosts.setPlainText("\n".join(last))
+        hosts_row.addWidget(self.hosts, 1)
+        self.btn_recent = QToolButton()
+        self.btn_recent.setText("Recent")
+        self.btn_recent.setProperty("role", "ghost")
+        self.btn_recent.setToolTip("Add a host you deployed to, or connected to, before")
+        self.btn_recent.setPopupMode(QToolButton.InstantPopup)
+        self._recent_menu = QMenu(self.btn_recent)
+        self._recent_menu.aboutToShow.connect(self._fill_recent)
+        self.btn_recent.setMenu(self._recent_menu)
+        hosts_row.addWidget(self.btn_recent, 0, Qt.AlignTop)
+        grid.addLayout(hosts_row, 0, 1)
 
         grid.addWidget(self._lbl("Admin user"), 1, 0, Qt.AlignRight | Qt.AlignVCenter)
         self.user = QLineEdit(settings_mod.get("deploy_user") or "")
@@ -112,8 +147,9 @@ class DeployDialog(QDialog):
         pw_row = QHBoxLayout()
         pw_row.setContentsMargins(0, 0, 0, 0)
         pw_row.setSpacing(8)
-        # pre-filled from the OS credential vault so it isn't retyped every time
-        self.pw = QLineEdit(settings_mod.deploy_password())
+        # pre-filled from the OS credential vault (see _load_password) so it
+        # isn't retyped every time
+        self.pw = QLineEdit()
         self.pw.setEchoMode(QLineEdit.Password)
         eye = QToolButton()
         eye.setText("Show")
@@ -207,11 +243,55 @@ class DeployDialog(QDialog):
         btns.addWidget(self.btn_deploy)
         btns.addWidget(cancel)
         outer.addWidget(footer)
+        if self.remember.isChecked():
+            self._load_password()
 
     @staticmethod
     def _lbl(text):
         # colour and size come from the application stylesheet
         return QLabel(text)
+
+    # ---- the remembered password, off the UI thread ----
+    def _load_password(self):
+        """Fill in the remembered password from the OS credential vault on a
+        worker thread: a locked Linux keyring waits on D-Bus (and its unlock
+        prompt), and opening this dialog froze the main window meanwhile."""
+        from .qtutil import FunctionThread, park_thread
+
+        job = FunctionThread(settings_mod.deploy_password)
+        job.done.connect(self._password_loaded)
+        park_thread(job)
+        self._pw_load = job
+        job.start()
+
+    def _password_loaded(self, value):
+        try:
+            # a password typed meanwhile (even one typed and erased) wins
+            if value and not self.pw.text() and not self.pw.isModified():
+                self.pw.setText(value)
+        except RuntimeError:  # the dialog is already gone
+            pass
+
+    # ---- recent hosts ----
+    def _fill_recent(self):
+        """The hosts of the last deploy, then those opened from Connect →
+        Remote; picking one adds it to the Host(s) box."""
+        self._recent_menu.clear()
+        seen = set()
+        for host in _host_list(_LAST_HOSTS) + _host_list("recent_remote_hosts"):
+            if host.lower() in seen:
+                continue
+            seen.add(host.lower())
+            action = self._recent_menu.addAction(host)
+            action.triggered.connect(lambda _checked=False, h=host: self._add_host(h))
+        if not seen:
+            self._recent_menu.addAction("(no recent hosts)").setEnabled(False)
+
+    def _add_host(self, host):
+        hosts = self.values()["hosts"]
+        if host.lower() in (h.lower() for h in hosts):
+            return
+        self.hosts.setPlainText("\n".join(hosts + [host]))
 
     # ---- validation + values ----
     def values(self) -> dict:
@@ -263,26 +343,59 @@ class DeployDialog(QDialog):
 
     def _save_credentials(self):
         """Persist (or forget) the admin login per the Remember checkbox —
-        user in settings.json, password in the OS credential vault only."""
+        user in settings.json, password in the OS credential vault only —
+        and the hosts of this deploy, the next one's starting list."""
         v = self.values()
         remember = self.remember.isChecked()
         try:
-            settings_mod.update(
-                {"deploy_remember": remember, "deploy_user": v["user"] if remember else ""}
-            )
+            settings_mod.update({
+                "deploy_remember": remember,
+                "deploy_user": v["user"] if remember else "",
+                _LAST_HOSTS: v["hosts"],
+            })
         except (OSError, ValueError) as exc:
             self._append(f"[WARNING] could not remember the login: {exc}")
-        # the password lives only in the OS vault ("" deletes it)
-        settings_mod.set_deploy_password(v["password"] if remember else "")
+        # The password lives only in the OS vault ("" deletes it), written on
+        # a thread of its own: like the read, the write can wait on a locked
+        # keyring, and the deploy it precedes must not.
+        threading.Thread(
+            target=settings_mod.set_deploy_password,
+            args=(v["password"] if remember else "",),
+            name="turboadb-keyring",
+            daemon=True,
+        ).start()
+
+    def _confirm_hosts(self, hosts) -> bool:
+        """For more than one host, list them and ask first: the Host(s) box
+        shows only three lines, and every host listed gets the admin password,
+        a restarted adb server and a SYSTEM startup task."""
+        if len(hosts) < 2:
+            return True
+        shown = "\n".join(f"• {h}" for h in hosts[:_LISTED_HOSTS])
+        if len(hosts) > _LISTED_HOSTS:
+            shown += f"\n… and {len(hosts) - _LISTED_HOSTS} more"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Deploy to several hosts")
+        box.setText(f"Deploy to these {len(hosts)} hosts?\n\n{shown}")
+        box.setInformativeText(
+            "On each one TurboADB signs in with the admin account, restarts the "
+            "adb server and installs a startup task that runs as SYSTEM.")
+        deploy = box.addButton(f"Deploy to {len(hosts)} hosts", QMessageBox.AcceptRole)
+        box.setDefaultButton(box.addButton(QMessageBox.Cancel))
+        box.exec_()
+        return box.clickedButton() is deploy
 
     def done(self, result):
-        # A WinRM test can outlive the dialog; keep the thread alive but never
-        # let it call back into a closed dialog.
+        # A WinRM test (or the vault read) can outlive the dialog; keep the
+        # thread alive but never let it call back into a closed dialog.
         from .qtutil import disconnect_signals, park_thread, thread_running
 
         if thread_running(self._test):
             disconnect_signals(self._test, ("line", "done"))
             park_thread(self._test)
+        if thread_running(self._pw_load):
+            disconnect_signals(self._pw_load)
         super().done(result)
 
     def _on_deploy(self):
@@ -290,13 +403,15 @@ class DeployDialog(QDialog):
         if prob:
             self._append(f"[WARNING] {prob}")
             return
+        if not self._confirm_hosts(self.values()["hosts"]):
+            return
         self._save_credentials()
         self.accept()
 
     def _append(self, text):
-        # strip the [LEVEL] tag for the compact in-dialog view
-        import re
+        # the message without its [LEVEL] tag, read as the log panel reads it
+        from .log_panel import classify
 
-        self.status.appendPlainText(re.sub(r"^\[(OK|ERROR|WARNING|INFO)\]\s*", "", text))
+        self.status.appendPlainText(classify(text)[1])
         sb = self.status.verticalScrollBar()
         sb.setValue(sb.maximum())

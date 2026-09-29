@@ -265,6 +265,12 @@ def sms_row(d: dict) -> dict:
     }
 
 
+def _same_row(a: dict, b: dict) -> bool:
+    """Whether two list rows (:func:`call_row` / :func:`sms_row`) show the
+    same call or message."""
+    return all(a.get(key) == b.get(key) for key in ("kind", "number", "when", "detail", "body"))
+
+
 def _text_width(fm, text) -> int:
     try:
         return fm.horizontalAdvance(text)
@@ -594,9 +600,13 @@ class PhonePanel(QWidget):
     PAGE_CALLS = 0
     PAGE_MESSAGES = 1
 
-    def __init__(self, handler, parent=None):
+    def __init__(self, handler, parent=None, *, adb_gate=None):
+        """*adb_gate* (optional, from the device tab) has ``wrap(fn)``: device
+        jobs then wait for one of the tab's adb slots before starting adb, so
+        opening or refreshing the page never forks a burst of adb processes."""
         super().__init__(parent)
         self.handler = handler
+        self._adb_gate = adb_gate
         self._jobs = []
         self._closed = False
         self._loaded = False  # load lazily on first view (keeps connect fast)
@@ -604,6 +614,11 @@ class PhonePanel(QWidget):
         self._call_state = None
         self._state_busy = False
         self._generation = {"calls": 0, "sms": 0}
+        # One call-log and one messages query at a time: a load asked for while
+        # one runs (Refresh clicked again) runs once, when that one ends.
+        self._loading = {"calls": False, "sms": False}
+        self._reload = {"calls": False, "sms": False}
+        self._support_busy = False
         self._warned = {"state": None, "calls": None, "sms": None}
         self._counts = {"calls": None, "sms": None}
         # What the device offers (phone_support): None until checked.
@@ -617,6 +632,11 @@ class PhonePanel(QWidget):
         self._link_busy = False
         self._link_reload = False
         self._link_checked_at = None
+        # The recipient box holds a number the user typed (a message picked in
+        # the list no longer replaces it), and a list is being refilled (the
+        # selection it restores is not the user's pick).
+        self._to_typed = False
+        self._refilling = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -967,6 +987,7 @@ class PhonePanel(QWidget):
         self.sms_to.setMinimumWidth(120)
         self.sms_to.setMaximumWidth(200)
         self.sms_to.textChanged.connect(lambda _t: self._sync_actions())
+        self.sms_to.textEdited.connect(self._on_to_edited)
         self.sms_body = QLineEdit()
         self.sms_body.setPlaceholderText("Message…")
         self.sms_body.addAction(cached_icon("message", "dim"), QLineEdit.LeadingPosition)
@@ -1174,13 +1195,13 @@ class PhonePanel(QWidget):
         if self._needs_phone():
             return
         self._action("answer", lambda h: h.answer_call(safe=True), "[OK] Answer sent",
-                     then_state=True, expected_without_telephony=True)
+                     then_state=True, expected_without_telephony=True, gated=False)
 
     def _end_call(self):
         if self._needs_phone():
             return
         self._action("end call", lambda h: h.end_call(safe=True), "[OK] End call sent",
-                     then_state=True, expected_without_telephony=True)
+                     then_state=True, expected_without_telephony=True, gated=False)
 
     def use_number(self, number):
         """Fill the dialler with *number* (never places the call)."""
@@ -1215,11 +1236,23 @@ class PhonePanel(QWidget):
             self.log.emit(f"[OK] Copied {row['number']}")
 
     def compose_to(self, number):
+        """Write to *number* (Reply, "Message…"): it replaces whatever the
+        recipient box held, typed or not."""
         self.show_page(self.PAGE_MESSAGES)
+        self._to_typed = False
         self.sms_to.setText(str(number or "").strip())
         self.sms_body.setFocus()
 
+    def _on_to_edited(self, text):
+        # a number typed in (or pasted) stays until the box is emptied again
+        self._to_typed = bool(text.strip())
+
     def _on_sms_selected(self, current, _previous=None):
+        """A message picked in the list fills the recipient box, unless the
+        user typed a number there: a list refilled by a refresh, or the first
+        row Qt makes current when the list gets the focus, overwrote it."""
+        if self._refilling or self._to_typed:
+            return
         data = current.data(ROW_ROLE) if current is not None else None
         if isinstance(data, dict) and is_callable(data.get("number")):
             self.sms_to.setText(data["number"])
@@ -1266,14 +1299,18 @@ class PhonePanel(QWidget):
         )
 
     # ----------------------------------------------------------------- jobs
+    def _device_job(self, fn):
+        return self._adb_gate.wrap(fn) if self._adb_gate is not None else fn
+
     def _action(self, label, fn, ok_text, *, then_state=False,
-                expected_without_telephony=False):
+                expected_without_telephony=False, gated=True):
         """Run one device action on a worker and report the outcome.
 
         *expected_without_telephony* marks an action (Answer / End) that is
         offered on purpose even where there is no call state: a device that has
         nothing to answer is a normal condition, so it is reported as a hint
-        instead of an error the user has to investigate.
+        instead of an error the user has to investigate. *gated* False: the
+        action takes no adb slot (a call key must not wait behind a listing).
         """
         if self._closed:
             return
@@ -1299,7 +1336,10 @@ class PhonePanel(QWidget):
             else:
                 self.log.emit(f"[ERROR] {label}: {message}")
 
-        run_job(self._jobs, lambda: unwrap(fn(handler)), done, failed)
+        def job():
+            return unwrap(fn(handler))
+
+        run_job(self._jobs, self._device_job(job) if gated else job, done, failed)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1326,12 +1366,15 @@ class PhonePanel(QWidget):
         self._loaded = True
         probe = getattr(self.handler, "phone_support", None)
         if self._support is None and callable(probe):
+            if self._support_busy:
+                return  # the check that is running loads the page when it answers
             # First find out what the device has: a customised head unit may have
             # no dialler, no call log and no telephony, none of which is an error.
+            self._support_busy = True
             self._set_state("checking")
             run_job(
                 self._jobs,
-                lambda: unwrap(probe(safe=True)),
+                self._device_job(lambda: unwrap(probe(safe=True))),
                 self._support_loaded,
                 lambda _message: self._support_loaded(None),
             )
@@ -1375,6 +1418,7 @@ class PhonePanel(QWidget):
         self._state_soon.stop()
         for key in ("calls", "sms"):
             self._generation[key] += 1  # drop answers still on their way
+            self._reload[key] = False  # ...and ask nothing more
             self._counts[key] = None
             self._warned[key] = None
         self._set_state("no phone", tip=_TIP_NO_PHONE)
@@ -1425,7 +1469,7 @@ class PhonePanel(QWidget):
         # log as an engine error.
         run_job(
             self._jobs,
-            lambda: _unwrap_flag(probe(safe=False)),
+            self._device_job(lambda: _unwrap_flag(probe(safe=False))),
             self._link_checked,
             lambda _message: self._link_checked(None),
         )
@@ -1451,6 +1495,7 @@ class PhonePanel(QWidget):
             self._update_link_poll()
 
     def _support_loaded(self, info):
+        self._support_busy = False
         if self._closed:
             return
         self._apply_support(info)
@@ -1518,7 +1563,7 @@ class PhonePanel(QWidget):
         handler = self.handler
         run_job(
             self._jobs,
-            lambda: unwrap(handler.call_state(safe=True)),
+            self._device_job(lambda: unwrap(handler.call_state(safe=True))),
             self._state_loaded,
             self._state_failed,
         )
@@ -1558,17 +1603,30 @@ class PhonePanel(QWidget):
 
     def _load(self, key, fn, on_done, on_failed):
         self._generation[key] += 1
+        if self._loading[key]:
+            # Ten Refresh clicks used to start ten queries per list at once.
+            self._reload[key] = True  # asked again when the running one ends
+            return
+        self._loading[key] = True
+        self._reload[key] = False
         generation = self._generation[key]
         handler = self.handler
 
-        def current(g=generation):
-            return not self._closed and g == self._generation[key]
+        def finished(callback, value, g=generation):
+            self._loading[key] = False
+            if self._closed:
+                return
+            if self._reload[key]:
+                # a newer load was asked for meanwhile: this answer is stale
+                (self._load_calls if key == "calls" else self._load_sms)()
+            elif g == self._generation[key]:
+                callback(value)
 
         run_job(
             self._jobs,
-            lambda: _unwrap_rows(fn(handler)),
-            lambda rows: on_done(rows) if current() else None,
-            lambda message: on_failed(message) if current() else None,
+            self._device_job(lambda: _unwrap_rows(fn(handler))),
+            lambda rows: finished(on_done, rows),
+            lambda message: finished(on_failed, message),
         )
 
     def _load_calls(self):
@@ -1591,22 +1649,35 @@ class PhonePanel(QWidget):
         self._load("sms", lambda h: h.sms_list(limit, safe=safe),
                    self._fill_sms, self._sms_failed)
 
-    @staticmethod
-    def _fill(view, rows, make_row):
-        view.clear()
-        for d in rows:
-            data = make_row(d)
-            item = QListWidgetItem(f"{data['label']} — {data['title']} — {data['when']}")
-            item.setData(ROW_ROLE, data)
-            tip = f"{data['label']} · {data['title']}"
-            if data["when"]:
-                tip += f" · {data['when']}"
-            if data["body"]:
-                tip += "\n\n" + data["body"][:500]
-            elif data["detail"]:
-                tip += f" · {data['detail']}"
-            item.setToolTip(tip)
-            view.addItem(item)
+    def _fill(self, view, rows, make_row):
+        """Show *rows* in *view*.  The row that was selected stays selected
+        when the refresh still lists it: with no row current, the first one
+        became current as soon as the list got the focus, and took the
+        recipient box with it."""
+        picked = self._current_row(view)
+        keep = None
+        self._refilling = True
+        try:
+            view.clear()
+            for d in rows:
+                data = make_row(d)
+                item = QListWidgetItem(f"{data['label']} — {data['title']} — {data['when']}")
+                item.setData(ROW_ROLE, data)
+                tip = f"{data['label']} · {data['title']}"
+                if data["when"]:
+                    tip += f" · {data['when']}"
+                if data["body"]:
+                    tip += "\n\n" + data["body"][:500]
+                elif data["detail"]:
+                    tip += f" · {data['detail']}"
+                item.setToolTip(tip)
+                view.addItem(item)
+                if keep is None and picked is not None and _same_row(data, picked):
+                    keep = item
+            if keep is not None:
+                view.setCurrentItem(keep)
+        finally:
+            self._refilling = False
 
     def _fill_calls(self, rows):
         self._warned["calls"] = None

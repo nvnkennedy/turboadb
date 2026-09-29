@@ -43,7 +43,7 @@ def test_theme_stylesheet(qapp):
     from turboadb.gui import theme
 
     names = theme.theme_names()
-    assert names[:2] == ("dark", "light") and len(names) == 10
+    assert names[:2] == ("dark", "light") and len(names) == 18
     for name in names:
         # every theme belongs to a dark/light pair
         pair = theme.counterpart(name)
@@ -504,6 +504,8 @@ def test_local_shell_adb_shell_force_pty(qapp):
     w._send(b"exit\r\n")
     assert w._in_adb_shell is False
 
+    # once cmd's prompt is back, the next line is a command again
+    w._feed_from(w.reader, b"exit\r\n\r\nC:\\w>\x1b]7717;C:\\w\x1b\\")
     w._send(b"adb -s 12345 shell\r\n")
     assert sent[-1] == b"adb -s 12345 shell -t -t\r\n"
     w.close()
@@ -964,53 +966,6 @@ def test_webcam_defaults_to_fit_view(qapp):
         assert "Start camera" in panel.view.text()
     finally:
         panel.close()
-
-
-def test_render_box_banner():
-    import re
-    from turboadb.gui.device_tab import _render_box_banner, _render_mobaxterm_banner, _str_width
-
-    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
-
-    title = "⚡ TurboADB Shell"
-    lines = [
-        "\x1b[36mTarget\x1b[0m : \x1b[1;97mvivo V2318\x1b[0m \x1b[92m· Android 16\x1b[0m",
-        "\x1b[36mLink\x1b[0m   : \x1b[93mvia USB\x1b[0m [10BE330KG9000AF]",
-        "\x1b[36mMode\x1b[0m   : \x1b[37mInteractive cooked shell · Tab: complete · Ctrl+C: stop\x1b[0m",
-    ]
-    banner = _render_box_banner(title, lines, min_width=74)
-    raw_lines = [l for l in banner.splitlines() if l.strip()]
-    assert len(raw_lines) == 7  # top, title, blank, 3 body lines, bottom
-
-    target_width = _str_width(raw_lines[0])
-    assert target_width >= 74
-
-    for line in raw_lines:
-        plain = ansi_re.sub("", line)
-        assert plain.startswith(("┌", "│", "└"))
-        assert plain.endswith(("┐", "│", "┘"))
-        assert _str_width(line) == target_width
-
-    # Restore the framed welcome banner, but leave the redundant date/path bar
-    # to the real terminal prompt below it.
-    h1 = "\x1b[1;92m•  TurboADB Professional v1.1.16  •\x1b[0m"
-    h2 = "\x1b[93m(ADB client, Screen mirror and device tools)\x1b[0m"
-    sess = "\x1b[37mADB session to \x1b[1;35mvivo V2318 [USB]\x1b[0m  \x1b[37m(\x1b[91m@Android 16\x1b[37m)\x1b[0m"
-    items = [
-        ("File-browser", "", True),
-        ("Screen-mirror", "\x1b[90m(remote display is forwarded)\x1b[0m", True),
-    ]
-    mob_banner = _render_mobaxterm_banner(h1, h2, sess, items, min_width=60, cwd="/")
-    mob_lines = [l for l in mob_banner.splitlines() if l.strip()]
-    assert len(mob_lines) == 8
-    mob_target_w = _str_width(mob_lines[0])
-    assert mob_target_w >= 60
-    for line in mob_lines:
-        plain = ansi_re.sub("", line)
-        assert plain.startswith(("┌", "│", "└"))
-        assert plain.endswith(("┐", "│", "┘"))
-        assert _str_width(line) == mob_target_w
-    assert "📅" not in mob_banner and "📁" not in mob_banner
 
 
 def test_adb_init_thread(qapp):

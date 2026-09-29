@@ -24,6 +24,9 @@ from PyQt5.QtWidgets import (
 from .icons import icon
 from .qtutil import close_jobs, page_toolbar, run_job, unwrap
 
+# What `adb install` takes (APEX modules install the same way).
+_INSTALLABLE = (".apk", ".apex")
+
 
 def _glyph(name, tone, size=16):
     """A non-interactive, theme-following icon (a flat #iconButton)."""
@@ -79,7 +82,8 @@ class AppsPanel(QWidget):
         # It wraps instead of widening the window when the tab is narrow.
         toolbar, top = page_toolbar()
         self.btn_install = self._button("Install APK(s)…", self._install, "ok",
-                                        "Install one APK, or several split APKs together",
+                                        "Install one APK, several apps, or the split APKs "
+                                        "of one app together",
                                         "download", "on-accent")
         self.filt = QLineEdit()
         self.filt.setPlaceholderText("Filter packages…")
@@ -320,7 +324,7 @@ class AppsPanel(QWidget):
 
     def _apply_filter(self, text):
         raw = (text or "").strip()
-        text = (text or "").lower()
+        text = raw.lower()  # " chrome" (a pasted name) matches like "chrome"
         self.list.clear()
         for p in self._all:
             if not text or text in p.lower():
@@ -347,15 +351,45 @@ class AppsPanel(QWidget):
 
     def _install(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select APK(s)", filter="APK files (*.apk *.apks *.apkm);;All files (*)"
+            self, "Select APK(s)", filter="APK files (*.apk);;All files (*)"
         )
         if not files:
             return
+        # adb installs .apk files (and .apex modules) only: a bundle - .apks,
+        # .apkm, .xapk - is a zip of APKs that has to be unpacked first
+        others = [f for f in files if os.path.splitext(f)[1].lower() not in _INSTALLABLE]
+        if others:
+            names = ", ".join(os.path.basename(f) for f in others[:3])
+            if len(others) > 3:
+                names += f" +{len(others) - 3} more"
+            QMessageBox.warning(
+                self, "Install APK",
+                f"Not an APK file: {names}\n\nadb installs .apk files only. Unpack an app "
+                "bundle (.apks, .apkm, .xapk) and select the APK files inside it.")
+            return
         handler = self.handler
+        splits = False
         if len(files) > 1:
+            splits = self._ask_splits(files)
+            if splits is None:
+                return
+        if splits:
 
             def fn():
                 return handler.install_multiple(files, grant_perms=True, safe=True)
+        elif len(files) > 1:
+
+            def fn():
+                # separate apps: one after another, each on its own
+                failed = []
+                for path in files:
+                    res = handler.install(path, grant_perms=True, safe=True)
+                    if not getattr(res, "success", True):
+                        failed.append(f"{os.path.basename(path)}: {res.error}")
+                if failed:
+                    raise RuntimeError(f"{len(files) - len(failed)} of {len(files)} installed; "
+                                       + "; ".join(failed))
+                return f"{len(files)} apps installed"
         else:
 
             def fn():
@@ -369,6 +403,34 @@ class AppsPanel(QWidget):
         if len(files) > 2:
             names += f" +{len(files) - 2} more"
         self._do(fn, f"install {names}", refresh=True, gated=False)
+
+    def _ask_splits(self, files):
+        """Several APKs: True for the split APKs of ONE app (installed together,
+        ``adb install-multiple``), False for separate apps, None to cancel.
+
+        install-multiple puts every file into one package, so two different
+        apps sent that way both failed; only the user knows which it is."""
+        names = [os.path.basename(f).lower() for f in files]
+        # the usual names of split APKs: base.apk, split_config.arm64_v8a.apk
+        looks_split = any(n == "base.apk" or n.startswith("split_") or "config." in n
+                          for n in names)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Install APKs")
+        box.setText(f"Install {len(files)} APK files as separate apps, or as the parts "
+                    "(split APKs) of one app?")
+        separate = box.addButton("Separate apps", QMessageBox.AcceptRole)
+        parts = box.addButton("Parts of one app", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(parts if looks_split else separate)
+        box.exec_()
+        clicked = box.clickedButton()
+        box.deleteLater()
+        if clicked is parts:
+            return True
+        if clicked is separate:
+            return False
+        return None
 
     def _uninstall(self):
         pkg = self._selected()

@@ -443,7 +443,7 @@ def test_stop_button_cancels_queued_lines_in_a_local_terminal(qapp, monkeypatch)
         def read(self, _size=4096):
             return b""
 
-        def interrupt(self, on_done=None):
+        def interrupt(self):
             self.running = False
 
         def close(self):

@@ -104,6 +104,8 @@ def test_the_burst_loop_runs_on_the_device():
 @pytest.fixture
 def handler(fake_adb):
     fake_adb.add("getevent -pl", stdout=GETEVENT)
+    # the shell may write to the touchscreen: the probe prints its marker
+    fake_adb.add("test -w /dev/input/event3", stdout="@@writable\n")
     fake_adb.add("dumpsys window displays",
                  stdout="  Display: mDisplayId=0\n  cur=1080x2400 app=1080x2400\n")
     return ADBHandler(ADBConfig(serial="S1"))
@@ -149,7 +151,7 @@ def test_a_burst_taps_through_the_touchscreen_when_it_can(handler, monkeypatch):
 
 def test_a_burst_falls_back_to_input_when_the_screen_is_not_writable(fake_adb, monkeypatch):
     fake_adb.add("getevent -pl", stdout=GETEVENT)
-    fake_adb.add(lambda argv: "test" in argv and "-w" in argv, returncode=1)
+    fake_adb.add("test -w", returncode=1)  # refused: no marker printed
     handler = ADBHandler(ADBConfig(serial="S1"))
     calls = _lines(handler, monkeypatch, taps=20)
     report = handler.tap_burst(10, 20, count=20)
@@ -213,6 +215,214 @@ def test_a_failing_tap_stops_the_loop_instead_of_running_it_out(handler, monkeyp
     handler.tap_burst(5, 5, count=10, method="input")
     script = calls[0][0][1]
     assert "||" in script and "exit" in script  # the loop gives up on the first failure
+    assert 'echo "tap failed after $i taps"' in script  # and says how far it got
+    assert touch.refused_after("tap failed after 12 taps") == 12
+    assert touch.refused_after("@@12") is None
+
+
+# ---- a turned display ------------------------------------------------------ #
+PHONE_PANEL = """add device 4: /dev/input/event2
+  name:     "sec_touchscreen"
+  events:
+    KEY (0001): BTN_TOUCH
+    ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_X     : value 0, min 0, max 1079, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 2399, fuzz 0, flat 0, resolution 0
+                ABS_MT_TRACKING_ID    : value 0, min 0, max 65535, fuzz 0, flat 0, resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+"""
+
+
+def _dumpsys_input(field="SurfaceOrientation: 1"):
+    """``dumpsys input`` as Android prints it: a keyboard, then the touchscreen."""
+    return ("Input Reader State (Nums of device: 2):\n"
+            "  Device 1: gpio-keys\n"
+            "    Sources: 0x00000101\n"
+            "      SurfaceOrientation: 3\n"  # never another device's
+            "  Device 4: sec_touchscreen\n"
+            "    Touch Input Mapper (mode - DIRECT):\n"
+            "      Raw Touch Axes:\n"
+            "        X: min=0, max=1079, flat=0, fuzz=0, resolution=0\n"
+            "      Viewport INTERNAL: displayId=0, orientation=1, logicalFrame=[0, 0, 2400, 1080]\n"
+            f"      {field}\n"
+            "Input Dispatcher State:\n")
+
+
+def _android_maps(raw, turns, panel):
+    """Android's own mapping of a panel point to display pixels (the inverse
+    of what scale_point does), for a panel whose units are its pixels."""
+    x, y = raw
+    return {0: (x, y), 1: (y, panel.max_x - x), 2: (panel.max_x - x, panel.max_y - y),
+            3: (panel.max_y - y, x)}[turns]
+
+
+def test_a_point_on_a_turned_display_lands_where_android_puts_it():
+    panel = touch.pick_touch_device(touch.parse_touch_devices(PHONE_PANEL))
+    for turns, screen in ((0, (1080, 2400)), (1, (2400, 1080)), (2, (1080, 2400)),
+                          (3, (2400, 1080))):
+        for point in ((2000 % screen[0], 500), (10, 20), (screen[0] - 1, screen[1] - 1)):
+            raw = touch.scale_point(*point, screen, panel, turns)
+            assert _android_maps(raw, turns, panel) == point, (turns, point)
+    # the case that went wrong: landscape, a portrait panel, tapped near the right edge
+    assert touch.scale_point(2000, 500, (2400, 1080), panel, 1) == (579, 2000)
+    assert touch.scale_point(2000, 500, (2400, 1080), panel) == (900, 1111)  # unturned: wrong
+
+
+def test_the_rotation_comes_from_the_touchscreens_own_section_of_dumpsys_input():
+    assert touch.input_rotation(_dumpsys_input(), "sec_touchscreen") == 1
+    assert touch.input_rotation(_dumpsys_input("SurfaceOrientation: 0"), "sec_touchscreen") == 0
+    # Android 14 names the rotation instead
+    assert touch.input_rotation(_dumpsys_input("InputDeviceOrientation: Rotation270"),
+                                "sec_touchscreen") == 3
+    assert touch.input_rotation(_dumpsys_input("InputDeviceOrientation: Rotation0"),
+                                "sec_touchscreen") == 0
+    assert touch.input_rotation(_dumpsys_input(""), "sec_touchscreen") is None
+    assert touch.input_rotation(_dumpsys_input(), "goodix-ts") is None  # not listed
+    assert touch.input_rotation("", "sec_touchscreen") is None
+
+
+def test_the_panels_shape_tells_a_quarter_turn_when_dumpsys_cannot():
+    panel = touch.pick_touch_device(touch.parse_touch_devices(PHONE_PANEL))
+    assert touch.looks_rotated((2400, 1080), panel) is True
+    assert touch.looks_rotated((1080, 2400), panel) is False
+    square = touch.TouchDevice("/dev/input/event1", "ts", 4095, 4095, "b", True)
+    assert touch.looks_rotated((1920, 720), square) is None  # a square grid can't tell
+
+
+@pytest.fixture
+def landscape(fake_adb):
+    """A rooted phone held in landscape: its panel reports in portrait."""
+    fake_adb.add("getevent -pl", stdout=PHONE_PANEL)
+    fake_adb.add("test -w /dev/input/event2", stdout="@@writable\n")
+    fake_adb.add("dumpsys window displays",
+                 stdout="  Display: mDisplayId=0\n  init=1080x2400 cur=2400x1080\n")
+    return fake_adb
+
+
+def test_auto_taps_a_turned_display_through_input(landscape, monkeypatch):
+    landscape.add("dumpsys input", stdout=_dumpsys_input("SurfaceOrientation: 1"))
+    handler = ADBHandler(ADBConfig(serial="S1"))
+    calls = _lines(handler, monkeypatch, taps=100)
+    report = handler.tap_burst(2000, 500, count=100)
+    assert "input tap 2000 500" in calls[0][0][1] and "sendevent" not in calls[0][0][1]
+    assert report["method"] == "input"
+
+
+def test_events_on_a_turned_display_turn_the_point_back(landscape, monkeypatch):
+    landscape.add("dumpsys input", stdout=_dumpsys_input("SurfaceOrientation: 1"))
+    handler = ADBHandler(ADBConfig(serial="S1"))
+    calls = _lines(handler, monkeypatch, taps=100)
+    handler.tap_burst(2000, 500, count=100, method="events")
+    script = calls[0][0][1]
+    assert "sendevent /dev/input/event2 3 53 579 " in script  # X on the panel
+    assert "sendevent /dev/input/event2 3 54 2000 " in script  # Y on the panel
+
+
+def test_a_turn_nobody_reports_is_never_guessed(landscape, monkeypatch):
+    # dumpsys input says nothing, but a portrait panel under a landscape display
+    handler = ADBHandler(ADBConfig(serial="S1"))
+    calls = _lines(handler, monkeypatch, taps=100)
+    assert handler.tap_burst(2000, 500, count=100)["method"] == "input"
+    assert "input tap 2000 500" in calls[0][0][1]
+    with pytest.raises(ADBError, match="could not tell how the display is turned"):
+        handler.tap_burst(2000, 500, count=100, method="events")
+
+
+# ---- Android 6 and older: every adb shell exits 0 ------------------------- #
+def test_writability_is_read_from_the_probe_not_its_exit_code(fake_adb, monkeypatch):
+    fake_adb.add("getevent -pl", stdout=GETEVENT)
+    # `test -w` refused, yet adb (no shell protocol) exits 0 and prints nothing
+    fake_adb.add("test -w", stdout="", returncode=0)
+    fake_adb.add("dumpsys window displays",
+                 stdout="  Display: mDisplayId=0\n  cur=1080x2400 app=1080x2400\n")
+    handler = ADBHandler(ADBConfig(serial="S1"))
+    assert handler.touch_device()["writable"] is False
+    probe = next(" ".join(c) for c in fake_adb.calls if "test -w" in " ".join(c))
+    assert "&& echo @@writable" in probe
+    calls = _lines(handler, monkeypatch, taps=20)
+    assert handler.tap_burst(10, 20, count=20)["method"] == "input"
+    assert "input tap 10 20" in calls[0][0][1]
+
+
+def _refusing_panel(handler, monkeypatch, *, after=0):
+    """sendevent is refused (after *after* taps); input taps work."""
+    runs = []
+
+    def iter_lines(args, **_kwargs):
+        runs.append(args[1])
+        if "sendevent" in args[1]:
+            yield "sendevent: /dev/input/event3: Permission denied"
+            yield f"tap failed after {after} taps"
+        else:
+            yield "@@30"
+
+    monkeypatch.setattr(handler, "iter_lines", iter_lines)
+    return runs
+
+
+def test_auto_goes_on_with_input_when_the_panel_refuses_the_first_event(handler, monkeypatch):
+    runs = _refusing_panel(handler, monkeypatch)
+    report = handler.tap_burst(5, 5, count=30)
+    assert report["method"] == "input" and report["taps"] == 30 and report["device"] is None
+    assert "sendevent" in runs[0] and "input tap 5 5" in runs[1]
+    assert handler.touch_device()["writable"] is False  # never tried again on this device
+
+
+def test_taps_already_made_are_never_made_again(handler, monkeypatch):
+    runs = _refusing_panel(handler, monkeypatch, after=12)
+    with pytest.raises(ADBError, match="tap failed after 12 taps"):
+        handler.tap_burst(5, 5, count=30)
+    assert len(runs) == 1
+    # and "events" asked for by name is never swapped for input
+    runs = _refusing_panel(handler, monkeypatch)
+    with pytest.raises(ADBError, match="Permission denied"):
+        handler.tap_burst(5, 5, count=30, method="events")
+    assert len(runs) == 1
+
+
+# ---- slow devices ------------------------------------------------------------ #
+def test_a_slow_burst_runs_as_long_as_the_device_reports_progress(handler, monkeypatch):
+    import time
+
+    monkeypatch.setattr(ADBHandler, "_BURST_TAP_SECONDS", {"input": 0.001, "events": 0.001})
+    monkeypatch.setattr(ADBHandler, "_BURST_QUIET_SLACK_S", 0.6)
+
+    def iter_lines(args, *, stop_event=None, **_kwargs):
+        for done in range(5, 101, 5):  # 20 reports, 0.2 s apart: 4 s in all
+            time.sleep(0.2)
+            if stop_event is not None and stop_event.is_set():
+                return
+            yield f"@@{done}"
+
+    monkeypatch.setattr(handler, "iter_lines", iter_lines)
+    report = handler.tap_burst(5, 5, count=100, method="input")
+    assert report["taps"] == 100 and report["seconds"] >= 4
+
+
+def test_a_burst_that_goes_quiet_is_ended_and_says_why(handler, monkeypatch):
+    monkeypatch.setattr(ADBHandler, "_BURST_TAP_SECONDS", {"input": 0.001, "events": 0.001})
+    monkeypatch.setattr(ADBHandler, "_BURST_QUIET_SLACK_S", 0.3)
+    ended = []
+
+    def iter_lines(args, *, stop_event=None, **_kwargs):
+        yield "@@5"
+        ended.append(stop_event.wait(10))  # the device hangs until the burst is ended
+
+    monkeypatch.setattr(handler, "iter_lines", iter_lines)
+    with pytest.raises(ADBError, match=r"no progress for 0\.3\d* s \(after 5 of 100 taps\)"):
+        handler.tap_burst(5, 5, count=100, method="input")
+    assert ended == [True]
+
+
+def test_the_quiet_limit_covers_the_taps_between_two_reports(handler, monkeypatch):
+    calls = _lines(handler, monkeypatch, taps=1000)
+    handler.tap_burst(5, 5, count=1000, method="input")
+    # a head unit's `input tap` can take a second: 1000 of them are far from the backstop
+    assert calls[0][1]["timeout"] >= 1000 * 1.0
+    calls = _lines(handler, monkeypatch, taps=1000)
+    handler.tap_burst(5, 5, count=1000, method="input", timeout=90)
+    assert calls[0][1]["timeout"] == 90  # an explicit cap is kept
 
 
 # ---- the CLI --------------------------------------------------------------- #
@@ -272,6 +482,15 @@ def test_cli_tap_burst_passes_its_options_and_reports(run_cli):
     assert "5000/5000 taps" in err  # progress while it runs
     rc, out, _err = run_cli(["-s", "S1", "tap-burst", "1", "2", "--json"], _Dev())
     assert rc == 0 and json.loads(out)["result"]["method"] == "events"
+
+
+def test_cli_tap_burst_timeout_caps_the_whole_burst(run_cli):
+    dev = _Dev()
+    assert run_cli(["-s", "S1", "tap-burst", "1", "2"], dev)[0] == 0
+    assert dev.calls[0][2]["timeout"] is None  # no cap: it runs while the device reports
+    dev = _Dev()
+    assert run_cli(["-s", "S1", "tap-burst", "1", "2", "--timeout", "900"], dev)[0] == 0
+    assert dev.calls[0][2]["timeout"] == 900
 
 
 def test_cli_touch_device_reports_or_fails(run_cli):

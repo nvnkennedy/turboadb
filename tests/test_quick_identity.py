@@ -42,23 +42,23 @@ def test_unexpected_output_gives_empty_identity(fake_adb):
     assert ADBHandler(ADBConfig(serial="x")).quick_identity() == {}
 
 
-def test_device_details_thread_reports_failure_without_error_logs(monkeypatch):
+def test_device_details_probe_reports_failure_without_error_logs(monkeypatch):
     import pytest
 
     pytest.importorskip("PyQt5")
-    from turboadb.gui.device_tab import _DeviceInfoThread
+    from turboadb.gui.device_tab import _ProbeThread
 
     lines = []
     handler = ADBHandler(ADBConfig(serial="x"), safe=True, log_callback=lines.append)
 
-    def boom(*, safe=None):
-        raise ADBTimeoutError("getprop timed out")
+    def boom(args, **_kwargs):
+        raise ADBTimeoutError("adb shell timed out")
 
-    monkeypatch.setattr(handler, "device_info", boom)
+    monkeypatch.setattr(handler, "popen", boom)
     results = []
-    thread = _DeviceInfoThread(handler)
-    thread.done.connect(results.append)
+    thread = _ProbeThread(handler)
+    thread.details.connect(results.append)
     thread.run()  # synchronously, in this thread
-    assert len(results) == 1 and results[0].success is False
-    assert "timed out" in str(results[0].error)
+    assert len(results) == 1 and results[0]["info"] is None
+    assert "timed out" in results[0]["error"]
     assert not [line for line in lines if line.startswith("[ERROR]")]

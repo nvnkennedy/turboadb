@@ -18,6 +18,7 @@ pytest.importorskip("PyQt5")
 from PyQt5.QtCore import QObject, Qt, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
+from turboadb import ADBConfig, ADBHandler  # noqa: E402
 from turboadb.gui import file_browser as fb  # noqa: E402
 
 
@@ -106,7 +107,7 @@ TOYBOX_LS_B = (
 )
 
 
-# ---- 1 / 10 / 13: lossless ls parsing ---------------------------------------
+# ---- lossless ls parsing ----------------------------------------------------
 
 
 def test_ls_names_keep_leading_and_trailing_spaces():
@@ -217,7 +218,7 @@ def test_duplicate_names_refuse_destructive_actions(app, monkeypatch):
         browser.close_panel()
 
 
-# ---- 2: device paste never recurses ------------------------------------------
+# ---- device paste never recurses ---------------------------------------------
 
 
 def _fake_probe(monkeypatch, table):
@@ -269,7 +270,7 @@ def test_remote_paste_merges_existing_folder_after_asking(app, monkeypatch):
         browser.close_panel()
 
 
-# ---- 3: shortcuts are scoped per table ----------------------------------------
+# ---- shortcuts are scoped per table -------------------------------------------
 
 
 def test_delete_key_in_remote_table_deletes(app, monkeypatch):
@@ -309,7 +310,7 @@ def test_delete_key_in_remote_table_deletes(app, monkeypatch):
         browser.close_panel()
 
 
-# ---- 4: transfers onto existing folders merge instead of nesting -------------
+# ---- transfers onto existing folders merge instead of nesting ----------------
 
 
 def test_push_plan_merges_into_existing_device_folder(monkeypatch, tmp_path):
@@ -361,14 +362,16 @@ def test_safe_local_name():
     assert fb._safe_local_name("a:b", windows=False) == "a:b"
 
 
-# ---- 5: rename never overwrites or moves into a folder silently --------------
+# ---- rename never overwrites or moves into a folder silently -----------------
 
 
 def test_rename_commands_use_no_clobber_and_T():
-    assert shlex.split(fb._rename_cmd("/s/a", "/s/b", overwrite=True)) == [
-        "mv", "-f", "-T", "--", "/s/a", "/s/b"]
-    free = shlex.split(fb._rename_cmd("/s/a", "/s/b"))
-    assert free[:6] == ["mv", "-n", "-T", "--", "/s/a", "/s/b"] and "exit" in free
+    # -T first; a shell without it falls back (tests/test_rename_fallback.py
+    # runs both paths in a real sh).
+    assert "err=$(mv -f -T -- /s/a /s/b 2>&1)" in fb._rename_cmd("/s/a", "/s/b", overwrite=True)
+    free = fb._rename_cmd("/s/a", "/s/b")
+    assert "err=$(mv -n -T -- /s/a /s/b 2>&1)" in free and "mv -n -- /s/a /s/b" in free
+    assert free.rstrip().endswith("exit 1; fi")
 
 
 def test_rename_asks_before_replacing_and_refuses_folders(app, monkeypatch):
@@ -384,20 +387,25 @@ def test_rename_asks_before_replacing_and_refuses_folders(app, monkeypatch):
         assert ran == [] and boxes[-1][0] == "warning"
         _quiet_boxes(monkeypatch, answer=fb.QMessageBox.Yes)
         browser._on_rename_checked("a", "b", "/s/a", "/s/b", _Res("file\r\n"))
-        assert shlex.split(ran[-1][1]) == ["mv", "-f", "-T", "--", "/s/a", "/s/b"]
+        assert ran[-1][1] == fb._rename_cmd("/s/a", "/s/b", overwrite=True)
         browser._on_rename_checked("a", " b", "/s/a", "/s/b", _Res("free\n"))
-        assert shlex.split(ran[-1][1])[:3] == ["mv", "-n", "-T"]
+        assert ran[-1][1] == fb._rename_cmd("/s/a", "/s/b", verify=True)
     finally:
         browser.close_panel()
 
 
-# ---- 6 / 7 / editor guards: edit through links, keep the mode ----------------
+# ---- editor guards: edit through links, keep the mode ------------------------
 
 
-class _EditHandler:
+class _EditHandler(ADBHandler):
+    """The engine's file methods (the editor loads and saves through
+    ``stat_path`` and ``replace_file``) over a scripted shell, pull and push."""
+
     def __init__(self, stat_reply):
+        super().__init__(ADBConfig(serial="x"))
         self.stat_reply = stat_reply
         self.shells, self.pulls, self.pushes = [], [], []
+        self.temps = {}  # copies pushed next to a file, before they are written over it
 
     def shell(self, cmd, timeout=None, safe=None):
         self.shells.append(cmd)
@@ -405,6 +413,10 @@ class _EditHandler:
             return _Res(self.stat_reply)
         if cmd.startswith("stat -c"):
             return _Res("755\r\n")
+        if cmd.startswith("cat "):  # the saved copy written over the file, in place
+            src, _into, dst = shlex.split(cmd)[1:4]
+            self.pushes.append((dst, self.temps.pop(src)))
+            return _Res("TURBOADB_WRITTEN\n")
         return _Res("")
 
     def pull(self, remote, local, cancel_event=None, safe=None, **kw):
@@ -414,7 +426,7 @@ class _EditHandler:
 
     def push(self, local, remote, safe=None, **kw):
         with open(local, "rb") as fh:
-            self.pushes.append((remote, fh.read()))
+            self.temps[remote] = fh.read()
 
 
 def _remote_link_row(browser, name="run.sh"):
@@ -438,8 +450,9 @@ def test_remote_edit_follows_symlink_and_restores_mode(app, monkeypatch):
         dlg.edit.setPlainText("#!/bin/sh\necho saved\n")
         dlg._save()
         assert handler.pushes == [("/data/t/real.sh", b"#!/bin/sh\necho saved\n")]
-        chmods = [shlex.split(c) for c in handler.shells if c.startswith("chmod")]
-        assert chmods == [["chmod", "755", "--", "/data/t/real.sh"]]
+        # written over the file in place, so its mode (755) never changed
+        assert not [c for c in handler.shells if c.startswith("chmod")]
+        assert [c for c in handler.shells if c.startswith("rm -f -- /data/t/.turboadb-save-")]
         dlg.done(0)
     finally:
         browser.close_panel()
@@ -463,7 +476,7 @@ def test_remote_edit_refuses_devices_and_big_link_targets(app, monkeypatch, repl
         browser.close_panel()
 
 
-def test_double_click_edits_the_clicked_row(app, monkeypatch):
+def test_double_click_opens_the_clicked_row(app, monkeypatch):
     browser = fb.FileBrowser(None)
     try:
         rows = [("a.txt", 1, "1 B", "File", "", "", "", False),
@@ -471,8 +484,8 @@ def test_double_click_edits_the_clicked_row(app, monkeypatch):
         browser._populate(browser.local_table, rows, parent_row=False)
         browser._populate(browser.remote_table, rows, parent_row=False)
         got = []
-        monkeypatch.setattr(browser, "_local_edit_row", lambda r: got.append(("local", r)))
-        monkeypatch.setattr(browser, "_remote_edit_row", lambda r: got.append(("remote", r)))
+        monkeypatch.setattr(browser, "_local_open_row", lambda r: got.append(("local", r)))
+        monkeypatch.setattr(browser, "_remote_open_row", lambda r: got.append(("remote", r)))
         _select_name(browser.local_table, "a.txt")
         _select_name(browser.remote_table, "a.txt")
         b_local = [r for r in range(2) if browser.local_table.item(r, 0).data(Qt.UserRole)[0] == "b.txt"][0]
@@ -483,7 +496,7 @@ def test_double_click_edits_the_clicked_row(app, monkeypatch):
         browser.close_panel()
 
 
-# ---- 8: a bad timestamp doesn't hide the folder -----------------------------
+# ---- a bad timestamp doesn't hide the folder --------------------------------
 
 
 def test_local_listing_survives_unrepresentable_mtime(monkeypatch, tmp_path):
@@ -505,7 +518,7 @@ def test_local_listing_survives_unrepresentable_mtime(monkeypatch, tmp_path):
     assert by_name["old.txt"][4] == "" and by_name["new.txt"][4] != ""
 
 
-# ---- 9: editor keeps NBSP / U+2028 and refuses U+2029 ------------------------
+# ---- editor keeps NBSP / U+2028 and refuses U+2029 ---------------------------
 
 
 def test_editor_text_is_raw(app):
@@ -522,7 +535,7 @@ def test_editor_text_is_raw(app):
         fb._decode_for_edit("para\u2029graph".encode("utf-8"))
 
 
-# ---- 11 / loading guards: never act on a folder that isn't shown ------------
+# ---- loading guards: never act on a folder that isn't shown -----------------
 
 
 def test_failed_remote_listing_restores_previous_folder(app, monkeypatch):
@@ -575,7 +588,7 @@ def test_actions_wait_for_the_listing_being_loaded(app, monkeypatch, tmp_path):
         browser.close_panel()
 
 
-# ---- 12: local delete handles read-only files and junctions -----------------
+# ---- local delete handles read-only files and junctions ---------------------
 
 
 def test_local_delete_read_only_items(tmp_path):
@@ -606,7 +619,7 @@ def test_local_delete_junction_keeps_target(tmp_path):
     assert (target / "keep.txt").read_text() == "keep"
 
 
-# ---- plausible fixes: UI text, UNC drive combo, transfer cancel --------------
+# ---- UI text, UNC drive combo, transfer cancel -------------------------------
 
 
 def test_hints_no_longer_claim_f5_transfers(app):

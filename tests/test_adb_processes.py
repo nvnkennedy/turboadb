@@ -89,6 +89,7 @@ class _Session:
     def __init__(self):
         self.argv = ["shell"]
         self.closed = threading.Event()
+        self.sent = []
 
     @property
     def alive(self):
@@ -100,11 +101,24 @@ class _Session:
         time.sleep(0.005)
         return b""
 
-    def send(self, _data):
+    def send(self, data):
+        self.sent.append(data)
         return True
 
     def close(self):
         self.closed.set()
+
+
+def _pipe_mode(monkeypatch):
+    """Run the Android shell over plain pipes (the ``android_shell_pty``
+    setting off): TurboADB draws its prompt, from the device's user@host."""
+    from turboadb.gui import settings as settings_mod
+
+    get = settings_mod.get
+    monkeypatch.setattr(
+        settings_mod, "get",
+        lambda key, default=None: False if key == "android_shell_pty" else get(key, default),
+    )
 
 
 def _probe_output(*, prompt="2000|shell|V2318", characteristics="default",
@@ -258,7 +272,7 @@ def _connect(tab, device, payload=None):
 
 
 # --------------------------------------------------------------------------- #
-# (a) persistent processes only for what is on screen or started
+# persistent processes only for what is on screen or started
 # --------------------------------------------------------------------------- #
 def test_hidden_tab_opens_no_adb_shell_until_its_terminal_is_shown(qapp):
     device = _Device()
@@ -304,7 +318,7 @@ def test_logcat_starts_no_process_until_start_is_pressed(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# (b) polls: only while the page is visible, never overlapping themselves
+# polls: only while the page is visible, never overlapping themselves
 # --------------------------------------------------------------------------- #
 def test_call_state_poll_stops_while_the_phone_page_is_hidden(qapp, monkeypatch):
     from turboadb.gui import phone_panel
@@ -377,7 +391,7 @@ def test_apps_refresh_burst_runs_one_listing_at_a_time(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# (c) the connect-time probe: one adb process for identity, prompt, kind, displays
+# the connect-time probe: one adb process for identity, prompt, kind, displays
 # --------------------------------------------------------------------------- #
 # Before: quick identity, prompt, getprop, device kind and a display scan (5).
 CONNECT_PROBE_PROCESS_TARGET = 1
@@ -447,9 +461,12 @@ def test_device_probe_matches_the_engine_parsers(qapp):
     assert "cmd display get-displays" in script and "dumpsys display" in script
 
 
-def test_a_failed_probe_still_connects_and_falls_back(qapp):
+@pytest.mark.parametrize("pty", [True, False], ids=["device-terminal", "pipes"])
+def test_a_failed_probe_still_connects_and_falls_back(qapp, monkeypatch, pty):
     from turboadb.gui.device_tab import _DeviceProbe
 
+    if not pty:
+        _pipe_mode(monkeypatch)
     failed = _DeviceProbe(_Device(probe_output=b"error: device offline\n"))
     identities = []
     result = failed.run(on_identity=identities.append)
@@ -466,14 +483,21 @@ def test_a_failed_probe_still_connects_and_falls_back(qapp):
         _pump(qapp, lambda: False, timeout=0.1)
         assert device.commands == []  # the probe's answer is still on its way
         tab._on_probe_details(device, result)
-        assert _pump(qapp, lambda: {"list_displays", "shell"} <= set(device.commands))
+        assert _pump(qapp, lambda: "list_displays" in device.commands)
+        # Over pipes TurboADB draws the prompt, so the shell asks for user@host
+        # itself; on a device terminal the device prints its own prompt.
+        if pty:
+            _pump(qapp, lambda: False, timeout=0.3)
+            assert "shell" not in device.commands
+        else:
+            assert _pump(qapp, lambda: "shell" in device.commands)
         assert any("Device details are still unavailable" in m for m in messages)
     finally:
         _close(qapp, tab)
 
 
 # --------------------------------------------------------------------------- #
-# (d) closing the tab ends every process it started
+# closing the tab ends every process it started
 # --------------------------------------------------------------------------- #
 def test_closing_the_tab_ends_every_adb_process_it_started(qapp):
     from turboadb.gui.qtutil import thread_running
@@ -510,7 +534,7 @@ def test_closing_before_pages_were_shown_builds_nothing(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# (e) at most ADB_SLOTS one-shot commands of one tab at once
+# at most ADB_SLOTS one-shot commands of one tab at once
 # --------------------------------------------------------------------------- #
 def test_background_commands_are_capped_per_tab(qapp):
     from turboadb.gui.device_tab import DeviceTab
@@ -624,9 +648,11 @@ def test_lazy_pages_are_built_on_first_show_and_attributes_resolve(qapp, monkeyp
         _close(qapp, tab)
 
 
-def test_android_shell_stop_reuses_the_known_prompt(qapp):
+def test_android_shell_stop_reuses_the_known_prompt(qapp, monkeypatch):
+    """Over pipes (where TurboADB draws the prompt) Stop reopens the shell."""
     from turboadb.gui.device_tab import _AndroidShellWidget
 
+    _pipe_mode(monkeypatch)
     device = _Device()
     widget = _AndroidShellWidget(device, device_name="mock")
     try:
@@ -644,7 +670,7 @@ def test_android_shell_stop_reuses_the_known_prompt(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# review regressions
+# device tabs: the banner, the "connected" notice, split views and adb slots
 # --------------------------------------------------------------------------- #
 def _banner_after_show(qapp, tab):
     """Seconds from showing the tab until the Android terminal's banner is out."""
@@ -698,6 +724,8 @@ def test_installs_and_reboot_never_wait_for_an_adb_slot(qapp, monkeypatch):
     for _ in range(held):
         gate.acquire()  # two slow commands are running
     panel = AppsPanel(device, adb_gate=gate)
+    # two files: the parts of one app, installed together
+    monkeypatch.setattr(panel, "_ask_splits", lambda _files: True)
     sent = []
     try:
         for files in (["one.apk"], ["base.apk", "split.apk"]):
@@ -868,7 +896,7 @@ def test_engine_diagnostics_reach_the_tabs_trace_not_its_notifications(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# (f) adb root / unroot and making files writable: every terminal follows
+# adb root / unroot and making files writable: every terminal follows
 # --------------------------------------------------------------------------- #
 class _RootDevice(_Device):
     """Adds the root and write-access calls of the engine."""
@@ -936,8 +964,11 @@ def _nested_adb_shell(widget, pc_folder, cwd="/sdcard"):
     return widget.session
 
 
+@pytest.mark.parametrize("pty", [True, False], ids=["device-terminal", "pipes"])
 def test_adb_root_reconnects_the_android_shell_and_reopens_nested_adb_shells(
-        qapp, monkeypatch, tmp_path):
+        qapp, monkeypatch, tmp_path, pty):
+    if not pty:
+        _pipe_mode(monkeypatch)
     device = _RootDevice()
     tab = _tab(qapp)
     try:
@@ -956,10 +987,17 @@ def test_adb_root_reconnects_the_android_shell_and_reopens_nested_adb_shells(
         assert first.closed.is_set() and powershell._adb_resume == ("adb shell -t -t", "/sdcard")
         assert _pump(qapp, lambda: not tab._adbd_busy)
         assert "root" in device.commands
-        # the Android shell is open again and asks the device for its prompt
-        # (root shows as "#", so the old answer must not be reused)
         assert _pump(qapp, lambda: len(device.sessions()) == 2)
-        assert _pump(qapp, lambda: device.commands.count("shell") > prompt_queries)
+        if pty:
+            # the Android shell is open again on a device terminal, which
+            # prints its own prompt (root shows as "#"): nothing to ask
+            assert _pump(qapp, lambda: any(b"set +o emacs" in data
+                                           for data in device.sessions()[1].sent))
+            assert device.commands.count("shell") == prompt_queries
+        else:
+            # over pipes it asks the device for its prompt again (root shows
+            # as "#", so the old answer must not be reused)
+            assert _pump(qapp, lambda: device.commands.count("shell") > prompt_queries)
 
         # PowerShell reopens its adb shell as soon as the PC prompt is back
         powershell._feed_from(powershell.reader, f"\r\nPS {tmp_path}> ".encode())

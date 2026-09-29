@@ -3,6 +3,330 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 3.0.0
+
+### New
+
+- **A status bar in colour.** The bar at the bottom shows what is going on at
+  a glance: a green **Connected** with the device's name, a blue note when a
+  device is attached but not open, and every message with its kind — a red
+  **Error** or amber **Warning** on a tinted banner, a green tick when
+  something is done. Chips on the right show the ADB server (green ready,
+  amber starting, a solid red pill when it is unavailable), the devices
+  (green when all are online, amber when one is waiting for authorisation)
+  and the version, which turns blue when a newer TurboADB is out. Click a chip
+  for what belongs to it: the ADB server menu, the device list, updates.
+- **Eight more themes, in dark and light pairs.** **Ocean** and **Sky** (navy
+  and a crisp blue-white), **Dusk** and **Lavender** (violet), **Evergreen**
+  and **Meadow** (green), and **High contrast** in dark and light, the most
+  readable of all. Pick one in **Themes** or **Settings → Themes**; the
+  existing ten stay as they were.
+- **Open files in their apps from the Files tab.** Double-click, Enter or the
+  new **Open** button opens a file in the app Windows has for it (Photos,
+  Notepad, Media Player, a PDF reader…), and **Open with…** lets you pick the
+  app. A device file opens as a copy on this PC, copied with the usual
+  progress and Cancel, and every time you save it in that app it goes back
+  to the device, keeping its permissions. If the device file changed in the
+  meantime, TurboADB asks before replacing it. Programs are never started
+  (`.exe`, `.msi`, shortcuts, `.apk`), scripts (`.bat`, `.ps1`, `.sh`,
+  `.py`) open in TurboADB's editor so they can't run by accident, and so do
+  text files no app opens, such as `build.prop`. **Edit** (F4) still opens
+  the built-in editor.
+- **Full-screen programs run in the terminals.** `top`, `watch`, `vi`, `less`
+  and other programs that draw on the whole screen now redraw in place in the
+  Android shell and in an `adb shell` typed in PowerShell or CMD, instead of
+  printing frame after frame. Every key goes straight to the program (arrows,
+  Esc, function keys, Ctrl+letters; `q` quits `top` without Enter), and when
+  it ends its last frame stays and the prompt comes back; `vi` and `less` give
+  back the screen as it was. Resizing the window resizes the program's screen
+  on the device. `adb shell top` typed in PowerShell or CMD gets a device
+  terminal by itself.
+- **Colour in device shells.** The device prompt is coloured (exit status,
+  host, path, `$` or `#`), `ls` and `grep` show their colours where the
+  device's tools can (Android 16's `ls` too, which colours only output that
+  does not go to a terminal), and `adb logcat` lines in any terminal are coloured by
+  priority, as in the Logcat tab. Output that brings colours of its own keeps
+  them.
+- **Logcat App filter.** Show one app's lines by package name or process id
+  (Android 7 and later). `turboadb logcat` has matching `--package` and `--pid`
+  options.
+- **Android shell setting.** **Settings → Appearance → Android shell** chooses
+  between the new device terminal and the old plain-pipe mode.
+- **History limit.** Terminal and Logcat history files stay under 1 GB each
+  (`history_limit_mb` in settings.json, `0` for no limit); a save says how much
+  was dropped.
+- **`turboadb doctor` checks the adb server.** It shows the running server's
+  release, protocol and executable, warns when it belongs to another adb, and
+  warns when the TurboADB you are running isn't the one installed.
+- **Deploy dialog Recent menu** with your deploy and Connect history.
+
+### Changed
+
+- **The Android shell runs on a real device terminal.** The device prints its
+  own prompt, pipelines such as `logcat | grep` or `| sed` show their output as
+  it comes, and programs that wait for input (`read`, `su`, `top`) work.
+  **Stop** sends a real Ctrl+C, so `ping` prints its summary and the shell
+  stays open; a command that ignores it gets a fresh shell in the same folder
+  after three seconds. A device or adb that can't give a terminal falls back to
+  the old mode by itself.
+- **Stop in PowerShell and CMD works like Ctrl+C in a console window.** It used
+  to close the whole shell and open a new one, losing your variables, modules
+  and history, and `ping` never printed its summary. Now `ping` prints its
+  statistics, a script or batch file stops, and the same shell shows its prompt
+  again. A command that ignores Ctrl+C has its processes ended; only if that
+  fails too, or you press Stop again, is the shell replaced. Stop never types
+  anything for you, so it can't answer a waiting question such as `-Confirm`.
+- **PowerShell in TurboADB follows the PC's script execution policy**, like a
+  normal PowerShell window.
+- **Every IVI display starts stopped.** Only a display's own **Start**, or
+  **Start all**, starts it; a display you stop stays stopped across rescans,
+  and a newly found display arrives stopped. On Linux and macOS each display
+  now shows inside its tile.
+- **Closing a device tab no longer disconnects a device someone else is
+  using.** A network connection is dropped only when TurboADB made it and the
+  last tab using it closes, never on a remote or shared adb server.
+- **"Close ADB and scrcpy when TurboADB closes" stops only what TurboADB
+  started.** An adb server started by Android Studio, a script or a terminal
+  keeps running; turning the setting off also leaves separate scrcpy windows
+  open.
+- **Sharing opens the firewall on Domain and Private networks only.** The
+  status line names a Public network you're on and warns that the adb server
+  has no password; **Stop sharing** removes the rules.
+- **Remote webcam** only runs ffmpeg from folders only administrators can write
+  (`C:\Program Files\TurboADB\ffmpeg`), and checks a copied ffmpeg first.
+- **The deploy dialog** starts with only the last deploy's hosts and asks
+  before deploying to several hosts.
+- **A transfer fails only after it stops moving.** A push or pull times out
+  after 10 minutes without progress (`--timeout` / `transfer_timeout`), not
+  after 10 minutes in all, so big copies over slow links finish (a push to a
+  device without `stat`, Android 5 and older, still ends after 10 minutes in
+  all). `--timeout 0` means no limit.
+- **`turboadb shell -- CMD` and `turboadb adb -- ARGS` stream their output** as
+  it arrives and no longer stop after 60 s; `--json` still collects it.
+- **Logcat's Filter ignores case**, like Highlight and the CLI's `--grep`; the
+  new **Aa** button matches case. Text that isn't a valid regular expression is
+  searched as plain text with a hint.
+- A `--adb-path`, `--scrcpy-path`, `adb_path` or `TURBOADB_ADB` that doesn't
+  exist is now an error instead of silently using another adb: nothing is
+  downloaded for it, the CLI exits 3 naming it, and `doctor` names it. The
+  window warns and uses its Settings or managed adb, and a stale Settings path
+  falls back with a warning.
+- `text`, `search` and `send-sms` refuse options written after the words
+  instead of typing them; use `--` to type such words.
+- Install APK lists `.apk` files only, explains why app bundles can't be
+  installed directly, and asks whether several APKs are separate apps or parts
+  of one app.
+- Restart ADB server refuses to kill a remote adb server it could not start
+  again, and says to restart it on that machine.
+- Sizes and speeds read the same everywhere (`12.0 MB`, `48.0 MB/s`).
+
+### Fixed
+
+#### Terminals
+
+- **Ctrl+W in a terminal deletes a word again, instead of closing the device
+  tab.** The window's shortcuts won over the terminal, so Ctrl+W closed the
+  whole tab (shells, logcat, transfers) without asking. The terminal now
+  keeps the keys it uses, the window keeps its others (Ctrl+T, Ctrl+B, F1…),
+  and a full-screen program such as nano or vi gets every key.
+- **Non-English text reaches an `adb shell` started in CMD intact.** It was
+  re-encoded for the Windows console on its way, so `echo café` arrived
+  garbled.
+- **An unfinished title sequence no longer hides the rest of the output**,
+  and odd escape sequences can't stall or break a terminal.
+- **Ctrl+C and Stop stop the output at once.** After a logcat flood, lines
+  kept scrolling for seconds after Ctrl+C, so logcat looked as if it had not
+  stopped. Output that was not on screen yet is now skipped (one line says
+  how much; **Save…** still has all of it), the device's `^C` and its prompt
+  show straight away, and a flood never gets more than about a second ahead
+  of the view.
+- **The Android shell's terminal is exactly as wide as the view.** The device
+  was told a width that ignored the scroll bar, so a full-width `ls` row
+  wrapped and its columns went out of line. Progress bars that redraw their
+  line in place now show correctly too.
+- **Ping, logcat and other long-running commands stream in every terminal.**
+  In PowerShell and CMD, Python tools held their output until they ended, and
+  `adb logcat | findstr …` or `| grep …` showed nothing until the command
+  stopped. Python now runs unbuffered, `| grep` gets `--line-buffered`, and a
+  simple `| findstr word` runs `find` in CMD and `Select-String` in PowerShell.
+- **No more extra blank lines in PowerShell and CMD.** Enter pressed while a
+  command ran, every command inside a typed `adb shell`, `pause`, Stop and
+  reconnect notices, and `cls` / `Clear-Host` all added blank lines. The only
+  blank lines left are the ones the shell prints itself.
+- **Typing while output streams no longer scrambles it**, and a line typed
+  before a shell is ready, or while a command runs, shows once.
+- Answers typed into a running program (`set /p`, `Read-Host`, `input()`) are
+  left alone instead of being swallowed or rewritten, and `Read-Host` shows its
+  prompt.
+- Stopping or closing a terminal no longer takes down the adb server a command
+  typed there had started.
+- The Android shell never freezes the window when the device stops reading
+  input, shows one prompt after Stop or a reopen, says so when a reopen fails,
+  and no longer stays paused after a failed ADB restart.
+- After a resize or font change, the next command in the Android shell and in
+  PowerShell uses the new width.
+- `adb` typed in the PowerShell/CMD terminals of a device on a remote adb
+  server reaches that server.
+- Tab completion no longer freezes the window on slow or network folders and
+  works in quoted paths with spaces.
+- Send key offers only keys that do something in that terminal; Clear brings
+  the Android shell's prompt back; command history keeps the last 1000 lines.
+- Terminal scrollback no longer shows stray "(B", "7" or "=" characters.
+
+#### Logcat
+
+- **A slow Filter or Highlight pattern can no longer freeze the window.** A
+  pattern such as `\w+.*\w+Exception` took seconds per screenful and minutes
+  to re-mark a long capture. Patterns that slow are now matched as plain text
+  (with a note), and highlighting works in short slices.
+- **Logcat keeps every line.** While the page was hidden, or during a burst,
+  the oldest lines were dropped before they were saved, so Save and the Filter
+  missed most of a busy capture. Every line is now saved first, the Filter runs
+  before the on-screen limit, and a new filter searches the whole capture.
+- Tag, Level and App apply during a capture (it restarts where it left off),
+  several tags (`A, B`) work, Highlight changes apply to lines already shown,
+  and level colours work in every logcat format.
+- Logcat says when it failed, and a live capture resumes after a reboot, an ADB
+  restart or a reconnect.
+- Filters that could freeze the window, such as `(a|aa)+`, are matched as
+  plain text; "Live from now", "Last N + live" and the Crashes preset work on
+  Android 4 and older.
+- `turboadb logcat`: an invalid `--match` is reported instead of a traceback,
+  Ctrl+C prints the match count, output reaches a pipe line by line, a failing
+  logcat exits 1 with adb's error, and `--tail 0` is refused.
+
+#### adb and devices
+
+- **Updating the tools or TurboADB no longer trips over open device tabs.**
+  They pause and reconnect as they do for Restart ADB; before, their shells
+  started a stray adb server that kept the tools folder locked and outlived
+  TurboADB.
+- **Restart ADB keeps a shared server shared** (it came back on this PC only,
+  and other machines lost the devices), waits its turn while a share, tools
+  download or update is running, and leaves tabs on another machine's adb
+  server alone.
+- **Discover Wi-Fi devices updates a saved target** when wireless debugging
+  moves to a new port, instead of adding one more each time.
+- **Fewer adb processes.** A cold start could launch up to three
+  `adb start-server` at once; they now share one. The Phone page no longer runs
+  six adb commands in parallel, connecting skips needless round trips, and a
+  hard-stopped scrcpy takes its adb helpers with it.
+- A first wireless connect to a device that has never seen this PC waits while
+  you accept "Allow USB debugging?" instead of failing with "failed to
+  authenticate".
+- Remote adb servers given by an IPv6 address work, for devices, mirrors, `adb`
+  typed in PowerShell/CMD, Wi-Fi discovery, deploy and the remote webcam.
+- A "remote" adb server that is really this PC is treated as local everywhere.
+- Wireless-debugging devices are shown as network devices; disconnecting one
+  says adb can't end that connection instead of claiming it did.
+- Connecting with no adb installed downloads platform-tools, and a local adb
+  server that fails to start says why.
+- The ADB status recovers after a slow first start, and unplugging the last
+  device updates the list within about two seconds.
+- TurboADB follows `ANDROID_ADB_SERVER_PORT` everywhere, warns when the running
+  adb server is a different version, and never stops a server another program
+  started at the same moment.
+- A device whose details didn't arrive right after connecting is asked again,
+  so a busy head unit still gets its IVI Displays tab.
+- Text typed into a device is never written to the log; only its length is.
+- `shell --su` works on userdebug and eng head units, and runs without `su`
+  when adbd is already root.
+- Tap bursts tap the right spot on a rotated display, no longer fail on slow
+  head units, and fall back to `input` when the touchscreen refuses events.
+- `forward` / `reverse` with `tcp:0` show the port adb picked and can remove
+  the rule again; `adb remount` says when a reboot is still needed.
+
+#### Files
+
+- **Saving a device file can no longer lose it.** `adb push` deletes a file
+  before writing it, so a save from the editor or `turboadb edit` that was cut
+  off halfway (a loose cable, a full disk) left no file at all, and a saved
+  file got adb's owner. The copy now goes next to the file and is written over
+  it on the device, so the file keeps its owner, permissions and SELinux label,
+  and a failed save leaves it as it was.
+- **A name ending in a line break is no longer taken for its neighbour.** A
+  script with Windows line endings can create `out\r` beside `out`; Delete,
+  Edit or Paste on the odd row acted on `out`. Such names are now refused with
+  a message, as other names that can't be matched exactly are.
+- **A Shift-drag from Explorer no longer deletes your files.** A drop is always
+  a copy.
+- Folders with thousands of entries appear up to three times faster, and
+  selecting in them no longer stalls.
+- Transfers show real progress while copying, and a pull that is cancelled or
+  times out no longer leaves a cut-off file that looks complete.
+- Retrying a folder transfer no longer nests the folder (`/sdcard/logs/logs`).
+- Rename and Move work on head units older than Android 11, and never move an
+  item into a folder of the same name, or into the folder a link of that name
+  points to.
+- Renaming a PC item accepts only a name, asks before replacing a file and
+  never replaces a folder.
+- A push or pull this PC refused (a locked file, Program Files) is reported as
+  such, without offering adb root.
+- The built-in editor saves PC files safely, and the editor and
+  `turboadb edit` keep a device file's permissions.
+- Paste and `turboadb cp` follow the same rules: links are copied as links, and
+  an item of another kind is never overwritten.
+- F5 works with two Files tabs side by side; Desktop and Downloads open the real
+  folders, including a OneDrive Desktop; device rows show icons on Linux.
+- Closing a Files tab stops a device paste or delete after the current item,
+  Cancel also drops a transfer still being prepared, and a cancelled transfer
+  says what it left behind.
+
+#### Screens, recording and webcam
+
+- **A scrcpy window that stops responding no longer freezes TurboADB.**
+- A display that keeps failing to start is no longer retried forever, and a
+  display you can't see is not retried behind your back.
+- OpenGL is only turned off when scrcpy reports it can't use it.
+- Recording a display no longer takes or mutes the device's audio, several
+  recordings stopped at once all finish playable, and continuous recording no
+  longer loses the time spent saving each part.
+- `record` on Linux and macOS stops cleanly on Ctrl+C, and a terminal's Stop
+  no longer interferes with stopping a recording.
+- Webcam: a stream that ends is reported (and a recording saved) instead of
+  freezing, changing Source during a scan works, and camera names with accents
+  are listed correctly.
+
+#### App, settings and sharing
+
+- **An error in a background task no longer crashes TurboADB**; it is logged
+  and shown once.
+- **Saved targets keep saving with one damaged entry in the file**: the file is
+  kept aside as `.corrupt-<date>` and the good targets are written back, as a
+  manual save already did.
+- **Check for updates no longer freezes the window** the first time it runs.
+- **The Connect dialog never stays at "scanning…"** after a second scan was
+  asked for while one was queued.
+- **Saved targets and settings survive other windows and typos.** A window left
+  open no longer writes back an old list of targets, and a `sessions.json` or
+  `settings.json` that can't be read is kept as `….corrupt-<date>` before it is
+  rewritten.
+- Closing TurboADB leaves no shells or adb server behind and no longer hangs
+  behind a share, restart or several scrcpy windows.
+- Share and Stop sharing pause and reconnect the device tabs' shells and
+  logcat, won't start during another adb server task, and the Share question
+  names the firewall scope. The login auto-start runs the same adb.
+- `serve --startup-task` and remote deploy report failure when the startup task
+  never starts its server, and the task's server accepts your devices.
+- Updating adb and scrcpy restarts a shared server once, including servers
+  shared on other ports; a failed upgrade restores the old tools.
+- "Run a command on ALL devices" runs on all devices at once.
+- Self-update (CLI and window) installs exactly the version PyPI offers, says
+  "already up to date" when nothing is newer, and refuses source checkouts
+  with the reason.
+- `--json` prints a single JSON document for every command (a failure still
+  prints one `ERROR:` line), and a command that timed out includes its partial
+  output with `"timed_out": true`.
+- `turboadb gui` opens straight away, `start-activity` no longer fails on the
+  word "error", `edit --editor "code --wait"` works on Windows, and
+  `turboadb info` prints aligned lines.
+- Opening a second TurboADB no longer deletes the first one's terminal and
+  logcat history, and a missing adb path in Settings is reported in the log.
+- The Phone page keeps a recipient you typed across refreshes, and the Apps
+  filter ignores surrounding spaces.
+- Build reports keep fingerprints and dates whole; the start page's "Open
+  target" opens Wi-Fi devices without a duplicate tab.
+
 ## 2.5.0
 
 ### New

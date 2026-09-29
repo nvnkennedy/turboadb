@@ -34,7 +34,8 @@ from PyQt5.QtWidgets import QWidget
 
 from ..core import ADBHandler
 from ..results import OperationResult
-from .qtutil import park_thread
+from .device_commands import DeviceCommandDispatcher, command_error
+from .qtutil import park_thread, thread_running
 
 # --------------------------------------------------------------------------- #
 # Stream parsing (no Qt)
@@ -621,19 +622,12 @@ def frame_to_image(frame, target=None):
 
 
 def _kill(proc, wait=True) -> None:
-    """End a capture process (a finished one is left alone)."""
+    """End a capture process (a finished one is left alone); *wait* reaps it."""
     if proc is None:
         return
-    try:
-        if proc.poll() is None:
-            proc.kill()
-    except Exception:
-        pass
-    if wait:
-        try:
-            proc.wait(timeout=2.0)
-        except Exception:
-            pass
+    from ..proctree import stop_process
+
+    stop_process(proc, grace=0, reap=wait)
 
 
 class ScreencapWorker(QThread):
@@ -886,8 +880,6 @@ class ScreencapView(QWidget):
         self.fmt = fmt
         self._owns_dispatcher = dispatcher is None
         if dispatcher is None:
-            from .device_commands import DeviceCommandDispatcher
-
             dispatcher = DeviceCommandDispatcher()
         self._dispatcher = dispatcher
         self._key_sink = key_sink
@@ -1020,7 +1012,11 @@ class ScreencapView(QWidget):
             self._batcher.stop()
         if self._owns_dispatcher:
             self._dispatcher.stop()
-            park_thread(self._dispatcher)
+            # Only a started dispatcher is parked: one that never ran (no
+            # input was sent) never finishes, so it would stay parked for
+            # the rest of the process.
+            if thread_running(self._dispatcher):
+                park_thread(self._dispatcher)
 
     def set_paused(self, paused: bool) -> None:
         """A hidden view stops reading (the device loop then waits) and lets
@@ -1240,12 +1236,9 @@ class ScreencapView(QWidget):
                 self._wheel_busy = False
             if self._closed:
                 return
-            if isinstance(result, OperationResult) and not result.success:
-                self.log.emit(f"[WARNING] screen input ({label}): {result.error}")
-            elif result is False or (
-                isinstance(result, OperationResult) and result.value is False
-            ):
-                self.log.emit(f"[WARNING] screen input ({label}): the device rejected it")
+            error = command_error(result, "the device rejected it")
+            if error:
+                self.log.emit(f"[WARNING] screen input ({label}): {error}")
 
         def fail(message):
             if wheel:

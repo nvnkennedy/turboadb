@@ -8,6 +8,7 @@ import pytest
 
 import turboadb.cli as cli
 from turboadb.config import ADBConfig
+from turboadb.exceptions import ADBCommandError
 
 
 class FakeDev:
@@ -155,9 +156,16 @@ def test_state_wait_and_serialno_do_not_connect(run):
 
 
 def test_adb_passthrough(run):
+    """adb runs on the console, as adb itself does (its output streams as it
+    comes); with --json the output is collected into the one document."""
+    dev = FakeDev(run_attached=0)
+    rc, _out, _ = run(["adb", "--", "get-state"], dev)
+    assert rc == 0
+    assert dev.called("run_attached") == [((["get-state"],), {"timeout": None})]
+    assert not dev.called("adb")
     dev = FakeDev(adb=_result("device\n", exit_code=0))
-    rc, out, _ = run(["adb", "--", "get-state"], dev)
-    assert rc == 0 and out == "device\n"
+    rc, out, _ = run(["--json", "adb", "--", "get-state"], dev)
+    assert rc == 0 and json.loads(out)["stdout"] == "device\n"
     assert dev.called("adb") == [(("get-state",), {})]
     assert run(["adb"])[0] == 2
 
@@ -214,7 +222,9 @@ def test_devices_and_discover_follow_a_saved_remote_target(run, monkeypatch, tmp
     import turboadb.devices as devices
 
     monkeypatch.setattr(devices, "mdns_devices", lambda adb_path=None, **k: [])
-    assert run(["-s", "@lab", "--adb-path", "my-adb", "discover"])[0] == 0
+    my_adb = tmp_path / "my-adb.exe"  # an --adb-path must name a real file
+    my_adb.write_text("")
+    assert run(["-s", "@lab", "--adb-path", str(my_adb), "discover"])[0] == 0
 
 
 def test_shell_all_enumerates_the_targets_own_server(monkeypatch, capsys, tmp_path):
@@ -323,10 +333,11 @@ def test_edit_picks_the_editor_and_reports_the_engine_result(run, monkeypatch):
         return 0
 
     monkeypatch.setattr(cli.subprocess, "call", editor)
+    monkeypatch.setattr("shutil.which", lambda name, *a, **k: "/opt/bin/" + name)
     dev = _edit_dev()
     rc, out, _ = run(["edit", "/data/x.ini", "--editor", "myeditor"], dev)
     assert rc == 0 and "Saved /data/x.ini" in out
-    assert seen["cmd"] == ["myeditor", "/tmp/turboadb-edit.ini"]
+    assert seen["cmd"] == ["/opt/bin/myeditor", "/tmp/turboadb-edit.ini"]
     (path, _opener), kwargs = dev.called("edit_file")[0]
     assert path == "/data/x.ini" and kwargs == {"editor": "myeditor"}
     assert not dev.called("push") and not dev.called("stat_path")
@@ -348,8 +359,9 @@ def test_edit_uses_the_EDITOR_environment_variable(run, monkeypatch):
     monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.setenv("EDITOR", "nano -w")
     monkeypatch.setattr(cli.subprocess, "call", lambda cmd: seen.setdefault("cmd", cmd) and 0)
+    monkeypatch.setattr("shutil.which", lambda name, *a, **k: "/usr/bin/" + name)
     assert run(["edit", "/data/x.ini"], _edit_dev())[0] == 0
-    assert seen["cmd"][:2] == ["nano", "-w"]
+    assert seen["cmd"][:2] == ["/usr/bin/nano", "-w"]
 
 
 # --- apps ------------------------------------------------------------------- #
@@ -364,8 +376,14 @@ def test_app_flags(run):
     dev = FakeDev(start_activity="Starting: Intent { cmp=com.x/.Main }")
     assert run(["start-activity", "com.x/.Main", "--es", "mode", "demo", "--ez", "debug", "true"], dev)[0] == 0
     assert dev.called("start_activity")[0][1]["extras"] == ["--es", "mode", "demo", "--ez", "debug", "true"]
-    dev = FakeDev(start_activity="Error: Activity class {com.x/.Nope} does not exist.")
-    assert run(["start-activity", "com.x/.Nope"], dev)[0] == 1
+
+    def missing_class(*a, **k):  # the engine raises when am refuses (it exits 0)
+        refusal = "Error: Activity class {com.x/.Nope} does not exist."
+        raise ADBCommandError("shell am start -n com.x/.Nope",
+                              types.SimpleNamespace(exit_code=0, stderr=refusal))
+
+    rc, _, err = run(["start-activity", "com.x/.Nope"], FakeDev(start_activity=missing_class))
+    assert rc == 1 and "does not exist" in err
     dev = FakeDev()
     assert run(["grant", "com.x", "android.permission.CAMERA"], dev)[0] == 0
     assert dev.called("grant") == [(("com.x", "android.permission.CAMERA"), {})]
@@ -474,9 +492,19 @@ def test_forward_list_remove_and_no_wait(run):
     dev = FakeDev()
     assert run(["reverse", "--remove", "tcp:3000"], dev)[0] == 0
     assert dev.called("remove_reverse") == [(("tcp:3000",), {})]
-    dev = FakeDev(forward="tcp:1 -> tcp:2")
+    dev = FakeDev(forward=types.SimpleNamespace(local="tcp:1", remote="tcp:2"))
     assert run(["forward", "tcp:1", "tcp:2", "--no-wait"], dev)[0] == 0
     assert dev.called("forward") == [(("tcp:1", "tcp:2"), {})]
+
+
+def test_forward_no_wait_names_the_port_adb_picked(run):
+    """``tcp:0`` lets adb choose the port; the removal hint needs the real one."""
+    dev = FakeDev(forward=types.SimpleNamespace(local="tcp:40123", remote="localabstract:x"))
+    rc, out, _ = run(["forward", "tcp:0", "localabstract:x", "--no-wait"], dev)
+    assert rc == 0 and "--remove tcp:40123" in out
+    dev = FakeDev(reverse=types.SimpleNamespace(local="tcp:8000", remote="tcp:38001"))
+    rc, out, _ = run(["reverse", "tcp:0", "tcp:8000", "--no-wait"], dev)
+    assert rc == 0 and "--remove tcp:38001" in out
 
 
 # --- sharing and updates ---------------------------------------------------- #
@@ -501,7 +529,7 @@ def test_serve_failures_go_to_stderr(run, monkeypatch):
     monkeypatch.setattr(devices, "start_shared_server", lambda **kw: "adb server shared")
     monkeypatch.setattr(devices, "open_firewall", lambda ports: "firewall rules added")
 
-    def refuse(port=5037):
+    def refuse(port=5037, adb_path=None):
         raise RuntimeError("access denied — run as Administrator")
 
     monkeypatch.setattr(devices, "install_serve_task", refuse)
@@ -527,7 +555,7 @@ def test_serve_never_auto_fetches_tools(run, monkeypatch):
     assert not fetched
 
 
-def test_auto_fetch_honours_an_explicit_scrcpy_path(run, monkeypatch):
+def test_auto_fetch_honours_an_explicit_scrcpy_path(run, monkeypatch, tmp_path):
     """`--scrcpy-path X scrcpy` downloaded a whole toolchain because the guard
     asked scrcpy_available() with no argument."""
     import turboadb.toolsdl as toolsdl
@@ -537,8 +565,10 @@ def test_auto_fetch_honours_an_explicit_scrcpy_path(run, monkeypatch):
     monkeypatch.setattr(cli, "adb_available", lambda *a, **k: True)
     monkeypatch.setattr(cli, "scrcpy_available", lambda explicit=None: asked.append(explicit) or True)
     dev = FakeDev(mirror=types.SimpleNamespace(pid=1, wait=lambda: 0))
-    assert run(["--scrcpy-path", "C:/tools/scrcpy.exe", "scrcpy"], dev)[0] == 0
-    assert asked == ["C:/tools/scrcpy.exe"] and not fetched
+    scrcpy = tmp_path / "scrcpy.exe"  # an explicit path must name a real file
+    scrcpy.write_text("")
+    assert run(["--scrcpy-path", str(scrcpy), "scrcpy"], dev)[0] == 0
+    assert asked == [str(scrcpy)] and not fetched
 
     # a missing scrcpy fetches scrcpy; any other command must not ask for it
     monkeypatch.setattr(cli, "scrcpy_available", lambda explicit=None: False)
@@ -554,9 +584,15 @@ def test_setup_commands_take_json_before_or_after(run, monkeypatch):
     import turboadb.toolsdl as toolsdl
 
     diag = {"adb": "1.0.41", "adb_path": "adb.exe", "scrcpy": "2.4", "scrcpy_path": "scrcpy.exe"}
-    monkeypatch.setattr(tools, "diagnose", lambda: diag)
-    assert json.loads(run(["--json", "doctor"])[1]) == diag
-    assert json.loads(run(["doctor", "--json"])[1]) == diag
+    monkeypatch.setattr(tools, "diagnose", lambda: dict(diag))
+    # doctor also reports the adb server and which TurboADB runs
+    server = {"port": 5037, "protocol": 41, "version": "36.0.0", "executable": "adb.exe", "notes": []}
+    copy = {"version": "9.9.9", "path": "turboadb", "note": None}
+    monkeypatch.setattr(cli, "_adb_server_report", lambda adb_path: dict(server))
+    monkeypatch.setattr(cli, "_install_report", lambda: dict(copy))
+    expected = dict(diag, adb_server=server, turboadb=copy)
+    assert json.loads(run(["--json", "doctor"])[1]) == expected
+    assert json.loads(run(["doctor", "--json"])[1]) == expected
 
     monkeypatch.setattr(toolsdl, "tools_dir", lambda: "tools")
     monkeypatch.setattr(toolsdl, "fetch_tools", lambda **kw: {"adb": "adb.exe", "errors": {}})

@@ -30,7 +30,6 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QSpinBox,
     QInputDialog,
-    QLineEdit,
     QMessageBox,
     QFileDialog,
     QToolButton,
@@ -44,7 +43,7 @@ from ..config import ScrcpyOptions
 from ..results import OperationResult
 from ..scrcpy import is_remote_session
 from . import settings as settings_mod
-from .device_commands import DeviceCommandDispatcher
+from .device_commands import DeviceCommandDispatcher, command_error
 from .fileutil import download_dir, saved_dialog
 from .flowlayout import ToolbarFlowLayout
 from .icons import icon as _icon
@@ -115,6 +114,22 @@ def _win_api():
     u.GetForegroundWindow.argtypes = []
     u.IsChild.restype = wintypes.BOOL
     u.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
+    u.IsWindow.restype = wintypes.BOOL
+    u.IsWindow.argtypes = [wintypes.HWND]
+    u.IsWindowVisible.restype = wintypes.BOOL
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.GetClientRect.restype = wintypes.BOOL
+    u.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    u.SendMessageTimeoutW.restype = wintypes.LPARAM
+    u.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
     return ctypes, u
 
 
@@ -136,6 +151,58 @@ _SWP_NOACTIVATE = 0x0010
 _SWP_FRAMECHANGED = 0x0020
 _GA_PARENT = 1
 _GA_ROOT = 2
+_WM_NULL = 0x0000
+_SMTO_ABORTIFHUNG = 0x0002
+# How long the UI thread asks scrcpy's window to answer (see _answering), and
+# how long a window that did not is then left alone before it is asked again.
+_ANSWER_TIMEOUT_MS = 150
+_SILENT_RETRY_S = 1.0
+# The stop worker's question (_post_close) may take longer: it is off the UI.
+_CLOSE_ANSWER_TIMEOUT_MS = 1000
+_silent_until = {}  # window handle -> time.monotonic() it may be asked again
+
+
+def _answering(hwnd, timeout_ms=_ANSWER_TIMEOUT_MS) -> bool:
+    """Whether a message sent to *hwnd* now would be handled promptly.
+
+    Moving, sizing, restyling or re-parenting scrcpy's window, and moving the
+    keyboard focus to or from it, send it a message and wait for the answer.
+    A scrcpy whose window thread hangs (a device disconnecting, a stuck
+    decoder or GPU driver) never answers, and TurboADB used to wait with it.
+    SWP_ASYNCWINDOWPOS does not help: the embedded window shares its input
+    queue with ours, so Windows handles even that call synchronously.
+
+    So the window is asked first, with a WM_NULL that waits at most
+    *timeout_ms* (Windows answers at once for a thread it already considers
+    hung).  A window that did not answer is not asked again for
+    _SILENT_RETRY_S: a hung scrcpy costs a caller one short wait a second at
+    most.  A window of the calling thread, or one that is gone, counts as
+    answering, since nothing would wait on it.
+    """
+    if not _IS_WIN or not hwnd:
+        return True
+    try:
+        ctypes, u = _win_api()
+        hwnd = int(hwnd)
+        if not u.IsWindow(hwnd):
+            return True
+        if int(u.GetWindowThreadProcessId(hwnd, None) or 0) == threading.get_native_id():
+            return True
+        now = time.monotonic()
+        if _silent_until.get(hwnd, 0.0) > now:
+            return False
+        result = ctypes.c_size_t()
+        if u.SendMessageTimeoutW(
+            hwnd, _WM_NULL, 0, 0, _SMTO_ABORTIFHUNG, int(timeout_ms), ctypes.byref(result)
+        ):
+            _silent_until.pop(hwnd, None)
+            return True
+        if len(_silent_until) > 64:  # handles of windows long gone
+            _silent_until.clear()
+        _silent_until[hwnd] = now + _SILENT_RETRY_S
+        return False
+    except Exception:
+        return True
 
 
 def _set_restype(fn, restype) -> None:
@@ -207,8 +274,8 @@ def _focus_window(hwnd) -> bool:
     the caller thread's input queue — attaches to the scrcpy window's input
     thread before focusing it. Do not synthesize Alt here: Qt treats it as a
     menu activation and may route the next key to Help/Documentation."""
-    if not hwnd:
-        return False
+    if not hwnd or not _answering(hwnd):
+        return False  # (focusing a window that does not answer waits with it)
     try:
         ctypes, u = _win_api()
         k = ctypes.windll.kernel32
@@ -238,13 +305,17 @@ def _claim_native_focus(hwnd) -> bool:
     A click on the embedded scrcpy video can leave the keyboard with SDL's child
     window (another process, whose input queue the parent/child link attaches
     to ours).  Qt's ``setFocus`` alone does not move Win32 focus back, so do it
-    explicitly for the container HWND.
+    explicitly for the container HWND.  Nothing is done while the focus is
+    with a window that does not answer (see :func:`_answering`).
     """
     if not _IS_WIN or not hwnd:
         return False
     try:
         _ctypes, u = _win_api()
-        if int(u.GetFocus() or 0) != int(hwnd):
+        current = int(u.GetFocus() or 0)
+        if current != int(hwnd):
+            if not _answering(current):
+                return False
             u.SetFocus(hwnd)
         return int(u.GetFocus() or 0) == int(hwnd)
     except Exception:
@@ -267,6 +338,9 @@ def _focus_embedded_child(child_hwnd, parent_hwnd) -> bool:
     top-level window first: Qt reads focus moving from a native widget
     straight to its foreign child as the whole application losing activation,
     after which clicks no longer focus TurboADB's widgets.
+
+    A child (or a window holding the focus) that does not answer is left
+    alone, as a refusal: moving the focus would wait with it.
     """
     if not _IS_WIN or not child_hwnd or not parent_hwnd:
         return False
@@ -278,6 +352,8 @@ def _focus_embedded_child(child_hwnd, parent_hwnd) -> bool:
         current = int(u.GetFocus() or 0)
         if current == child:
             return True
+        if not (_answering(child) and _answering(current)):
+            return False
         target_tid = int(u.GetWindowThreadProcessId(child, None) or 0)
         if not target_tid:
             return False
@@ -300,6 +376,19 @@ def _focus_embedded_child(child_hwnd, parent_hwnd) -> bool:
         return False
 
 
+def _focus_owner_answering() -> bool:
+    """False while the Win32 keyboard focus is with a window that does not
+    answer (a stuck scrcpy that had the keyboard).  Any focus change then
+    waits for that window, Qt's own ``setFocus`` on a native widget too."""
+    if not _IS_WIN:
+        return True
+    try:
+        _ctypes, u = _win_api()
+        return _answering(int(u.GetFocus() or 0))
+    except Exception:
+        return True
+
+
 def _release_child_focus(child_hwnd, target_hwnd, *, if_lost=False) -> bool:
     """Move Win32 keyboard focus from the embedded SDL child to *target_hwnd*.
 
@@ -307,7 +396,8 @@ def _release_child_focus(child_hwnd, target_hwnd, *, if_lost=False) -> bool:
     keyboard from any other window.  With *if_lost* it also acts when no
     window has the focus (the child was just destroyed): keys typed into a
     focus-less active window arrive as system keys and open Qt menus.
-    Returns whether the focus was moved.
+    A child that does not answer keeps the focus (taking it would wait with
+    it; see :func:`_answering`).  Returns whether the focus was moved.
     """
     if not _IS_WIN or not child_hwnd or not target_hwnd:
         return False
@@ -315,6 +405,8 @@ def _release_child_focus(child_hwnd, target_hwnd, *, if_lost=False) -> bool:
         _ctypes, u = _win_api()
         current = int(u.GetFocus() or 0)
         if current != int(child_hwnd) and not (if_lost and current == 0):
+            return False
+        if current and not _answering(current):
             return False
         u.SetFocus(int(target_hwnd))
         return int(u.GetFocus() or 0) == int(target_hwnd)
@@ -444,7 +536,9 @@ def _post_close(title, hwnd=None) -> bool:
     ``scrcpy._post_close_to_pid`` cannot replace this: EnumWindows only visits
     top-level windows, so it never finds an embedded (WS_CHILD) scrcpy window.
     Callers run this on a worker thread; every Win32 call here is a synchronous
-    message to scrcpy's thread, and a hung scrcpy must not freeze the UI.
+    message to scrcpy's thread, and a hung scrcpy must not freeze the UI.  A
+    window that does not answer is not touched either (False): the stop would
+    wait for as long as it hangs, so the caller ends the process instead.
     """
     if not _IS_WIN:
         return False
@@ -452,7 +546,7 @@ def _post_close(title, hwnd=None) -> bool:
 
     _ctypes, u = _win_api()
     hwnd = hwnd or _find_window(title)
-    if not hwnd:
+    if not hwnd or not _answering(hwnd, _CLOSE_ANSWER_TIMEOUT_MS):
         return False
     # If the window is currently reparented as a child (WS_CHILD), detach it back to
     # the desktop so Win32 DefWindowProc and SDL2 deliver WM_CLOSE to the event pump
@@ -527,6 +621,40 @@ def _read_log_tail(session, limit: int = 65536) -> str:
         return ""
 
 
+# scrcpy.launch_scrcpy starts every session log with its own header: the
+# command line it ran, then a line of dashes. scrcpy's output follows.
+_LOG_HEADER = "TurboADB launched scrcpy as:"
+_LOG_HEADER_END = "\n" + "-" * 60 + "\n"
+
+
+def _scrcpy_output(log_text) -> str:
+    """scrcpy's own output from a session log, without TurboADB's header."""
+    text = str(log_text or "")
+    if text.startswith(_LOG_HEADER):
+        _header, found, output = text.partition(_LOG_HEADER_END)
+        if found:
+            return output
+    return text
+
+
+def _renderer_failed(log_text) -> bool:
+    """True when scrcpy reported that it could not set up its renderer.
+
+    Only scrcpy's own error lines count. The header repeats the command line,
+    which names the render driver (``--render-driver=opengl``) whatever went
+    wrong, and a healthy start prints "Renderer: opengl" and the OpenGL version
+    too, so a plain "opengl"/"render" match is true for every failed start.
+    """
+    for line in _scrcpy_output(log_text).splitlines():
+        low = line.strip().lower()
+        if "could not create renderer" in low:
+            return True
+        level = low.split(":", 1)[0]
+        if level in ("error", "critical") and ("opengl" in low or "renderer" in low):
+            return True
+    return False
+
+
 # Logs of ended scrcpy sessions.  Windows refuses to delete a log that a
 # stopping scrcpy still holds open, so entries wait for a later purge.
 _STALE_SCRCPY_LOGS = []
@@ -544,15 +672,6 @@ def _purge_scrcpy_logs() -> None:
 
 
 atexit.register(_purge_scrcpy_logs)
-
-
-def _command_error(result, rejected: str):
-    """Failure text for a device-command result (safe-mode or raw), else None."""
-    if isinstance(result, OperationResult):
-        if not result.success:
-            return str(result.error or rejected)
-        result = result.value
-    return rejected if result is False else None
 
 
 def _parse_display_size(size):
@@ -672,6 +791,33 @@ _DEVICE_EDIT_SHORTCUTS = (
     (QKeySequence.Copy, 278),  # KEYCODE_COPY
     (QKeySequence.Cut, 277),  # KEYCODE_CUT
 )
+# Keys sent to the device as Android keycodes; printable text goes as text.
+_DEVICE_KEYCODES = {
+    Qt.Key_Return: 66,
+    Qt.Key_Enter: 66,
+    Qt.Key_Backspace: 67,
+    Qt.Key_Tab: 61,
+    Qt.Key_Escape: 111,
+    Qt.Key_Delete: 112,
+    Qt.Key_Up: 19,
+    Qt.Key_Down: 20,
+    Qt.Key_Left: 21,
+    Qt.Key_Right: 22,
+    Qt.Key_Home: 122,
+    Qt.Key_End: 123,
+    Qt.Key_PageUp: 92,
+    Qt.Key_PageDown: 93,
+}
+
+
+def _map_device_key(key, text):
+    """``(kind, payload)`` for a Qt key: ``("key", android_keycode)``,
+    ``("text", text)`` for printable text, or ``(None, None)``."""
+    if key in _DEVICE_KEYCODES:
+        return "key", _DEVICE_KEYCODES[key]
+    if text and text.isprintable():
+        return "text", text
+    return None, None
 
 
 def device_paste_message(text: str) -> str:
@@ -691,7 +837,7 @@ def _forward_device_key(event, send, *, with_repeat=False, notify=None) -> bool:
     """Send one Qt key press to the device; False when it is not a device key.
 
     Paste arrives as one text batch, edit shortcuts become Android keycodes
-    and everything else goes through :meth:`_DeviceKeyEdit.map_event`.  With
+    and everything else goes through :func:`_map_device_key`.  With
     *with_repeat*, ``send`` also receives ``auto_repeat=`` so the key batcher
     can drop keyboard auto-repeat the device cannot keep up with.
 
@@ -713,7 +859,7 @@ def _forward_device_key(event, send, *, with_repeat=False, notify=None) -> bool:
         if event.matches(sequence):
             send("key", code, **extra)
             return True
-    kind, payload = _DeviceKeyEdit.map_event(event.key(), event.text())
+    kind, payload = _map_device_key(event.key(), event.text())
     if kind is None:
         return False
     send(kind, payload, **extra)
@@ -733,7 +879,7 @@ def _forward_device_key_release(event, release) -> bool:
             code = shortcut_code
             break
     if code is None:
-        kind, payload = _DeviceKeyEdit.map_event(event.key(), "")
+        kind, payload = _map_device_key(event.key(), "")
         if kind != "key":
             return False
         code = payload
@@ -1143,52 +1289,6 @@ class _EmbedContainer(QWidget):
         return super().event(event)
 
 
-class _DeviceKeyEdit(QLineEdit):
-    """A keyboard-capture field: every keystroke is forwarded to the device (via
-    the panel's ``send`` callback) instead of edited locally, so typing here IS
-    typing on the device — Enter, Backspace, arrows and all. The field itself
-    stays empty (it's a wire, not a buffer)."""
-
-    _KEYMAP = {
-        Qt.Key_Return: 66,
-        Qt.Key_Enter: 66,
-        Qt.Key_Backspace: 67,
-        Qt.Key_Tab: 61,
-        Qt.Key_Escape: 111,
-        Qt.Key_Delete: 112,
-        Qt.Key_Up: 19,
-        Qt.Key_Down: 20,
-        Qt.Key_Left: 21,
-        Qt.Key_Right: 22,
-        Qt.Key_Home: 122,
-        Qt.Key_End: 123,
-        Qt.Key_PageUp: 92,
-        Qt.Key_PageDown: 93,
-    }
-
-    def __init__(self, send, parent=None):
-        super().__init__(parent)
-        self._send = send  # send("text", str) / send("key", code)
-
-    @classmethod
-    def map_event(cls, key, text):
-        """(kind, payload) for a Qt key event — pure + unit-testable."""
-        if key in cls._KEYMAP:
-            return "key", cls._KEYMAP[key]
-        if text and text.isprintable():
-            return "text", text
-        return None, None
-
-    def keyPressEvent(self, event):
-        if not _forward_device_key(event, self._send):
-            super().keyPressEvent(event)  # let Qt handle what we don't map
-
-    def event(self, event):
-        if _swallow_shortcut_override(event):
-            return True
-        return super().event(event)
-
-
 _SKIPPED = object()  # a queued keyboard command discarded before it ran
 
 
@@ -1405,7 +1505,7 @@ class _KeyBatcher(QObject):
             finish()
             if result is _SKIPPED or self._closed:
                 return
-            error = _command_error(result, rejected)
+            error = command_error(result, rejected)
             if error:
                 self.note.emit(f"[WARNING] device keyboard: {error}")
 
@@ -1423,7 +1523,10 @@ class _ScrcpyCloseThread(QThread):
 
     WM_CLOSE gives scrcpy a real close path, far more reliable than Ctrl+Break
     from a GUI process, and lets it flush a recording's MP4 index before it
-    exits.  ``done`` reports whether the process ended cleanly.
+    exits.  Where there is no window to close (off Windows, or one that can no
+    longer be found or does not answer), ``stop()`` asks scrcpy to quit and
+    waits the same CLOSE_TIMEOUT before it ends the process.  ``done`` reports
+    whether the process ended cleanly.
     """
 
     done = pyqtSignal(bool)
@@ -1445,7 +1548,9 @@ class _ScrcpyCloseThread(QThread):
                         return
                     except Exception:
                         pass
-                self.session.stop()
+                # stop()'s own default is five seconds: a recording that needs
+                # longer to write its MP4 index was killed before it finished.
+                self.session.stop(timeout=self.CLOSE_TIMEOUT)
                 self.done.emit(not self.session.running)
                 return
         except Exception:
@@ -1546,17 +1651,22 @@ class _MirrorLaunchThread(QThread):
             )
             if isinstance(res, OperationResult) and not res.success:
                 self.fail.emit(str(res.error))
-            else:
-                sess = res.value if isinstance(res, OperationResult) else res
-                if self._cancelled and sess is not None:
-                    # The owning tab may already be gone. Clean up here instead
-                    # of relying on a Qt slot on a deleted widget.
-                    sess.stop()
-                elif not self._cancelled:
-                    self.done.emit(sess)
-        except Exception as exc:
+                return
+            sess = res.value if isinstance(res, OperationResult) else res
             if not self._cancelled:
-                self.fail.emit(str(exc))
+                self.done.emit(sess)
+                return
+            if sess is not None:
+                # The owning tab may already be gone. Clean up here instead
+                # of relying on a Qt slot on a deleted widget.
+                sess.stop()
+            # Still report the end (the panel's cancelled branch takes it; PyQt
+            # delivers nothing to a panel that is already deleted): a removed
+            # display tile is destroyed only once its panel hears that the
+            # launch is over (DisplayWall._remove_tile).
+            self.fail.emit("screen start cancelled")
+        except Exception as exc:
+            self.fail.emit(str(exc))
 
 
 class _RecordThread(QThread):
@@ -1580,30 +1690,31 @@ class _RecordThread(QThread):
 
     def run(self):
         # A single device-side screenrecord is capped at ~3 min by Android. Rather
-        # than just stopping mid-capture, record back-to-back parts until the user
-        # stops — each a valid, sharp clip (explicit high bitrate + native size).
-        base, ext = os.path.splitext(self.path)
-        ext = ext or ".mp4"
-        parts, n = [], 0
+        # than just stopping mid-capture, the engine records back-to-back parts
+        # until the user stops — each a valid, sharp clip (explicit high bitrate
+        # + native size) — and pulls each one while the next records, so the
+        # pulls leave no gaps.
+        parts = []
+        if self.stop_event.is_set():  # stopped before it started
+            self.done.emit(parts)
+            return
+
+        def saved(path):
+            parts.append(path)
+            if not self.stop_event.is_set():
+                self.part.emit(len(parts) + 1)  # the 3-min cap: the next part runs
+
         try:
-            while not self.stop_event.is_set():
-                seg = self.path if n == 0 else f"{base}-part{n + 1:02d}{ext}"
-                if n > 0:
-                    self.part.emit(n + 1)
-                self.handler.screen_record(
-                    seg,
-                    time_limit=180,
-                    size=self.size,
-                    bit_rate=self.bit_rate,
-                    display_id=self.display_id,
-                    stop_event=self.stop_event,
-                    safe=False,
-                )
-                if os.path.exists(seg) and os.path.getsize(seg) > 0:
-                    parts.append(seg)
-                n += 1
-                # if the user didn't press stop, the 3-min cap ended this segment —
-                # loop straight into the next part instead of stopping
+            self.handler.screen_record_continuous(
+                self.path,
+                part_seconds=180,
+                size=self.size,
+                bit_rate=self.bit_rate,
+                display_id=self.display_id,
+                stop_event=self.stop_event,
+                on_part=saved,
+                safe=False,
+            )
             self.done.emit(parts)
         except Exception as exc:
             if parts:
@@ -1706,11 +1817,11 @@ class MirrorPanel(QWidget):
         self._launch_spec = {}
         self._log_path = None
         self._scrcpy_error = ""  # the last failed start's output, shown on demand
-        self._stale_logs = []  # scrcpy logs of ended sessions, removed when unlocked
         self._max_hidden = []
         self._rec_status_text = None  # the recording's own status line, while shown
         self._retry_pending = False
         self._retry_generation = 0
+        self._retry_error = ""  # the failure a scheduled retry follows
         self._owns_dispatcher = dispatcher is None
         self._dispatcher = dispatcher or DeviceCommandDispatcher()
         self._rec_restore_spec = None
@@ -1725,6 +1836,8 @@ class MirrorPanel(QWidget):
         self._rec_title = None
         self._rec_log_path = None
         self._launch_opts = None  # the options of the current screen session
+        # scrcpy reported that it could not create an OpenGL renderer here
+        self._avoid_opengl = False
         self._default_display_size = None
         self._poll_interval = self.POLL_MS  # slowed while the panel is off screen
 
@@ -1911,6 +2024,9 @@ class MirrorPanel(QWidget):
         # True while scrcpy's own SDL window holds the keyboard (the native
         # route, see _focus_embedded); False while keys reach the container.
         self._native_keyboard = False
+        # scrcpy's window, when it kept the keyboard because it did not answer
+        # (see _release_native_keyboard and _take_back_keyboard)
+        self._keyboard_left_with = None
         self._keyboard_route = None  # the route last reported in the log
         self._native_kb_timer = QTimer(self)
         self._native_kb_timer.setSingleShot(True)
@@ -2020,7 +2136,9 @@ class MirrorPanel(QWidget):
         focus still moves to the container, so choosing any other TurboADB
         widget is noticed (_on_app_focus_changed) and takes the keyboard back.
         When Windows refuses, Win32 focus goes to the container's own HWND and
-        the container forwards keys over ADB (_KeyBatcher).
+        the container forwards keys over ADB (_KeyBatcher).  While the keyboard
+        is with a scrcpy that does not answer, nothing moves (every focus
+        change would wait for scrcpy).
         Returns whether the container took focus.
         """
         if not self.container.isVisible():
@@ -2028,6 +2146,8 @@ class MirrorPanel(QWidget):
         if self._screencap is not None:
             self._screencap.setFocus(reason)  # it reads the keys itself
             return True
+        if self._child_hwnd and not _focus_owner_answering():
+            return False
         self.container.setFocus(reason)
         if self._child_hwnd:
             native = False
@@ -2104,11 +2224,17 @@ class MirrorPanel(QWidget):
         """Take the keyboard back from scrcpy's SDL window.
 
         Win32 focus moves to *target*'s native window (by default this panel's
-        top-level window), but only while the SDL child still holds it.
+        top-level window), but only while the SDL child still holds it.  A
+        scrcpy that does not answer keeps it for now (taking it would wait
+        with scrcpy): :meth:`_take_back_keyboard` finishes the job once it
+        answers again, or has gone.
         """
         was, self._native_keyboard = self._native_keyboard, False
         self._native_kb_timer.stop()
         if not was or not self._child_hwnd:
+            return
+        if not _answering(self._child_hwnd):
+            self._keyboard_left_with = self._child_hwnd
             return
         try:
             widget = target if target is not None else self.window()
@@ -2120,6 +2246,26 @@ class MirrorPanel(QWidget):
                 int(hwnd),
                 if_lost=bool(if_lost and self.isActiveWindow()),
             )
+        except Exception:
+            pass
+
+    def _take_back_keyboard(self) -> None:
+        """Finish a keyboard release that waited for scrcpy to answer (see
+        :meth:`_release_native_keyboard`): once it answers again, or once it
+        has gone, when the focus it had is otherwise lost."""
+        child = self._keyboard_left_with
+        if child is None:
+            return
+        if self._native_keyboard:
+            self._keyboard_left_with = None  # the keyboard was given back to it
+            return
+        if not _answering(child):
+            return
+        self._keyboard_left_with = None
+        try:
+            window = int(self.effectiveWinId() or 0)  # (never creates one)
+            if window:
+                _release_child_focus(child, window, if_lost=self.isActiveWindow())
         except Exception:
             pass
 
@@ -2229,6 +2375,11 @@ class MirrorPanel(QWidget):
             _ctypes, u = _win_api()
             attached = int(u.GetParent(self._child_hwnd) or 0)
             if parent != self._embed_parent_hwnd or attached != parent:
+                if not _answering(self._child_hwnd):
+                    # Re-parenting waits for scrcpy's window to answer: try
+                    # again in a moment rather than hang with a stuck scrcpy.
+                    QTimer.singleShot(int(_SILENT_RETRY_S * 1000), self.ensure_embedded)
+                    return
                 _reparent(
                     self._child_hwnd, parent, self.container.width(), self.container.height()
                 )
@@ -2237,6 +2388,26 @@ class MirrorPanel(QWidget):
             self.log.emit(f"[WARNING] could not re-attach the embedded screen: {exc}")
             return
         self._fit()
+
+    def keep_window_open(self) -> bool:
+        """Let a separate scrcpy window outlive this panel: TurboADB is exiting
+        with Settings → Startup "Close ADB and scrcpy when TurboADB closes" off.
+
+        The panel forgets the session, so closing it leaves the window alone.
+        A screen shown inside the tab cannot outlive the tab, and a recording
+        is still finished by the normal close, so only a plain separate window
+        is kept.  True when one was."""
+        session = self._scrcpy
+        if session is None or not session.running:
+            return False
+        if self._embed_on or self._child_hwnd or self._recording:
+            return False
+        self._release_viewer()
+        self._scrcpy = None
+        # The window still uses the device connection: the closing tab must
+        # not drop it (DeviceTab.close_session reads this).
+        self._window_kept = True
+        return True
 
     def _integrated_recording_blocks(
         self,
@@ -2466,7 +2637,10 @@ class MirrorPanel(QWidget):
 
         self.btn_ivi = QPushButton("All displays")
         self.btn_ivi.setProperty("role", "ghost")
-        self.btn_ivi.setToolTip("Show every display of this device live, side by side")
+        self.btn_ivi.setToolTip(
+            "Open the displays tab: every display side by side, stopped until you "
+            "start it (or Start all)"
+        )
         self.btn_ivi.clicked.connect(lambda: (menu.close(), self.open_ivi_view()))
         self.btn_ivi.setVisible(self._all_displays_offered())
         extra_grid.addWidget(self.btn_ivi, 2, 1)  # last: hidden unless IVI
@@ -2976,7 +3150,7 @@ class MirrorPanel(QWidget):
         def done(result):
             if self._closing:
                 return
-            if _command_error(result, "rejected") is None:
+            if command_error(result, "rejected") is None:
                 self.log.emit("[OK] text sent")
             else:
                 self.log.emit(
@@ -3017,7 +3191,11 @@ class MirrorPanel(QWidget):
         if self.__dict__.get("act_mirror_all") is not None:
             self.act_mirror_all.setEnabled(True)
         self.btn_stop.setVisible(active)
-        self.btn_stop.setEnabled(active and not self._stopping_mirror)
+        # While a session closes, Stop only has something to do if a start
+        # waits behind it (see stop()).
+        self.btn_stop.setEnabled(
+            active and (not self._stopping_mirror or self._queued_start is not None)
+        )
         # Screenshot remains available while a mirror is running; it is disabled
         # only during its own short capture worker to prevent duplicate writes.
         self.btn_shot.setEnabled(self._shot is None)
@@ -3530,6 +3708,12 @@ class MirrorPanel(QWidget):
             if timer is not None and timer.isActive():
                 timer.setInterval(self._poll_interval)
 
+    @staticmethod
+    def embeds_scrcpy() -> bool:
+        """Whether scrcpy's window can be shown inside a panel. Only on Windows:
+        elsewhere every scrcpy start opens a window of its own."""
+        return _IS_WIN
+
     def is_active(self) -> bool:
         """True while a screen session is starting, running, stopping or retrying."""
         return bool(
@@ -3583,7 +3767,11 @@ class MirrorPanel(QWidget):
         self.start(display_id=disp_id)
 
     def _select_and_record(self, disp_id):
-        self._sync_display_selection(disp_id)
+        # A running screen keeps showing its own display while another one is
+        # recorded beside it (a second scrcpy, or screenrecord), so the picker
+        # and the screen's shape stay with what is on screen.
+        if self._scrcpy is None and self._screencap is None:
+            self._sync_display_selection(disp_id)
         self._begin_record(display_id=disp_id)
 
 
@@ -3747,7 +3935,12 @@ class MirrorPanel(QWidget):
             window_title=self._rec_title,
             extra_args=["--no-window"],
         )
-        return self._apply_audio_options(opts, allow_audio=not bool(camera))
+        # The same rule as the screen itself (start()): a display tile never
+        # captures audio. The device's sound is not a display's, and the
+        # default "output" source mutes the device while it records.
+        return self._apply_audio_options(
+            opts, allow_audio=not bool(camera) and not self._fixed_display
+        )
 
     def _start_parallel_record(self, path, display_id):
         """Record with a second, windowless scrcpy; the live session is untouched."""
@@ -4016,6 +4209,8 @@ class MirrorPanel(QWidget):
         self._restore_mirror_focus(direct=True)
 
     def _on_integrated_record_done(self, clean):
+        # a scrcpy that did not answer kept the keyboard until it was ended
+        self._take_back_keyboard()
         restore = self._rec_restore_spec if self._rec_restore_after_finish else None
         self._rec_restore_spec = None
         self._rec_wait = None
@@ -4146,7 +4341,7 @@ class MirrorPanel(QWidget):
         self._shot.start()
 
     def _on_shot_result(self, result):
-        error = _command_error(result, "the device returned no screenshot")
+        error = command_error(result, "the device returned no screenshot")
         if error:
             self._shot_fail(error)
         else:
@@ -4179,6 +4374,11 @@ class MirrorPanel(QWidget):
         _retry=False,
     ):
         if self._closing:  # tab closed during a retry delay
+            return
+        if _retry and self._retries_on_hold():
+            # Out of sight since the attempt that failed (its tab was hidden
+            # meanwhile): report that failure rather than retry unseen.
+            self._give_up_scrcpy_start(self._retry_error, self._retry_count, hidden=True)
             return
         if not _retry:
             self._cancel_retry()
@@ -4247,7 +4447,11 @@ class MirrorPanel(QWidget):
                 self._refresh_buttons()
             return
         if self._stopping_mirror:
-            self._queued_start = requested
+            # A retry must replay as a retry (_on_scrcpy_stop_done): replayed
+            # as a fresh start it reset the retry count, so a scrcpy that the
+            # startup watchdog kept killing was retried forever and its error
+            # never shown.
+            self._queued_start = dict(requested, _retry=True) if _retry else requested
             self.status.show()
             self.status.setText("Stopping the current display before restarting…")
             self._refresh_buttons()
@@ -4430,7 +4634,8 @@ class MirrorPanel(QWidget):
 
     def _on_mirror_launch_failed(self, error):
         queued = getattr(self, "_queued_start", None)
-        cancelled = self._cancel_launch
+        # (a closing panel cancelled its launch: never retry or report it)
+        cancelled = self._cancel_launch or self._closing
         was_record_launch = bool((self._launch_spec or {}).get("record"))
         self._launch_pending = False
         self._cancel_launch = False
@@ -4438,6 +4643,9 @@ class MirrorPanel(QWidget):
             self._clear_cancelled_record_start()
             self.status.setText("Screen start cancelled.")
             self._refresh_buttons()
+            # The launch is over and left no window behind: an owner waiting
+            # to destroy this panel (a removed display tile) can do so now.
+            self.screen_stopped.emit()
             if queued:
                 self._start_queued_after_cancel()
             return
@@ -4499,6 +4707,7 @@ class MirrorPanel(QWidget):
         ready→exit is a normal close."""
         if self._scrcpy is None:
             return
+        self._take_back_keyboard()  # (only when scrcpy kept it, not answering)
         # readiness = the window is up (fast, while running) OR a video marker is
         # in the log (a fallback that lands at exit, when the buffered log flushes
         # — covers scrcpy builds whose window title we can't match).  Neither
@@ -4518,11 +4727,12 @@ class MirrorPanel(QWidget):
         # server-push race can leave scrcpy waiting forever) — kill it so the
         # retry path runs instead of the user staring at nothing
         if running and not self._became_ready and ran_s > self._STARTUP_TIMEOUT:
-            action = (
-                "failing the recording start"
-                if self._rec_mode == "integrated"
-                else "retrying"
-            )
+            if self._rec_mode == "integrated":
+                action = "failing the recording start"
+            elif self._retry_count >= 2 or self._retries_on_hold():
+                action = "giving up"  # (_retry_or_show_scrcpy_failure says why)
+            else:
+                action = "retrying"
             self.log.emit(
                 f"[WARNING] scrcpy didn't show a window within "
                 f"{int(self._STARTUP_TIMEOUT)}s — {action}."
@@ -4581,15 +4791,35 @@ class MirrorPanel(QWidget):
         automatic warm-up and IVI-compatible fallback.
         """
         tail = " ".join(str(error or "").splitlines()[-2:])[:200] or "no output from scrcpy"
-        lowered = str(error or "").lower()
-        if "opengl" in lowered or "render" in lowered:
-            # A PC without a working OpenGL driver: retry with scrcpy's default.
+        opts = self._launch_opts  # the options of the start that failed
+        renderer_failed = (
+            not self._avoid_opengl
+            and opts is not None
+            and str(opts.render_driver or "").lower() == "opengl"
+            and _renderer_failed(error)
+        )
+        if renderer_failed:
+            # scrcpy could not create an OpenGL renderer on this PC (a missing
+            # or broken driver): the retries, and later starts, use scrcpy's
+            # default renderer instead.
             self._avoid_opengl = True
+            self.log.emit(
+                "[INFO] scrcpy could not use OpenGL on this PC; "
+                "using its default renderer instead"
+            )
         tries = getattr(self, "_retry_count", 0)
+        self._retry_error = error  # what a retry that is put on hold reports
+        if tries < 2 and self._retries_on_hold():
+            self._give_up_scrcpy_start(error, tries + 1, hidden=True)
+            return
         if tries == 0:
             self._retry_count = 1
             self.log.emit(f"[WARNING] scrcpy didn't start ({tail}); retrying…")
-            self.status.setText("scrcpy is waiting for ADB — retrying…")
+            self.status.setText(
+                "Retrying with scrcpy's default renderer…"
+                if renderer_failed
+                else "scrcpy is waiting for ADB — retrying…"
+            )
             self._schedule_retry(900, self._retry_start)
             return
         if tries == 1:
@@ -4606,13 +4836,34 @@ class MirrorPanel(QWidget):
             self.status.setText("Retrying with IVI-compatible video…")
             self._schedule_retry(900, lambda spec=overrides: self._retry_start(**spec))
             return
+        self._give_up_scrcpy_start(error, tries + 1)
+
+    def _retries_on_hold(self) -> bool:
+        """True for a display tile the user can't see: its tab is hidden, or
+        another display is maximized. Nothing restarts a display behind the
+        user's back, so such a tile reports a failed start at once instead of
+        retrying it; its Start (or Start all) tries again."""
+        return bool(self._fixed_display) and not self.isVisible()
+
+    def _give_up_scrcpy_start(self, error, attempts, hidden=False):
+        """The last word on a failed scrcpy start: say so, emit screen_failed
+        and offer scrcpy's log. *hidden*: retries were left out because the
+        display could not be seen (_retries_on_hold)."""
+        tail = " ".join(str(error or "").splitlines()[-2:])[:200] or "no output from scrcpy"
+        attempts = max(1, int(attempts or 1))
         self._retry_count = 0
         self.status.setText("Mirror couldn't start — see the log below.")
-        self.log.emit("[ERROR] scrcpy could not start after 3 attempts. Last output: " + tail)
+        self.log.emit(
+            f"[ERROR] scrcpy could not start after {attempts} "
+            f"attempt{'s' if attempts != 1 else ''}"
+            + (" (not retried while this display is out of sight: press Start to try again)"
+               if hidden else "")
+            + ". Last output: " + tail
+        )
         self._refresh_buttons()
         self.screen_failed.emit(tail)
         self._show_scrcpy_log(
-            str(error)
+            str(error or "")
             or "(scrcpy exited immediately with no output. "
             "It likely couldn't reach the device, or couldn't "
             "open a video encoder for this display.)"
@@ -4754,6 +5005,10 @@ class MirrorPanel(QWidget):
                 return
             if now - self._win_first_seen < self._EMBED_SETTLE:
                 return
+            if not _answering(hwnd):
+                # Adopting the window waits for scrcpy to answer: a busy or
+                # stuck scrcpy is adopted on a later tick instead.
+                return
             self._stop_embed_timer()
             aspect = _window_aspect(hwnd)
             if aspect and abs(aspect - (self._video_aspect or 0.0)) > 0.01:
@@ -4833,8 +5088,8 @@ class MirrorPanel(QWidget):
             hwnd = hwnd or self._child_hwnd or _find_window(self._win_title)
         except Exception:
             hwnd = None
-        if not hwnd:
-            return False
+        if not hwnd or not _answering(hwnd):
+            return False  # (moving a window that does not answer waits with it)
         try:
             _ctypes, u = _win_api()
             u.SetParent(hwnd, None)  # back to a real top-level window
@@ -4877,7 +5132,12 @@ class MirrorPanel(QWidget):
         keeps resizing itself to the video frame, so we keep correcting it).
         Skips the call when the window ALREADY fills the container — the old
         unconditional MoveWindow every 500 ms made SDL re-handle a resize twice
-        a second forever, a steady source of embedded-mirror stutter."""
+        a second forever, a steady source of embedded-mirror stutter.
+
+        Only the resize itself waits on scrcpy (reading the sizes does not), so
+        a window that does not answer is left as it is and re-fitted on a later
+        call once it answers again: a stuck scrcpy never freezes the UI here.
+        """
         if not self._child_hwnd:
             return
         try:
@@ -4901,6 +5161,8 @@ class MirrorPanel(QWidget):
                 curr_h = rect.bottom - rect.top
                 if abs(curr_w - w) <= 1 and abs(curr_h - h) <= 1:
                     return  # already the right size
+            if not _answering(self._child_hwnd):
+                return
             u.MoveWindow(self._child_hwnd, 0, 0, w, h, True)
         except Exception:
             pass
@@ -4930,8 +5192,10 @@ class MirrorPanel(QWidget):
             self._mon.deleteLater()
             self._mon = None
         # scrcpy's window is closing (or already gone): give the keyboard back
-        # to Qt while the child handle is still known.
+        # to Qt while the child handle is still known.  One that does not
+        # answer keeps it until it has been stopped (_on_scrcpy_stop_done).
         self._release_native_keyboard(if_lost=True)
+        self._take_back_keyboard()
         self._keyboard_route = None
         handle = self._child_hwnd or self._separate_hwnd
         self._child_hwnd = None
@@ -4999,6 +5263,8 @@ class MirrorPanel(QWidget):
     def _on_scrcpy_stop_done(self, clean):
         self._stopping_mirror = False
         self._mirror_stop_thread = None
+        # a scrcpy that did not answer kept the keyboard until it was ended
+        self._take_back_keyboard()
         _purge_scrcpy_logs()
         if not clean:
             self.log.emit("[WARNING] scrcpy did not stop cleanly; its process was ended.")
@@ -5025,6 +5291,13 @@ class MirrorPanel(QWidget):
             self.status.show()
             self.status.setText("Cancelling screen start…")
             return
+        if self._stopping_mirror and self._queued_start is not None:
+            # A start waits for the previous session to finish closing (a
+            # retry after the startup watchdog, or Start pressed meanwhile).
+            # Stop (or the displays tab's Stop all) cancels it too, or the
+            # screen would come back by itself once the old one is gone.
+            self._queued_start = None
+            self._clear_cancelled_record_start()
         if (
             self._rec_mode == "integrated"
             and self._recording

@@ -124,11 +124,18 @@ def _channels(colour):
 # --------------------------------------------------------------------------- #
 THEME_SET = (
     ("dark", "Graphite"), ("light", "Porcelain"),
+    ("ocean-dark", "Ocean"), ("ocean-light", "Sky"),
+    ("dusk-dark", "Dusk"), ("dusk-light", "Lavender"),
+    ("evergreen-dark", "Evergreen"), ("evergreen-light", "Meadow"),
     ("mono-dark", "Black"), ("mono-light", "White"),
     ("slate-dark", "Slate"), ("slate-light", "Mist"),
     ("night-dark", "Night"), ("night-light", "Paper"),
     ("mocha-dark", "Mocha"), ("mocha-light", "Latte"),
+    ("contrast-dark", "High contrast"), ("contrast-light", "High contrast light"),
 )
+# The one pair meant to go past the comfortable text contrast band: for bright
+# rooms, projectors and weak eyes, as readable as a theme can be.
+HIGH_CONTRAST = ("contrast-dark", "contrast-light")
 RETIRED = {
     "forest-dark": "dark", "forest-light": "light",
     "plum-dark": "dark", "plum-light": "light",
@@ -136,7 +143,7 @@ RETIRED = {
 }
 
 
-def test_theme_set_is_five_dark_light_pairs_in_order():
+def test_theme_set_is_nine_dark_light_pairs_in_order():
     from turboadb.gui import theme
 
     assert theme.theme_names() == tuple(key for key, _label in THEME_SET)
@@ -179,6 +186,8 @@ def test_every_palette_is_easy_on_the_eyes():
         for surface in ("chrome", "win", "panel", "raised", "input", "button"):
             assert c[surface] not in ("#000000", "#ffffff"), (name, surface)
         low, high = (10, 14) if light else (9, 13)
+        if name in HIGH_CONTRAST:
+            low, high = 15, 21
         assert low <= _contrast(c["text"], c["win"]) <= high, (name, _contrast(c["text"], c["win"]))
         assert _contrast(c["input"], c["win"]) >= 1.03, name
         if not light:
@@ -505,8 +514,10 @@ def test_ribbon_dropdown_lists_every_theme_in_dark_and_light_groups(window):
     labels = [(a.text(), a.isEnabled()) for a in menu.actions() if not a.isSeparator()]
     dark = [theme.theme_label(n) for n in theme.theme_names() if not theme.is_light(n)]
     light = [theme.theme_label(n) for n in theme.theme_names() if theme.is_light(n)]
-    assert dark == ["Graphite", "Black", "Slate", "Night", "Mocha"]
-    assert light == ["Porcelain", "White", "Mist", "Paper", "Latte"]
+    assert dark == ["Graphite", "Ocean", "Dusk", "Evergreen", "Black", "Slate", "Night", "Mocha",
+                    "High contrast"]
+    assert light == ["Porcelain", "Sky", "Lavender", "Meadow", "White", "Mist", "Paper", "Latte",
+                     "High contrast light"]
     assert labels == (
         [("Dark themes", False)] + [(label, True) for label in dark]
         + [("Light themes", False)] + [(label, True) for label in light]
@@ -567,11 +578,22 @@ def test_ribbon_label_and_tooltip_name_the_target_theme(window):
 
 
 def _menu_row(menu, action, checked):
-    """The pixels of *action*'s row in *menu*, drawn checked or unchecked."""
-    action.setChecked(checked)
-    menu.ensurePolished()
-    menu.adjustSize()
-    return menu.grab().copy(menu.actionGeometry(action)).toImage()
+    """The pixels of *action*'s row in *menu*, drawn checked or unchecked.
+
+    The other rows are hidden meanwhile: with eighteen themes the menu is
+    taller than the test's 800x600 screen allows (Qt scrolls it there), and a
+    row past the fold drew blank in both states."""
+    others = [a for a in menu.actions() if a is not action and a.isVisible()]
+    for other in others:
+        other.setVisible(False)
+    try:
+        action.setChecked(checked)
+        menu.ensurePolished()
+        menu.adjustSize()
+        return menu.grab().copy(menu.actionGeometry(action)).toImage()
+    finally:
+        for other in others:
+            other.setVisible(True)
 
 
 @pytest.mark.parametrize("name", ["mono-light", "mono-dark", "dark", "night-light"])
@@ -1002,7 +1024,7 @@ def test_theme_descriptions_fit_their_settings_cards():
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
     cards = json.loads(done.stdout.strip().splitlines()[-1])
-    assert len(cards) == 10
+    assert len(cards) == 18
     for name, (family, needed, width) in cards.items():
         assert family == "Segoe UI", (name, family)
         assert needed <= width, (name, needed, width)

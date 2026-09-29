@@ -8,7 +8,15 @@ class ADBError(Exception):
 
 
 class ADBNotFoundError(ADBError):
-    """The adb (or scrcpy) executable could not be located on the system."""
+    """The adb (or scrcpy) executable could not be located on the system.
+
+    ``configured`` is the path that was set on purpose (``adb_path``,
+    ``--adb-path``, ``TURBOADB_ADB``…) when it is that path that names no
+    executable, or None when none could be found at all."""
+
+    def __init__(self, *args, configured=None):
+        super().__init__(*args)
+        self.configured = configured
 
 
 class ADBConnectionError(ADBError):
@@ -16,7 +24,14 @@ class ADBConnectionError(ADBError):
 
 
 class ADBTimeoutError(ADBError):
-    """An adb operation exceeded its allotted time."""
+    """An adb operation exceeded its allotted time.
+
+    ``result`` is the :class:`~turboadb.results.CommandResult` of what a
+    one-shot command printed before it was stopped (exit code -1), or None."""
+
+    def __init__(self, *args, result=None):
+        super().__init__(*args)
+        self.result = result
 
 
 class ADBNotConnectedError(ADBError):

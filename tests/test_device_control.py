@@ -59,7 +59,8 @@ def _controls(**kwargs):
 
     handler = _Handler()
     dispatcher = _SyncDispatcher()
-    panel = ControlsPanel(handler, dispatcher=dispatcher, **kwargs)
+    # the launchers' own queue runs at once too, so the calls keep click order
+    panel = ControlsPanel(handler, dispatcher=dispatcher, slow_dispatcher=dispatcher, **kwargs)
     logs = []
     panel.log.connect(logs.append)
     return panel, handler, dispatcher, logs
@@ -757,7 +758,7 @@ def test_leaving_the_tab_gives_the_docks_back_but_keeps_the_tab_maximized(qapp):
 
 
 # --------------------------------------------------------------------------- #
-# review regressions: the toolbar re-plans when (and only when) it must
+# the toolbar re-plans when (and only when) it must
 # --------------------------------------------------------------------------- #
 def _wait(qapp, ms):
     """Let queued layout requests and the view's 40 ms re-plan timer run."""

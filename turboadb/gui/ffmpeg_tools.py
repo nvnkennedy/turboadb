@@ -23,7 +23,7 @@ import zipfile
 from typing import Optional
 
 from ..config import user_path
-from ..tools import NO_WINDOW as _NO_WINDOW
+from ..tools import NO_WINDOW
 
 _log = logging.getLogger(__name__)
 
@@ -238,6 +238,11 @@ def _usable_cached(log) -> Optional[str]:
     A user-supplied path or an ffmpeg on PATH is theirs to manage and is used as
     is; the managed copy is dropped when it no longer matches its checksum, so
     the next call replaces it.
+
+    A copy that failed its check but cannot be deleted (Windows: another camera
+    stream or TurboADB window runs it) keeps its record, so it is never adopted
+    as a trusted old copy later; an ffmpeg on PATH is used instead, else this
+    raises RuntimeError saying why.
     """
     path = cached_ffmpeg()
     managed = os.path.join(_CACHE, "ffmpeg.exe")
@@ -247,10 +252,26 @@ def _usable_cached(log) -> Optional[str]:
         return path
     if verify_cached(path, log):
         return path
-    _remove_quietly(path)
-    _remove_quietly(path + _SHA_SUFFIX)
     _VERIFIED.pop(path, None)
+    _remove_quietly(path)
+    if os.path.exists(path):
+        other = shutil.which("ffmpeg")
+        if other and os.path.normcase(os.path.abspath(other)) != os.path.normcase(path):
+            log("The cached ffmpeg failed its check and is in use; using the ffmpeg on PATH.")
+            return other
+        raise RuntimeError(
+            "the downloaded ffmpeg no longer matches its checksum and can't be replaced "
+            "while it runs. Close other camera streams (and other TurboADB windows), "
+            "then scan again."
+        )
+    _remove_quietly(path + _SHA_SUFFIX)
     return None
+
+
+def find_local_ffmpeg(log=lambda m: None) -> Optional[str]:
+    """A usable ffmpeg without downloading one: the Settings path, the checked
+    cached copy or an ffmpeg on PATH, else None."""
+    return _usable_cached(log)
 
 
 def _download_zip(url: str, dest: str, log, should_cancel=None) -> None:
@@ -392,14 +413,20 @@ def ensure_local_ffmpeg(log=lambda m: None, should_cancel=None) -> str:
 
 
 def list_local_cameras(ffmpeg: str) -> list:
-    """List DirectShow cameras on THIS machine (Windows)."""
+    """List DirectShow cameras on THIS machine (Windows).
+
+    ffmpeg writes the device names as UTF-8, whatever the console code page,
+    and a name goes back to it unchanged as ``video=<name>``: read with the
+    locale's code page, "Caméra intégrée" came back garbled (no such device),
+    and a byte that code page lacks lost the whole listing."""
     try:
         p = subprocess.run(
             [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
-            creationflags=_NO_WINDOW,
+            creationflags=NO_WINDOW,
         )
         return parse_dshow_devices((p.stdout or "") + "\n" + (p.stderr or ""))
     except (OSError, subprocess.SubprocessError) as exc:

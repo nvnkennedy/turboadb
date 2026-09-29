@@ -158,7 +158,10 @@ def _unpark(t) -> None:
 def park_thread(t) -> None:
     """Keep *t* (a QThread) alive until Qt has deleted it, even after the widget
     that owns it is closed — e.g. a device tab closed while its connect thread
-    is still waiting on a slow remote adb server. Safe to call before start().
+    is still waiting on a slow remote adb server. Safe to call just before
+    start(); a thread that will never start must not be parked, since it never
+    finishes and would stay referenced for good (a closing panel parks only a
+    dispatcher that is running: see ``thread_running``).
 
     The reference is held until ``destroyed``, not ``finished``: a QThread that
     Python still owns when it asks for ``deleteLater`` can be garbage-collected

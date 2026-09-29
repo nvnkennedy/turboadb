@@ -348,7 +348,15 @@ def test_a_tile_retries_inside_the_wall_and_reports_without_a_dialog(qapp, monke
     """Issue: the last retry rung dropped embedding, so a failing tile opened a
     free-floating scrcpy window, and each failure stacked a modal log dialog."""
     pytest.importorskip("PyQt5")
+    from PyQt5.QtCore import Qt
+
     wall = _wall([{"id": 2, "size": "1920x720", "name": "Cluster"}])
+    # on screen: a tile nobody can see is not retried at all (see
+    # test_display_retries.py)
+    wall.setAttribute(Qt.WA_DontShowOnScreen, True)
+    wall.resize(900, 600)
+    wall.show()
+    qapp.processEvents()
     try:
         panel = wall._tiles[0].panel
         retries, starts, opened = [], [], []
@@ -373,6 +381,7 @@ def test_a_tile_retries_inside_the_wall_and_reports_without_a_dialog(qapp, monke
         qapp.processEvents()
         assert opened == ["no encoder"]
     finally:
+        wall.hide()
         _close_wall(wall, qapp)
 
 
@@ -460,7 +469,6 @@ def test_maximizing_a_tile_shows_that_display_alone_and_restore_returns_the_grid
         {"id": 2, "size": "1920x720"},
         {"id": 3, "size": "1280x720"},
     ])
-    wall.start_all = lambda: None  # showing the wall never starts a screen here
     wall.setAttribute(Qt.WA_DontShowOnScreen, True)
     wall.resize(1600, 900)
     wall.show()
@@ -533,7 +541,6 @@ def test_esc_outside_the_wall_is_left_to_whatever_has_the_keyboard(qapp):
     lay = QHBoxLayout(host)
     field = Field()
     wall = _wall([{"id": 0, "size": "1920x720"}, {"id": 2, "size": "1920x720"}])
-    wall.start_all = lambda: None
     lay.addWidget(field)
     lay.addWidget(wall, 1)
     host.resize(1600, 800)
@@ -787,6 +794,9 @@ def test_the_wall_shares_one_video_budget_between_its_tiles(qapp, monkeypatch):
 
     monkeypatch.setattr(mp, "_MirrorLaunchThread", Launch)
     monkeypatch.setattr(mp, "park_thread", lambda thread: None)
+    # the budget is scrcpy's: tiles that run it, as on Windows (elsewhere a
+    # tile shows ADB screencap frames)
+    monkeypatch.setattr(mp.MirrorPanel, "embeds_scrcpy", staticmethod(lambda: True))
     wall = _wall([{"id": 0, "size": "1920x720"}, {"id": 2}, {"id": 3}])
     try:
         assert wall.tile_bit_rate() == "5M" and wall.tile_bit_rate(1) == "16M"
@@ -892,7 +902,7 @@ def test_the_screencap_setting_shows_the_screen_with_screencap_frames(qapp, monk
 
 
 # --------------------------------------------------------------------------- #
-# review regressions: renderer switching, the wall's start chain, recording
+# renderer switching, the wall's start chain, recording
 # --------------------------------------------------------------------------- #
 class _FakeLaunch:
     """_MirrorLaunchThread stand-in: records the options, never runs scrcpy."""
@@ -1043,7 +1053,6 @@ def test_a_failed_screencap_tile_does_not_hold_up_the_next_display(qapp, monkeyp
     logs = []
     wall.log.connect(logs.append)
     try:
-        wall._auto_started = True
         wall.resize(900, 700)
         wall.show()
         wall.set_displays(ADBHandler.parse_display_info(IVI_GET_DISPLAYS)[2:] + [

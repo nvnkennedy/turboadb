@@ -11,6 +11,12 @@ the remote camera is reached with the **same WinRM/NTLM stack** used by
      internet. This is the WinRM-friendly equivalent of TurboSSH's SFTP push.
   3. If the admin share isn't reachable, fall back to having the **remote download
      ffmpeg itself** from the public BtbN build.
+
+     Either way the copy goes to ``%ProgramFiles%\\TurboADB\\ffmpeg``, where only
+     administrators can write: ffmpeg runs with the admin's rights, so it is
+     never taken from a folder another user of that PC could have filled first.
+     A pushed copy must hash like the local one, and a downloaded copy like
+     ``TURBOADB_FFMPEG_SHA256`` when that pins a build.
   4. WinRM then runs ffmpeg's ``-list_devices`` to enumerate cameras, and launches
      ffmpeg serving MJPEG on a listening TCP socket (``tcp://0.0.0.0:PORT?listen=1``)
      with the firewall port opened **only for this PC's address**; the GUI reads
@@ -26,6 +32,7 @@ someone's RDP session is only visible inside that session.
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import shutil
 import socket
@@ -33,8 +40,8 @@ import subprocess
 import threading
 from contextlib import contextmanager
 
-from ..remote_deploy import _ensure_winrm, _session
-from ..tools import NO_WINDOW as _NO_WINDOW
+from ..remote_deploy import _ensure_winrm, _run_ps as _winrm_run_ps
+from ..tools import NO_WINDOW
 from .ffmpeg_tools import ffmpeg_url
 
 _log = logging.getLogger(__name__)
@@ -46,43 +53,88 @@ _SMB_CONNECT_TIMEOUT_S = 45  # an unreachable host takes ~40 s to fail
 # scan forever, which left "Scan cameras" greyed out for the whole session.
 _SMB_COPY_TIMEOUT_S = 300
 
-# where the pushed copy lives on the remote (admin-accessible, no profile guessing)
-_PUSH_DIR = r"C:\Windows\Temp\turboadb-ffmpeg"
-_PUSH_EXE = _PUSH_DIR + r"\ffmpeg.exe"
+# Where TurboADB's copy of ffmpeg lives on the remote: under Program Files,
+# where only administrators can create or change anything.  It used to be
+# C:\Windows\Temp\turboadb-ffmpeg (and C:\ffmpeg\bin was searched too): any
+# local user can create those folders first and put an ffmpeg.exe of their own
+# in them, which the admin's next Scan then ran with the admin's rights.
+_PUSH_DIR_PS = "(Join-Path $env:ProgramFiles 'TurboADB\\ffmpeg')"
+# What the folder usually is, for messages written before it has been asked.
+_PUSH_DIR_HINT = r"C:\Program Files\TurboADB\ffmpeg"
 
-# Find ffmpeg on the remote: PATH, the pushed location, then the turboadb/turbossh caches.
+# SHA-256 of a file in lowercase hex, without Get-FileHash (PowerShell 4+).
+_SHA256_PS = r"""
+function Get-Sha256($path) {
+  $s = [IO.File]::OpenRead($path)
+  try { -join ([Security.Cryptography.SHA256]::Create().ComputeHash($s) | ForEach-Object { $_.ToString('x2') }) }
+  finally { $s.Dispose() }
+}
+"""
+
+# Find ffmpeg on the remote: PATH (the admin's own setup), TurboADB's folder,
+# then the admin's own turboadb/turbossh caches.
 _LOCATE = r"""
 $ff = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
 if (-not $ff) {
-  foreach ($p in @("C:\Windows\Temp\turboadb-ffmpeg\ffmpeg.exe",
+  foreach ($p in @((Join-Path __PUSH_DIR__ 'ffmpeg.exe'),
                    "$env:USERPROFILE\.turboadb\ffmpeg\ffmpeg.exe",
-                   "$env:USERPROFILE\.turbossh\ffmpeg\ffmpeg.exe",
-                   "C:\ffmpeg\bin\ffmpeg.exe")) {
-    if (Test-Path $p) { $ff = $p; break }
+                   "$env:USERPROFILE\.turbossh\ffmpeg\ffmpeg.exe")) {
+    if (Test-Path -LiteralPath $p) { $ff = $p; break }
   }
 }
 if ($ff) { 'FFMPEG:' + $ff } else { 'NOFFMPEG:' }
+""".replace("__PUSH_DIR__", _PUSH_DIR_PS)
+
+# Create TurboADB's folder on the remote, for the copy pushed over SMB.
+_PREPARE = r"""
+$ErrorActionPreference='Stop'
+try {
+  $dir = __PUSH_DIR__
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  'DIR:' + $dir
+} catch { 'NODIR:' + $_.Exception.Message }
+""".replace("__PUSH_DIR__", _PUSH_DIR_PS)
+
+# Check the pushed copy against the local one; one that differs is removed.
+_VERIFY = _SHA256_PS + r"""
+$exe = '__EXE__'
+try {
+  $got = Get-Sha256 $exe
+  if ($got -eq '__SHA256__') { 'HASH:OK' } else {
+    Remove-Item -Force -LiteralPath $exe -ErrorAction SilentlyContinue
+    'HASH:' + $got
+  }
+} catch { 'HASH:' + $_.Exception.Message }
 """
 
-# Remote self-download (fallback when the admin share isn't reachable).
-_REMOTE_DOWNLOAD = r"""
+# Remote self-download (fallback when the admin share isn't reachable), into
+# TurboADB's folder under a temporary name, moved into place once complete
+# (and, with a pinned TURBOADB_FFMPEG_SHA256, only when it matches).
+_REMOTE_DOWNLOAD = _SHA256_PS + r"""
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
-$dir = 'C:\Windows\Temp\turboadb-ffmpeg'; $exe = Join-Path $dir 'ffmpeg.exe'
-if (Test-Path $exe) { 'FFMPEG:' + $exe } else {
+$dir = __PUSH_DIR__; $exe = Join-Path $dir 'ffmpeg.exe'
+$pin = '__SHA256__'
+if ((Test-Path -LiteralPath $exe) -and (-not $pin -or (Get-Sha256 $exe) -eq $pin)) { 'FFMPEG:' + $exe } else {
+  $tag = [guid]::NewGuid().ToString('N')
+  $zip = Join-Path $dir "ffmpeg-$tag.zip"; $part = Join-Path $dir "ffmpeg-$tag.part"
   try {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $zip = Join-Path $dir 'ffmpeg.zip'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     (New-Object Net.WebClient).DownloadFile('__URL__', $zip)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $z = [IO.Compression.ZipFile]::OpenRead($zip)
-    $e = $z.Entries | Where-Object { $_.FullName -like '*/bin/ffmpeg.exe' } | Select-Object -First 1
-    if ($e) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $exe, $true) }
-    $z.Dispose(); Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    if (Test-Path $exe) { 'FFMPEG:' + $exe } else { 'NOFFMPEG:extract failed' }
+    try {
+      $e = $z.Entries | Where-Object { $_.FullName -like '*/bin/ffmpeg.exe' } | Select-Object -First 1
+      if ($e) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $part, $true) }
+    } finally { $z.Dispose() }
+    if (-not (Test-Path -LiteralPath $part)) { 'NOFFMPEG:extract failed' }
+    elseif ($pin -and (Get-Sha256 $part) -ne $pin) {
+      'NOFFMPEG:the downloaded ffmpeg does not match TURBOADB_FFMPEG_SHA256'
+    } else { Move-Item -Force -LiteralPath $part -Destination $exe; 'FFMPEG:' + $exe }
   } catch { 'NOFFMPEG:' + $_.Exception.Message }
+  finally { Remove-Item -Force -LiteralPath $zip, $part -ErrorAction SilentlyContinue }
 }
-"""
+""".replace("__PUSH_DIR__", _PUSH_DIR_PS)
 
 
 def _ps_squote(s: str) -> str:
@@ -115,10 +167,9 @@ def _clean_exe(path: str) -> str:
 
 
 def _run_ps(host, login, password, script, winrm_port=5985):
-    r = _session(host, login, password, winrm_port=winrm_port).run_ps(script)
-    out = (r.std_out or b"").decode("utf-8", "replace")
-    err = (r.std_err or b"").decode("utf-8", "replace")
-    return r.status_code, out, err
+    """``remote_deploy``'s WinRM runner, the output left as the remote
+    printed it: the scripts here are parsed line by line."""
+    return _winrm_run_ps(host, login, password, script, winrm_port=winrm_port, strip=False)
 
 
 def _parse_ffmpeg(out):
@@ -136,7 +187,7 @@ def _existing_connection(share):
             ["net", "use"],
             capture_output=True,
             timeout=_NET_TIMEOUT_S,
-            creationflags=_NO_WINDOW,
+            creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _log.debug("`net use` listing failed: %s", exc)
@@ -241,25 +292,48 @@ def _share_connection(share, login, password):
             _log.warning("couldn't close the temporary connection to %s: %s", share, exc)
 
 
-def _smb_push(host, login, password, local_ffmpeg, log=None):
-    """Copy the local ffmpeg.exe to the remote over its admin share (``\\host\\C$``)
-    using the WinRM credentials. Fast on a LAN; needs SMB (445) + the admin share."""
+def _admin_share_path(host, remote_path):
+    """*remote_path* (``C:\\Program Files\\…`` on *host*) as a path on the host's
+    administrative share (``\\\\host\\C$\\Program Files\\…``)."""
+    drive, rest = ntpath.splitdrive(remote_path or "")
+    if len(drive) != 2 or drive[1] != ":" or not drive[0].isalpha():
+        raise RuntimeError(f"{remote_path!r} is not on a drive with an administrative share")
+    return rf"\\{host}\{drive[0].upper()}$" + rest
+
+
+def _push_dir(host, login, password, winrm_port):
+    """Create TurboADB's ffmpeg folder on the remote (see ``_PUSH_DIR_PS``) and
+    return its path there."""
+    code, out, err = _run_ps(host, login, password, _PREPARE, winrm_port)
+    for line in out.splitlines():
+        if line.startswith("DIR:"):
+            return line[len("DIR:"):].strip()
+        if line.startswith("NODIR:"):
+            raise RuntimeError(f"couldn't create the ffmpeg folder there: {line[6:].strip()}")
+    raise RuntimeError(f"couldn't create the ffmpeg folder there: {(err or out)[:200] or 'no output'}")
+
+
+def _smb_push(host, login, password, local_ffmpeg, remote_dir, log=None):
+    """Copy the local ffmpeg.exe into *remote_dir* (TurboADB's folder on the
+    remote, see :func:`_push_dir`) over its admin share (``\\host\\C$``) using
+    the WinRM credentials. Fast on a LAN; needs SMB (445) + the admin share.
+    Returns the path of the copy on the remote."""
     if os.name != "nt":
         raise RuntimeError("admin-share copy is Windows-only")
-    share = rf"\\{host}\C$"
-    remote_dir = rf"{share}\Windows\Temp\turboadb-ffmpeg"
-    remote_exe = rf"{remote_dir}\ffmpeg.exe"
+    unc_dir = _admin_share_path(host, remote_dir)
+    share = "\\".join(unc_dir.split("\\")[:4])  # \\host\C$
+    unc_exe = unc_dir + r"\ffmpeg.exe"
     with _share_connection(share, login, password):
         if log:
             log("Copying ffmpeg to the remote over the admin share (fast)…")
         # copy under a temp name + rename, so an interrupted copy never leaves
         # a truncated ffmpeg.exe that _LOCATE would then "find" forever
-        part = remote_exe + f".{os.getpid()}.part"
+        part = unc_exe + f".{os.getpid()}.part"
 
         def copy():
-            os.makedirs(remote_dir, exist_ok=True)
+            os.makedirs(unc_dir, exist_ok=True)
             shutil.copyfile(local_ffmpeg, part)
-            os.replace(part, remote_exe)
+            os.replace(part, unc_exe)
 
         try:
             # Only the connect was bounded before; a share that stops answering
@@ -272,15 +346,31 @@ def _smb_push(host, login, password, local_ffmpeg, log=None):
                 pass
             except OSError as exc:
                 _log.debug("couldn't remove %s: %s", part, exc)
-    return _PUSH_EXE
+    return remote_dir.rstrip("\\") + r"\ffmpeg.exe"
+
+
+def _verify_push(host, login, password, remote_exe, digest, winrm_port):
+    """Raise unless the copy at *remote_exe* hashes to *digest* (the local
+    copy's SHA-256); a copy that does not is removed on the remote."""
+    script = _VERIFY.replace("__EXE__", _ps_squote(remote_exe)).replace(
+        "__SHA256__", _ps_squote(digest))
+    code, out, err = _run_ps(host, login, password, script, winrm_port)
+    result = next((line[5:].strip() for line in out.splitlines() if line.startswith("HASH:")), "")
+    if result != "OK":
+        raise RuntimeError(
+            f"the copy on the remote is not the local ffmpeg (SHA-256 {digest[:16]}…): "
+            f"{result or (err or out)[:200] or 'no answer'}"
+        )
 
 
 def _remote_download(host, login, password, winrm_port, log=None):
+    from .ffmpeg_tools import expected_sha256
+
     if log:
         log("Downloading ffmpeg on the remote (one-time, ~160 MB — needs internet there)…")
-    code, out, err = _run_ps(
-        host, login, password, _REMOTE_DOWNLOAD.replace("__URL__", ffmpeg_url()), winrm_port
-    )
+    script = _REMOTE_DOWNLOAD.replace("__URL__", _ps_squote(ffmpeg_url())).replace(
+        "__SHA256__", _ps_squote(expected_sha256()))
+    code, out, err = _run_ps(host, login, password, script, winrm_port)
     ff = _parse_ffmpeg(out)
     if ff:
         return ff
@@ -293,7 +383,11 @@ def _remote_download(host, login, password, winrm_port, log=None):
 
 def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
     """Make sure ffmpeg is on the remote, provisioning it if needed. Returns the
-    remote ffmpeg path; raises RuntimeError with the real reason if it can't."""
+    remote ffmpeg path; raises RuntimeError with the real reason if it can't.
+
+    ffmpeg is only ever taken from the admin's PATH, the admin's own caches
+    and ``%ProgramFiles%\\TurboADB\\ffmpeg``: nowhere a less privileged user of
+    that PC could have written to (see ``_PUSH_DIR_PS``)."""
     if not _ensure_winrm():
         raise RuntimeError("pywinrm isn't available (pip install pywinrm).")
     if log:
@@ -304,7 +398,7 @@ def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
         return found
 
     # not there — push our LOCAL copy (like TurboSSH), fetching it locally first
-    from .ffmpeg_tools import cached_ffmpeg, ensure_local_ffmpeg
+    from .ffmpeg_tools import _sha256_file, cached_ffmpeg, ensure_local_ffmpeg
 
     if not cached_ffmpeg() and log:
         log("Fetching ffmpeg locally first (one-time)…")
@@ -312,9 +406,14 @@ def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
     # SHA-256 recorded beside it — never push an unverified binary to a host.
     local = ensure_local_ffmpeg(log or (lambda m: None))
 
+    folder = _PUSH_DIR_HINT
     smb_err = ""
     try:
-        return _smb_push(host, login, password, local, log=log)
+        folder = _push_dir(host, login, password, winrm_port)
+        remote_exe = _smb_push(host, login, password, local, folder, log=log)
+        # and the copy that arrived is the one that left
+        _verify_push(host, login, password, remote_exe, _sha256_file(local), winrm_port)
+        return remote_exe
     except Exception as exc:
         smb_err = str(exc)
         if log:
@@ -329,8 +428,8 @@ def ensure_remote_ffmpeg(host, login, password, *, winrm_port=5985, log=None):
             "couldn't get ffmpeg onto the remote machine.\n\n"
             f"• Admin-share copy (\\\\{host}\\C$) failed: {smb_err or 'n/a'}\n"
             f"• Remote download failed: {dl_exc}\n\n"
-            "Easiest fix: paste ffmpeg.exe into C:\\Windows\\Temp\\turboadb-ffmpeg\\ "
-            "on the remote over RDP, then Scan again."
+            f"Easiest fix: as an administrator on the remote (over RDP), put ffmpeg.exe "
+            f"into {folder}\\, then Scan again."
         ) from dl_exc
 
 
