@@ -14,6 +14,7 @@ the caller carries on without it (the frozen exe and ``pythonw`` did before).
 
 from __future__ import annotations
 
+import ntpath
 import os
 import sys
 import uuid
@@ -436,7 +437,7 @@ def is_turboadb_shortcut(info) -> bool:
     earlier TurboADB, or pinned from one, has no app ID)."""
     if info.get("app_id") == APP_ID:
         return True
-    target = os.path.basename(str(info.get("target") or "")).lower()
+    target = ntpath.basename(str(info.get("target") or "")).lower()  # a Windows path everywhere
     if target in ("turboadb.exe", "turboadb-gui.exe"):
         return True
     if target.startswith("turboadb-") and target.endswith(".exe"):

@@ -142,6 +142,12 @@ All notable changes are recorded here. Versions follow
 - **Non-English text reaches an `adb shell` started in CMD intact.** It was
   re-encoded for the Windows console on its way, so `echo café` arrived
   garbled.
+- **The PowerShell terminal no longer says "Cannot load PSReadline module"
+  when TurboADB was started from PowerShell 7** (a Windows Terminal or VS
+  Code tab). It inherited PowerShell 7's module folders and loaded its
+  PSReadLine, which Windows PowerShell can't use, and a command sent while
+  it started could be lost; it now gets Windows PowerShell's folders only,
+  as PowerShell 7 itself does.
 - **An unfinished title sequence no longer hides the rest of the output**,
   and odd escape sequences can't stall or break a terminal.
 - **Ctrl+C and Stop stop the output at once.** After a logcat flood, lines

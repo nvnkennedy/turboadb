@@ -242,6 +242,20 @@ def _get_registry_env() -> Dict[str, str]:
     )
 
 
+def is_pwsh_module_path(entry: str, isfile=os.path.isfile) -> bool:
+    """Whether the ``PSModulePath`` *entry* is PowerShell 7's (pwsh's) rather
+    than Windows PowerShell's: ``Documents\\PowerShell\\Modules``,
+    ``Program Files\\PowerShell\\Modules``, or the ``Modules`` folder of a
+    pwsh installation (beside ``pwsh.dll``).  The rule pwsh applies when it
+    starts powershell.exe (``GetWindowsPowerShellModulePath``)."""
+    path = ntpath.normpath(entry.strip().strip('"')).rstrip("\\")
+    parts = path.lower().split("\\")
+    if len(parts) >= 2 and parts[-2:] == ["powershell", "modules"]:
+        return True
+    parent = ntpath.dirname(path)
+    return bool(parent) and parent != path and isfile(ntpath.join(parent, "pwsh.dll"))
+
+
 def build_shell_env(
     base_env: Mapping[str, str],
     *,
@@ -267,6 +281,11 @@ def build_shell_env(
     * ``PATH`` = *prepend_dirs* (ADB), the inherited ``PATH``, new registry
       entries, the Windows system folders if missing, then *append_dirs*
       (scrcpy); de-duplicated ignoring case, quotes and trailing slashes.
+    * ``PSModulePath`` without PowerShell 7's own folders
+      (:func:`is_pwsh_module_path`), as pwsh itself starts powershell.exe.
+      Inherited from a pwsh terminal they made Windows PowerShell load pwsh's
+      PSReadLine, which fails there ("Cannot load PSReadline module"), and
+      the first command typed was lost.
     * ``PYTHONUNBUFFERED=1`` unless it is set: over a pipe Python holds its
       output until it exits, where a console window shows every line.
     * The device tab's adb server (*adb_server_host* / *adb_server_port*), so
@@ -367,6 +386,14 @@ def build_shell_env(
         if directory:
             add(directory, allow_private=True)
     put("PATH", sep.join(entries))
+
+    modules = get("PSModulePath")
+    if windows and modules:
+        kept = [entry for entry in modules.split(";") if entry.strip() and not is_pwsh_module_path(entry)]
+        if kept:
+            put("PSModulePath", ";".join(kept))
+        else:
+            drop("PSModulePath")  # Windows PowerShell builds its own
 
     if windows:
         # Without SystemRoot, Winsock (ipconfig, ping, adb) and .NET fail to
