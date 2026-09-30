@@ -71,15 +71,26 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
+          <h3><span class="ver">v3.1.0</span> Colour that means something</h3>
+          <ul>
+            <li><b>Errors stand out</b> in the terminals: <b>Permission denied</b>,
+            <b>not found</b>, <b>blocked</b> and other errors and denials in red,
+            warnings in amber, successes in green.</li>
+            <li><b>Everything else stays plain</b>: <code>ls</code> and
+            <code>grep</code> are no longer forced into colour, logcat colours only
+            its warnings and errors, and the prompt is one quiet colour.</li>
+            <li><b>Push and Pull line up</b> in Files, centred between two lists
+            that stay level.</li>
+          </ul>
+        </div>
+        <div class="wn">
           <h3><span class="ver">v3.0.0</span> Terminals that behave</h3>
           <ul>
             <li><b>A real device terminal</b> for the Android shell: <code>ping</code>,
             <code>logcat | grep</code> and prompts that wait for input just work, and
             Stop sends Ctrl+C.</li>
-            <li><b>Full-screen programs and colour that means something</b>:
-            <code>top</code>, <code>vi</code> and <code>less</code> redraw in place;
-            errors and denials show in red, warnings in amber and successes in green,
-            and the rest stays plain.</li>
+            <li><b>Full-screen programs</b>: <code>top</code>, <code>vi</code> and
+            <code>less</code> redraw in place and get every key.</li>
             <li><b>Stop keeps your shell</b> in PowerShell and CMD, variables and
             all.</li>
             <li><b>No stray blank lines</b>, and typing never scrambles streaming
@@ -87,29 +98,18 @@
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v3.0.0</span> Leaner and calmer</h3>
+          <h3><span class="ver">v3.0.0</span> Leaner and dependable</h3>
           <ul>
             <li><b>One adb server</b>: no duplicate adb processes, and only the
             server TurboADB started is stopped on exit.</li>
             <li><b>IVI displays start stopped</b>: start one, or all, when you need
             them.</li>
-            <li><b>A hung scrcpy window</b> never freezes TurboADB.</li>
             <li><b>TurboADB by name</b> in Task Manager and on the taskbar, with an
-            icon that follows Windows' light or dark mode and pins that start
-            TurboADB.</li>
-          </ul>
-        </div>
-        <div class="wn">
-          <h3><span class="ver">v3.0.0</span> Logs and files you can trust</h3>
-          <ul>
+            icon that follows Windows' light or dark mode.</li>
             <li><b>Logcat keeps every line</b>, even while hidden, and its filter
             searches the whole capture.</li>
-            <li><b>Faster Files</b> for big folders, with real transfer
-            progress.</li>
             <li><b>Open files in their apps</b>: a picture, video or text file on
             the device opens on the PC, and your saves go back to the device.</li>
-            <li><b>Safer defaults</b>: drops never delete your originals, and
-            sharing opens the firewall on private networks only.</li>
           </ul>
         </div>
       </div>
@@ -259,7 +259,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-3.0.0-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-3.1.0-win64.exe</code> from the latest release
           and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
           on first run and adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>

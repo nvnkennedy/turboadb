@@ -16,18 +16,13 @@
 
 ---
 
-> **New in 3.0.0:** the Android shell runs on a real device terminal, so `ping`,
-> `logcat | grep` and programs that wait for input work, and Stop sends Ctrl+C;
-> `top`, `vi` and `less` redraw in place; the prompt, `ls`, `grep` and logcat
-> lines are in colour; Stop in PowerShell and CMD keeps your shell; no more
-> stray blank lines; IVI displays start stopped; one adb server and no duplicate
-> adb processes; a Logcat page that keeps every line and filters the whole
-> capture; faster Files for big folders with real transfer progress, and device
-> files that open in the PC's own apps with your saves going back to the device;
-> TurboADB by name and icon in Task Manager and on the taskbar, with an icon
-> that follows Windows' light or dark mode and pins that start TurboADB;
-> safer sharing and deploy defaults; and well over a hundred other fixes. Full
-> notes in the
+> **New in 3.1.0:** colour that means something in the terminals — errors,
+> denials and blocks in red (**Permission denied**, **not found**,
+> **blocked**), warnings in amber and successes in green, while everything
+> else stays plain: `ls` and `grep` are no longer forced into colour, logcat
+> colours only its warnings and errors, and the prompt is one quiet colour.
+> In Files, Push and Pull line up, centred between two lists that stay level.
+> Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -64,7 +59,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-3.0.0-win64.exe`** from the
+1. Download **`TurboADB-3.1.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
