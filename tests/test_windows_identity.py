@@ -125,6 +125,16 @@ def test_the_version_resource_holds_turboadbs_strings():
     assert translation == "Translation" and struct.unpack("<HH", lang) == (0x0409, 0x04B0)
 
 
+def test_the_one_file_exe_names_itself_turboadb():
+    """Task Manager names a process after its FileDescription, and showed the
+    one-file exe's file name without one."""
+    spec = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "turboadb-gui.spec"), encoding="utf-8").read()
+    assert "StringStruct('FileDescription', 'TurboADB')" in spec
+    assert "version=VERSION_INFO" in spec
+    assert "'turboadb/assets/icon-light.ico'" in spec  # the light taskbar's icon travels too
+
+
 def test_the_generated_script_is_python_for_any_folder():
     """A path with backslashes (C:\\Users\\x...) in a plain string literal was a
     syntax error: every value goes in as a repr."""

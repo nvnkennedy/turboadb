@@ -3,6 +3,8 @@ from pathlib import Path
 import re
 
 from PyInstaller.utils.hooks import collect_submodules, collect_all
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo, StringFileInfo, StringStruct, StringTable, VarFileInfo, VarStruct, VSVersionInfo)
 
 # PyInstaller executes a spec with ``SPECPATH`` rather than ``__file__``.
 ROOT = Path(SPECPATH)
@@ -12,6 +14,28 @@ if _version_match is None:
     raise RuntimeError('Could not read the TurboADB version for the executable name.')
 APP_VERSION = _version_match.group(1)
 EXE_NAME = f'TurboADB-{APP_VERSION}-win64'
+
+# The exe's version information: Task Manager names the process after its
+# FileDescription, and showed the file name without one.
+_numbers = tuple((
+    [int(re.match(r'\d*', part).group() or 0) for part in APP_VERSION.split('.')[:4]] + [0, 0, 0, 0])[:4])
+VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=_numbers, prodvers=_numbers, mask=0x3F, flags=0x0, OS=0x40004,
+                      fileType=0x1, subtype=0x0, date=(0, 0)),
+    kids=[
+        StringFileInfo([StringTable('040904B0', [
+            StringStruct('CompanyName', 'TurboADB'),
+            StringStruct('FileDescription', 'TurboADB'),
+            StringStruct('FileVersion', APP_VERSION),
+            StringStruct('InternalName', 'TurboADB'),
+            StringStruct('LegalCopyright', 'Copyright (c) 2026 TurboADB contributors. MIT License.'),
+            StringStruct('OriginalFilename', f'{EXE_NAME}.exe'),
+            StringStruct('ProductName', 'TurboADB'),
+            StringStruct('ProductVersion', APP_VERSION),
+        ])]),
+        VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])]),
+    ],
+)
 
 hiddenimports = ['winrm', 'requests_ntlm', 'spnego']   # WinRM remote-deploy (NTLM)
 hiddenimports += ['keyring.backends', 'keyring.backends.Windows']  # OS vault (password)
@@ -69,4 +93,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['turboadb\\assets\\icon.ico'],
+    version=VERSION_INFO,
 )
