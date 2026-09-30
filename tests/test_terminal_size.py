@@ -45,7 +45,19 @@ def test_a_line_of_exactly_the_columns_never_scrolls_sideways(qapp, width, size)
         assert bar.maximum() == 0  # all of it shows
         _draw(term, "M")
         qapp.processEvents()
-        assert bar.maximum() > 0  # one more does not: cols is every whole cell
+        # One more does not: cols is every whole cell.  The sideways scroll
+        # range counts whole pixels, though, and with a font whose advance is a
+        # fraction of a pixel (Linux's DejaVu Sans Mono at some sizes) one more
+        # character may overrun the view by less than one; two more always
+        # show.  One over, which would scroll every full-width line sideways,
+        # is what the check above rules out.
+        from PyQt5.QtGui import QFontMetricsF
+
+        advance = QFontMetricsF(term.document().defaultFont()).horizontalAdvance("M")
+        if not float(advance).is_integer() and bar.maximum() == 0:
+            _draw(term, "M")
+            qapp.processEvents()
+        assert bar.maximum() > 0
     finally:
         term.close_archive()
         term.deleteLater()

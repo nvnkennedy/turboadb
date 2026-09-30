@@ -166,8 +166,10 @@ _NO_T_OPTION = '*"nknown option"*|*"nvalid option"*|*"llegal option"*'
 
 def _rename_cmd(src: str, dst: str, overwrite: bool = False, verify: bool = True) -> str:
     """``mv -T`` never moves *src* INTO an existing folder.  Without *overwrite*,
-    ``-n`` refuses to replace anything; toybox then still exits 0, so the move
-    is verified.
+    ``-n`` refuses to replace anything: toybox then still exits 0, while GNU's
+    mv 9.2 and later fail, each in words of its own.  So a failed mv that
+    leaves both names in place counts as that refusal, and the move is
+    verified.
 
     Many head units run a toybox without ``-T``.  There the command falls back
     to a plain ``mv`` that first refuses a folder at *dst*, or a link to one (a
@@ -177,14 +179,18 @@ def _rename_cmd(src: str, dst: str, overwrite: bool = False, verify: bool = True
     s, d = shlex.quote(src), shlex.quote(dst)
     flag = "-f " if overwrite else "-n " if verify else ""
     tmp = shlex.quote(dst.rstrip("/") + ".turboadb-rename")
+    report = "{ printf '%s\\n' \"$err\" >&2; false; }"
+    if flag == "-n ":  # the refusal: the check at the end says it in plain words
+        report = (f"{{ {{ [ -e {s} ] || [ -L {s} ]; }} && "
+                  f"{{ [ -e {d} ] || [ -L {d} ]; }}; }} || {report}")
     plain = (f"if [ ! -L {s} ] && [ ! -L {d} ] && [ {s} -ef {d} ]; then "
              f"[ ! -e {tmp} ] && mv -- {s} {tmp} && mv -- {tmp} {d}; "
              f"elif [ -d {d} ]; then "
              f"echo 'mv: not renamed: a folder with the new name exists' >&2; false; "
-             f"else mv {flag}-- {s} {d}; fi")
+             f"else err=$(mv {flag}-- {s} {d} 2>&1) || {report}; fi")
     cmd = (f"err=$(mv {flag}-T -- {s} {d} 2>&1) || case \"$err\" in "
            f"{_NO_T_OPTION}) {plain} || exit 1;; "
-           f"*) printf '%s\\n' \"$err\" >&2; exit 1;; esac")
+           f"*) {report} || exit 1;; esac")
     if verify and not overwrite:
         cmd += (f"; if [ -e {s} ] || [ -L {s} ]; then "
                 f"echo 'mv: not renamed: the new name already exists' >&2; exit 1; fi")

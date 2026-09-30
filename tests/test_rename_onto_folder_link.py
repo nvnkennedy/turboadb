@@ -38,7 +38,7 @@ def _run(cmd, cwd, old_mv):
         bindir = cwd / "oldbin"
         bindir.mkdir(exist_ok=True)
         fake = bindir / "mv"
-        fake.write_text(_OLD_MV, newline="\n")
+        fake.write_bytes(_OLD_MV.encode())  # no CRLF on Windows (write_text's newline= is 3.10+)
         fake.chmod(0o755)
         # $PWD, not the path as Python writes it: "C:/…" would split PATH at
         # the drive's colon under a Windows sh, and the real mv would run

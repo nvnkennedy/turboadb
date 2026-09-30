@@ -2,7 +2,6 @@
 import os
 import subprocess
 import sys
-import time
 
 import pytest
 
@@ -78,14 +77,19 @@ def test_an_unreadable_process_table_returns_none(monkeypatch):
 
 @pytest.mark.skipif(os.name != "nt", reason="exercises the Toolhelp32 walk")
 def test_kill_tree_ends_a_real_grandchild_and_keeps_the_root():
-    code = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); time.sleep(60)"
-    root = subprocess.Popen([sys.executable, "-c", code], creationflags=0x08000000)
+    # The interpreter itself: a venv's python.exe is a launcher that runs it as
+    # its child, which ends the launcher (the root here) when it is killed.
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    # The root names its child once it runs: the first to show up otherwise is
+    # the conhost.exe of the root's hidden console, well before the child.
+    code = ("import subprocess,sys,time; "
+            "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "print(c.pid, flush=True); time.sleep(60)")
+    root = subprocess.Popen([python, "-c", code], stdout=subprocess.PIPE, creationflags=0x08000000)
     try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and len(proctree.descendants(root.pid)) < 1:
-            time.sleep(0.1)
+        child = int(root.stdout.readline())
         kids = proctree.descendants(root.pid)
-        assert kids, "the child never appeared"
+        assert child in {k.pid for k in kids}
         killed = proctree.kill_tree(root.pid, include_root=False)
         assert set(killed) >= {k.pid for k in kids}
         assert root.poll() is None          # the root was kept
@@ -94,3 +98,4 @@ def test_kill_tree_ends_a_real_grandchild_and_keeps_the_root():
     finally:
         if root.poll() is None:
             root.kill()
+        root.stdout.close()

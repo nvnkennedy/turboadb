@@ -239,3 +239,26 @@ def qapp():
 def app(qapp):
     """Alias of :func:`qapp` (some modules ask for ``app``)."""
     return qapp
+
+
+def _workflow_escape(text, prop=False):
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def pytest_terminal_summary(terminalreporter):
+    """On GitHub Actions each failure is an annotation too: the run's page
+    lists it, and the checks API returns it without signing in for the log."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    stats = terminalreporter.stats
+    for report in (stats.get("failed", []) + stats.get("error", []))[:10]:  # GitHub keeps ten
+        path, line, _name = getattr(report, "location", None) or (report.nodeid, None, "")
+        lines = (report.longreprtext or "").strip().splitlines()
+        detail = [text for text in lines if text.startswith("E ")][:8] or lines[-6:]
+        if lines and lines[-1] not in detail:
+            detail.append(lines[-1])  # where it failed
+        terminalreporter.write_line(
+            f"::error file={_workflow_escape(str(path).replace(os.sep, '/'), True)},"
+            f"line={(line or 0) + 1},title={_workflow_escape(report.nodeid, True)}"
+            f"::{_workflow_escape(chr(10).join(detail))}")

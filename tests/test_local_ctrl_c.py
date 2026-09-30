@@ -396,7 +396,10 @@ def test_real_ctrl_c_from_a_process_without_a_console(tmp_path):
     script.write_text(_NO_CONSOLE_CHILD)
     report = tmp_path / "report.txt"
     root = os.path.dirname(os.path.dirname(os.path.abspath(turboadb.__file__)))
-    proc = subprocess.Popen([sys.executable, str(script), root, str(report)],
+    # The interpreter itself: a venv's python.exe is a launcher, and the
+    # interpreter it starts under a detached launcher gets a console again.
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    proc = subprocess.Popen([python, str(script), root, str(report)],
                             creationflags=0x00000008)  # DETACHED_PROCESS: no console
     assert proc.wait(120) == 0
     lines = report.read_text().splitlines()
