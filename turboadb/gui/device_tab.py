@@ -3004,9 +3004,10 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     (``resize_terminal``, so the program redraws).  A hidden first line
     switches mksh's line editor off (adb gives the terminal no size, so the
     editor scrolled every line longer than 80 columns sideways and garbled
-    its echo), gives the terminal this view's size, makes ``ls`` and
-    ``grep`` colour their output where the device's tools can, and reports
-    the terminal's name; nothing is shown until it ran.
+    its echo), gives the terminal this view's size and reports the
+    terminal's name; nothing is shown until it ran.  Output stays in the
+    terminal's own colours (``ls`` and ``grep`` are not made to colour it):
+    the console colours the words that say what happened.
     The console keeps its cooked mode: one Enter sends one line (a LF), the
     device's echo of it is hidden, and the device prompt tells when the shell
     is ready (for the next pasted line, a Ctrl+C that was answered, the
@@ -3022,25 +3023,6 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     # printed by the hidden first line, with the terminal's name (``tty``);
     # the output before it is not shown
     _INIT_MARK = re.compile(rb"\x1b\]7718;ready(?:;([^\x07\x1b]*))?\x07")
-    # toybox 0.8.12 (Android 16) turned ls --color around: it colours what
-    # does not go to a terminal (--color=never too) and never a terminal.
-    # There ls is this function: a listing for the terminal goes through
-    # cat, in the columns and escaping ls gives a terminal and with its exit
-    # status; output to a pipe or file, or a --color of the user's, runs ls
-    # as typed.  Its variables are local: the user's own stay as they were.
-    _LS_THROUGH_CAT = (
-        "ls() { [ -t 1 ] || { command ls \"$@\"; return; }; local _tc=-C _tb=-b _ta; "
-        "for _ta; do case $_ta in --) break;; --color*) command ls \"$@\"; return;; "
-        "--show-control-chars) _tb=;; --full-time) _tc=;; --*) ;; -*[lnog1xm]*) _tc=;; esac; done; "
-        "(set -o pipefail; command ls $_tc $_tb --color=auto \"$@\" | cat); }"
-    )
-    # ls and grep in colour where the device's tools take the option
-    # (toybox's do; an older toolbox ls refuses it and stays as it was)
-    _COLOR_ALIASES = (
-        "case $(ls --color=never -d / 2>/dev/null) in *\"$(printf '\\033')\"*) " + _LS_THROUGH_CAT + ";; "
-        "*) ls --color=auto / >/dev/null 2>&1 && alias ls='ls --color=auto';; esac",
-        "echo x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'",
-    )
     # how long the view's size must stay put before the device terminal
     # hears it while a program has the screen
     RESIZE_DELAY_MS = 250
@@ -3282,7 +3264,6 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             steps.append("stty cols {} rows {}".format(*size))
         self._tty_size = size
         steps += ["set +o emacs", "set +o vi"]  # mksh's line editor (see the class docstring)
-        steps += self._COLOR_ALIASES
         if cwd and cwd != "/":
             steps.append("cd " + shlex.quote(cwd))
         # The leading space keeps it out of a shell history that honours that.

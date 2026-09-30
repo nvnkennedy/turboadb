@@ -281,23 +281,32 @@ ANSI_BG = {
     104: "#3f76ad", 105: "#935cab", 106: "#3d939c", 107: "#c8cbd0",
 }
 
-# A device shell's own prompt, which the terminal colours (gui/shell_colors.py):
-# the parts of "130|user@host:/path $" as TurboADB draws its own prompt over
-# a pipe, as (colour, bold): the exit status and root's "#" red, the user
-# magenta, the host cyan, ":" grey, the path yellow and "$" green.
+# The prompt, in one quiet colour whoever draws it: a device shell's own
+# (gui/shell_colors.py), TurboADB's over a pipe, PowerShell's and CMD's.  The
+# parts of "130|user@host:/path $" as (colour, bold); red only where it means
+# something: a failed command's exit status and root's "#".
 TERM_PROMPT_COLORS = {
     "status": (ANSI_FG[91], True),
-    "user": (ANSI_FG[95], True),
-    "host": (ANSI_FG[96], True),
+    "user": (TERM_PROMPT, False),
+    "host": (TERM_PROMPT, False),
     "colon": (ANSI_FG[90], False),
-    "path": (ANSI_FG[93], True),
-    "mark": (ANSI_FG[92], True),
+    "path": (TERM_PROMPT, False),
+    "mark": (TERM_PROMPT, False),
     "root": (ANSI_FG[91], True),
 }
 
 # Messages TurboADB itself echoes into a terminal.
 ECHO_ERROR = "#e06c75"
 ECHO_WARN = "#e9b44c"
+
+# The words of plain output that say what happened (gui/shell_colors.py), as
+# (colour, bold): something failed or was refused, needs attention, or worked.
+# All other output keeps TERM_FG, so what matters stands out.
+TERM_MEANING_COLORS = {
+    "error": (ANSI_FG[91], True),
+    "warning": (ECHO_WARN, False),
+    "success": (ANSI_FG[92], False),
+}
 
 # Log dock: level -> (badge colour, message colour).
 LOG_LEVEL_STYLE = {
@@ -311,6 +320,8 @@ LOG_TIMESTAMP = "#7c8189"
 LOG_TEXT = "#c3c7cd"
 
 # Logcat priority letters, plus the default line colour and match highlight.
+# A terminal colours only warnings, errors and fatal lines (see
+# shell_colors.COLOURED_LEVELS); the Logcat tab colours every line.
 LOGCAT_LEVELS = {
     "E": "#e06c75",
     "F": "#d292e6",

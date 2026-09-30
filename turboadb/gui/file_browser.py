@@ -31,8 +31,8 @@ from collections import deque
 from itertools import accumulate
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import (QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect,
-                          QSize, QThread, QTimer, QUrl, Qt, pyqtSignal)
+from PyQt5.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QMimeData, QObject, QPoint,
+                          QRect, QSize, QThread, QTimer, QUrl, Qt, pyqtSignal)
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
                              QInputDialog, QMessageBox, QLabel, QProgressBar,
@@ -530,11 +530,47 @@ class _NameDelegate(QStyledItemDelegate):
 
 class _PathEdit(QLineEdit):
     """The folder path field: it takes the spare width of its header row but
-    asks for little, so Up and Refresh stay beside it on a laptop screen."""
+    asks for little, so Up and Refresh stay beside it on a laptop screen (a
+    window half a 1920-pixel screen wide keeps both header rows on one line)."""
 
     def sizeHint(self):
         hint = super().sizeHint()
-        return QSize(min(hint.width(), 140), hint.height())
+        return QSize(min(hint.width(), 72), hint.height())
+
+
+class _LevelPanes(QObject):
+    """Keeps the PC and device panes level whatever their widths: each pane's
+    header row as tall as the other's, and its footer (the status line and
+    the file buttons) too.  A row that wraps on one side only (the PC side
+    also has the drive list; a pane dragged narrower) moved that side's list
+    down, so the lists started at different heights.  The middle column gets
+    the lists' height, so Push and Pull are centred between them."""
+
+    def __init__(self, heads, feet, middle, gap: int):
+        super().__init__(middle.parentWidget())
+        self._heads, self._feet = tuple(heads), tuple(feet)
+        self._middle, self._gap = middle, gap
+        for widget in self._heads + self._feet:
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Resize, QEvent.LayoutRequest):
+            self.level()
+        return False
+
+    @staticmethod
+    def _even(widgets) -> int:
+        tallest = max(max(0, widget.heightForWidth(widget.width())) for widget in widgets)
+        for widget in widgets:
+            if widget.minimumHeight() != tallest:
+                widget.setMinimumHeight(tallest)
+        return tallest
+
+    def level(self):
+        if not all(w.isVisible() and w.width() > 0 for w in self._heads + self._feet):
+            return  # not laid out yet: once shown it is
+        top, bottom = self._even(self._heads), self._even(self._feet)
+        self._middle.setContentsMargins(0, top + self._gap, 0, bottom + self._gap)
 
 
 class _FileTableWidget(QTableWidget):
@@ -1835,7 +1871,9 @@ class FileBrowser(QWidget):
         ltop.addWidget(self.local_path, 1)
         ltop.addWidget(lup)
         ltop.addWidget(lref)
-        left_lay.addLayout(ltop)
+        lhead = QWidget()
+        lhead.setLayout(ltop)
+        left_lay.addWidget(lhead)
 
         self.local_table = self._create_table(is_remote=False)
         self.local_table.cellDoubleClicked.connect(self._on_local_double_click)
@@ -1844,9 +1882,7 @@ class FileBrowser(QWidget):
         self.local_table.dropped.connect(self._on_local_dropped)
         left_lay.addWidget(self.local_table, 1)
         self.local_status = self._pane_status()
-        left_lay.addWidget(self.local_status)
-
-        left_lay.addLayout(self._pane_ops((
+        lfoot = self._pane_foot(self.local_status, self._pane_ops((
             ("New folder", self._local_mkdir),
             ("New file", self._local_newfile),
             ("Open", self._local_open),
@@ -1855,35 +1891,28 @@ class FileBrowser(QWidget):
             ("Paste", self._local_paste),
             ("Rename", self._local_rename),
         ), self._local_delete))
+        left_lay.addWidget(lfoot)
 
         # ----------------- Center Action Column -----------------
+        # Push and Pull alike, one above the other, centred between the lists
+        # (_LevelPanes sets the column's margins to the lists' height).
         center_w = QWidget()
         center_lay = QVBoxLayout(center_w)
         center_lay.setContentsMargins(0, 0, 0, 0)
-        center_lay.setSpacing(8)
+        center_lay.setSpacing(10)
         center_lay.addStretch(1)
 
-        self.btn_push = QPushButton("Push")
-        self.btn_push.setProperty("tone", "blue")
-        self.btn_push.setIcon(icon("arrow-right", "blue"))
-        # icon after the text, so the button reads "Push →"
+        self.btn_push = self._transfer_button(
+            "Push", "arrow-right", "blue", "Push selected local files to the Android device folder")
+        # icon after the text, so the button reads "Push →" (and "← Pull")
         self.btn_push.setLayoutDirection(Qt.RightToLeft)
-        self.btn_push.setToolTip("Push selected local files to the Android device folder")
-        self.btn_push.setFixedWidth(84)
-        self.btn_push.setFixedHeight(32)
-        self.btn_push.setFocusPolicy(Qt.TabFocus)  # a click keeps the pane's focus
         self.btn_push.clicked.connect(self.push_selected)
-        center_lay.addWidget(self.btn_push)
+        center_lay.addWidget(self.btn_push, 0, Qt.AlignHCenter)
 
-        self.btn_pull = QPushButton("Pull")
-        self.btn_pull.setProperty("tone", "green")
-        self.btn_pull.setIcon(icon("arrow-left", "green"))
-        self.btn_pull.setToolTip("Pull selected Android files to the local PC folder")
-        self.btn_pull.setFixedWidth(84)
-        self.btn_pull.setFixedHeight(32)
-        self.btn_pull.setFocusPolicy(Qt.TabFocus)
+        self.btn_pull = self._transfer_button(
+            "Pull", "arrow-left", "green", "Pull selected Android files to the local PC folder")
         self.btn_pull.clicked.connect(self.pull_selected)
-        center_lay.addWidget(self.btn_pull)
+        center_lay.addWidget(self.btn_pull, 0, Qt.AlignHCenter)
 
         center_lay.addStretch(1)
 
@@ -1908,7 +1937,9 @@ class FileBrowser(QWidget):
         rtop.addWidget(rtitle)
         rtop.addWidget(self.remote_path, 1)
         rtop.addWidget(rup); rtop.addWidget(rref)
-        right_lay.addLayout(rtop)
+        rhead = QWidget()
+        rhead.setLayout(rtop)
+        right_lay.addWidget(rhead)
 
         self.remote_table = self._create_table(is_remote=True)
         self.remote_table.cellDoubleClicked.connect(self._on_remote_double_click)
@@ -1917,9 +1948,7 @@ class FileBrowser(QWidget):
         self.remote_table.dropped.connect(self._on_remote_dropped)
         right_lay.addWidget(self.remote_table, 1)
         self.remote_status = self._pane_status()
-        right_lay.addWidget(self.remote_status)
-
-        right_lay.addLayout(self._pane_ops((
+        rfoot = self._pane_foot(self.remote_status, self._pane_ops((
             ("New folder", self._remote_mkdir),
             ("New file", self._remote_newfile),
             ("Open", self._remote_open),
@@ -1928,6 +1957,7 @@ class FileBrowser(QWidget):
             ("Paste", self._remote_paste),
             ("Rename", self._remote_rename),
         ), self._remote_delete))
+        right_lay.addWidget(rfoot)
 
         split.addWidget(left_w)
         split.addWidget(center_w)
@@ -1935,7 +1965,8 @@ class FileBrowser(QWidget):
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 0)
         split.setStretchFactor(2, 5)
-        split.setSizes([460, 92, 460])
+        split.setSizes([460, 104, 460])
+        self._level = _LevelPanes((lhead, rhead), (lfoot, rfoot), center_lay, left_lay.spacing())
         # The panes above, the transfer history below: the handle between them
         # gives the history as much room as the user wants.
         self._vsplit = QSplitter(Qt.Vertical)
@@ -2054,6 +2085,33 @@ class FileBrowser(QWidget):
         label = QLabel("")
         label.setObjectName("mutedHint")
         return label
+
+    @staticmethod
+    def _pane_foot(status: QLabel, ops) -> QWidget:
+        """A pane's footer: its status line over its file buttons."""
+        foot = QWidget()
+        lay = QVBoxLayout(foot)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addWidget(status)
+        lay.addLayout(ops)
+        return foot
+
+    @staticmethod
+    def _transfer_button(text: str, glyph: str, tone: str, tip: str) -> QPushButton:
+        """Push or Pull: both the same size, in the colour of the side the
+        files come from (the PC blue, the device green)."""
+        button = QPushButton(text)
+        button.setProperty("tone", tone)
+        button.setIcon(icon(glyph, tone))
+        button.setToolTip(tip)
+        button.setFixedSize(92, 34)
+        # placed by the button itself: the room a style keeps beside a button
+        # is mirrored for Push (right to left, for its icon), which set the
+        # two buttons apart sideways
+        button.setAttribute(Qt.WA_LayoutUsesWidgetRect, True)
+        button.setFocusPolicy(Qt.TabFocus)  # a click keeps the pane's focus
+        return button
 
     @staticmethod
     def _pane_title(text: str, glyph: str, tone: str) -> QToolButton:

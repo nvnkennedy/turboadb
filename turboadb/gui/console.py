@@ -57,6 +57,15 @@ _BG_ANSI = theme.ANSI_BG
 _LOCAL_PS_PROMPT = re.compile(r"(?m)^(PS )([^\r\n>]*)(> ?)")
 _LOCAL_CMD_PROMPT = re.compile(r"(?m)^([A-Za-z]:[^\r\n>]*)(> ?)")
 
+
+def _prompt_sgr(part: str) -> str:
+    """The SGR escape that draws a prompt's *part* in its colour (see
+    theme.TERM_PROMPT_COLORS), for the prompts the console styles itself."""
+    color, bold = theme.TERM_PROMPT_COLORS[part]
+    red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return f"\x1b[0;{'1;' if bold else ''}38;2;{red};{green};{blue}m"
+
+
 # Complete escape sequences (CSI, OSC/DCS/APC/PM/SOS strings, nF/Fp/Fe escapes)
 # removed from the plain-text archive.
 _ARCHIVE_ESC_RE = re.compile(
@@ -1050,9 +1059,9 @@ class AnsiConsole(QPlainTextEdit):
         user, _, host = (self._host or "android").rpartition("@")
         user = user or ("root" if self._root else "shell")
         return (
-            f"\x1b[1;95m{user}@\x1b[1;96m{host or 'android'}"
-            f"\x1b[90m:\x1b[1;93m{cwd} "
-            f"\x1b[1;92m{marker}\x1b[0m "
+            f"{_prompt_sgr('user')}{user}@{_prompt_sgr('host')}{host or 'android'}"
+            f"{_prompt_sgr('colon')}:{_prompt_sgr('path')}{cwd} "
+            f"{_prompt_sgr('root' if self._root else 'mark')}{marker}\x1b[0m "
         )
 
     @staticmethod
@@ -1060,14 +1069,12 @@ class AnsiConsole(QPlainTextEdit):
         """Colour the real local-shell prompt without replacing its semantics."""
         def powershell(match):
             return (
-                f"\x1b[1;96m{match.group(1)}\x1b[1;93m{match.group(2)}"
-                f"\x1b[1;92m{match.group(3)}\x1b[0m"
+                f"{_prompt_sgr('host')}{match.group(1)}{_prompt_sgr('path')}{match.group(2)}"
+                f"{_prompt_sgr('mark')}{match.group(3)}\x1b[0m"
             )
 
         def cmd(match):
-            return (
-                f"\x1b[1;93m{match.group(1)}\x1b[1;92m{match.group(2)}\x1b[0m"
-            )
+            return f"{_prompt_sgr('path')}{match.group(1)}{_prompt_sgr('mark')}{match.group(2)}\x1b[0m"
 
         text = _LOCAL_PS_PROMPT.sub(powershell, text)
         return _LOCAL_CMD_PROMPT.sub(cmd, text)
@@ -1712,6 +1719,22 @@ class AnsiConsole(QPlainTextEdit):
                 if self._line_clean and len(self._line_head) < 256:
                     self._line_head += chunk
 
+        def newline(fmt):
+            if self._wc.position() == self._out_end():
+                # Appending: one insert for the text and its break.  A
+                # lone newline in front of a typed line costs Qt a
+                # relayout that grows with the document.  Blanks a cursor
+                # move left past the line's end stay only for text that
+                # follows them ("abc", 2 right, "d" is "abc  d").
+                if not run:
+                    self._pad = 0
+                run.append("\n")
+                flush(fmt)
+            else:
+                flush(fmt)
+                self._wc.setPosition(self._out_end())
+                self._wc.insertText("\n", self._fmt)
+
         if self._wc.position() > self._out_end():
             self._wc.setPosition(self._out_end())  # output never goes into the edit region
         # A CR is applied lazily: "\r\n" (and adb.exe's "\r\r\n") is only a line
@@ -1754,21 +1777,19 @@ class AnsiConsole(QPlainTextEdit):
                     continue
                 if ch == "\n":
                     cr = False
-                    fmt = self._line_format(run)
-                    if self._wc.position() == self._out_end():
-                        # Appending: one insert for the text and its break.  A
-                        # lone newline in front of a typed line costs Qt a
-                        # relayout that grows with the document.  Blanks a cursor
-                        # move left past the line's end stay only for text that
-                        # follows them ("abc", 2 right, "d" is "abc  d").
-                        if not run:
-                            self._pad = 0
-                        run.append("\n")
-                        flush(fmt)
+                    fmt, words = self._line_format(run)
+                    if words:
+                        # the line and its words' colours in one edit, laid out
+                        # once: a flood of "Permission denied" stays as fast
+                        line = self._wc.block()
+                        self._wc.beginEditBlock()
+                        try:
+                            newline(fmt)
+                            self._colour_words(line)
+                        finally:
+                            self._wc.endEditBlock()
                     else:
-                        flush(fmt)
-                        self._wc.setPosition(self._out_end())
-                        self._wc.insertText("\n", self._fmt)
+                        newline(fmt)
                     self._start_line()
                     continue
                 if cr:
@@ -1912,10 +1933,10 @@ class AnsiConsole(QPlainTextEdit):
                 if len(head) >= 256:
                     break
                 head += piece
-            level = shell_colors.logcat_level(head)
-            if level is None:
+            fmt = self._level_format(shell_colors.logcat_level(head))
+            if fmt is None:
                 return None
-            self._line_fmt = self._level_format(level)
+            self._line_fmt = fmt
             self._line_fmt_end = (self._wc.block(), self._wc.positionInBlock())
             if self._line_head:  # its start, drawn earlier in the default colour
                 start = QTextCursor(self.document())
@@ -1953,13 +1974,18 @@ class AnsiConsole(QPlainTextEdit):
             self._wc.movePosition(QTextCursor.Left)
 
     def _line_format(self, run):
-        """The format for the line that ends now: its logcat priority's when
-        all of it was plain text in the default colours (see shell_colors),
-        else None (the stream's own).  The start of the line, drawn earlier
-        when it came in an earlier read, is recoloured to match."""
+        """How the line that ends now is coloured when all of it was plain
+        text in the default colours (see shell_colors): ``(fmt, words)``.
+
+        *fmt* is its logcat priority's format for a warning, error or fatal
+        logcat line, else None (the stream's own); the start of the line,
+        drawn earlier when it came in an earlier read, is recoloured to
+        match.  *words* is whether it is other output (no logcat line, no
+        prompt and the command after it) with words to look at once it is
+        drawn (see _colour_words)."""
         if not self._line_clean or (run and not self._fmt_plain):
             self._logcat.reset()
-            return None
+            return None, False
         head = self._line_head
         for piece in run:
             if len(head) >= 256:
@@ -1967,18 +1993,23 @@ class AnsiConsole(QPlainTextEdit):
             head += piece
         level = self._logcat.level(head)
         if level is None:
-            return None
+            # a head cut short may leave the words out: all of it is looked at
+            words = len(head) >= 256 or shell_colors.may_mean(head)
+            return None, words and shell_colors.prompt_spans(head) is None
         fmt = self._level_format(level)
-        if self._line_head:
+        if fmt is not None and self._line_head:
             start = QTextCursor(self.document())
             start.setPosition(self._wc.block().position())
             start.setPosition(self._wc.position(), QTextCursor.KeepAnchor)
             start.setCharFormat(fmt)
-        return fmt
+        return fmt, False
 
     def _level_format(self, level):
-        """The format of a logcat line of priority *level* (the Logcat tab's
-        colours; fatal ones bold)."""
+        """The format of a logcat line of priority *level*: the Logcat tab's
+        colours for warnings, errors and fatal lines (fatal ones bold), None
+        for the rest (and for no priority), which keep the default colour."""
+        if level is None or level not in shell_colors.COLOURED_LEVELS:
+            return None
         fmt = self._level_formats.get(level)
         if fmt is None:
             fmt = QTextCharFormat()
@@ -1987,6 +2018,35 @@ class AnsiConsole(QPlainTextEdit):
             if level in ("F", "A"):
                 fmt.setFontWeight(QFont.Bold)
             self._level_formats[level] = fmt
+        return fmt
+
+    def _colour_words(self, block):
+        """Colour the words of the output line *block* that say something
+        went wrong or was refused, needs attention or worked
+        (theme.TERM_MEANING_COLORS; see shell_colors.meaning_spans).  The rest
+        of the line keeps the default colour."""
+        if not block.isValid():
+            return
+        spans = shell_colors.meaning_spans(block.text())
+        if not spans:
+            return
+        start = block.position()
+        painter = QTextCursor(block)
+        for first, last, kind in spans:
+            painter.setPosition(start + first)
+            painter.setPosition(start + last, QTextCursor.KeepAnchor)
+            painter.setCharFormat(self._meaning_format(kind))
+
+    def _meaning_format(self, kind):
+        key = ("meaning", kind)
+        fmt = self._level_formats.get(key)
+        if fmt is None:
+            color, bold = theme.TERM_MEANING_COLORS[kind]
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            if bold:
+                fmt.setFontWeight(QFont.Bold)
+            self._level_formats[key] = fmt
         return fmt
 
     def _prompt_format(self, part):

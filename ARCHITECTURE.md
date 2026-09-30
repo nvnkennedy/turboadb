@@ -130,7 +130,7 @@ device_tab.py     per-device tab; connects in the background; hosts the sub-pane
   console.py        AnsiConsole — the interactive shell terminal
     vtscreen.py       the VT100/xterm screen for full-screen programs (no Qt)
     screen_view.py    paints that screen over the console's scrollback
-    shell_colors.py   device prompts and logcat lines the console colours (no Qt)
+    shell_colors.py   what the console colours: words that say what happened, prompts, logcat lines (no Qt)
   terminal.py       reader thread that pumps shell bytes into the console
   logcat_view.py    live logcat with filtering + complete-save
   file_browser.py   device filesystem tree + push/pull; one per Files tab
@@ -236,11 +236,9 @@ These patterns recur and are worth preserving:
   `stty cols/rows` in front (its echo hidden); nothing is typed into a
   running program. The size is
   `AnsiConsole.cell_size`: whole character cells, margins and the scroll bar
-  left out whether it shows yet or not. The hidden first line also aliases
-  `ls`/`grep` to `--color=auto` where the device's tools take it (toybox
-  0.8.12, which colours only output that is not a terminal, gets an `ls`
-  function that lists for the terminal through `cat`), and its
-  mark carries the terminal's name (`tty`). The reader
+  left out whether it shows yet or not. The hidden first line's mark carries
+  the terminal's name (`tty`); it leaves `ls` and `grep` as they are, so they
+  do not colour their output (see the colour rules below). The reader
   folds adb.exe's CR CR LF into CR LF,
   carrying CRs across reads. A terminal shell that ends or reports an adb error
   before its first prompt (an adb without `-t`, a build without terminals)
@@ -249,12 +247,24 @@ These patterns recur and are worth preserving:
   without shell_v2 gives a terminal even over pipes: its prompt before any
   command gives that away, and it is set up like one.
 - **Colour, Ctrl+C and full-screen programs.** The console draws output as
-  lines (horizontal cursor moves included). An owner that recognises its
-  shell's prompt calls `mark_prompt()` after feeding the output, and the
-  console colours that prompt (`shell_colors.prompt_spans`) unless it has
-  colours of its own; a line that was plain text from start to end and is a
-  logcat line (`shell_colors.LogcatLines`) takes its priority's colour, even
-  when it came in several reads. The undrawn backlog is capped at about a
+  lines (horizontal cursor moves included). Colour it adds is kept for what
+  matters; output with colours of its own keeps them. An owner that
+  recognises its shell's prompt calls `mark_prompt()` after feeding the
+  output, and the console colours that prompt (`shell_colors.prompt_spans`)
+  unless it has colours of its own, in one quiet colour
+  (`theme.TERM_PROMPT_COLORS`, which the prompts the console styles itself
+  use too), red only for a failed command's status and root's `#`. A line
+  that was plain text from start to end and is a logcat line
+  (`shell_colors.LogcatLines`) takes its priority's colour when it is a
+  warning, error or fatal one (`COLOURED_LEVELS`), even when it came in
+  several reads; the rest stay plain. In any other plain line, bar a prompt
+  and the command after it, only the words `shell_colors.meaning_spans` finds
+  are coloured (`theme.TERM_MEANING_COLORS`): errors, denials and blocks red,
+  warnings amber, successes green. They are words of their own (not part of
+  a path, a file name, an identifier or a `key=`), matched through a letter
+  tree (`_trie`); `may_mean` rules most lines out before that, and a line's
+  text and its words' formats go in as one edit, laid out once, so floods
+  stay fast. The undrawn backlog is capped at about a
   second of drawing (`_backlog_cap`, from the measured rate). Ctrl+C on a
   device terminal calls `interrupt_output()`: the backlog goes, and so does
   what arrives before the terminal's own `^C` echo (held, released after a

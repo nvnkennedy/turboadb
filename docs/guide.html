@@ -94,8 +94,11 @@ dev.connect()</code></pre></div></div>
             <code>logcat | grep</code> show their output as it comes and programs that
             ask for input (<code>read</code>, <code>su</code>) work. Full-screen
             programs (<code>top</code>, <code>vi</code>, <code>less</code>) redraw in
-            place and get every key; the prompt, <code>ls</code>, <code>grep</code>
-            and logcat lines are shown in colour.</li>
+            place and get every key. Colour is kept for what matters: the words
+            that say what happened (a red <b>Permission denied</b> or
+            <b>not found</b>, an amber <b>Warning</b>, a green <b>Success</b>) and
+            logcat's warning and error lines; the prompt is one quiet colour and
+            everything else stays plain.</li>
             <li>Right-click for Copy / Paste / <b>Send key</b> / <b>Save full output to
             file…</b>; <b>Stop</b> (Ctrl+C) stops whatever is running and keeps the
             shell (<code>ping</code> prints its summary); a command that ignores it is

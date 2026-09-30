@@ -3,6 +3,38 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 3.1.0
+
+### New
+
+- **Colour that means something in the terminals.** In the Android shell,
+  PowerShell and CMD, the words that say what happened stand out: errors,
+  denials and blocks in red (**Permission denied**, **Read-only file
+  system**, **not found**, **Connection refused**, **blocked**, **Failure
+  [INSTALL_FAILED_…]**, an exception's name), warnings in amber
+  (**Warning**, **deprecated**, **retrying**) and successes in green
+  (**Success**, **connected to**, **1 file pushed**, **0 errors**). Only those
+  words are coloured: a file named `error.log`, a folder like `/data/fail` or a
+  setting such as `granted=true` stays as it is.
+
+### Changed
+
+- **A calmer terminal.** Everything else keeps the terminal's plain colour.
+  `ls` and `grep` are no longer made to colour their output, logcat colours
+  only its warning, error and fatal lines (the Logcat tab still colours every
+  level), and the prompt — the device's, TurboADB's own and PowerShell's or
+  CMD's — is one quiet blue, red only for a failed command's exit status
+  (`1|`) and a root shell's `#`.
+
+### Fixed
+
+- **Push and Pull line up in Files.** The two buttons are the same size, one
+  right above the other and centred between the PC and device lists. The lists
+  start and end at the same height even when one side's header wraps onto a
+  second line (the PC side also has the drive list) or a pane is dragged
+  narrower, and both header rows stay on one line in a window half a
+  1920-pixel screen wide.
+
 ## 3.0.0
 
 ### New

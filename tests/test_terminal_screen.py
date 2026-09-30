@@ -440,7 +440,9 @@ def test_over_a_pipe_there_is_no_screen_and_no_answer(qapp):
 # --------------------------------------------------------------------------- #
 # the Android shell
 # --------------------------------------------------------------------------- #
-def test_the_android_shells_first_line_colours_ls_and_names_the_terminal(qapp):
+def test_the_android_shells_first_line_names_the_terminal_and_leaves_colours_alone(qapp):
+    """ls and grep are not made to colour their output: the console colours
+    the words that say what happened, and nothing else."""
     from test_android_shell_pty import _Handler, _Mksh, _close as close_widget, _ready, _widget
 
     class Named(_Mksh):
@@ -456,11 +458,7 @@ def test_the_android_shells_first_line_colours_ls_and_names_the_terminal(qapp):
     try:
         _ready(qapp, widget)
         line = handler.sessions[0].init_line
-        assert "*) ls --color=auto / >/dev/null 2>&1 && alias ls='ls --color=auto';; esac" in line
-        # toybox 0.8.12 colours only output that is not a terminal: ls through cat
-        assert "case $(ls --color=never -d / 2>/dev/null) in *\"$(printf '\\033')\"*) ls() {" in line
-        assert "(set -o pipefail; command ls $_tc $_tb --color=auto \"$@\" | cat); };;" in line
-        assert "grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'" in line
+        assert "--color" not in line and "alias " not in line and "ls()" not in line
         assert line.endswith("printf '\\033]7718;ready;%s\\007' \"$(tty 2>/dev/null)\"")
         assert widget._tty_name == "/dev/pts/3"
         assert "7718" not in widget.term.toPlainText()
@@ -469,15 +467,17 @@ def test_the_android_shells_first_line_colours_ls_and_names_the_terminal(qapp):
 
 
 @pytest.mark.skipif(os.name == "nt" or not shutil.which("sh"), reason="needs a POSIX sh")
-def test_the_colour_steps_of_the_first_line_are_valid_shell(qapp):
-    """The colour steps as the hidden first line sends them (each with its
-    2>/dev/null) parse; an ls function's own errors are not silenced by it."""
-    from turboadb.gui.device_tab import _AndroidShellWidget
+def test_the_android_shells_first_line_is_valid_shell(qapp):
+    from test_android_shell_pty import _Handler, _Mksh, _close as close_widget, _ready, _widget
 
-    steps = "; ".join(step + " 2>/dev/null" for step in _AndroidShellWidget._COLOR_ALIASES)
-    done = subprocess.run(["sh", "-n", "-c", steps], capture_output=True, text=True, timeout=30)
+    widget, handler = _widget(qapp, _Handler(lambda tty: _Mksh(tty)))
+    try:
+        _ready(qapp, widget)
+        line = handler.sessions[0].init_line
+    finally:
+        close_widget(widget)
+    done = subprocess.run(["sh", "-n", "-c", line], capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
-    assert "cat); } 2>/dev/null" not in steps
 
 
 def test_a_screen_resized_in_the_android_shell_resizes_the_device_terminal(qapp, monkeypatch):

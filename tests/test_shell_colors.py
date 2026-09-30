@@ -1,14 +1,17 @@
-"""Which lines the terminal colours by itself (pure Python, no Qt).
+"""What the terminal colours by itself (pure Python, no Qt).
 
 A device shell on a terminal prints a plain prompt and ``adb logcat`` plain
-lines; the console colours the prompt's parts and logcat lines by priority.
-Only lines that clearly are logcat lines count, in any of logcat's formats,
-so ordinary output that merely resembles one keeps its own look."""
+lines; the console colours the prompt's parts, logcat lines by priority, and
+in other output only the words that say what happened.  Only lines that
+clearly are logcat lines count, in any of logcat's formats, so ordinary
+output that merely resembles one keeps its own look; only words of their
+own count, so a file named ``error.log`` or ``granted=true`` stays plain."""
 
 import pytest
 
+from turboadb.gui import shell_colors
 from turboadb.gui.shell_colors import (
-    LogcatLines, is_long_header, logcat_level, prompt_spans,
+    LogcatLines, is_long_header, logcat_level, may_mean, meaning_spans, prompt_spans,
 )
 
 
@@ -137,3 +140,88 @@ def test_the_command_after_a_prompt_is_not_part_of_it():
 ])
 def test_lines_that_do_not_start_with_a_prompt(line):
     assert prompt_spans(line) is None
+
+
+# --------------------------------------------------------------------------- #
+# the words that say what happened
+# --------------------------------------------------------------------------- #
+def words(line):
+    return [(line[a:b], kind) for a, b, kind in meaning_spans(line)]
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("ls: /data/system: Permission denied", [("Permission denied", "error")]),
+    ("rm: /system/app: Read-only file system", [("Read-only file system", "error")]),
+    ("cat: /sdcard/x.txt: No such file or directory", [("No such file or directory", "error")]),
+    ("/system/bin/sh: foo: inaccessible or not found", [("not found", "error")]),
+    ("Failure [INSTALL_FAILED_VERSION_DOWNGRADE: Downgrade detected]",
+     [("Failure", "error"), ("INSTALL_FAILED_VERSION_DOWNGRADE", "error")]),
+    ("failed to connect to '10.0.0.2:5555': Connection refused",
+     [("failed", "error"), ("Connection refused", "error")]),
+    ("error: device unauthorized.", [("error", "error"), ("unauthorized", "error")]),
+    ("emulator-5554\toffline", [("offline", "error")]),
+    ("java.lang.SecurityException: Permission Denial: not allowed to send broadcast",
+     [("java.lang.SecurityException", "error"), ("Permission Denial", "error"),
+      ("not allowed", "error")]),
+    ("Caused by: java.io.IOException: Broken pipe", [("java.io.IOException", "error")]),
+    ("Get-Item : Cannot find path 'C:\\foo' because it does not exist.",
+     [("Cannot", "error"), ("does not exist", "error")]),
+    ("'foo' is not recognized as an internal or external command,", [("not recognized", "error")]),
+    ("Access is denied.", [("Access is denied", "error")]),
+    ("the request was blocked by policy", [("blocked", "error")]),
+    ("Segmentation fault", [("Segmentation fault", "error")]),
+    ("WARNING: linker: libfoo.so: unused DT entry", [("WARNING", "warning")]),
+    ("Warning: deprecated option -r", [("Warning", "warning"), ("deprecated", "warning")]),
+    ("disconnected 10.0.0.2:5555", [("disconnected", "warning")]),
+    ("Success", [("Success", "success")]),
+    ("connected to 10.0.0.2:5555", [("connected to", "success")]),
+    ("already connected to 10.0.0.2:5555", [("already connected to", "success")]),
+    ("* daemon started successfully", [("successfully", "success")]),
+    ("/sdcard/a.mp4: 1 file pushed, 0 skipped. 38.1 MB/s", [("pushed", "success")]),
+    ("        1 file(s) copied.", [("copied", "success")]),
+    ("OK:/bugreports/bugreport.zip", [("OK", "success")]),
+    ("5 passed, 0 failed, 0 errors",
+     [("passed", "success"), ("0 failed", "success"), ("0 errors", "success")]),
+    ("12 passed, 10 failed", [("passed", "success"), ("failed", "error")]),
+])
+def test_words_that_say_what_happened(line, expected):
+    assert words(line) == expected
+
+
+@pytest.mark.parametrize("line", [
+    "drwxr-xr-x  2 root root 4096 2026-09-30 10:00 error_logs",
+    "-rw-r--r--  1 root root  220 2026-09-30 10:00 error.log",
+    "-rw-r--r--  1 root root  220 2026-09-30 10:00 failed-uploads.txt",
+    "/data/local/tmp/fail",
+    "com.android.fail.provider",
+    "    android.permission.CAMERA: granted=false, flags=[ USER_SENSITIVE_WHEN_DENIED ]",
+    "  mLastError=0 mFailedCount=3 onError()",
+    "  lastError=null errors=0 installed=true",
+    "non-fatal: continuing",
+    "--------- beginning of crash",
+    "0123456789ABCDEF\tdevice",
+    "LOOKUP_TOKEN BOOK",
+    "total 24",
+    "",
+])
+def test_words_that_are_part_of_something_else(line):
+    assert meaning_spans(line) == []
+
+
+@pytest.mark.parametrize("kind, phrases", [
+    ("error", shell_colors._ERROR_PHRASES),
+    ("warning", shell_colors._WARNING_PHRASES),
+    ("success", shell_colors._SUCCESS_PHRASES),
+])
+def test_every_phrase_is_found_in_any_case(kind, phrases):
+    """The quick look (may_mean) never rules out a line one of them is in."""
+    for phrase in phrases:
+        for text in (phrase, phrase.upper(), phrase.capitalize()):
+            assert may_mean(f"x: {text}."), text
+            assert words(f"x: {text}.") == [(text, kind)], text
+
+
+def test_a_very_long_line_is_not_searched():
+    assert may_mean("x " * 1000 + "error")
+    assert not may_mean("x" * 5000 + " error")
+    assert meaning_spans("x" * 5000 + " error") == []
