@@ -450,34 +450,38 @@ def test_settings_set_and_mute_popups(qapp):
         settings_mod.set("mute_popups_with_log", orig)
 
 
+def _first_output(session, marker, timeout=30.0):
+    """What *session* prints until *marker* shows.  A first, cold start of
+    Windows PowerShell on a CI runner takes several seconds (it loads
+    PSReadLine), so 4 s was not always enough."""
+    import time
+
+    out = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and marker not in out:
+        chunk = session.read().decode("utf-8", "replace")
+        if chunk:
+            out += chunk
+        else:
+            time.sleep(0.05)
+    return out
+
+
 @pytest.mark.skipif(os.name != "nt", reason="starts a real powershell.exe / cmd.exe")
 def test_local_terminal_startup_banners(qapp):
-    import time
     from turboadb.gui.local_terminal import LocalShellSession
 
     ps = LocalShellSession("powershell")
-    out_ps = ""
-    for _ in range(40):
-        time.sleep(0.1)
-        chunk = ps.read().decode("utf-8", "replace")
-        if chunk:
-            out_ps += chunk
-            if "PS" in out_ps:
-                break
-    ps.close()
-    assert "PS" in out_ps
+    try:
+        assert "PS" in _first_output(ps, "PS")
+    finally:
+        ps.close()
 
     cmd = LocalShellSession("cmd")
-    out_cmd = ""
-    for _ in range(40):
-        time.sleep(0.1)
-        chunk = cmd.read().decode("utf-8", "replace")
-        if chunk:
-            out_cmd += chunk
-            if ">" in out_cmd:
-                break
-    cmd.close()
-    assert ">" in out_cmd
+    try:
+        assert ">" in _first_output(cmd, ">")
+    finally:
+        cmd.close()
 
 
 def test_local_shell_adb_shell_force_pty(qapp):
