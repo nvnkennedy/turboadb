@@ -229,12 +229,15 @@ def test_merge_sources_keep_their_dot(tmp_path, fake_adb):
 def test_a_slow_copy_that_keeps_moving_outlasts_the_timeout(fake_adb, monkeypatch, tmp_path,
                                                           quick):
     target = tmp_path / "drive.mp4"
-    adb = _Adb(100_000, lambda done: target.write_bytes(b"v" * done), steps=12, pause=0.15)
+    # a step every 0.25 s against a 1.5 s stall limit: a busy CI runner that
+    # pauses a thread for a moment (0.45 s failed 0.15 s steps against 0.6 s)
+    # must not look like a stall
+    adb = _Adb(100_000, lambda done: target.write_bytes(b"v" * done), steps=13, pause=0.25)
     monkeypatch.setattr(core.subprocess, "Popen", adb)
     _device(fake_adb, monkeypatch, _sizes_of(100_000))
     started = time.monotonic()
-    res = ADBHandler(ADBConfig(serial="x")).pull("/sdcard/drive.mp4", str(target), timeout=0.6)
-    assert time.monotonic() - started > 1.2  # twice the timeout, and still fine
+    res = ADBHandler(ADBConfig(serial="x")).pull("/sdcard/drive.mp4", str(target), timeout=1.5)
+    assert time.monotonic() - started > 3.0  # twice the timeout, and still fine
     assert res.size_bytes == 100_000
 
 
