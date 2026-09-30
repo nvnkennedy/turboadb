@@ -21,6 +21,16 @@ All notable changes are recorded here. Versions follow
   and **Meadow** (green), and **High contrast** in dark and light, the most
   readable of all. Pick one in **Themes** or **Settings → Themes**; the
   existing ten stay as they were.
+- **TurboADB is TurboADB on Windows.** Task Manager lists it as **TurboADB**
+  with its own icon instead of "Python", and pinning it to the taskbar keeps
+  the TurboADB icon and name and starts TurboADB again (a pin used to start a
+  bare Python). The icon follows Windows' mode: a dark icon on a dark taskbar,
+  a light one on a light taskbar, switching as soon as you change the mode —
+  the window's, the pin's and the Start-menu and Desktop shortcuts'. The app
+  runs in TurboADB.exe, a copy of your Python's `pythonw.exe` that TurboADB
+  keeps in `~/.turboadb/launcher` and refreshes when Python or TurboADB
+  change; it uses the same Python and packages as before, and
+  `TURBOADB_NO_LAUNCHER=1` runs it the old way.
 - **Open files in their apps from the Files tab.** Double-click, Enter or the
   new **Open** button opens a file in the app Windows has for it (Photos,
   Notepad, Media Player, a PDF reader…), and **Open with…** lets you pick the

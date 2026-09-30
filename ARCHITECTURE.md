@@ -45,7 +45,9 @@ turboadb/
 ├── remote_deploy.py   deploy 'serve' to remote Windows hosts over WinRM (pywinrm/NTLM)
 ├── remotefs.py        device-file shell helpers (ls parsing, mv/cp/rm/probe) shared by the engine and the Files tab
 ├── cli.py             argparse front-end; console-script entry points
-├── assets/            icon.ico / icon.png
+├── launcher.py        Windows: the GUI as TurboADB.exe, a branded copy of this Python (see below)
+├── winshell.py        Windows: taskbar mode, window app ID + pin command, .lnk shortcuts (ctypes COM)
+├── assets/            icon.ico / icon.png (dark), icon-light.ico / icon-light.png
 └── gui/               the PyQt5 application (see below)
 ```
 
@@ -120,6 +122,7 @@ never freezes.
 
 ```
 app.py            QApplication bootstrap, theme, excepthook, app-user-model-id
+  taskbar.py        the taskbar icon for Windows' light/dark mode, live; what a pin starts
 main_window.py    ribbon + menu bar, device tabs, sidebar, log dock, split view,
                   upgrade/self-update, shortcuts, share/deploy actions
   status_bar.py     the coloured status bar: state, messages by kind, ADB/devices/version chips
@@ -357,6 +360,48 @@ While held, the tab's shell-lost and reconnect paths leave the terminals alone
 (`_release_terminals` brings them back and resumes a Logcat capture), and a
 Terminal opened for the first time meanwhile opens after the release.
 
+## TurboADB on Windows: its name, its taskbar icon, its pins
+
+Windows names a process after its program file, and the GUI ran in
+`pythonw.exe`: Task Manager listed "Python" with Python's icon, and a taskbar
+pin of the window started a bare `pythonw`. Three parts fix that.
+
+- **TurboADB.exe** (`launcher.py`). `turboadb-gui`, `turboadb gui` and
+  `python main.py` start the GUI through `launcher.relaunch()`, which runs it in
+  `~/.turboadb/launcher/<environment>/bin/TurboADB.exe`: a copy of this Python's
+  `pythonw.exe` whose icon and version resources (Task Manager's name is the
+  `FileDescription`) are replaced with `UpdateResourceW`, beside copies of the
+  Python DLLs and a `pyvenv.cfg` pointing at the Python home — the layout of a
+  virtualenv made with copies. `TurboADB.exe -m turboadb_launch` runs a
+  generated module of the copy's own site folder, which puts the originating
+  `sys.path` back (a source checkout first, as `python main.py` has it), runs
+  the `.pth` files of its site folders (editable installs) and sets
+  `sys.executable` back to the real interpreter: pip, the update checks and
+  every helper process run the real Python, exactly as before. The copy is
+  rebuilt when Python, TurboADB or the icon change and checked once by starting
+  it (`--probe`); a copy that fails is not retried until something changes, and
+  any failure runs the GUI in-process as before. The launching process waits
+  1.5 s (a GUI that ends at once runs in-process instead) and ends; inside a job
+  that allows no breakaway (an IDE) it stays with the GUI. `TURBOADB_NO_LAUNCHER=1`
+  turns it off; the test suite sets it. The one-file exe is TurboADB already.
+- **The window's identity** (`winshell.set_window_identity`, from
+  `gui/taskbar.py`). The main window carries the app ID and what a pin shows
+  and runs: `RelaunchCommand` (TurboADB.exe, else what the shortcuts start),
+  the name and the icon. Windows keeps 255 characters of each, so the command
+  is a module name rather than a script path, with an 8.3 fallback.
+- **The icon follows the taskbar's mode.** `scripts/make_icon.py` draws the
+  dark and a light variant; `winshell.icon_file()` keeps lasting copies in
+  `~/.turboadb/icons` (shortcuts must not point into a pip-upgraded package or
+  the one-file exe's temp folder). A native event filter catches
+  `WM_SETTINGCHANGE` "ImmersiveColorSet"; after a short pause the window icon
+  follows `SystemUsesLightTheme`, and the icons of TurboADB's pins, Start-menu
+  and Desktop shortcuts follow in a worker thread (their `.lnk` files, through
+  `IShellLinkW`, which keeps their app ID). Shortcuts are written through COM
+  with the app ID (so a pin made of one groups with the running window), and an
+  out-of-date one is rewritten once, never on every launch. The shell is only
+  touched on the real `windows` platform, never from the tests' offscreen
+  windows.
+
 ## Packaging
 
 - `pyproject.toml` — package metadata, the console-script/gui-script entry
@@ -382,6 +427,8 @@ Terminal opened for the first time meanwhile opens after the release.
 ├── logs/             temp scrollback archives (cleaned on close; 1 GB each at most;
 │                     named after their process, which holds a lock there while
 │                     it runs, so a start's clean-up spares another's)
+├── launcher/         Windows: one TurboADB.exe per Python environment (launcher.py)
+├── icons/            the dark and light icons that shortcuts and pins point at
 └── crash.log         uncaught GUI errors
 ```
 

@@ -21,6 +21,9 @@ os.environ["USERPROFILE"] = _TEST_HOME
 # Qt later crashed the whole run (access violation).  Tests that exercise
 # auto-fetch opt back in with monkeypatch.setenv.
 os.environ["TURBOADB_AUTO_FETCH"] = "0"
+# A GUI launch on Windows builds TurboADB.exe and starts the GUI in it: tests
+# keep it in-process.  Those of the launcher itself delete this.
+os.environ["TURBOADB_NO_LAUNCHER"] = "1"
 # Qt's platform plugin is chosen once per process, by whichever test happens to
 # create the QApplication first.  Several test modules set this themselves, so a
 # GUI test could pass when run alone and crash natively in the full run.  conftest

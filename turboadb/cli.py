@@ -110,15 +110,23 @@ def open_docs(argv=None) -> int:
     return 0
 
 
-def _resolve_gui_target():
+def _resolve_gui_target(build: bool = True):
     """The best way to launch the GUI from a shortcut, always from the CURRENT
-    environment: the frozen exe itself, the windowless ``turboadb-gui`` launcher
-    installed next to this interpreter, else ``pythonw -m turboadb gui``. (A
-    ``turboadb-gui`` merely found on PATH may belong to another environment.)"""
+    environment: the frozen exe itself, this environment's TurboADB.exe
+    (:mod:`launcher`; *build* False takes it only when it is ready, for the UI
+    thread), the windowless ``turboadb-gui`` launcher installed next to this
+    interpreter, else ``pythonw -m turboadb gui``. (A ``turboadb-gui`` merely
+    found on PATH may belong to another environment.)"""
     if getattr(sys, "frozen", False):
         # running the bundled one-file exe: the exe the user launched is the
         # stable launcher (NOT the ephemeral _MEIPASS copy)
         return sys.executable, "", os.path.dirname(sys.executable)
+    from . import launcher
+
+    branded = launcher.gui_command(build=build)
+    if branded:
+        exe, args, folder = branded
+        return exe, subprocess.list2cmdline(args), folder
     pydir = os.path.dirname(sys.executable)
     for base in (os.path.join(pydir, "Scripts"), pydir):
         cand = os.path.join(base, "turboadb-gui.exe")
@@ -128,14 +136,40 @@ def _resolve_gui_target():
     return exe, "-m turboadb gui", os.path.dirname(exe)
 
 
-def _write_shortcut(folder_expr: str, name: str) -> bool:
-    """Create ``<folder>/<name>.lnk`` pointing at the GUI, with our icon. The
-    *folder_expr* is a PowerShell expression yielding the target directory (e.g.
-    ``[Environment]::GetFolderPath('Desktop')``)."""
+_SHORTCUT_DESCRIPTION = "TurboADB - Android ADB + scrcpy toolkit"
+
+
+def _shortcut_icon() -> str:
+    """The icon of the taskbar's current mode, from a lasting copy (a pip
+    upgrade or the one-file exe's temp folder would pull the package's own)."""
+    try:
+        from . import winshell
+
+        return winshell.icon_file()
+    except Exception:
+        return _icon_path()
+
+
+def _write_shortcut(folder_expr: str, name: str, folder: str | None = None) -> bool:
+    """Create ``<folder>/<name>.lnk`` pointing at the GUI, with our icon and
+    TurboADB's app ID (so a pin made of it groups with the running window).
+    Written through COM into *folder*; PowerShell is the fallback, with
+    *folder_expr* a PowerShell expression yielding the target directory
+    (e.g. ``[Environment]::GetFolderPath('Desktop')``)."""
     if os.name != "nt":
         return False
     target, args, workdir = _resolve_gui_target()
-    icon = _icon_path()
+    icon = _shortcut_icon()
+    if folder:
+        from . import winshell
+
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        path = os.path.join(folder, f"{name}.lnk")
+        if winshell.write_shortcut(path, target, args, workdir, icon, _SHORTCUT_DESCRIPTION):
+            return True
 
     def q(s):
         return str(s).replace("'", "''")  # for PS single-quoted strings —
@@ -150,7 +184,7 @@ def _write_shortcut(folder_expr: str, name: str) -> bool:
         + (f"$lnk.Arguments = '{q(args)}'; " if args else "")
         + f"$lnk.WorkingDirectory = '{q(workdir)}'; "
         + (f"$lnk.IconLocation = '{q(icon)}'; " if os.path.exists(icon) else "")
-        + "$lnk.Description = 'TurboADB - Android ADB + scrcpy toolkit'; "
+        + f"$lnk.Description = '{q(_SHORTCUT_DESCRIPTION)}'; "
         "$lnk.Save()"
     )
     try:
@@ -178,13 +212,13 @@ def _write_shortcut(folder_expr: str, name: str) -> bool:
 
 def create_desktop_shortcut(name: str = "TurboADB") -> bool:
     """Create/refresh a Desktop shortcut to the GUI (Windows only)."""
-    return _write_shortcut("[Environment]::GetFolderPath('Desktop')", name)
+    return _write_shortcut("[Environment]::GetFolderPath('Desktop')", name, _desktop_folder())
 
 
 def create_start_menu_shortcut(name: str = "TurboADB") -> bool:
     """Create/refresh a Start-menu (Programs) shortcut so the GUI shows up in the
     Start menu and Windows search."""
-    return _write_shortcut("[Environment]::GetFolderPath('Programs')", name)
+    return _write_shortcut("[Environment]::GetFolderPath('Programs')", name, _programs_folder())
 
 
 def _windows_folder(csidl: int) -> str:
@@ -203,22 +237,28 @@ def _windows_folder(csidl: int) -> str:
     return buf.value
 
 
+def _desktop_folder() -> str:
+    try:
+        return _windows_folder(0x10)  # CSIDL_DESKTOPDIRECTORY
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def _programs_folder() -> str:
+    try:
+        return _windows_folder(0x02)  # CSIDL_PROGRAMS
+    except Exception:
+        appdata = os.environ.get("APPDATA", "")
+        return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs")
+
+
 def _shortcut_paths(name: str = "TurboADB"):
     """The Desktop and Start-menu .lnk paths we manage (Windows only)."""
     if os.name != "nt":
         return []
-    try:
-        desktop = _windows_folder(0x10)  # CSIDL_DESKTOPDIRECTORY
-    except Exception:
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    try:
-        programs = _windows_folder(0x02)  # CSIDL_PROGRAMS
-    except Exception:
-        appdata = os.environ.get("APPDATA", "")
-        programs = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs")
     return [
-        ("desktop", os.path.join(desktop, f"{name}.lnk"), create_desktop_shortcut),
-        ("start menu", os.path.join(programs, f"{name}.lnk"), create_start_menu_shortcut),
+        ("desktop", os.path.join(_desktop_folder(), f"{name}.lnk"), create_desktop_shortcut),
+        ("start menu", os.path.join(_programs_folder(), f"{name}.lnk"), create_start_menu_shortcut),
     ]
 
 
@@ -247,6 +287,30 @@ def _shortcut_blocker() -> str | None:
     return f"{copy['note']}, so a shortcut {started}. To use this one, {fix}"
 
 
+def _stale_shortcuts(existing):
+    """Those of the *existing* ``(location, path, maker)`` shortcuts that start
+    something else than this environment's GUI, lack TurboADB's app ID (a pin
+    made of one showed beside the running window) or the icon of the
+    taskbar's mode.  One that can't be read is left alone."""
+    if not existing or os.name != "nt":
+        return []
+    from . import winshell
+
+    read = [(item, winshell.read_shortcut(item[1])) for item in existing]
+    read = [(item, info) for item, info in read if info]
+    if not read:
+        return []
+    target, args, _folder = _resolve_gui_target()
+    icon = _shortcut_icon()
+
+    def norm(path):
+        return os.path.normcase(os.path.abspath(path)) if path else ""
+
+    return [item for item, info in read
+            if norm(info["target"]) != norm(target) or (info["args"] or "").strip() != (args or "").strip()
+            or info.get("app_id") != winshell.APP_ID or norm(info["icon"]) != norm(icon)]
+
+
 def ensure_shortcuts(name: str = "TurboADB", force: bool = False) -> dict:
     """Make sure the Desktop and Start-menu shortcuts exist. With *force* (the
     menu's refresh, and ``turboadb shortcut``) it re-creates them so they point
@@ -254,20 +318,24 @@ def ensure_shortcuts(name: str = "TurboADB", force: bool = False) -> dict:
     before or whose refresh failed, so an ordinary GUI launch logs nothing.
     Returns {location: ok_bool} for created/repaired or failed locations only.
 
+    A shortcut that is there but out of date (it starts something else, lacks
+    TurboADB's app ID or the taskbar mode's icon) is brought up to date
+    quietly; an up-to-date one is never rewritten.
+
     Nothing is written while this process runs a different TurboADB than the
     one a shortcut starts (see :func:`_shortcut_blocker`): a launch then leaves
     the shortcuts alone quietly, and a forced refresh reports every location
     as failed."""
     out = {}
-    wanted = [
-        (loc, path, maker)
-        for loc, path, maker in _shortcut_paths(name)
-        if force or not os.path.exists(path)
-    ]
-    if not wanted:
+    paths = _shortcut_paths(name)
+    wanted = [(loc, path, maker) for loc, path, maker in paths if force or not os.path.exists(path)]
+    stale = [] if force else _stale_shortcuts([item for item in paths if os.path.exists(item[1])])
+    if not wanted and not stale:
         return out
     if _shortcut_blocker() is not None:
         return {loc: False for loc, _path, _maker in wanted} if force else {}
+    for _loc, _path, maker in stale:
+        maker(name)
     for loc, path, maker in wanted:
         existed = os.path.exists(path)
         ok = maker(name)
@@ -359,14 +427,16 @@ def launch_gui(argv=None) -> int:
 
     Runs the GUI from the installed Python package when PyQt5 is available, so
     ``pip install --upgrade turboadb`` always takes effect on the next launch.
+    On Windows it runs as TurboADB.exe, a copy of this Python's pythonw.exe
+    that Task Manager and the taskbar know as TurboADB (:mod:`launcher`).
     Without PyQt5 (e.g. a Python with no PyQt5 wheel) it starts the Windows
     executable bundled in the wheel, from a temp copy so upgrades never block."""
+    args = list(argv) if argv is not None else sys.argv[1:]
     try:
         import PyQt5  # noqa: F401
     except ImportError:
         exe = _gui_exe_path()
         if os.name == "nt" and os.path.isfile(exe):
-            args = list(argv) if argv is not None else sys.argv[1:]
             return subprocess.call([_staged_exe(exe)] + args)
         print(
             "The GUI needs PyQt5 (or, on Windows, the executable bundled in the wheel). "
@@ -374,6 +444,11 @@ def launch_gui(argv=None) -> int:
             file=sys.stderr,
         )
         return 1
+    from . import launcher
+
+    code = launcher.relaunch(args)
+    if code is not None:
+        return code  # it runs as TurboADB.exe, which starts its own adb server
     _prewarm_gui_adb_server()
     # Any other ImportError inside the GUI is a real bug: let it surface with
     # its traceback instead of being mislabelled as "PyQt5 missing".

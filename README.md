@@ -24,6 +24,8 @@
 > adb processes; a Logcat page that keeps every line and filters the whole
 > capture; faster Files for big folders with real transfer progress, and device
 > files that open in the PC's own apps with your saves going back to the device;
+> TurboADB by name and icon in Task Manager and on the taskbar, with an icon
+> that follows Windows' light or dark mode and pins that start TurboADB;
 > safer sharing and deploy defaults; and well over a hundred other fixes. Full
 > notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).

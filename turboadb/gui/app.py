@@ -266,14 +266,17 @@ def _first_run_tasks():
 
 def _set_app_user_model_id():
     """Tell Windows this process is its OWN app (not generic python/pythonw), so
-    the taskbar and Task Manager use our icon instead of a blank/Python one. Must
-    run before any window is created."""
+    the taskbar groups its windows under our icon instead of a blank/Python
+    one. Must run before any window is created.  (Task Manager names a process
+    after its program file: that is TurboADB.exe's part, see launcher.)"""
     if sys.platform != "win32":
         return
     try:
         import ctypes
 
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TurboADB.DeviceToolkit")
+        from ..winshell import APP_ID
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     except Exception:
         pass
 
@@ -492,6 +495,11 @@ def main():
 
     global _window
     _window = MainWindow()
+    # The taskbar's icon for the Windows mode, and what a pin shows and starts:
+    # set before the window shows, as Windows reads them then
+    from . import taskbar
+
+    _window._taskbar = taskbar.install(app, _window)
     # Always open maximized; the workspace (sidebar, screen and controls side by
     # side) is designed for the full screen.
     _window.showMaximized()

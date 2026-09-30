@@ -1,6 +1,7 @@
-"""Enable ``python -m turboadb.gui``."""
+"""Enable ``python -m turboadb.gui`` (as ``turboadb-gui``: on Windows the GUI
+runs as TurboADB.exe, see :mod:`turboadb.launcher`)."""
 
-from .app import main
+from ..cli import launch_gui
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(launch_gui())
