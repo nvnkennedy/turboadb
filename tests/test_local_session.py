@@ -261,6 +261,23 @@ def test_kill_command_ends_the_commands_and_keeps_the_shell(lt, monkeypatch):
     session.close()
 
 
+@windows_only
+def test_the_ctrl_c_report_says_when_it_was_raised(lt, monkeypatch):
+    """The report follows the event a moment later, and the command may have
+    answered by then: the report names the moment of the event itself."""
+    session = _session(lt, monkeypatch, _BlockingPipe())
+    monkeypatch.setattr(lt, "_runs_programs", lambda pid: True)
+    for raised, pair in ((1234.5, (True, True)), (None, (False, True))):
+        monkeypatch.setattr(lt, "_console_ctrl_c", lambda pid, raised=raised: raised)
+        results = []
+        done = threading.Event()
+        assert session.send_ctrl_c(lambda result: (results.append(result), done.set()))
+        assert done.wait(5)
+        assert results[0] == pair and results[0].at == raised
+        assert (results[0].sent, results[0].programs) == pair
+    session.close()
+
+
 def test_kill_command_reports_an_unreadable_process_table(lt, monkeypatch):
     from turboadb import proctree
 
@@ -313,6 +330,41 @@ def test_the_tree_kill_spares_the_adb_server_and_falls_back_to_taskkill(lt, monk
         assert calls == [] and not proc.alive  # terminate()
 
 
+def test_the_tree_kill_ends_what_a_shell_that_exited_left_running(lt, monkeypatch):
+    """``start /b ping -t …`` and then ``exit``: the shell is gone, its
+    command runs on.  Only the pipes were closed then."""
+    from turboadb import proctree
+
+    class Proc:
+        pid = 777
+        stdin = stdout = None
+
+        def poll(self):
+            return 0  # exit was typed
+
+    calls = []
+    monkeypatch.setattr(proctree, "kill_tree", lambda pid, **kw: calls.append((pid, kw)) or [])
+    monkeypatch.setattr(lt.subprocess, "run", lambda argv, **kw: calls.append(("run", argv)))
+    lt._kill_process_tree(Proc())
+    if os.name == "nt":
+        # the PID is still the shell's own while its handle is open
+        assert calls == [(777, {"include_root": False})]
+    else:
+        assert calls == []  # reaped: the PID may be another process's by now
+
+
+def test_interrupt_cleans_up_after_a_shell_that_exited_too(lt, monkeypatch):
+    session = _session(lt, monkeypatch, _BlockingPipe())
+    session._proc.poll = lambda: 0  # the shell ended by itself
+    ended = []
+    monkeypatch.setattr(lt, "_kill_process_tree", lambda proc, wait_s=2.0: ended.append(proc))
+    session.interrupt()
+    assert lt.join_closers(5) == 0 and ended == [session._proc]
+    session.interrupt()
+    session.close()
+    assert lt.join_closers(5) == 0 and len(ended) == 1  # once
+
+
 def test_proctree_passes_the_exit_code(monkeypatch):
     from turboadb import proctree
     from turboadb.proctree import ProcInfo
@@ -339,6 +391,46 @@ def test_gnu_grep_is_recognised_by_its_version(lt, tmp_path):
     assert lt.gnu_grep(env) is True
     (tmp_path / "grep.bat").write_text("@echo BusyBox v1.36 multi-call binary\r\n")
     assert lt.gnu_grep(env) is False
+
+
+@windows_only
+def test_a_grep_in_the_working_folder_is_never_run(lt, tmp_path, monkeypatch):
+    """The working folder is TurboADB's own (where the exe was started:
+    Downloads, a cloned repository), not the shell's.  Windows searches it
+    before the PATH, so a ``grep.bat`` lying there was run when the Command
+    Prompt tab started, with nothing typed."""
+    here = tmp_path / "started-here"
+    here.mkdir()
+    ran = tmp_path / "ran.txt"
+    (here / "grep.bat").write_text(f'@echo ran> "{ran}"\r\n@echo grep (GNU grep) 3.11\r\n')
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    monkeypatch.chdir(here)
+    assert lt.gnu_grep(dict(os.environ, PATH=str(tools))) is False
+    # nor through a PATH entry that only means "the folder I am in"
+    assert lt.gnu_grep(dict(os.environ, PATH=os.pathsep.join([".", "", str(tools)]))) is False
+    assert not ran.exists()
+
+    (tools / "grep.bat").write_text("@echo grep (GNU grep) 3.11\r\n")
+    assert lt.gnu_grep(dict(os.environ, PATH=str(tools))) is True  # the PATH's own is asked
+    assert not ran.exists()
+
+
+@windows_only
+def test_a_command_is_found_as_the_shell_finds_it_on_its_path(lt, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "tool.cmd").write_text("")
+    (first / "tool.txt").write_text("")
+    (second / "tool.exe").write_text("")
+    (second / "other.bat").write_text("")
+    env = {"Path": f'"{first}";{second}', "PATHEXT": ".EXE;.BAT;.CMD"}
+    assert lt.find_command("tool", env) == str(first / "tool.CMD")  # the first folder wins
+    assert lt.find_command("other", env) == str(second / "other.BAT")
+    assert lt.find_command("tool", dict(env, PATHEXT=".EXE")) == str(second / "tool.EXE")
+    assert lt.find_command("missing", env) is None
+    assert lt.find_command("tool", {}) is None
 
 
 # ------------------------------------------------------------------ real shells

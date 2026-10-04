@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Optional
@@ -193,8 +194,12 @@ def list_displays(
     on Android Automotive / IVI head units, which expose several displays
     (center stack, cluster, passenger). Returns ``[{"id": int, "size": str}, …]``.
 
-    Raises :class:`ScrcpyError` if scrcpy can't reach the device.
+    Raises :class:`ScrcpyError` if scrcpy can't reach the device, or has not
+    answered within *timeout* seconds: scrcpy and the adb clients it started
+    are ended then.
     """
+    from .proctree import stop_process
+
     exe = find_scrcpy(scrcpy_path)
     remote = _remote_server_host(adb_server_host)
     cmd = [exe]
@@ -203,18 +208,29 @@ def list_displays(
     if remote:
         cmd += ["--tunnel-host", remote]
     cmd += ["--list-displays"]
-    try:
-        out = subprocess.run(
+    # Into a file, not pipes: scrcpy's adb clients inherit its output, and on
+    # Windows a pipe is read until the last of them lets go of it.  A push to
+    # a head unit that stopped answering held the call long past its timeout.
+    with tempfile.TemporaryFile() as captured:
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=captured,
+            stderr=subprocess.STDOUT,
             creationflags=NO_WINDOW,
             env=_server_env(remote, adb_server_port, adb_path),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ScrcpyError("scrcpy --list-displays timed out") from exc
-    text = (out.stdout or "") + "\n" + (out.stderr or "")
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except BaseException as exc:  # out of time, or interrupted
+            stop_process(proc, grace=0, tree=True)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise ScrcpyError("scrcpy --list-displays timed out") from exc
+            raise
+        captured.seek(0)
+        # adb's lines are in there too, in bytes of its own choosing (a pushed
+        # file's path): decoded strictly, one of them cost the whole output.
+        text = captured.read().decode("utf-8", "replace")
     displays = []
     seen = set()
     for m in re.finditer(r"--display(?:-id)?[= ](\d+)\s*(?:\(([^)]*)\))?", text):
@@ -222,7 +238,7 @@ def list_displays(
         if did not in seen:
             seen.add(did)
             displays.append({"id": did, "size": (m.group(2) or "").strip()})
-    if not displays and out.returncode != 0:
+    if not displays and returncode != 0:
         raise ScrcpyError(
             f"scrcpy could not list displays: {text.strip()[:400] or 'no device reachable'}"
         )

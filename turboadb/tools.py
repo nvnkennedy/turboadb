@@ -11,6 +11,10 @@ Search order (first hit wins):
   6. the system ``PATH``
   7. common Android SDK / install locations
 
+Auto-detection (4 to 7) never looks in the current folder, and every answer is
+an absolute path.  A relative path given on purpose (1 to 3) names a file in
+the working folder.
+
 An explicit path or an environment variable that names no executable raises
 :class:`ADBNotFoundError` instead of falling through to the others: a different
 adb would restart the server the chosen one started.  The Settings path is a
@@ -72,6 +76,11 @@ def _exe(name: str) -> str:
     return f"{name}.exe" if os.name == "nt" else name
 
 
+# adb on Windows, and the DLLs it loads from its own folder: what a copy of adb
+# is made of (the one beside scrcpy, the startup task's).
+ADB_WINDOWS_FILES = ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")
+
+
 def managed_tools_dir() -> str:
     """Path of the managed download cache (``~/.turboadb/tools``). Never creates it.
 
@@ -90,6 +99,25 @@ def windowless_python() -> str:
     exe = sys.executable or "python"
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
     return cand if os.name == "nt" and os.path.exists(cand) else exe
+
+
+# Windows PowerShell, below System32 (see windows_program).
+POWERSHELL = r"WindowsPowerShell\v1.0\powershell.exe"
+
+
+def windows_program(name: str) -> str | None:
+    """Windows' own program *name* (``netsh.exe``, :data:`POWERSHELL`) by its
+    full path in System32, to start it with: ``subprocess.run(["netsh", …],
+    executable=windows_program("netsh.exe"))``.  None when it is not there
+    (and anywhere but Windows), which leaves it to Windows to find.
+
+    Started by its bare name alone, a program is looked for in the current
+    folder before System32: a ``netsh.exe`` or ``schtasks.exe`` lying in the
+    folder ``turboadb serve --startup-task`` was run in was started in its
+    place, as Administrator."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    path = os.path.join(root, "System32", name)
+    return path if _is_absolute(path) and os.path.isfile(path) else None
 
 
 def _recv_exact(sock, size: int, *, retry_timeouts: bool = False) -> bytes | None:
@@ -140,36 +168,38 @@ def _managed_candidates(name: str) -> list:
 
 
 def _sdk_candidates(name: str) -> list:
-    """Common Android SDK / package-manager install locations."""
+    """Common Android SDK / package-manager install locations.
+
+    The Unix folders are left out on Windows, where ``/usr/bin`` names a
+    folder of whichever drive is current, one any account may create.  So is
+    what hangs on ``LOCALAPPDATA`` while that is unset: it was looked up in
+    the current folder."""
     exe = _exe(name)
     home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA", "")
+    unix = [] if os.name == "nt" else [
+        "/usr/local/bin/" + exe,
+        "/usr/bin/" + exe,
+        "/opt/homebrew/bin/" + exe,
+    ]
     paths = []
     if name == "adb":
         roots = [
             os.environ.get("ANDROID_HOME", ""),
             os.environ.get("ANDROID_SDK_ROOT", ""),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk"),
+            os.path.join(local, "Android", "Sdk") if local else "",
             os.path.join(home, "Android", "Sdk"),
             os.path.join(home, "Library", "Android", "sdk"),
-            "/usr/lib/android-sdk",
+            "" if os.name == "nt" else "/usr/lib/android-sdk",
         ]
         for r in roots:
             if r:
                 paths.append(os.path.join(r, "platform-tools", exe))
-        paths += [
-            os.path.join(home, "platform-tools", exe),
-            "/usr/local/bin/" + exe,
-            "/usr/bin/" + exe,
-            "/opt/homebrew/bin/" + exe,
-        ]
+        paths += [os.path.join(home, "platform-tools", exe)] + unix
     else:  # scrcpy
-        paths += [
-            os.path.join(home, "scrcpy", exe),
-            "/usr/local/bin/" + exe,
-            "/usr/bin/" + exe,
-            "/opt/homebrew/bin/" + exe,
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "scrcpy", exe),
-        ]
+        paths += [os.path.join(home, "scrcpy", exe)] + unix
+        if local:
+            paths.append(os.path.join(local, "scrcpy", exe))
     return paths
 
 
@@ -195,15 +225,61 @@ def _gui_setting(name: str) -> str | None:
         return None
 
 
+def _is_absolute(path: str) -> bool:
+    """True for a path that names the same place from any working folder.  On
+    Windows that takes its drive (or share) too: a path that only starts
+    with a slash is on whichever drive is current."""
+    return os.path.isabs(path) and (os.sep == "/" or bool(os.path.splitdrive(path)[0]))
+
+
+def _absolute(path: str) -> str:
+    """*path* as an absolute one; a path that is one already comes back as it
+    was written."""
+    return path if _is_absolute(path) else os.path.abspath(path)
+
+
+# What Windows adds to a bare command name while PATHEXT is unset.
+_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def _on_path(name: str) -> str | None:
+    """*name* in one of PATH's folders, as an absolute path, or None.
+
+    ``shutil.which(name)`` also looks in the current folder: before any other
+    on Windows, and for an empty or relative PATH entry everywhere.  A tool
+    lying in the folder a command happened to be run from (an ``adb.bat`` in
+    a downloaded project) was started as adb.  Each absolute folder of PATH
+    is asked for the file by its full path instead, and no other folder is."""
+    names = [name]
+    if os.name == "nt":
+        extensions = [e for e in (os.environ.get("PATHEXT") or _PATHEXT).split(os.pathsep) if e]
+        if not any(name.lower().endswith(e.lower()) for e in extensions):
+            names = [name + e for e in extensions]
+    for folder in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not _is_absolute(folder):
+            continue
+        for candidate in names:
+            path = os.path.join(folder, candidate)
+            # shutil.which, given the whole path, says whether it may be run
+            if os.path.isfile(path) and shutil.which(path):
+                return path
+    return None
+
+
 def _path_candidate(name: str, value: str) -> str | None:
-    """A file path, a directory containing the exe, or a bare name on PATH."""
+    """A file path, a directory containing the exe, or a bare name on PATH,
+    as an absolute path.  A relative path is the user's own choice of a file
+    in the working folder; a bare name that is no file there is looked up in
+    PATH's folders only (see :func:`_on_path`)."""
     p = os.path.expanduser(value)
     if os.path.isfile(p):
-        return p
+        return _absolute(p)
     cand = os.path.join(p, _exe(name))
     if os.path.isfile(cand):
-        return cand
-    return shutil.which(value)
+        return _absolute(cand)
+    # with a folder in it, shutil.which looks the value up as it is written
+    hit = shutil.which(value) if os.path.dirname(value) else _on_path(value)
+    return _absolute(hit) if hit else None
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -240,18 +316,24 @@ def _not_found_at(name: str, value: str, env_var: str | None) -> ADBNotFoundErro
     )
 
 
-def _discover(name: str) -> str | None:
-    """The managed, bundled, PATH and SDK copies of *name*, in that order."""
-    for cand in _managed_candidates(name) + _bundled_candidates(name):
-        if os.path.isfile(cand):
-            return cand
-    which = shutil.which(name)
-    if which:
-        return which
-    for cand in _sdk_candidates(name):
-        if cand and os.path.isfile(cand):
+def _first_file(candidates) -> str | None:
+    """The first of *candidates* that exists.  One that is not absolute (a
+    location built on a variable that is unset or relative) is never looked
+    at: it would be found in whichever folder is current."""
+    for cand in candidates:
+        if _is_absolute(cand) and os.path.isfile(cand):
             return cand
     return None
+
+
+def _discover(name: str) -> str | None:
+    """The managed, bundled, PATH and SDK copies of *name*, in that order;
+    never one in the current folder."""
+    return (
+        _first_file(_managed_candidates(name) + _bundled_candidates(name))
+        or _on_path(name)
+        or _first_file(_sdk_candidates(name))
+    )
 
 
 def _stale_setting_text(name: str, value: str, found: str | None) -> str:
@@ -371,9 +453,18 @@ def scrcpy_available(explicit: str | None = None) -> bool:
 
 
 def _adb_version_output(exe: str, timeout: float = 15.0) -> str:
-    """Raw ``adb version`` output (stdout, else stderr). May raise OSError/TimeoutExpired."""
+    """Raw ``adb version`` output (stdout, else stderr). May raise OSError/TimeoutExpired.
+
+    adb prints where it is installed: decoded with the system code page, a
+    folder name that has no character there cost the whole output."""
     out = subprocess.run(
-        [exe, "version"], capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW
+        [exe, "version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        creationflags=NO_WINDOW,
     )
     return out.stdout or out.stderr or ""
 
@@ -619,6 +710,9 @@ class _Launch:
         self.started = time.monotonic()
         self.exited_at = None  # first time a waiter saw the launcher gone
         self.text = None  # what it printed, kept once the file is closed
+        # What its credit for the server took the place of (see _settle): the
+        # adb credited until then, and the launcher still to confirm that one.
+        self.replaced = (None, None)
         try:
             import tempfile
 
@@ -682,8 +776,8 @@ class _Launch:
 
 
 def _retire(port: int, launch: _Launch, *, kill: bool = False) -> None:
-    """Stop waiting for *launch* (ending the process first with *kill*).  Call
-    with the server lock held."""
+    """Stop waiting for *launch* (ending the process first with *kill*), and
+    for a launcher it replaced.  Call with the server lock held."""
     if _INFLIGHT.get(port) is launch:
         del _INFLIGHT[port]
     if _UNCONFIRMED.get(port) is launch:
@@ -694,7 +788,10 @@ def _retire(port: int, launch: _Launch, *, kill: bool = False) -> None:
                 launch.proc.kill()
         except Exception:
             pass
+    earlier, launch.replaced = launch.replaced[1], (None, None)
     launch.close()
+    if earlier is not None:
+        _retire(port, earlier)
 
 
 def _settle(port: int, *, alive: bool | None = None) -> None:
@@ -709,11 +806,10 @@ def _settle(port: int, *, alive: bool | None = None) -> None:
         if alive:
             # A launcher lingers (for its daemon's first USB scan) after that
             # daemon answers: nothing to wait for any more, but it has yet to
-            # say whose server this is.
+            # say whose server this is.  What its credit replaces is kept
+            # until it has (see _confirm).
             del _INFLIGHT[port]
-            earlier = _UNCONFIRMED.pop(port, None)
-            if earlier is not None:
-                _retire(port, earlier)
+            launch.replaced = (_STARTED_HERE.get(port), _UNCONFIRMED.pop(port, None))
             _STARTED_HERE[port] = launch.adb
             _UNCONFIRMED[port] = launch
     _confirm(port)
@@ -723,15 +819,27 @@ def _confirm(port: int) -> None:
     """Keep or take back the credit for the server on *port* once its launcher
     has said whether it started it.  Call with the server lock held."""
     launch = _UNCONFIRMED.get(port)
-    if launch is None:
-        return
-    started = launch.started_daemon()
-    if started is None:
-        return
-    if not started:
-        # it found a server there after all: another program's, not ours to stop
-        _STARTED_HERE.pop(port, None)
-    _retire(port, launch)
+    while launch is not None:
+        started = launch.started_daemon()
+        if started is None:
+            return
+        if started:
+            _retire(port, launch)
+            return
+        # It found a server there after all.  One credited before it, which
+        # was only slow to answer when this launcher was started, is ours as
+        # it was (as far as the launcher before had said so: that one is
+        # asked next).  Else it is another program's, and not ours to stop.
+        credit, earlier = launch.replaced
+        launch.replaced = (None, None)
+        _retire(port, launch)
+        if credit:
+            _STARTED_HERE[port] = credit
+        else:
+            _STARTED_HERE.pop(port, None)
+        if earlier is not None:
+            _UNCONFIRMED[port] = earlier
+        launch = earlier
 
 
 def _await_launch(launch: _Launch, port: int, timeout: float) -> bool:

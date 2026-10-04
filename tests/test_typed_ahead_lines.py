@@ -150,3 +150,61 @@ def test_the_android_shell_sends_an_early_line_at_its_first_prompt(qapp):
         assert _after_banner(widget.term) == "PD2318:/ $ ls\nacct\ncache\nPD2318:/ $ "
     finally:
         _close(widget)
+
+
+def test_a_line_typed_while_early_lines_still_wait_runs_after_them(qapp):
+    """Two lines typed before the first prompt run one per prompt.  A line
+    typed while the second still waited went out at once, ahead of it."""
+    from test_android_shell_pty import (
+        _Handler, _Mksh, _after_banner, _close, _enter, _pump, _settle, _widget,
+    )
+
+    widget, handler = _widget(qapp, _Handler(make=lambda tty: _Mksh(tty, prompt_first=False)))
+    try:
+        session, term = handler.sessions[0], widget.term
+        _enter(term, "tick")  # both before the shell's first prompt was shown
+        _enter(term, "cd /sdcard")
+        _settle(qapp, widget, "PD2318:/ $ tick\n")
+        _enter(term, "ls")  # tick runs, "cd /sdcard" waits for the next prompt
+        _pump(qapp, lambda: False, timeout=0.2)
+        assert session.sent[1:] == [b"tick\n"]
+        assert term.send_key(b"\x03")  # the key alone ends tick: no Stop
+        _settle(qapp, widget, "cache\nPD2318:/sdcard $ ")
+        assert session.sent[1:] == [b"tick\n", b"\x03", b"cd /sdcard\n", b"ls\n"]
+        # each line shows once, where it ran
+        assert _after_banner(term) == (
+            "PD2318:/ $ tick\n^C\n--- summary ---\n"
+            "PD2318:/ $ cd /sdcard\nPD2318:/sdcard $ ls\nacct\ncache\nPD2318:/sdcard $ "
+        )
+        _enter(term, "ls")  # nothing waits any more: at once, as usual
+        assert session.sent[-1] == b"ls\n"
+        _settle(qapp, widget, "PD2318:/sdcard $ ls\nacct\ncache\nPD2318:/sdcard $ ")
+    finally:
+        _close(widget)
+
+
+def test_stop_drops_the_lines_typed_before_the_first_prompt(qapp):
+    """Stop drops what was typed ahead.  A line still waiting for its prompt
+    ran at the prompt that followed the Stop (``logcat``, ``rm x``: Stop on
+    logcat, and ``rm x`` ran)."""
+    from test_android_shell_pty import (
+        _Handler, _Mksh, _after_banner, _close, _enter, _pump, _settle, _widget,
+    )
+
+    widget, handler = _widget(qapp, _Handler(make=lambda tty: _Mksh(tty, prompt_first=False)))
+    try:
+        session, term = handler.sessions[0], widget.term
+        _enter(term, "tick")
+        _enter(term, "cd /sdcard")
+        _settle(qapp, widget, "PD2318:/ $ tick\n")
+        _enter(term, "ls")
+        widget.interrupt()
+        _settle(qapp, widget, "--- summary ---\nPD2318:/ $ ")
+        _pump(qapp, lambda: False, timeout=0.3)
+        assert session.sent[1:] == [b"tick\n", b"\x03"]
+        _enter(term, "ls")  # the shell takes a line at once again, and shows it once
+        assert session.sent[-1] == b"ls\n"
+        _settle(qapp, widget, "cache\nPD2318:/ $ ")
+        assert _after_banner(term).endswith("--- summary ---\nPD2318:/ $ ls\nacct\ncache\nPD2318:/ $ ")
+    finally:
+        _close(widget)

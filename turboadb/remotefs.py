@@ -75,6 +75,24 @@ def _dir_arg(path: str) -> str:
     return path if path.endswith("/") else path + "/"
 
 
+# Printed by a device command that did what it was asked.  Before Android 7
+# (no shell protocol) `adb shell` exits 0 whatever the command did, so a
+# change is judged by this mark as well, never by the exit code alone.
+DONE_MARK = "TURBOADB_DONE"
+
+
+def _marked(command: str) -> str:
+    """*command*, followed by :data:`DONE_MARK` on a line of its own when it worked."""
+    return f"{{ {command}; }} && echo {DONE_MARK}"
+
+
+def _marked_done(res, mark: str = DONE_MARK) -> bool:
+    """True when the output of a :func:`_marked` command ends with the mark
+    (a line of its own: the device's complaint may name a path that holds it)."""
+    lines = _output_lines(getattr(res, "stdout", ""))
+    return bool(lines) and lines[-1].strip() == mark
+
+
 def _ls_cmd(path: str) -> str:
     return f"ls -la {shlex.quote(_dir_arg(path))}"
 
@@ -163,6 +181,21 @@ def _rename_check_cmd(src: str, dst: str) -> str:
 # Android 11 says "Unknown option 'T'", busybox "invalid option").
 _NO_T_OPTION = '*"nknown option"*|*"nvalid option"*|*"llegal option"*'
 
+_RENAME_TEMP = ".turboadb-rename"
+
+
+def _rename_temp(dst: str) -> str:
+    """The temporary name of a two-step rename to *dst*: *dst* with a suffix,
+    its name cut where the two together would be longer than the 255 bytes a
+    file name may have (the rename of a long name failed on that)."""
+    path = dst.rstrip("/")
+    folder, name = posixpath.split(path)
+    room = 255 - len(_RENAME_TEMP)
+    raw = name.encode("utf-8", "surrogatepass")
+    if len(raw) <= room:
+        return path + _RENAME_TEMP
+    return posixpath.join(folder, raw[:room].decode("utf-8", "ignore") + _RENAME_TEMP)
+
 
 def _rename_cmd(src: str, dst: str, overwrite: bool = False, verify: bool = True) -> str:
     """``mv -T`` never moves *src* INTO an existing folder.  Without *overwrite*,
@@ -171,30 +204,43 @@ def _rename_cmd(src: str, dst: str, overwrite: bool = False, verify: bool = True
     leaves both names in place counts as that refusal, and the move is
     verified.
 
+    A *dst* that is *src* in other letters is the same file on storage that
+    ignores case (/sdcard).  ``-n`` skipped it as existing, and the check then
+    called the name taken, although the rename replaces nothing.  There it is
+    done in two steps through a temporary name, which every mv does, and not
+    checked: the old name answers for the file afterwards too.
+
     Many head units run a toybox without ``-T``.  There the command falls back
     to a plain ``mv`` that first refuses a folder at *dst*, or a link to one (a
-    plain mv would move *src* inside it, over a file of its name there), and
-    does a case-only rename of the same file in two steps through a temporary
-    name."""
+    plain mv would move *src* inside it, over a file of its name there)."""
     s, d = shlex.quote(src), shlex.quote(dst)
     flag = "-f " if overwrite else "-n " if verify else ""
-    tmp = shlex.quote(dst.rstrip("/") + ".turboadb-rename")
     report = "{ printf '%s\\n' \"$err\" >&2; false; }"
     if flag == "-n ":  # the refusal: the check at the end says it in plain words
         report = (f"{{ {{ [ -e {s} ] || [ -L {s} ]; }} && "
                   f"{{ [ -e {d} ] || [ -L {d} ]; }}; }} || {report}")
-    plain = (f"if [ ! -L {s} ] && [ ! -L {d} ] && [ {s} -ef {d} ]; then "
-             f"[ ! -e {tmp} ] && mv -- {s} {tmp} && mv -- {tmp} {d}; "
-             f"elif [ -d {d} ]; then "
+    plain = (f"if [ -d {d} ]; then "
              f"echo 'mv: not renamed: a folder with the new name exists' >&2; false; "
              f"else err=$(mv {flag}-- {s} {d} 2>&1) || {report}; fi")
     cmd = (f"err=$(mv {flag}-T -- {s} {d} 2>&1) || case \"$err\" in "
            f"{_NO_T_OPTION}) {plain} || exit 1;; "
            f"*) {report} || exit 1;; esac")
+    taken = "echo 'mv: not renamed: the new name already exists' >&2"
     if verify and not overwrite:
-        cmd += (f"; if [ -e {s} ] || [ -L {s} ]; then "
-                f"echo 'mv: not renamed: the new name already exists' >&2; exit 1; fi")
-    return cmd
+        cmd += f"; if [ -e {s} ] || [ -L {s} ]; then {taken}; exit 1; fi"
+    if src == dst or src.lower() != dst.lower():
+        return cmd
+    # A name still there once the file is moved aside is another entry for it
+    # (a hard link): taken, and the file goes back, as it does when the second
+    # step fails.
+    tmp = shlex.quote(_rename_temp(dst))
+    two_steps = (f"if [ -e {tmp} ] || [ -L {tmp} ]; then "
+                 f"printf 'mv: not renamed: %s is in the way\\n' {tmp} >&2; false; "
+                 f"else mv -- {s} {tmp} && if [ -e {d} ] || [ -L {d} ]; then "
+                 f"mv -- {tmp} {s}; {taken}; false; "
+                 f"else mv -- {tmp} {d} || {{ mv -- {tmp} {s}; false; }}; fi; fi")
+    return (f"if [ ! -L {s} ] && [ ! -L {d} ] && [ {s} -ef {d} ]; then {two_steps} || exit 1; "
+            f"else {cmd}; fi")
 
 
 def _probe_cmd(paths) -> str:
@@ -234,8 +280,37 @@ def _write_over_cmd(src: str, dst: str) -> str:
     """Write the device file *src* over *dst* in place: *dst* keeps its owner,
     mode and SELinux label (``cat`` into it, where adb push would replace it),
     and :data:`WRITTEN_MARK` is printed when it worked (old devices give no
-    exit status)."""
+    exit status).
+
+    The shell empties *dst* before ``cat`` writes: a write that fails midway
+    leaves a part of *src* in it. :func:`_write_over_check_cmd` says before
+    whether there is room, and afterwards whether *dst* was touched."""
     return f"cat {shlex.quote(src)} > {shlex.quote(dst)} && echo {WRITTEN_MARK}"
+
+
+def _write_over_check_cmd(dst: str) -> str:
+    """Two lines about *dst*, the file of a :func:`_write_over_cmd`: ``@@room
+    <free blocks> <block size>`` of its file system, and ``@@file <size> <time
+    of its last change>`` of what it points to. A ``stat`` that can't say
+    leaves the mark alone on its line."""
+    q = shlex.quote(dst)
+    return (f"echo \"@@room $(stat -f -c '%a %S' -- {q} 2>/dev/null)\"; "
+            f"echo \"@@file $(stat -L -c '%s %y' -- {q} 2>/dev/null)\"")
+
+
+def _parse_write_over_check(stdout):
+    """``(free bytes, size, stamp)`` from :func:`_write_over_check_cmd` output,
+    each None where the device did not say. *stamp* is the whole ``@@file``
+    answer: it is another one once the file was written to."""
+    free = size = stamp = None
+    for line in _output_lines(stdout):
+        mark, _, said = line.strip().partition(" ")
+        words = said.split()
+        if mark == "@@room" and len(words) == 2 and all(w.isdigit() for w in words):
+            free = int(words[0]) * int(words[1])
+        elif mark == "@@file" and words and words[0].isdigit():
+            size, stamp = int(words[0]), said.strip()
+    return free, size, stamp
 
 
 def _rm_file_cmd(path: str) -> str:
@@ -527,6 +602,30 @@ def _parse_ls_listing(text, escaped: bool = False):
     return rows, uncertain, clean
 
 
+def _unlisted(text) -> str:
+    """What an ``ls -la`` printed in place of entries, such as "ls: /data/:
+    Permission denied"; ``""`` when it listed anything, be it only "." and
+    "..": what a tool says besides is then no refusal."""
+    said = []
+    for ln in _output_lines(text):
+        if not ln.strip() or _LS_TOTAL_RE.match(ln.strip()):
+            continue
+        if _parse_ls_entry(ln) is not None:
+            return ""
+        said.append(ln.strip())
+    return "\n".join(said)
+
+
+def _lists(handler, path: str) -> bool:
+    """True when the device's ``ls`` can list *path*: asked with a mark of its
+    own, since adb's exit code says nothing on a device before Android 7."""
+    command = f"{_ls_cmd(path)} >/dev/null 2>&1 && echo {DONE_MARK}"
+    try:
+        return _marked_done(handler.shell(command, timeout=30, safe=False))
+    except Exception:
+        return False
+
+
 def _list_remote_dir(handler, path: str):
     """Worker: list a device folder and resolve which symlinks are folders.
 
@@ -545,6 +644,13 @@ def _list_remote_dir(handler, path: str):
             rows_b, uncertain_b, clean_b = [], set(), False
         if rows_b and (clean_b or len(uncertain_b) < len(uncertain)):
             rows, uncertain = rows_b, uncertain_b
+    if not rows and not error:
+        # Before Android 7 adb exits 0 for a folder the device would not list.
+        # What it printed in place of entries is then the reason, or only a
+        # tool's own noise about an empty folder: the device is asked which.
+        said = _unlisted(res.stdout)
+        if said and not _lists(handler, path):
+            error = said
     rows = _Listing(rows, uncertain)
     links = [i for i, row in enumerate(rows) if row[5].startswith("l") and not row[7]]
     link_paths = [posixpath.join(path, rows[i][0]) for i in links]

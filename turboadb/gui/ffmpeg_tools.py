@@ -23,7 +23,7 @@ import zipfile
 from typing import Optional
 
 from ..config import user_path
-from ..tools import NO_WINDOW
+from ..tools import NO_WINDOW, _on_path
 
 _log = logging.getLogger(__name__)
 
@@ -96,7 +96,8 @@ def parse_dshow_devices(text: str) -> list:
 
 def cached_ffmpeg() -> str | None:
     """Return an ffmpeg we can use without downloading: an explicit Settings
-    path, our cache, or an ffmpeg already on PATH."""
+    path, our cache, or an ffmpeg already on PATH (in one of its folders,
+    never the current one: see :func:`turboadb.tools._on_path`)."""
     try:
         from . import settings as _s
 
@@ -108,7 +109,7 @@ def cached_ffmpeg() -> str | None:
     p = os.path.join(_CACHE, "ffmpeg.exe")
     if os.path.exists(p):
         return p
-    return shutil.which("ffmpeg")  # already installed system-wide?
+    return _on_path("ffmpeg")  # already installed system-wide?
 
 
 def _auto_download_supported() -> bool:
@@ -255,7 +256,7 @@ def _usable_cached(log) -> Optional[str]:
     _VERIFIED.pop(path, None)
     _remove_quietly(path)
     if os.path.exists(path):
-        other = shutil.which("ffmpeg")
+        other = _on_path("ffmpeg")
         if other and os.path.normcase(os.path.abspath(other)) != os.path.normcase(path):
             log("The cached ffmpeg failed its check and is in use; using the ffmpeg on PATH.")
             return other

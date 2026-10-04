@@ -19,6 +19,7 @@ import os
 import re
 import time
 import shlex
+import select
 import atexit
 import itertools
 import logging
@@ -33,7 +34,9 @@ from .config import ADBConfig, ScrcpyOptions, adb_server_args, format_host_port,
 from .devices import is_mdns_serial, is_network_serial, list_devices
 from . import touch
 from .proctree import stop_process
-from .results import CommandResult, TransferResult, StreamResult, OperationResult, strip_ansi
+from .results import (
+    CommandResult, TransferResult, StreamResult, OperationResult, human_bytes, strip_ansi,
+)
 from .tools import DEFAULT_ADB_SERVER_PORT, NO_WINDOW, find_adb, is_adb_server_alive
 from .exceptions import (
     ADBCommandError,
@@ -58,6 +61,18 @@ if os.name == "nt":
 else:  # pragma: no cover - POSIX has no named-pipe peek
     _ctypes = _msvcrt = _wintypes = None
     _PEEK_NAMED_PIPE = None
+
+
+def _readable(fd) -> bool:
+    """Whether a read from the pipe *fd* returns at once: output is waiting,
+    or its writer is gone (Linux and macOS; Windows peeks instead, see
+    ShellSession.read). poll() where there is one, since select() takes no
+    descriptor above 1023."""
+    if hasattr(select, "poll"):
+        waiting = select.poll()
+        waiting.register(fd, select.POLLIN)
+        return bool(waiting.poll(0))
+    return bool(select.select([fd], [], [], 0)[0])
 
 
 _TOKEN_COUNTER = itertools.count()
@@ -122,12 +137,29 @@ def _untrack_child(proc) -> None:
         _TRACKED.pop(proc, None)
 
 
+# The empty files that hold the name of a recording into a folder while it
+# runs (see ADBHandler._recording_file).
+_HELD_NAMES: set = set()
+
+
+def _free_name(path) -> None:
+    """Remove the empty file that held a recording's name in its folder."""
+    with _TRACKED_LOCK:
+        _HELD_NAMES.discard(path)
+    try:
+        if os.path.getsize(path) == 0:
+            os.remove(path)
+    except OSError:
+        pass
+
+
 @atexit.register
 def _end_tracked_children() -> None:
     """Stop the children nobody stopped before the exit, then clean up."""
     with _TRACKED_LOCK:
         left = list(_TRACKED.items())
         _TRACKED.clear()
+        held = list(_HELD_NAMES)
     for proc, cleanup in left:
         _stop_child(proc, close_pipes=True, grace=1.0)
         if cleanup is not None:
@@ -135,6 +167,8 @@ def _end_tracked_children() -> None:
                 cleanup()
             except Exception:
                 pass
+    for path in held:  # a recording the exit cut off: its name is given back
+        _free_name(path)
 
 
 class _AnyOf:
@@ -155,10 +189,58 @@ class _Clip(NamedTuple):
     forced: bool  # adb had to be ended: the device may still write the MP4 index
 
 
-def _local_files(path) -> dict:
+# Android takes file names that Windows does not.  With a ":" in the name NTFS
+# writes into a hidden stream of another, empty file ("Screenshot_12" for
+# "Screenshot_12:30.png") and reports no error; a trailing dot or space is
+# dropped; "nul" or "con.txt" is a device.  A pull stores such a file under a
+# name that works (see ADBHandler._pull_target).
+_WINDOWS_NAMES = os.name == "nt"
+_WINDOWS_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_DEVICES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{n}" for n in range(1, 10)] + [f"LPT{n}" for n in range(1, 10)]
+)
+
+
+def _windows_file_name(name: str) -> str:
+    """*name*, a device file's, as a file name Windows can store: ``_`` in
+    place of every character it forbids and of every trailing dot or space,
+    and in front of a device name."""
+    safe = _WINDOWS_FORBIDDEN_RE.sub("_", name)
+    kept = safe.rstrip(" .")
+    safe = kept + "_" * (len(safe) - len(kept))
+    if kept.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_DEVICES:
+        safe = "_" + safe
+    return safe or "_"
+
+
+def _as_windows_reads(path: str) -> str:
+    """*path*, a local path as it was typed, without the trailing dots and
+    spaces of its last name: Windows drops them itself, so the path as typed
+    names the same file or folder. (Inside a path it drops no space: what is
+    written "into" a folder typed as "Pictures " goes into no folder at all.)
+    A path given with the ``\\\\?\\`` prefix is taken as it is, as Windows does."""
+    if path.startswith(("\\\\?\\", "//?/")):
+        return path
+    head, last = os.path.split(path)
+    kept = last.rstrip(" .")
+    return os.path.join(head, kept) if kept and kept != last else path
+
+
+# A Windows folder lists each file with the size and time it had when it was
+# last closed: 0 bytes for a file adb still writes, however much is in it.
+_STALE_LISTINGS = os.name == "nt"
+
+
+def _local_files(path, before=None) -> dict:
     """``{file: (size, mtime_ns)}`` for *path*: itself when it is a file, every
     file under it when it is a folder (folder links are not followed).
-    Entries that can't be read are left out."""
+    Entries that can't be read are left out.
+
+    *before* is an earlier answer, given for a folder that is being written
+    to. On Windows each file that is listed differently from it is then asked
+    for its own size and time (see :data:`_STALE_LISTINGS`); the others are
+    spared that call."""
     if not os.path.isdir(path):
         try:
             info = os.stat(path)
@@ -177,7 +259,12 @@ def _local_files(path) -> dict:
                             stack.append(entry.path)
                         elif entry.is_file():
                             info = entry.stat()
-                            found[entry.path] = (info.st_size, info.st_mtime_ns)
+                            listed = (info.st_size, info.st_mtime_ns)
+                            if (_STALE_LISTINGS and before is not None
+                                    and before.get(entry.path) != listed):
+                                info = os.stat(entry.path)
+                                listed = (info.st_size, info.st_mtime_ns)
+                            found[entry.path] = listed
                     except OSError:
                         continue
         except OSError:
@@ -213,10 +300,11 @@ class _TransferWatch:
         self._want_total = percent
         self._delay = self.DELAY_S
         self._every = self.LOCAL_EVERY_S if self._pull else self.DEVICE_EVERY_S
-        self._most = None
+        self._most = None  # the longest pause between two looks
         if window:
             self._delay = min(self._delay, window / 4.0)
-            self._every = self._most = min(self._every, window / 4.0)
+            self._every = min(self._every, window / 4.0)
+            self._most = window / 4.0
         self.total = None  # bytes the copy moves, once measured
         self.done = 0  # bytes moved so far
         self.moved_at = None  # time.monotonic() when `done` last changed
@@ -283,14 +371,19 @@ class _TransferWatch:
             return self._device_bytes(remotefs._sizes_cmd(self._remote))
         return sum(size for size, _mtime in _local_files(self._local).values())
 
+    def pulled(self) -> dict:
+        """``{file: (size, mtime_ns)}`` for what this pull has written so far:
+        the files that were not there before it, or are not as they were."""
+        before = self._before
+        return {path: stamp for path, stamp in _local_files(self._local, before).items()
+                if before.get(path) != stamp}
+
     def _moved(self) -> Optional[int]:
         """Bytes copied so far, or None when they can't be told now."""
         from . import remotefs
 
         if self._pull:
-            before = self._before
-            return sum(size for path, (size, mtime) in _local_files(self._local).items()
-                       if before.get(path) != (size, mtime))
+            return sum(size for size, _mtime in self.pulled().values())
         if not self._folder:
             return self._device_bytes(remotefs._push_target_size_cmd(self._remote, self._name()))
         if self._target is None:
@@ -374,7 +467,7 @@ class ShellSession:
         return self.send(line + "\n")
 
     def read(self, size: int = 65536) -> bytes:
-        """Read available bytes without hanging on Windows pipe buffers.
+        """Read the output that has arrived, without waiting for more.
 
         Returns ``b''`` when no output is pending AND at EOF; check
         :attr:`at_eof` to distinguish an idle shell from a dead one."""
@@ -391,11 +484,16 @@ class ShellSession:
                 if avail.value == 0:
                     return b""
                 return os.read(self._proc.stdout.fileno(), min(size, avail.value))
-            data = self._proc.stdout.read1(size)  # type: ignore[attr-defined]
+            # Asked first: a read from the pipe waits until the shell prints
+            # again, and held a script that polls an idle shell for good.
+            fd = self._proc.stdout.fileno()
+            if not _readable(fd):
+                return b""
+            data = os.read(fd, size)
             if not data:
                 self._eof = True
             return data
-        except AttributeError:
+        except AttributeError:  # a stand-in without a file descriptor: its own read()
             data = self._proc.stdout.read(size)
             if not data:
                 self._eof = True
@@ -506,6 +604,7 @@ class ADBHandler:
         self._touch: Optional[tuple] = None  # cached (TouchDevice|None, writable)
         self._screencap_ids: dict = {}  # logical display id -> physical id
         self._su_forms: dict = {}  # serial -> how its su runs a command (see _su_form)
+        self._cut_saves: dict = {}  # device file -> the copy kept after a save cut it short
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -708,6 +807,17 @@ class ADBHandler:
                 exc.stdout, exc.stderr = out, err  # what it printed in time
             raise
 
+    @staticmethod
+    def _spawn(cmd, **kwargs) -> subprocess.Popen:
+        """``subprocess.Popen(cmd, …)`` for an adb child that is read while it
+        runs: a transfer, a stream, an interactive shell, a recorder. An adb
+        that can't be started is an ADBError here too, as for a one-shot
+        command (see :meth:`_exec`)."""
+        try:
+            return subprocess.Popen(cmd, **kwargs)
+        except OSError as exc:
+            raise ADBError(f"adb executable not runnable: {exc}") from exc
+
     def _run(
         self, args, *, timeout=None, check=False, binary=False, cancel=None, log_as=None
     ) -> CommandResult:
@@ -721,17 +831,20 @@ class ADBHandler:
         """Run an adb command not scoped to a device (connect/devices/pair...)."""
         return self._exec(args, timeout=timeout, target=False, check=check, cancel=cancel)
 
-    def _logged_run(self, label, args, *, timeout=None, check=False, log_as=None) -> CommandResult:
+    def _logged_run(
+        self, label, args, *, timeout=None, check=False, log_as=None, cancel=None
+    ) -> CommandResult:
         """Run a device command, logging the real adb command line and its
         outcome (duration on success; exit code + stderr on failure) so the GUI
         log explains exactly what happened, not just 'ok'.
 
         *log_as* is logged in place of the arguments, for a command whose words
         must not be written down (the text :meth:`input_text` types can be a
-        password): the log file and the log panel keep every line."""
+        password): the log file and the log panel keep every line.  *cancel*
+        is passed on (see :meth:`_exec`)."""
         command = " ".join(args) if log_as is None else log_as
         self._emit(logging.DEBUG, f"$ adb {command}")
-        res = self._run(args, timeout=timeout, log_as=log_as)
+        res = self._run(args, timeout=timeout, log_as=log_as, cancel=cancel)
         if res.ok:
             self._emit(logging.DEBUG, f"  -> {label}: ok ({res.duration:.2f}s)")
         else:
@@ -744,6 +857,16 @@ class ADBHandler:
         if check and not res.ok:
             raise ADBCommandError(command, res)
         return res
+
+    def _work_timeout(self, own: float) -> Optional[float]:
+        """The time limit for a command that runs as long as its data takes (an
+        install, a device copy or delete): *own*, that command's usual limit,
+        or ``command_timeout`` when that is longer, and no limit at all when
+        ``command_timeout`` is None (the CLI's ``--timeout 0``). The default
+        ``command_timeout`` is meant for quick commands, so a shorter one
+        never cuts these off."""
+        limit = self.config.command_timeout
+        return None if limit is None else max(float(own), limit)
 
     # ------------------------------------------------------------------ #
     # Output helpers shared by every action
@@ -1027,11 +1150,15 @@ class ADBHandler:
 
     def _use_target(self, target: str, *, owned: bool) -> None:
         """Make *target* this handler's device. *owned*: this handler's own
-        ``adb connect`` made the connection (see :attr:`owns_connection`)."""
+        ``adb connect`` made the connection (see :attr:`owns_connection`).
+        A connection it made before stays its own: adb answers "already
+        connected" when the same target is connected again (a tab's reconnect
+        loop does that after a reboot)."""
         if target != self._serial:
             self._reset_device_caches()
         self._serial = target
-        self._owned_target = target if owned else None
+        if owned or self._owned_target != target:
+            self._owned_target = target if owned else None
 
     def _reset_device_caches(self) -> None:
         """Forget what was learnt about the device: its touchscreen node, its
@@ -1122,7 +1249,9 @@ class ADBHandler:
         """True when this handler's ``connect()`` / ``connect_tcp()`` made the
         network connection it uses: adb answered "connected to", not "already
         connected to". Only such a connection is this handler's to drop; one
-        that another program (or another handler) made stays connected."""
+        that another program (or another handler) made stays connected.
+        Connecting the same target again keeps it this handler's, until
+        :meth:`disconnect`."""
         return bool(self._owned_target) and self._owned_target == self._serial
 
     @property
@@ -2987,17 +3116,27 @@ class ADBHandler:
 
         return self._guard("health_text", _do, safe=safe)
 
+    _BUGREPORT_COPIED_RE = re.compile(r"(?m)^Bug report copied to (.+?)\s*$")
+
     def bugreport(self, local_path: str, *, timeout: float = 900, safe: Optional[bool] = None):
         """Capture a full ``adb bugreport`` to *local_path* (a .zip on modern
-        devices). Slow — a couple of minutes is normal; *timeout* is generous."""
+        devices) and return the file it was saved as: *local_path* with
+        ``.zip`` added when it lacks it, as adb names it, or the file adb
+        names itself when *local_path* is an existing folder. Slow — a couple
+        of minutes is normal; *timeout* is generous."""
 
         def _do():
             lp = os.path.expanduser(local_path)
             parent = os.path.dirname(lp)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            if not os.path.isdir(lp) and not lp.lower().endswith(".zip"):
+                lp += ".zip"  # adb's own rule, so the file checked is the one it writes
             self._emit(logging.INFO, f"Capturing bugreport → {lp} (takes a few minutes)…")
             res = self._run(["bugreport", lp], timeout=timeout, check=False)
+            copied = self._BUGREPORT_COPIED_RE.search(res.text)
+            if copied and os.path.isfile(copied.group(1)):
+                lp = copied.group(1)  # in a folder: under the name the device gave it
             if not res.ok or not os.path.exists(lp):
                 raise ADBError(f"bugreport failed: {self._combined_output(res) or 'no output'}")
             self._emit(logging.INFO, f"Bugreport saved: {lp} ({os.path.getsize(lp)} bytes)")
@@ -3063,12 +3202,24 @@ class ADBHandler:
         return self.keyevent(5, safe=safe)  # KEYCODE_CALL
 
     def call_state(self, *, safe: Optional[bool] = None):
+        """``"in call"``, ``"ringing"`` or ``"idle"``, from ``dumpsys
+        telephony.registry``, or ``"unknown"`` when the device answers without
+        a call state (it has no telephony). Every SIM is read: a call on any
+        of them counts, then a ring.
+
+        A device that could not be asked (offline, rebooting, unplugged) is an
+        ADBCommandError, never ``"unknown"``: nothing was learnt about it."""
+
         def _do():
             r = self._run(["shell", "dumpsys", "telephony.registry"], timeout=15)
-            m = re.search(r"mCallState=(\d+)", r.text)
-            return {0: "idle", 1: "ringing", 2: "in call"}.get(
-                int(m.group(1)) if m else -1, "unknown"
-            )
+            if not r.ok:
+                raise self._command_error("shell dumpsys telephony.registry", r)
+            # one "mCallState=" per SIM: 0 idle, 1 ringing, 2 off the hook
+            states = set(re.findall(r"\bmCallState=(\d+)", r.text))
+            for number, name in (("2", "in call"), ("1", "ringing"), ("0", "idle")):
+                if number in states:
+                    return name
+            return "unknown"
 
         return self._guard("call_state", _do, safe=safe)
 
@@ -3091,7 +3242,8 @@ class ADBHandler:
         return int(m.group(1)) if m else None
 
     def _content_user(self) -> Optional[int]:
-        """The ``--user`` for ``content query``, or None to keep the default.
+        """The ``--user`` for ``content query`` (and for the ``pm`` commands
+        of :meth:`_package_user`), or None to keep the default.
 
         ``content query`` reads user 0 unless told otherwise. On Android
         Automotive user 0 is the headless system user and the driver is a
@@ -3117,7 +3269,7 @@ class ADBHandler:
                 )
             except ADBError as exc:
                 self._emit(
-                    logging.DEBUG, f"foreground user unknown, querying the default user: {exc}"
+                    logging.DEBUG, f"foreground user unknown, using the default user: {exc}"
                 )
                 user = None
             else:
@@ -3619,6 +3771,7 @@ class ADBHandler:
         timeout: Optional[float] = None,
         check: bool = False,
         su: bool = False,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Run a one-shot ``adb shell`` command. Returns CommandResult.
@@ -3627,11 +3780,17 @@ class ADBHandler:
         su takes (``su -c`` for Magisk and SuperSU, ``su 0 sh -c`` for the su
         of userdebug and eng builds), or as it is when adbd already runs as
         root (``adb root``).
+
+        *cancel* (a ``threading.Event``) lets another thread call the command
+        off: adb is killed at once instead of running until it ends or times
+        out, and the call fails with ADBConnectionError.
         """
 
         def _do():
             cmd = self._as_root(command) if su else command
-            return self._logged_run("shell", ["shell", cmd], timeout=timeout, check=check)
+            return self._logged_run(
+                "shell", ["shell", cmd], timeout=timeout, check=check, cancel=cancel
+            )
 
         return self._guard("shell", _do, safe=safe)
 
@@ -3732,7 +3891,7 @@ class ADBHandler:
             args = ["shell"]
             if tty:
                 args = ["shell", "-t", "-t"]  # force a PTY even over pipes
-            proc = subprocess.Popen(
+            proc = self._spawn(
                 self._base(target=True) + args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -3856,7 +4015,7 @@ class ADBHandler:
             raise ValueError("stderr must be 'merge' or 'separate'")
         separate = stderr == "separate"
         cmd = self._base(target=True) + list(args)
-        proc = subprocess.Popen(
+        proc = self._spawn(
             cmd,
             # never the caller's stdin: `adb shell CMD` would forward it to the device
             stdin=subprocess.DEVNULL,
@@ -3960,7 +4119,7 @@ class ADBHandler:
         if stderr not in ("merge", "pipe"):
             raise ValueError("stderr must be 'merge' or 'pipe'")
         cmd = self._base(target=True) + list(args)
-        return subprocess.Popen(
+        return self._spawn(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -4276,8 +4435,25 @@ class ADBHandler:
     # Device files — list, create, move, copy, delete (the Files tab's device
     # logic, shared with the CLI; the shell helpers live in remotefs)
     # ------------------------------------------------------------------ #
-    def _file_command(self, label: str, command: str, timeout: float = 60) -> CommandResult:
-        res = self.shell(command, timeout=timeout, safe=False)
+    # A recursive delete or copy of a large folder takes minutes (see
+    # _work_timeout for what raises or lifts these).
+    _REMOVE_TIMEOUT = 300.0
+    _COPY_TIMEOUT = 600.0
+
+    def _file_command(self, label: str, command: str,
+                      timeout: Optional[float] = 60) -> CommandResult:
+        """Run a device command that changes files; ADBCommandError (naming
+        *label*) when it did not do it.
+
+        A device before Android 7 gives adb no exit status: a refused change
+        ended 0 there and was taken for done. So the command prints a mark
+        once it has worked (``remotefs._marked``), and without the mark it
+        failed, whatever adb's own exit code says."""
+        from . import remotefs
+
+        res = self.shell(remotefs._marked(command), timeout=timeout, safe=False)
+        if res.ok and not remotefs._marked_done(res):
+            res = dataclasses.replace(res, exit_code=1)  # what the device would have said
         if not res.ok:
             raise self._command_error(label, res)
         return res
@@ -4352,7 +4528,10 @@ class ADBHandler:
     def remove(self, paths, *, recursive: bool = False, safe: Optional[bool] = None):
         """Delete device files, and folders too when *recursive* is True. Every
         path is checked first: a missing path or a folder without *recursive*
-        raises ADBError and nothing is deleted. Returns the deleted paths."""
+        raises ADBError and nothing is deleted. Returns the deleted paths.
+
+        A delete may take five minutes; a longer ``command_timeout`` raises
+        that limit, and None lifts it (see :meth:`_work_timeout`)."""
 
         def _do():
             from . import remotefs
@@ -4370,16 +4549,33 @@ class ADBHandler:
                     raise ADBError(f"{target}: no such file or folder")
                 if kind == "d" and not is_link and not recursive:
                     raise ADBError(f"{target} is a folder — pass recursive=True (CLI: rm -r)")
+            limit = self._work_timeout(self._REMOVE_TIMEOUT)
             for chunk in remotefs._chunks(targets):
-                self._file_command("rm " + " ".join(chunk), remotefs._rm_cmd(chunk), timeout=300)
+                self._file_command("rm " + " ".join(chunk), remotefs._rm_cmd(chunk), timeout=limit)
             return targets
 
         return self._guard("remove", _do, safe=safe)
 
+    def _in_other_letters(self, source: str, target: str) -> bool:
+        """True when the device item at *target* is *source* itself, named in
+        other letters: storage that ignores case (/sdcard) answers for one
+        item under both names."""
+        from . import remotefs
+
+        if source == target or source.lower() != target.lower():
+            return False
+        res = self.shell(remotefs._rename_check_cmd(source, target), timeout=30, safe=False)
+        lines = remotefs._output_lines(res.stdout)
+        return bool(lines) and lines[-1].strip() == "same"
+
     def move(self, src: str, dst: str, *, overwrite: bool = False, safe: Optional[bool] = None):
         """Move or rename *src* to *dst* — into *dst* when it is an existing
         folder. Without *overwrite* an existing target is never replaced.
-        Returns the new path."""
+        Returns the new path.
+
+        A folder given its own name in other letters (``Docs`` to ``docs`` on
+        /sdcard, which ignores case) is renamed: the folder found at *dst* is
+        then *src* itself, and not one to move it into."""
 
         def _do():
             from . import remotefs
@@ -4389,7 +4585,8 @@ class ADBHandler:
             info = self._probe_paths([source, target])
             if info[source][0] == "n":
                 raise ADBError(f"{source}: no such file or folder")
-            if info[target][0] == "d" and target != source:
+            if (info[target][0] == "d" and target != source
+                    and not self._in_other_letters(source, target)):
                 target = posixpath.join(target, posixpath.basename(source))
             if target == source:
                 return target
@@ -4408,7 +4605,9 @@ class ADBHandler:
         an existing item or one of another kind. Returns the new path.
 
         The Files tab's Paste decides with the same rules
-        (``remotefs._copy_decision``)."""
+        (``remotefs._copy_decision``). A copy may take ten minutes; a longer
+        ``command_timeout`` raises that limit, and None lifts it (see
+        :meth:`_work_timeout`)."""
 
         def _do():
             from . import remotefs
@@ -4420,6 +4619,9 @@ class ADBHandler:
             if kind == "n":
                 raise ADBError(f"{source}: no such file or folder")
             if info[target][0] == "d":
+                if self._in_other_letters(source, target):
+                    # the folder itself (see move): cp -r would copy it into itself
+                    raise ADBError(f"{source}: the source and destination are the same")
                 target = posixpath.join(target, posixpath.basename(source))
                 info.update(self._probe_paths([target]))
             folder = posixpath.dirname(target) or "/"
@@ -4436,7 +4638,8 @@ class ADBHandler:
                 raise ADBError(f"can't copy {source} over {target}: "
                                "a different kind of item is there")
             self._file_command(
-                f"cp {source} {target}", remotefs._copy_into_cmd(source, target, merge), timeout=600
+                f"cp {source} {target}", remotefs._copy_into_cmd(source, target, merge),
+                timeout=self._work_timeout(self._COPY_TIMEOUT),
             )
             return target
 
@@ -4486,7 +4689,15 @@ class ADBHandler:
         under a temporary name instead and then written over it on the device
         (see remotefs._write_over_cmd): the file keeps its owner, mode and
         SELinux label, a link is written through, and a failed push leaves
-        the file as it was. The temporary copy is removed either way.
+        the file as it was.
+
+        Writing over the file empties it first, so the device is asked for
+        room before: without it the save is refused and the file is as it
+        was. The temporary copy is removed either way, unless the write
+        itself was cut short (the device went away, or ran out of space after
+        all): the file may then hold only part of the new content, so the
+        copy stays next to it and the error names it. The next save of that
+        file that works removes it.
         Returns the file's octal mode (*mode* when the device can't say).
         :meth:`edit_file` and the Files tab's editor and Open save through this."""
 
@@ -4504,25 +4715,73 @@ class ADBHandler:
                 pass
             temp = posixpath.join(posixpath.dirname(target) or "/",
                                   f".turboadb-save-{os.getpid()}-{next(self._SAVES)}")
+            stale = [temp]  # device copies to remove at the end
             try:
                 self.push(local_path, temp, safe=False)
                 try:
                     size = os.path.getsize(local_path)
                 except OSError:
                     size = 0
-                res = self.shell(remotefs._write_over_cmd(temp, target),
-                                 timeout=60 + size / 20e6, safe=False)
-                if remotefs.WRITTEN_MARK not in remotefs._as_text(getattr(res, "stdout", "")):
-                    raise ADBError(f"{target} was not saved: "
-                                   f"{self._combined_output(res) or 'the device did not write it'}")
-            finally:
+                before = self._write_over_check(target, size)
                 try:
-                    self.shell(remotefs._rm_file_cmd(temp), timeout=30, safe=False)
-                except (ADBError, OSError):
-                    pass
+                    res = self.shell(remotefs._write_over_cmd(temp, target),
+                                     timeout=60 + size / 20e6, safe=False)
+                    # the mark as a line of its own: a complaint can name a file that holds it
+                    failure = "" if remotefs._marked_done(res, remotefs.WRITTEN_MARK) else (
+                        self._combined_output(res) or "the device did not write it")
+                except ADBError as exc:
+                    failure = str(exc)
+                if failure:
+                    if before is not None and self._file_stamp(target) != before:
+                        # this copy stays; one kept by an earlier save is older
+                        stale[:] = [self._cut_saves[target]] if target in self._cut_saves else []
+                        self._cut_saves[target] = temp
+                        failure += (". It may hold only part of the new content now: "
+                                    f"all of it is kept on the device as {temp}.")
+                    raise ADBError(f"{target} was not saved: {failure}")
+                if target in self._cut_saves:
+                    stale.append(self._cut_saves.pop(target))
+            finally:
+                for copy in stale:
+                    try:
+                        self.shell(remotefs._rm_file_cmd(copy), timeout=30, safe=False)
+                    except (ADBError, OSError):
+                        pass
             return kept
 
         return self._guard("replace_file", _do, safe=safe)
+
+    def _file_stamp(self, target: str) -> Optional[str]:
+        """The size and time of the device file *target* as one string that
+        changes when the file does, or None when the device can't say now."""
+        from . import remotefs
+
+        try:
+            res = self.shell(remotefs._write_over_check_cmd(target), timeout=30, safe=False)
+        except (ADBError, OSError):
+            return None
+        return remotefs._parse_write_over_check(res.stdout)[2] if res.ok else None
+
+    def _write_over_check(self, target: str, size: int) -> Optional[str]:
+        """Before *size* bytes are written over the device file *target*:
+        ADBError when its file system has no room for them, counting what the
+        file takes now; else the file's stamp (see :meth:`_file_stamp`).
+        A device that can't say how much is free is not held back."""
+        from . import remotefs
+
+        try:
+            res = self.shell(remotefs._write_over_check_cmd(target), timeout=30, safe=False)
+        except (ADBError, OSError):
+            return None
+        if not res.ok:
+            return None
+        free, held, stamp = remotefs._parse_write_over_check(res.stdout)
+        if free is not None and held is not None and size - held > free:
+            raise ADBError(
+                f"{target} was not saved: the device has {human_bytes(free)} free there, and "
+                f"the new content needs {human_bytes(size - held)} more than the file takes "
+                "now. The file is as it was.")
+        return stamp
 
     def edit_file(self, path: str, opener, *, editor: Optional[str] = None,
                   safe: Optional[bool] = None):
@@ -4548,9 +4807,12 @@ class ADBHandler:
                 raise ADBError(f"{info['path']} is not a regular file ({info['type']})")
             real = info["real_path"]
             # keep the extension so the editor picks the right syntax mode
-            handle, tmp = tempfile.mkstemp(
-                prefix="turboadb-edit-", suffix=os.path.splitext(real)[1]
-            )
+            ending = os.path.splitext(real)[1]
+            if _WINDOWS_NAMES:
+                # as the pull stores it: the copy the editor opens is the one
+                # adb wrote, under a name every editor can open
+                ending = _WINDOWS_FORBIDDEN_RE.sub("_", ending).rstrip(" .")
+            handle, tmp = tempfile.mkstemp(prefix="turboadb-edit-", suffix=ending)
             os.close(handle)
             try:
                 self.pull(real, tmp, safe=False)
@@ -4621,6 +4883,10 @@ class ADBHandler:
         )
 
     _PCT_RE = re.compile(r"\[\s*(\d+)%\]")
+    # "adb: error: failed to copy …", "error: device offline": why a copy
+    # failed. adb's summary ("1 file pushed, 0 skipped.") comes after them.
+    _ADB_ERROR_RE = re.compile(r"(?:\S+: )?error:")
+    _TRANSFER_ERRORS_KEPT = 5
 
     # Terminate an adb child promptly, escalating to kill only when necessary
     # (see _stop_child: every engine child stops through it).
@@ -4664,6 +4930,56 @@ class ADBHandler:
             return f"; a partial copy may remain at {measure}"
         return ""
 
+    def _pull_target(self, remote, local):
+        """``(source, target, measure)`` for a pull of *remote* to *local*:
+        what ``adb pull`` is given, and the path the copy ends up at.
+
+        ``adb pull X existing_dir`` writes ``existing_dir/basename(X)``:
+        *measure* is that, not the folder with everything already in it. On
+        Windows a name it cannot store (see :data:`_WINDOWS_NAMES`) is
+        replaced by one it can, and adb is given that path instead of naming
+        the file itself; the log says so."""
+        source, target = remote, self._typed_target(local)
+        name = posixpath.basename(str(remote).rstrip("/"))
+        if not name or not os.path.isdir(target):
+            return source, target, target
+        # "." and ".." are no names: a merge source ("folder/.") keeps its dot
+        stored = _windows_file_name(name) if _WINDOWS_NAMES and name not in (".", "..") else name
+        if stored == name:
+            return source, target, os.path.join(target, name)
+        self._stored_as(name, stored)
+        target = os.path.join(target, stored)
+        if os.path.isdir(target):
+            # a folder stored under that name before: its contents go into
+            # it, where adb would put a folder of the device's name inside
+            source = str(remote).rstrip("/") + "/."
+        return source, target, target
+
+    def _typed_target(self, target):
+        """*target*, the local path a copy was asked to be saved as, as Windows
+        reads it and with a last name it can store.
+
+        A trailing dot or space goes (see :func:`_as_windows_reads`), so the
+        path as typed goes on naming the copy. The characters Windows forbids
+        are replaced, and the log says so; a device typed on purpose ("NUL")
+        stays. A caller that looks at the copy afterwards asks for this path
+        first."""
+        if not _WINDOWS_NAMES or not target:
+            return target
+        target = _as_windows_reads(target)
+        if os.path.isdir(target):
+            return target
+        head, typed = os.path.split(target)
+        stored = _WINDOWS_FORBIDDEN_RE.sub("_", typed)
+        if stored != typed:
+            self._stored_as(typed, stored)
+            target = os.path.join(head, stored)
+        return target
+
+    def _stored_as(self, name: str, stored: str) -> None:
+        self._emit(logging.WARNING,
+                   f"{name!r} is saved as {stored!r}: Windows cannot store a file of that name")
+
     def _transfer(self, direction, a, b, on_progress, timeout, cancel_event) -> TransferResult:
         # direction push: a=local, b=remote ; pull: a=remote, b=local
         if direction == "push":
@@ -4674,12 +4990,11 @@ class ADBHandler:
             args = ["push", measure, b]
         else:
             local, remote = b, a
-            lp = os.path.expanduser(b)
-            args = ["pull", a, lp]
-            # `adb pull X existing_dir` writes existing_dir/basename(X); measure
-            # that, not the size/count of everything already in the directory.
-            name = posixpath.basename(str(a).rstrip("/"))
-            measure = os.path.join(lp, name) if name and os.path.isdir(lp) else lp
+            wanted = os.path.expanduser(b)
+            source, target, measure = self._pull_target(a, wanted)
+            if target != wanted and not os.path.isdir(wanted):
+                local = target  # stored under another name: the result names that file
+            args = ["pull", source, target]
         # A stall limit, not a deadline: a big copy over a slow link may take
         # an hour, as long as it keeps moving.
         eff_timeout = timeout if timeout is not None else self.config.transfer_timeout
@@ -4690,7 +5005,7 @@ class ADBHandler:
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
         self._emit(logging.INFO, f"{direction} {a} -> {b}")
         start = time.monotonic()
-        proc = subprocess.Popen(
+        proc = self._spawn(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -4723,7 +5038,7 @@ class ADBHandler:
         reader = None
         last = -1
         moved = start
-        tail = ""
+        tail, errors = "", []
         stream_closed = False
         try:
             reader = threading.Thread(target=_read_output, daemon=True)
@@ -4750,7 +5065,11 @@ class ADBHandler:
                         break
                     continue
                 moved = time.monotonic()  # adb said something: it is still going
-                tail = line.strip()
+                said = line.strip()
+                if said:
+                    tail = said
+                    if self._ADB_ERROR_RE.match(said) and len(errors) < self._TRANSFER_ERRORS_KEPT:
+                        errors.append(said)
                 m = self._PCT_RE.search(line)
                 if m:
                     last = self._report_progress(on_progress, int(m.group(1)), last)
@@ -4775,7 +5094,8 @@ class ADBHandler:
             except Exception:
                 pass
         if rc != 0:
-            raise ADBTransferError(f"adb {direction} failed (exit {rc}): {tail or '(no output)'}")
+            reason = "; ".join(errors) or tail or "(no output)"
+            raise ADBTransferError(f"adb {direction} failed (exit {rc}): {reason}")
         if on_progress:
             try:
                 on_progress(100)
@@ -4785,14 +5105,11 @@ class ADBHandler:
         lp = measure
         size, files = 0, 1
         if os.path.isdir(lp):
-            files = 0
-            for root, _dirs, fnames in os.walk(lp):
-                for f in fnames:
-                    try:
-                        size += os.path.getsize(os.path.join(root, f))
-                        files += 1
-                    except OSError:
-                        pass
+            # a pull counts what it wrote, not what its folder held before; a
+            # push every file, each asked for its own size (see _STALE_LISTINGS)
+            copied = watch.pulled() if direction == "pull" else _local_files(lp, {})
+            files = len(copied)
+            size = sum(file_size for file_size, _mtime in copied.values())
         elif os.path.isfile(lp):
             size = os.path.getsize(lp)
         src, dst = (local, remote) if direction == "push" else (remote, local)
@@ -4807,6 +5124,43 @@ class ADBHandler:
         flags = (("-r", replace), ("-d", downgrade), ("-g", grant_perms), ("-t", allow_test))
         return [flag for flag, wanted in flags if wanted]
 
+    # An install sends the APK and then waits for the package manager: five
+    # minutes (ten for split APKs), and on top the time the files take over a
+    # slow link.  A large APK over Wi-Fi was ended after five minutes while it
+    # was still being sent.
+    _INSTALL_TIMEOUT = 300.0
+    _INSTALL_MULTIPLE_TIMEOUT = 600.0
+    _INSTALL_SLOW_BPS = 128 * 1024
+
+    def _install_timeout(self, own: float, apks) -> Optional[float]:
+        """:meth:`_work_timeout` for an install of the files *apks*: *own* plus
+        the time their bytes take at :attr:`_INSTALL_SLOW_BPS`."""
+        size = 0
+        for apk in apks:
+            try:
+                size += os.path.getsize(apk)
+            except OSError:
+                pass  # adb says what is wrong with the file
+        return self._work_timeout(own + size / self._INSTALL_SLOW_BPS)
+
+    # The package manager answers on a line of its own: "Success", or
+    # "Failure [REASON]".  The word anywhere else is not its answer: adb names
+    # the APK in its error, and an APK can be called SuccessFactors.apk.  A
+    # staged install (an APEX module) says more after the word: "Success.
+    # Reboot device to apply staged session".
+    _PM_SUCCESS_RE = re.compile(r"(?m)^Success(?:\.(?:\s.*)?)?\s*$")
+    _PM_VERDICT_RE = re.compile(r"(?m)^(?:Success|Failure)\b")
+
+    def _pm_answer(self, what: str, res) -> str:
+        """*res*'s output when adb ended well and the package manager said
+        ``Success``; ADBInstallError (*what* failed) otherwise."""
+        out = self._combined_output(res)
+        if not res.ok or not self._PM_SUCCESS_RE.search(out):
+            # stdout is often just "Performing Streamed Install"; the real
+            # reason (Failure [INSTALL_FAILED_…]) is on stderr
+            raise ADBInstallError(f"{what} failed: {out or f'exit {res.exit_code}'}")
+        return res.text or "Success"
+
     def install(
         self,
         apk: str,
@@ -4818,20 +5172,20 @@ class ADBHandler:
         extra_args: Optional[Sequence[str]] = None,
         safe: Optional[bool] = None,
     ):
-        """Install a single APK (``adb install``)."""
+        """Install a single APK (``adb install``).
+
+        It may take five minutes plus the time a slow link needs for the
+        file; a longer ``command_timeout`` raises that limit, and None lifts
+        it (see :meth:`_work_timeout`)."""
 
         def _do():
+            path = os.path.expanduser(apk)
             args = ["install"] + self._install_flags(replace, downgrade, grant_perms, allow_test)
             args += list(extra_args or [])
-            args.append(os.path.expanduser(apk))
+            args.append(path)
             self._emit(logging.INFO, f"Installing {apk}…")
-            res = self._run(args, timeout=300)
-            out = self._combined_output(res)
-            if "Success" not in out:
-                # stdout is often just "Performing Streamed Install"; the real
-                # reason (Failure [INSTALL_FAILED_…]) is on stderr
-                raise ADBInstallError(f"Install failed: {out or f'exit {res.exit_code}'}")
-            return res.text or "Success"
+            res = self._run(args, timeout=self._install_timeout(self._INSTALL_TIMEOUT, [path]))
+            return self._pm_answer("Install", res)
 
         return self._guard("install", _do, safe=safe)
 
@@ -4845,31 +5199,40 @@ class ADBHandler:
         allow_test: bool = False,
         safe: Optional[bool] = None,
     ):
-        """Install split APKs together (``adb install-multiple``)."""
+        """Install split APKs together (``adb install-multiple``). Its time
+        limit works as :meth:`install`'s, from ten minutes."""
 
         def _do():
+            paths = [os.path.expanduser(a) for a in apks]
             args = ["install-multiple"] + self._install_flags(
                 replace, downgrade, grant_perms, allow_test)
-            args += [os.path.expanduser(a) for a in apks]
+            args += paths
             self._emit(logging.INFO, f"Installing {len(apks)} split APK(s)…")
-            res = self._run(args, timeout=600)
-            out = self._combined_output(res)
-            if "Success" not in out:
-                raise ADBInstallError(f"install-multiple failed: {out or f'exit {res.exit_code}'}")
-            return res.text or "Success"
+            res = self._run(
+                args, timeout=self._install_timeout(self._INSTALL_MULTIPLE_TIMEOUT, paths)
+            )
+            return self._pm_answer("install-multiple", res)
 
         return self._guard("install_multiple", _do, safe=safe)
 
     def uninstall(self, package: str, *, keep_data: bool = False, safe: Optional[bool] = None):
-        """Uninstall a package. *keep_data=True* keeps app data/cache (``-k``)."""
+        """Uninstall a package. *keep_data=True* keeps the app's data and cache:
+        ``adb uninstall`` refuses its ``-k``, so the device's package manager
+        is asked itself (``cmd package uninstall -k``, or ``pm`` on a device
+        without ``cmd``)."""
 
         def _do():
-            args = ["uninstall"] + (["-k"] if keep_data else []) + [package]
-            res = self._run(args, timeout=120)
-            out = self._combined_output(res)
-            if "Success" not in out:
-                raise ADBInstallError(f"Uninstall failed: {out or f'exit {res.exit_code}'}")
-            return res.text or "Success"
+            if keep_data:
+                res = self._run(
+                    self._shell_args("cmd", "package", "uninstall", "-k", package), timeout=120
+                )
+                if not self._PM_VERDICT_RE.search(self._combined_output(res)):
+                    res = self._run(
+                        self._shell_args("pm", "uninstall", "-k", package), timeout=120
+                    )
+            else:
+                res = self._run(["uninstall", package], timeout=120)
+            return self._pm_answer("Uninstall", res)
 
         return self._guard("uninstall", _do, safe=safe)
 
@@ -4912,13 +5275,34 @@ class ADBHandler:
 
         return self._guard("list_packages", _do, safe=safe)
 
+    def _package_user(self, package: str) -> tuple:
+        """``("--user", N)`` for a ``pm`` command that acts on one user's copy
+        of *package* (clear, grant, revoke), or ``()`` for the default user.
+
+        ``pm`` means user 0 unless told otherwise. On Android Automotive that
+        is the headless system user, so "Clear data" answered Success while
+        the app on the screen, the driver's (user 10), kept all of it. The
+        foreground user (see :meth:`_content_user`) is named when it has the
+        package; a package only the system user has keeps the plain command,
+        as does a phone, whose foreground user is 0."""
+        user = self._content_user()
+        if user is None:
+            return ()
+        res = self._run(self._shell_args("pm", "path", "--user", user, package), timeout=15)
+        if "package:" in res.text:
+            return ("--user", user)
+        self._foreground_user_cache = None  # the user may be gone: ask again next time
+        return ()
+
     def clear_app(self, package: str, *, safe: Optional[bool] = None):
-        """Clear an app's data and cache (``pm clear``)."""
+        """Clear an app's data and cache (``pm clear``): the foreground user's
+        on a device with several users (see :meth:`_package_user`)."""
         def _do():
-            res = self._run(self._shell_args("pm", "clear", package), timeout=60, check=True)
+            words = ["pm", "clear", *self._package_user(package), package]
+            res = self._run(self._shell_args(*words), timeout=60, check=True)
             text = self._combined_output(res)
             if "success" not in text.lower():
-                raise self._command_error("shell pm clear " + package, res)
+                raise self._command_error("shell " + " ".join(str(word) for word in words), res)
             return text
 
         return self._guard("clear_app", _do, safe=safe)
@@ -4970,28 +5354,22 @@ class ADBHandler:
 
         return self._guard("stop_app", _do, safe=safe)
 
+    def _set_permission(self, verb: str, package: str, permission: str) -> bool:
+        """``pm grant`` / ``pm revoke``, for the foreground user's copy of the
+        app on a device with several users (see :meth:`_package_user`)."""
+        words = ("pm", verb, *self._package_user(package), package, permission)
+        return self._run(self._shell_args(*words), timeout=30, check=True).ok
+
     def grant(self, package: str, permission: str, *, safe: Optional[bool] = None):
         """Grant a runtime permission (``pm grant``)."""
         return self._guard(
-            "grant",
-            lambda: (
-                self._run(
-                    self._shell_args("pm", "grant", package, permission), timeout=30, check=True
-                ).ok
-            ),
-            safe=safe,
+            "grant", lambda: self._set_permission("grant", package, permission), safe=safe
         )
 
     def revoke(self, package: str, permission: str, *, safe: Optional[bool] = None):
         """Revoke a runtime permission (``pm revoke``)."""
         return self._guard(
-            "revoke",
-            lambda: (
-                self._run(
-                    self._shell_args("pm", "revoke", package, permission), timeout=30, check=True
-                ).ok
-            ),
-            safe=safe,
+            "revoke", lambda: self._set_permission("revoke", package, permission), safe=safe
         )
 
     def current_activity(self, *, safe: Optional[bool] = None):
@@ -5247,7 +5625,7 @@ class ADBHandler:
             script = self.screencap_stream_script(capture_id, interval=1.0 / fps, fmt=fmt)
             args = ["exec-out", script]
             self._emit(logging.DEBUG, f"$ adb exec-out '{script}'  (screencap stream)")
-            proc = subprocess.Popen(
+            proc = self._spawn(
                 self._base(target=True) + args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -5359,7 +5737,9 @@ class ADBHandler:
     ):
         """Record the screen on-device (``screenrecord``), then pull it to
         *local_path* — ``~`` expanded and its folder created, like
-        :meth:`screenshot`; the saved path is returned. Stops at *time_limit*
+        :meth:`screenshot`; the saved path is returned. A folder (one that
+        exists, or a path ending in a separator) gets a file named after the
+        time, ``recording-YYYYMMDD-HHMMSS.mp4``. Stops at *time_limit*
         seconds (max 180 per adb) or when *stop_event* is set. *size* like
         ``1280x720``, *bit_rate* like ``8M``.
 
@@ -5375,13 +5755,52 @@ class ADBHandler:
         """
 
         def _do():
-            clip = self._record_clip(
-                time_limit, size=size, bit_rate=bit_rate, display_id=display_id,
-                remote_tmp=remote_tmp, stop_event=stop_event,
-            )
-            return self._save_clip(clip, local_path)
+            target = self._recording_file(local_path)
+            try:
+                clip = self._record_clip(
+                    time_limit, size=size, bit_rate=bit_rate, display_id=display_id,
+                    remote_tmp=remote_tmp, stop_event=stop_event,
+                )
+            finally:
+                if target != local_path:
+                    _free_name(target)  # held while it recorded: the pull writes the file
+            return self._save_clip(clip, target)
 
         return self._guard("screen_record", _do, safe=safe)
+
+    @staticmethod
+    def _recording_file(local_path):
+        """The file a recording asked for at *local_path* is saved as:
+        *local_path* itself, or for a folder a new file in it, named after the
+        time. Into a folder adb pulls the clip under its device name, which is
+        not the path that is checked and returned afterwards.
+
+        The name in a folder is taken at once, as an empty file that holds it
+        until the recording is over (see :func:`_free_name`): two recordings
+        started in the same second (two displays, two head units) both took
+        that second's name, and the later pull replaced the earlier clip."""
+        path = os.path.expanduser(local_path) if local_path else ""
+        if not (os.path.isdir(path) or path.endswith(("/", os.sep))):
+            return local_path
+        if _WINDOWS_NAMES:
+            folder = path.rstrip("/" + os.sep)
+            if folder and not folder.endswith(":"):  # not a drive or the root itself
+                path = _as_windows_reads(folder)
+        os.makedirs(path, exist_ok=True)
+        stem = os.path.join(path, time.strftime("recording-%Y%m%d-%H%M%S"))
+        target, count = stem + ".mp4", 1
+        while True:
+            try:
+                os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            except OSError:
+                if not os.path.lexists(target):
+                    raise  # not a name that is taken: the folder can't be written to
+            else:
+                with _TRACKED_LOCK:
+                    _HELD_NAMES.add(target)
+                return target
+            count += 1  # another recording of the same second
+            target = f"{stem}-{count}.mp4"
 
     def _record_clip(self, time_limit, *, size, bit_rate, display_id, remote_tmp,
                      stop_event, on_tick=None) -> _Clip:
@@ -5412,6 +5831,8 @@ class ADBHandler:
                     f"screenrecord rejected display id {candidate}; "
                     f"trying {candidates[index + 1]}",
                 )
+        # no candidate at all: never hand "no clip" on to be pulled
+        raise ADBError(f"no display id was found to record display {display_id} with")
 
     def _record_on(self, record_display, limit, *, size, bit_rate, remote_tmp,
                    stop_event, on_tick=None) -> _Clip:
@@ -5442,7 +5863,7 @@ class ADBHandler:
         )
         cmd = self._base(target=True) + ["shell", shell_command]
         self._emit(logging.INFO, f"Recording screen -> {remote_path} (limit {limit or 180}s)…")
-        proc = subprocess.Popen(
+        proc = self._spawn(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             creationflags=NO_WINDOW, start_new_session=_OWN_SESSION,
         )
@@ -5544,12 +5965,14 @@ class ADBHandler:
 
     def _save_clip(self, clip: _Clip, local_path: str) -> str:
         """Pull a recorded clip to *local_path* (``~`` expanded, its folder
-        created) and remove it from the device. A clip that could not be
-        pulled stays on the device (the log says where)."""
+        created) and remove it from the device; returns the file it was saved
+        as (see :meth:`_typed_target`). A clip that could not be pulled stays
+        on the device (the log says where)."""
         if clip.forced:
             # the device may still be finalising the MP4 index
             self._wait_remote_file_stable(clip.remote_path)
-        saved_path = self._prepare_local_path(local_path)
+        # the name the pull stores it under: that file is checked and returned
+        saved_path = self._typed_target(self._prepare_local_path(local_path))
         try:
             self._transfer("pull", clip.remote_path, saved_path, None, None, None)
         except ADBError:
@@ -5580,11 +6003,13 @@ class ADBHandler:
         run past ``screenrecord``'s three-minute cap.
 
         Parts are named after *local_path*: ``drive.mp4``, ``drive-part02.mp4``,
-        ``drive-part03.mp4`` … The next part starts the moment one ends, and
-        that one is pulled meanwhile, so pulling leaves no gap in the
-        recording. Each part is handed to *on_part* (on the calling thread, in
-        order) as soon as it is saved, so a long recording is never lost to a
-        later failure. Returns the list of saved paths once every part is saved.
+        ``drive-part03.mp4`` … (in a folder, after the name the first part
+        gets there, see :meth:`screen_record`). The next part starts the
+        moment one ends, and that one is pulled meanwhile, so pulling leaves
+        no gap in the recording. Each part is handed to *on_part* (on the
+        calling thread, in order) as soon as it is saved, so a long recording
+        is never lost to a later failure. Returns the list of saved paths once
+        every part is saved.
 
         Without a *stop_event* this records exactly one part. A failure in the
         FIRST part is raised as-is; a later one (or a part that could not be
@@ -5593,7 +6018,8 @@ class ADBHandler:
         """
 
         def _do():
-            base, ext = os.path.splitext(self._prepare_local_path(local_path))
+            first = self._recording_file(local_path)
+            base, ext = os.path.splitext(self._prepare_local_path(first))
             ext = ext or ".mp4"
             paths, errors = [], []
             clips = queue.Queue()  # (local path, clip) to pull, in order; None: no more
@@ -5631,7 +6057,7 @@ class ADBHandler:
             part = 0
             try:
                 while True:
-                    target = local_path if part == 0 else f"{base}-part{part + 1:02d}{ext}"
+                    target = first if part == 0 else f"{base}-part{part + 1:02d}{ext}"
                     try:
                         clip = self._record_clip(
                             part_seconds, size=size, bit_rate=bit_rate, display_id=display_id,
@@ -5640,6 +6066,9 @@ class ADBHandler:
                     except Exception as exc:
                         errors.append(exc)
                         break
+                    finally:
+                        if part == 0 and first != local_path:
+                            _free_name(first)  # held while the first part recorded
                     clips.put((target, clip))
                     part += 1
                     if stop_event is None or stop.is_set():
@@ -5813,6 +6242,10 @@ class ADBHandler:
         (``local:``) display, ``"physical_id"``: the id ``screencap -d`` takes
         on Android 10+, where ``input -d`` / ``wm size -d`` keep the logical
         ``"id"``.
+
+        The virtual display scrcpy mirrors through (named ``scrcpy``; Android
+        lists it while a screen runs) is left out: it is no display of the
+        device, and mirroring it would mirror the mirror.
         """
         text = text or ""
         headers = [(m.start(), int(m.group(1))) for m in re.finditer(r"mDisplayId=\s*(\d+)", text)]
@@ -5849,7 +6282,14 @@ class ADBHandler:
                 if local:
                     entry["physical_id"] = int(local.group(1))
             found[display_id] = entry
-        return [found[key] for key in sorted(found)]
+        return [found[key] for key in sorted(found) if not cls._is_scrcpy_display(found[key])]
+
+    @staticmethod
+    def _is_scrcpy_display(display: dict) -> bool:
+        """True for scrcpy's own virtual display (``uniqueId
+        "virtual:com.android.shell,2000,scrcpy,0"``): one named ``scrcpy``
+        that is not a physical display."""
+        return display.get("name") == "scrcpy" and "physical_id" not in display
 
     def _list_displays_adb(self) -> list:
         """Ask Android itself for its displays; ``[]`` when it can't say."""

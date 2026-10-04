@@ -246,6 +246,301 @@ def test_off_windows_the_local_source_says_it_needs_windows(qapp, panel, monkeyp
 
 
 # --------------------------------------------------------------------------- #
+# recording needs ffmpeg on this PC; a remote camera is watched without one
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def remote_view(qapp, panel, monkeypatch, tmp_path):
+    """A remote camera on screen, on a PC that has no ffmpeg of its own yet
+    (the remote one has: nothing was fetched here to watch it)."""
+    from turboadb.gui import camera_widget, ffmpeg_tools, fileutil
+    from turboadb.gui import settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "webcam_remote_password", lambda: "")
+    panel.source.setCurrentIndex(panel.source.findData("remote"))
+    reader = _stream(panel, [_jpeg()])
+    assert _pump(qapp, lambda: reader.frames > 0 and panel._viewing_announced)
+    view = panel
+    view.have = [None]  # the ffmpeg this PC has
+    view.asked, view.warned, view.encoders, view.fetches = [], [], [], []
+    view.answer = camera_widget.QMessageBox.Yes
+    view.clip = str(tmp_path / "webcam.mp4")
+    monkeypatch.setattr(ffmpeg_tools, "cached_ffmpeg", lambda: view.have[0])
+    monkeypatch.setattr(ffmpeg_tools, "_auto_download_supported", lambda: True)
+    monkeypatch.setattr(
+        camera_widget.QMessageBox, "question",
+        lambda *args, **_k: view.asked.append(args[2]) or view.answer,
+    )
+    monkeypatch.setattr(
+        camera_widget.QMessageBox, "warning", lambda *args, **_k: view.warned.append(args[2])
+    )
+    monkeypatch.setattr(fileutil, "ask_save_path", lambda *_a, **_k: view.clip)
+
+    def encoder(argv, **_kwargs):
+        view.encoders.append(list(argv))
+        return _Encoder()
+
+    monkeypatch.setattr(camera_widget.subprocess, "Popen", encoder)
+    return view
+
+
+def test_record_on_a_remote_camera_fetches_the_ffmpeg_this_pc_lacks(
+    qapp, remote_view, monkeypatch
+):
+    """Record answered "ffmpeg isn't ready yet." every time: nothing in the
+    Remote flow ever fetched an ffmpeg for this PC."""
+    from turboadb.gui import ffmpeg_tools
+
+    view = remote_view
+
+    def fetch(log=lambda m: None, should_cancel=None):
+        view.fetches.append(threading.get_ident())
+        log("Downloading ffmpeg… 80 MB (50%)")
+        view.have[0] = "C:/tools/ffmpeg.exe"
+        return view.have[0]
+
+    monkeypatch.setattr(ffmpeg_tools, "ensure_local_ffmpeg", fetch)
+    view._toggle_record()
+    assert len(view.asked) == 1 and "160 MB" in view.asked[0]  # asked before it downloads
+    assert _pump(qapp, lambda: view._rec_proc is not None)
+    assert view.fetches and view.fetches[0] != threading.get_ident()  # off the UI thread
+    assert view.encoders[0][0] == "C:/tools/ffmpeg.exe" and view.encoders[0][-1] == view.clip
+    assert view.rec_btn.text() == "Stop recording" and view.rec_btn.isEnabled()
+    assert view._dl_dialog is None and view.warned == []
+    assert view.reader is not None  # the stream was never stopped for it
+
+
+def test_record_asks_nothing_when_ffmpeg_is_at_hand(qapp, remote_view):
+    view = remote_view
+    view.have[0] = "C:/tools/ffmpeg.exe"
+    view._toggle_record()
+    assert view.asked == [] and view._rec_proc is not None
+    assert view.encoders[0][0] == "C:/tools/ffmpeg.exe"
+
+
+def test_record_downloads_nothing_unless_the_user_agrees(qapp, remote_view, monkeypatch):
+    from turboadb.gui import camera_widget, ffmpeg_tools
+
+    view = remote_view
+    monkeypatch.setattr(
+        ffmpeg_tools, "ensure_local_ffmpeg",
+        lambda *_a, **_k: view.fetches.append("download") or "C:/tools/ffmpeg.exe",
+    )
+    view.answer = camera_widget.QMessageBox.No
+    view._toggle_record()
+    qapp.processEvents()
+    assert len(view.asked) == 1 and view.fetches == []
+    assert view._rec_proc is None and view.rec_btn.isEnabled() and view.warned == []
+
+
+def test_record_says_how_to_get_ffmpeg_where_it_cannot_be_downloaded(
+    qapp, remote_view, monkeypatch
+):
+    from turboadb.gui import ffmpeg_tools
+
+    view = remote_view
+    monkeypatch.setattr(ffmpeg_tools, "_auto_download_supported", lambda: False)
+    view._toggle_record()
+    assert view.asked == [] and view._rec_proc is None
+    assert len(view.warned) == 1
+    assert "PATH" in view.warned[0] and "Settings → ffmpeg path" in view.warned[0]
+
+
+def test_a_failed_ffmpeg_fetch_says_why_and_gives_record_back(qapp, remote_view, monkeypatch):
+    from turboadb.gui import ffmpeg_tools
+
+    view = remote_view
+
+    def offline(log=lambda m: None, should_cancel=None):
+        raise RuntimeError("Couldn't download ffmpeg (offline).")
+
+    monkeypatch.setattr(ffmpeg_tools, "ensure_local_ffmpeg", offline)
+    view._toggle_record()
+    assert _pump(qapp, lambda: bool(view.warned))
+    assert "Couldn't download ffmpeg (offline)." in view.warned[0]
+    assert view._rec_proc is None and view.rec_btn.isEnabled()
+    assert view.rec_btn.text() == "Record"
+
+
+def test_a_cancelled_ffmpeg_fetch_is_no_error(qapp, remote_view, monkeypatch):
+    from turboadb.gui import ffmpeg_tools
+
+    view = remote_view
+    started = threading.Event()
+
+    def slow(log=lambda m: None, should_cancel=None):
+        log("Downloading ffmpeg… 5 MB (3%)")
+        started.set()
+        deadline = time.monotonic() + 10
+        while not should_cancel() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise ffmpeg_tools.DownloadCancelled("cancelled")
+
+    monkeypatch.setattr(ffmpeg_tools, "ensure_local_ffmpeg", slow)
+    view._toggle_record()
+    assert started.wait(5)
+    assert _pump(qapp, lambda: view._dl_dialog is not None)  # the usual setup dialog
+    view._cancel_download()  # its Cancel button
+    assert _pump(qapp, lambda: view.rec_btn.isEnabled())
+    assert view.warned == [] and view._rec_proc is None and view._dl_dialog is None
+    assert "cancelled" in view.status.text()
+
+
+# --------------------------------------------------------------------------- #
+# several streams from one remote PC
+# --------------------------------------------------------------------------- #
+class _Socket:
+    """The video socket of a remote stream that sends nothing for now."""
+
+    def __init__(self):
+        self.closed = False
+
+    def settimeout(self, _seconds):
+        pass
+
+    def recv(self, _n):
+        import socket
+
+        if self.closed:
+            return b""
+        time.sleep(0.01)
+        raise socket.timeout()
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def remote_pc(monkeypatch):
+    """A remote PC whose WinRM calls are recorded: ``started`` and ``stopped``
+    hold (camera or pid, stream port)."""
+    from turboadb.gui import camera_widget
+    from turboadb.gui import remote_webcam as rw
+    from turboadb.gui import settings as settings_mod
+
+    world = {"started": [], "stopped": [], "fail": None}
+
+    def start(host, login, password, camera, ffmpeg, *, stream_port, **_kwargs):
+        if world["fail"]:
+            raise RuntimeError(world["fail"])
+        world["started"].append((camera, stream_port))
+        return 5000 + stream_port  # its ffmpeg's pid there
+
+    def stop(host, login, password, pid, *, stream_port, **_kwargs):
+        world["stopped"].append((pid, stream_port))
+
+    monkeypatch.setattr(rw, "_ports_in_use", set())
+    monkeypatch.setattr(rw, "start_remote_stream", start)
+    monkeypatch.setattr(rw, "stop_remote_stream", stop)
+    monkeypatch.setattr(rw, "probe_remote_camera", lambda *_a, **_k: "")
+    monkeypatch.setattr(
+        camera_widget.socket, "create_connection", lambda _address, timeout=None: _Socket()
+    )
+    monkeypatch.setattr(settings_mod, "webcam_remote_password", lambda: "")
+    monkeypatch.setattr(camera_widget.CameraPanel, "_auto_scan", lambda self: None)
+    return world
+
+
+def _watch_remote(panel, camera):
+    """Source = Remote on lab-pc, scanned, then Start camera."""
+    panel.source.setCurrentIndex(panel.source.findData("remote"))
+    panel.r_host.setText("lab-pc")
+    panel.r_user.setText("me")
+    panel._remote_ffmpeg = r"C:\ffmpeg\bin\ffmpeg.exe"
+    panel.camera.addItem(camera)
+    panel._toggle_start()
+
+
+def test_every_remote_stream_gets_a_port_of_its_own(monkeypatch):
+    from turboadb.gui import remote_webcam as rw
+
+    monkeypatch.setattr(rw, "_ports_in_use", set())
+    first, second = rw.claim_stream_port(), rw.claim_stream_port()
+    assert first == rw.DEFAULT_STREAM_PORT and second not in (first, None)
+    rw.release_stream_port(first)
+    assert rw.claim_stream_port() == first  # free again once its stream is gone
+    taken = {first, second}
+    with pytest.raises(RuntimeError) as err:
+        while True:
+            port = rw.claim_stream_port()
+            assert port not in taken
+            taken.add(port)
+    assert "stop one" in str(err.value) and len(taken) >= 8
+
+
+def test_two_panels_on_one_remote_pc_keep_their_own_streams(qapp, remote_pc):
+    """The Webcam tab and a device tab's Webcam page on the same remote PC:
+    both streams used port 28100, so starting the second ended the first (its
+    ffmpeg looked stale), and stopping either ended the other and removed
+    the firewall rule they shared."""
+    from turboadb.gui import camera_widget
+    from turboadb.gui import remote_webcam as rw
+
+    panels = [camera_widget.CameraPanel(), camera_widget.CameraPanel()]
+    try:
+        _watch_remote(panels[0], "Front camera")
+        assert _pump(qapp, lambda: panels[0].reader is not None)
+        _watch_remote(panels[1], "Rear camera")
+        assert _pump(qapp, lambda: panels[1].reader is not None)
+        ports = [panel._remote_conn[3] for panel in panels]
+        assert ports[0] == rw.DEFAULT_STREAM_PORT and ports[1] != ports[0]
+        assert remote_pc["started"] == [("Front camera", ports[0]), ("Rear camera", ports[1])]
+
+        panels[0]._stop_stream()
+        assert _pump(qapp, lambda: bool(remote_pc["stopped"]))
+        # only its own ffmpeg, by its own port and rule
+        assert remote_pc["stopped"] == [(5000 + ports[0], ports[0])]
+        assert panels[1].reader is not None and panels[1]._remote_pid == 5000 + ports[1]
+        # ...and that port is free for the next stream once the remote side is stopped
+        assert _pump(qapp, lambda: ports[0] not in rw._ports_in_use)
+        assert ports[1] in rw._ports_in_use
+    finally:
+        for panel in panels:
+            panel.close_panel()
+            panel.close()
+            qapp.processEvents()
+            panel.deleteLater()
+    assert _pump(qapp, lambda: not rw._ports_in_use)
+
+
+def test_a_remote_stream_that_never_started_gives_its_port_back(
+    qapp, panel, remote_pc, monkeypatch
+):
+    from turboadb.gui import camera_widget
+    from turboadb.gui import remote_webcam as rw
+
+    warned = []
+    monkeypatch.setattr(
+        camera_widget.QMessageBox, "warning", lambda *args, **_k: warned.append(args[2])
+    )
+    remote_pc["fail"] = "the remote refused to launch ffmpeg"
+    _watch_remote(panel, "Front camera")
+    assert _pump(qapp, lambda: bool(warned))
+    assert "refused to launch ffmpeg" in warned[0]
+    assert _pump(qapp, lambda: not rw._ports_in_use)
+    assert panel.start_btn.isEnabled()
+
+
+def test_a_streams_remote_script_names_only_its_own_port(monkeypatch):
+    from turboadb.gui import remote_webcam as rw
+
+    scripts = []
+    monkeypatch.setattr(
+        rw, "_run_ps",
+        lambda host, login, password, script, winrm_port=5985:
+        scripts.append(script) or (0, "PID:77\nRC:0\n", ""),
+    )
+    other = rw.DEFAULT_STREAM_PORT
+    mine = other + 1
+    rw.start_remote_stream("lab-pc", "u", "p", "Cam", "ffmpeg.exe", stream_port=mine,
+                           client_ip="10.0.0.9")
+    rw.stop_remote_stream("lab-pc", "u", "p", 77, stream_port=mine)
+    for script in scripts:
+        assert f"tcp://0.0.0.0:{mine}?listen=1" in script
+        assert f'"TurboADB Webcam {mine}"' in script
+        assert str(other) not in script  # the other panel's ffmpeg and rule are left alone
+
+
+# --------------------------------------------------------------------------- #
 # the saved remote password
 # --------------------------------------------------------------------------- #
 def test_the_saved_password_is_read_off_the_ui_thread_and_only_for_its_host(qapp, monkeypatch):

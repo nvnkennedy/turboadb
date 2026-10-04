@@ -7,7 +7,8 @@ client. That's why this works where PowerShell's ``Invoke-Command`` / ``Test-WSM
 (which insist on Negotiate/Kerberos) were failing.
 
 On each host it runs (as the admin credential): optionally ``pip install -U
-turboadb``, then ``turboadb serve --startup-task`` — starting the shared adb
+turboadb``, ``turboadb fetch-tools --adb-only`` when the host has no adb yet,
+then ``turboadb serve --startup-task`` — starting the shared adb
 server now and registering a SYSTEM startup task so the host keeps sharing its
 devices headlessly. Prereqs per host: WinRM on (``Enable-PSRemoting -Force``),
 the account a local admin, and Python + turboadb installed."""
@@ -27,6 +28,11 @@ from .config import format_host_port, validate_port
 HOST_TIMEOUT = 120.0
 TOTAL_TIMEOUT = 600.0
 MAX_WORKERS = 4
+
+# What the log keeps of one note from a host.  A warning of serve names every
+# path it is about, and says what to do last: at 240 characters the one about
+# a Python installed for one user ended inside the second path.
+_NOTE_MAX = 1000
 
 # Reading the password from the environment (or stdin) keeps it out of argv,
 # where the process table and the shell history expose it to every local user.
@@ -118,12 +124,23 @@ def _ensure_winrm(say=None) -> bool:
 
 # Runs ON each remote host (via pywinrm run_ps). Starts serve + the SYSTEM
 # startup task, printing 'STATUS:…' on success, 'WARNING:…' for a non-fatal
-# problem, or 'ERROR:…' on failure.
+# problem, 'INFO:…' for something worth knowing, or 'ERROR:…' on failure.
 #
 # Native commands run with $ErrorActionPreference='Continue': under 'Stop',
 # Windows PowerShell 5.1 turns ANY stderr line of a redirected (2>&1) native
 # exe — e.g. a pip deprecation warning — into a terminating NativeCommandError,
 # failing a deploy that actually worked. Success is judged by $LASTEXITCODE.
+#
+# 'serve' never downloads adb (the startup task runs it as SYSTEM, where a
+# download would be a second adb), so a host with Python and turboadb but no
+# adb used to fail with "Could not find 'adb'".  The script downloads it first,
+# as the deploying account: only when the host finds none (exit code 3 of the
+# check), and not where downloads are turned off (TURBOADB_AUTO_FETCH=0) or an
+# adb path set on purpose is wrong, which serve then explains.
+#
+# What serve itself warns about (a startup task that runs a Python any user of
+# the host can change, devices that must accept a new key) is passed on: the
+# status line has no room for it.
 _DEPLOY_PS = r"""
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 function Join-Output($lines) {{ (($lines | ForEach-Object {{ "$_" }}) -join ' ') -replace '\s+',' ' }}
@@ -140,9 +157,21 @@ try {{
                 'WARNING:pip upgrade of turboadb failed (exit ' + $LASTEXITCODE + '): ' + (Join-Output $pipOut)
             }}
         }}
+        & $py -c "import sys; from turboadb import tools, toolsdl; d = tools.diagnose(); sys.exit(3 if toolsdl.auto_fetch_enabled() and not d.get('adb_path') and not d.get('adb_error') else 0)" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 3) {{
+            $fetchOut = & $py -m turboadb fetch-tools --adb-only 2>&1
+            if ($LASTEXITCODE -eq 0) {{
+                'INFO:the host had no adb: downloaded platform-tools for this account'
+            }} else {{
+                'WARNING:the host has no adb and it could not be downloaded (exit ' + $LASTEXITCODE + '): ' + (Join-Output $fetchOut)
+            }}
+        }}
         $out = & $py -m turboadb serve --port {port} --startup-task 2>&1
         $code = $LASTEXITCODE
         $ErrorActionPreference='Stop'
+        foreach ($line in $out) {{
+            if ("$line" -match '\[WARNING\] (?:turboadb[\w.]*: )?(.+)') {{ 'WARNING:' + $Matches[1] }}
+        }}
         if ($code -ne 0) {{
             'ERROR:turboadb serve exited with code ' + $code + ': ' + (Join-Output $out)
         }} else {{
@@ -251,8 +280,9 @@ def _deploy_one(
             host_timeout=host_timeout,
         )
         for line in out.splitlines():
-            if line.startswith("WARNING:"):
-                lines.append(f"[WARNING] {host}: {line[len('WARNING:'):].strip()[:240]}")
+            for level in ("WARNING", "INFO"):
+                if line.startswith(level + ":"):
+                    lines.append(f"[{level}] {host}: {line[len(level) + 1:].strip()[:_NOTE_MAX]}")
         ok = code == 0 and "STATUS:" in out and "ERROR:" not in out
         if ok:
             detail = next(

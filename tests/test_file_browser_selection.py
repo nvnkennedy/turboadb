@@ -42,13 +42,15 @@ class _Handler:
     def shell(self, command, timeout=None, safe=None, **_kw):
         self.shell_calls.append(command)
         ok = not self.error
+        # a command that worked prints the mark it ends with ("… && echo MARK")
+        said = command.rpartition(" && echo ")[2] + "\n" if ok and " && echo " in command else ""
 
         class _Res:
             def __init__(self, ok, error):
                 self.ok = ok
-                self.stdout = ""
+                self.stdout = said
                 self.stderr = "" if ok else error
-                self.text = ""
+                self.text = said.strip()
 
         return _Res(ok, self.error)
 
@@ -322,6 +324,35 @@ def test_recycling_asks_the_shell_to_allow_undo_and_reports_refusals(monkeypatch
     assert fb._recycle_local_items([]) == [] and len(operations) == 3
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the Recycle Bin is Windows-only")
+def test_recycling_takes_names_with_an_emoji(monkeypatch, tmp_path):
+    """"Party 🎉.jpg" takes two UTF-16 units for the emoji; the list was built
+    one unit per character, so Delete failed with "one character unicode
+    string expected" and nothing was recycled."""
+    import ctypes
+
+    lists = []
+
+    class _Shell32:
+        @staticmethod
+        def SHFileOperationW(pointer):
+            operation = pointer._obj
+            field = ctypes.byref(operation, type(operation).pFrom.offset)
+            address = ctypes.cast(field, ctypes.POINTER(ctypes.c_void_p)).contents.value
+            units = []  # the whole list: it ends at the first two NULs in a row
+            while units[-2:] != [0, 0]:
+                units.append(ctypes.c_uint16.from_address(address + 2 * len(units)).value)
+            raw = b"".join(unit.to_bytes(2, "little") for unit in units)
+            lists.append(raw.decode("utf-16-le", "surrogatepass"))
+            return 0
+
+    monkeypatch.setattr(ctypes, "windll", type("W", (), {"shell32": _Shell32})())
+    paths = [str(tmp_path / "Party \U0001F389.jpg"), str(tmp_path / "b.txt"),
+             str(tmp_path / "half\ud83c.txt")]  # and half an emoji, which NTFS allows
+    assert fb._recycle_local_items(paths) == []
+    assert lists == ["\0".join(paths) + "\0\0"]
+
+
 # ---- what each pane says --------------------------------------------------- #
 def test_the_status_line_counts_entries_and_the_selection(browser, qapp):
     table = browser.remote_table
@@ -386,12 +417,19 @@ def test_a_refused_device_command_asks_once_and_retries_only_what_failed(browser
     requests = []
     browser.write_access_needed.connect(requests.append)
     browser.remote_cwd = "/system"
+    logs = []
+    browser.log.connect(logs.append)
     browser._run_shell_batch([("mkdir x", "mkdir /system/x"), ("mkdir y", "mkdir /system/y")])
     assert len(requests) == 1 and requests[0]["action"] == "mkdir x"
     browser.handler.shell_calls.clear()
     browser.handler.error = ""
+    logs.clear()
     requests[0]["retry"]()
-    assert browser.handler.shell_calls == ["mkdir /system/x", "mkdir /system/y"]
+    # each is sent with the mark that says it worked (a device before
+    # Android 7 gives no exit status), and the retry is seen to work
+    assert browser.handler.shell_calls == [fb._marked("mkdir /system/x"),
+                                           fb._marked("mkdir /system/y")]
+    assert logs == ["[OK] Finished 2 items"] and len(requests) == 1
 
 
 def test_other_errors_are_not_offered_as_a_permission_problem(browser, monkeypatch):

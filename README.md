@@ -16,13 +16,17 @@
 
 ---
 
-> **New in 3.1.0:** colour that means something in the terminals — errors,
-> denials and blocks in red (**Permission denied**, **not found**,
-> **blocked**), warnings in amber and successes in green, while everything
-> else stays plain: `ls` and `grep` are no longer forced into colour, logcat
-> colours only its warnings and errors, and the prompt is one quiet colour.
-> In Files, Push and Pull line up, centred between two lists that stay level.
-> Full notes in the
+> **New in 4.0.0:** a release of fixes and hardening. The terminal draws
+> plain output about four times as fast and no longer stalls on a flood or a
+> line that never ends; Stop leaves a `python` or `node` prompt running;
+> device Delete and Rename in Files can no longer land in another folder; keys
+> on a multi-display head unit go to the display they are meant for, and
+> Clear data on Android Automotive acts on the driver's app; closing TurboADB
+> waits for a recording that is still being saved; shortcuts work on installs
+> without PyQt5; and adb, scrcpy, ffmpeg and Windows' own tools are never
+> picked up from the current folder. It is a major version because some
+> commands now report failures they used to pass over (`turboadb devices`
+> without adb exits 3). Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
@@ -59,7 +63,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-3.1.0-win64.exe`** from the
+1. Download **`TurboADB-4.0.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
@@ -73,8 +77,9 @@ pip install turboadb
 
 On Windows this already includes the app: the package carries the same
 executable (which is why the download is about 59 MB), so `turboadb-gui` starts
-it even without PyQt5. To run the GUI from the Python code instead — on Linux or
-macOS, for example — add the GUI extra:
+it even without PyQt5 (from a copy in `~/.turboadb/gui`, so an upgrade can
+replace the packaged file). To run the GUI from the Python code instead — on
+Linux or macOS, for example — add the GUI extra:
 
 ```bash
 pip install "turboadb[gui]"
@@ -91,7 +96,9 @@ pip install "turboadb[all]"    # GUI + WinRM support
 Upgrade any time with `pip install --upgrade turboadb`.
 
 `adb` and `scrcpy` download themselves into `~/.turboadb/tools` on first use, so
-they never need to be on your PATH.
+they never need to be on your PATH: adb on Windows, macOS and x86-64 Linux,
+scrcpy on Windows. Elsewhere install them with the system's package manager;
+TurboADB finds them on PATH.
 
 ## First, target a device
 
@@ -203,7 +210,7 @@ summary and you stay in the same shell (a program that answers it, such as
 `sqlite3`, keeps running). A command that ignores it is ended by reopening the
 shell in the same folder after 3 s, or at once when you press Stop again;
 **Restart shell** always opens a fresh one. Full-screen programs such as
-`top` print frame after frame (the terminal moves no cursor).
+`top`, `vi` and `less` redraw in place and get every key.
 
 If the device or adb gives no terminal (an old adb, a locked-down build),
 TurboADB falls back to plain pipes and draws the prompt itself; there Stop always
@@ -223,13 +230,17 @@ Node, Git, `where` and programs in the current folder all work, and output such
 as `ping` or a Python script shows as it comes (`adb logcat | findstr word`
 too). **Stop** (or Ctrl+C) presses a real Ctrl+C in the shell: `ping` prints
 its summary, a script or batch file stops as in a console window, and the shell
-keeps its folder and variables. A command that ignores Ctrl+C has its processes
-ended, and the shell stays; only one that still won't end, or a shell waiting
-for an answer (`pause`, `Read-Host`, a `-Confirm` question — Stop never answers
-for you), gets a fresh shell in the same folder. At an idle prompt Ctrl+C just
-starts a new line. Inside an `adb shell` typed there, Stop sends Ctrl+C to the
-device instead: only the device command stops and you stay in adb shell. If
-that command ignores it, Stop again reopens adb shell in the same device folder.
+keeps its folder and variables. A program that answers the Ctrl+C (a `python`
+or `node` prompt showing KeyboardInterrupt) keeps running. A command that
+ignores Ctrl+C has its processes ended, and the shell stays; only one that
+still won't end, or a shell that is still waiting for an answer three seconds
+later (`pause`, `Read-Host`, a `-Confirm` question — Stop never answers for
+you), gets a fresh shell in the same folder, at once when you press Stop
+again. Stop also drops the lines of a paste that have not run yet. At an idle
+prompt Ctrl+C just starts a new line. Inside an `adb shell` typed there, Stop
+sends Ctrl+C to the device instead: only the device command stops and you stay
+in adb shell. If that command ignores it, Stop again reopens adb shell in the
+same device folder.
 
 Need a second terminal on the same device? **More ▾ → New terminal session**,
 or right-click the **Terminal** tab, opens another terminal tab with its own
@@ -245,11 +256,14 @@ turboadb -s SERIAL shell --su -- "cat /data/misc/file"   # as root, through su
 **Python** — `shell()` for one-shots, `open_shell()` for an interactive session:
 
 ```python
+import time
+
 r = dev.shell("getprop ro.product.model")
 print(r.stdout, r.exit_code, r.ok)
 
 sess = dev.open_shell()          # persistent ShellSession
 sess.send("ls /sdcard\n")
+time.sleep(0.5)                  # read() never waits: it returns what has arrived
 print(sess.read())
 sess.close()
 ```
@@ -269,8 +283,9 @@ none).
 (**Live from now**, **Last 1,000 + live**, …), optionally **Tag(s)** (exact,
 comma-separated), an **App** (package name or PID, Android 7+), a live **Filter**
 regex or a **Highlight** pattern such as `error|anr` → **Start**. The Filter
-ignores case unless **Aa** is on, matches text that isn't a valid regex as plain
-text, and searches the whole capture, not just what is on screen. Changing Tag,
+ignores case unless **Aa** is on, matches text that isn't a valid regex (or a
+pattern that would take too long to search a long line) as plain text, and
+searches the whole capture, not just what is on screen. Changing Tag,
 Level or App restarts a running capture where it left off, and a live capture
 resumes by itself after a reboot, an ADB restart or a reconnect. **Crashes** is
 a one-click preset, **Pause** / **Clear** do what they say, and **Save…** writes
@@ -309,15 +324,19 @@ pictures in Photos, videos in Media Player, text in Notepad, or any app you pick
 with **Open with…**. A device file opens as a copy, and each time you save it in
 that app it goes back to the device, keeping its permissions (TurboADB asks
 first if the device file changed meanwhile). Programs are never started from
-here; scripts and text files no app opens go to the built-in editor.
+here; scripts and text files no app opens go to the built-in editor, which
+asks the same before it saves over a device file that changed since you
+opened it.
 
 Selecting works like a file manager: drag beside the names for a block of files,
 **Ctrl+A** for all of them, **Enter** to open, **Backspace** to go up,
 **Ctrl+Shift+N** for a new folder. On Windows **Delete** moves local files to the
 Recycle Bin and **Shift+Delete** deletes them for good; device files always go
-for good. Each pane shows what it holds and what is selected. When the device
-refuses a change, TurboADB offers **adb root**, **adb disable-verity** and **adb
-remount** and retries afterwards (see Root & mount).
+for good. Each pane shows what it holds and what is selected. A PC file or
+folder whose name ends in a dot or a space (made by WSL, Git Bash or a Linux
+drive) is left alone, with a message saying why: Windows cannot address it by
+its path. When the device refuses a change, TurboADB offers **adb root**, **adb
+disable-verity** and **adb remount** and retries afterwards (see Root & mount).
 
 The **Transfers** panel under the panes follows every copy: an overall bar with
 the files and bytes done, the speed and the time left, and under **Details** a
@@ -549,7 +568,9 @@ sess.wait()          # blocks until the scrcpy window closes
 **GUI** — **Screenshot** at the right end of the section tabs (or the screenshot
 icon in Device Control); **Record…** in the Device Control screen toolbar. If
 the screen is already live, a second, windowless recorder runs beside it, so the
-view never restarts, and stopping saves a playable MP4.
+view never restarts, and stopping saves a playable MP4. Closing TurboADB while
+a recording runs or is still being saved waits for it: a dialog names the
+file, and **Close without saving** is the way out.
 
 **CLI**:
 
@@ -566,7 +587,8 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")
 ```
 
 > The CLI `record` command and `screen_record()` use device-side `screenrecord`
-> and pull the file back, so they work over RDP without a video tunnel.
+> and pull the file back, so they work over RDP without a video tunnel. Given a
+> folder instead of a file, they save `recording-DATE-TIME.mp4` there.
 
 ## Webcam (host camera)
 
@@ -584,7 +606,9 @@ handy beside the screen. Pick a **Source**:
 - **Remote — Windows PC** — enter the **RDP host**, **User**, **Domain** and
   **Password** → **Scan cameras** → **Start camera**. No SSH: TurboADB uses the
   same WinRM/NTLM path as `deploy-serve` to run ffmpeg on the remote and stream
-  its camera back over a direct TCP socket.
+  its camera back over a direct TCP socket. Each stream uses a port of its own
+  (28100–28115): open that range in a firewall between the PCs to view more
+  than one.
 
 Then **Snapshot**, **Record** (clean H.264 MP4), **Pause**, **Rotate**, **Flip**,
 and **View**: Fit, Fill or Stretch. Right-click the video to copy the image.
@@ -608,7 +632,9 @@ and **View**: Fit, Fill or Stretch. Right-click the video to copy the image.
 > redirected into someone's RDP session is only visible inside that session.
 >
 > ffmpeg powers the capture; locally it's downloaded once (~160 MB, cached under
-> `~/.turboadb/ffmpeg`) or set **Settings → ffmpeg path** to your own.
+> `~/.turboadb/ffmpeg`) or set **Settings → ffmpeg path** to your own. A remote
+> camera is watched without it; **Record** on one encodes on this PC, and offers
+> that download when this PC has no ffmpeg yet.
 
 ## Telephony
 
@@ -616,11 +642,15 @@ and **View**: Fit, Fill or Stretch. Right-click the video to copy the image.
 first time you open the tab, never while connecting.
 
 - **Dialler** — type or paste a number, or use the keypad (hold **0** for **+**).
-  **Call** places the call, **End** hangs up or rejects, **Answer** picks up a
-  ringing call, and **Open in dialler** (or **Enter** in the number field) only
-  opens the device dialler pre-filled. The toolbar pill shows **Idle**,
-  **Ringing** or **In call**, or **No telephony** on devices without it (e.g. IVI
-  head units). **Refresh** reloads the call state, calls and messages.
+  **Call** places the call, **End** hangs up or rejects (while the pill shows
+  **Idle** it sends nothing: with no call Android takes the End key for the
+  power button), **Answer** picks up a ringing call, and **Open in dialler**
+  (or **Enter** in the number field) only opens the device dialler
+  pre-filled. The toolbar pill shows **Idle**,
+  **Ringing** or **In call**, **No telephony** on devices without it (e.g. IVI
+  head units), or **Checking…** while the device does not answer (it is
+  rebooting or unplugged): the page keeps asking and loads again once the
+  device is back. **Refresh** reloads the call state, calls and messages.
 - **Recent calls** — incoming, outgoing, missed and rejected calls with their
   time and duration. Double-click a call or press **Call back** to put its number
   in the dialler (it never calls by itself); **Message** starts a message to it.
@@ -767,8 +797,11 @@ dev.connect()
 Turn the machine a device is plugged into a host others can reach.
 
 **GUI** — **ADB server ▾ → Share THIS PC's devices…** (**Start once** or **Start
-+ run at login**; opening the firewall needs Administrator). **ADB server ▾ →
-Stop sharing & remove auto-start** undoes it.
++ run at login**; opening the firewall needs Administrator, and sharing ends on
+a warning when the firewall may keep other machines out). **ADB server ▾ →
+Stop sharing & remove auto-start** undoes it; removing the SYSTEM startup task
+needs Administrator too, and TurboADB says so when that task is still
+installed.
 
 **CLI**:
 
@@ -794,7 +827,11 @@ connect until you make that network Private (the status line names it).
 `open_firewall(..., remote_ip="localsubnet")` narrows the rules further;
 `profiles="any"` opens them everywhere. Stopping sharing deletes the rules again.
 The startup task signs in to devices with your own adb key too, so devices you
-already use need no new authorization.
+already use need no new authorization. It runs as SYSTEM, so an adb that other
+accounts could change (the downloaded one in `~/.turboadb/tools`) is copied to
+`Program Files\TurboADB\adb`, where only administrators can change it, and the
+task runs that copy; `serve --startup-task` warns when the Python it runs can
+be changed without administrator rights.
 
 ## Deploy serve over WinRM
 
@@ -822,14 +859,18 @@ deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password",
 ```
 
 > Each target needs WinRM enabled (`Enable-PSRemoting -Force` once), your account a
-> local admin, and Python + turboadb installed there.
+> local admin, and Python + turboadb installed there. adb is downloaded there
+> when the host has none.
 
 ## Keep things up to date
 
 **GUI** — **Tools ▾ → Check for updates…** checks PyPI for a newer TurboADB,
 updates it, refreshes `adb`/`scrcpy`, and restarts (with no newer TurboADB it
-still checks the tools). **Tools ▾ → Download and reinstall ADB and scrcpy…**
-refreshes only the tools.
+still checks the tools). The standalone Windows app and a source checkout,
+which pip cannot update, are told when a newer version is out (at launch, on
+the version chip and by this check) and how to get it. The device tabs pause
+only while an update replaces adb or scrcpy. **Tools ▾ → Download and reinstall
+ADB and scrcpy…** refreshes only the tools.
 
 ```bash
 turboadb self-update      # upgrade TurboADB itself, then adb/scrcpy
@@ -901,6 +942,9 @@ dev.screenshot("after_install.png")
   log says when nothing happened.
 - Hotspot can't always be toggled purely over adb (uid permissions) — TurboADB
   tries `cmd wifi`, then falls back to opening the tethering settings.
+- On Android Automotive the driver is a secondary user: **Clear data**, `grant`
+  and `revoke` act on the driver's copy of an app, not on the hidden system
+  user's.
 
 ## Build from source
 

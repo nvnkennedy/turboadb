@@ -6,6 +6,7 @@ copy of the interpreter (turboadb.launcher), its window tells the taskbar
 what a pin shows and starts, and its shortcuts carry its app ID
 (turboadb.winshell)."""
 
+import contextlib
 import ctypes
 import json
 import os
@@ -253,6 +254,165 @@ def test_python_m_turboadb_gui_starts_as_turboadb_exe_too():
     assert entry.launch_gui is cli.launch_gui
 
 
+# ------------------------------------ a start from a shortcut or a pin
+_STAMP = {"format": 1, "version": "4.0.0", "icon": "0a", "files": {"pythonw.exe": [100, 200]}}
+
+
+@pytest.fixture
+def direct(monkeypatch, tmp_path):
+    """TurboADB.exe as a shortcut or a pin starts it, with an up-to-date copy
+    and PyQt5 installed.  ``run()`` is its work and ``done`` what came of it:
+    "gui", or the command it handed the start over to."""
+    home = tmp_path / "launcher" / "py311-0"
+    home.mkdir(parents=True)
+    (home / "state.json").write_text(json.dumps({"built": {"stamp": _STAMP, "files": "0b"}, "ok": True}))
+    monkeypatch.setattr(launcher, "_stamp", lambda: json.loads(json.dumps(_STAMP)))
+    monkeypatch.setattr(launcher, "has_qt", lambda: True)
+    monkeypatch.setattr(launcher, "BRANDED", False)  # run_branded sets both: put back after the test
+    monkeypatch.setattr(launcher, "_HOME", None)
+    monkeypatch.delenv("TURBOADB_NO_LAUNCHER", raising=False)
+    monkeypatch.delenv(launcher._CHECKED, raising=False)
+    monkeypatch.setattr(sys, "executable", "C:\\Python\\pythonw.exe")
+    done = []
+    app = types.ModuleType("turboadb.gui.app")
+    app.main = lambda: done.append("gui") or 0
+    monkeypatch.setitem(sys.modules, "turboadb.gui.app", app)
+
+    def popen(cmd, creationflags=0, **kwargs):
+        done.append((cmd, kwargs))
+        return _Proc()
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    return types.SimpleNamespace(home=str(home), done=done,
+                                 run=lambda argv=(): launcher.run_branded(list(argv), str(home)))
+
+
+def test_a_copy_built_of_another_turboadb_or_python_hands_the_start_over(direct, monkeypatch):
+    """A shortcut or a pin starts TurboADB.exe itself, so nothing rebuilt the
+    copy after pip install -U turboadb or a Python update: the app kept
+    running the old python3X.dll under the old version."""
+    assert direct.run() == 0 and direct.done == ["gui"]  # up to date: the GUI, here
+    assert launcher.BRANDED and launcher.gui_command(build=False)[2] == direct.home
+    del direct.done[:]
+    monkeypatch.setattr(launcher, "_stamp", lambda: dict(_STAMP, version="4.0.1"))
+    assert direct.run(["-style", "fusion"]) == 0
+    (cmd, kwargs), = direct.done  # and no GUI in the copy
+    root = os.path.dirname(os.path.dirname(os.path.abspath(launcher.__file__)))
+    assert cmd == ["C:\\Python\\pythonw.exe", "-c", launcher._HAND_OVER, root, "-style", "fusion"]
+    assert kwargs["cwd"] == direct.home and kwargs["stdin"] == subprocess.DEVNULL
+    assert launcher._CHECKED not in kwargs["env"]
+
+
+def test_a_copy_that_failed_its_check_hands_the_start_over(direct):
+    """The GUI then runs in the real Python, as turboadb-gui has it."""
+    with open(os.path.join(direct.home, "state.json"), "w", encoding="utf-8") as fh:
+        json.dump({"built": {"stamp": _STAMP, "files": "0b"}, "ok": False}, fh)
+    assert direct.run() == 0
+    (cmd, _kwargs), = direct.done
+    assert cmd[1] == "-c"
+
+
+def test_turned_off_a_copy_started_directly_hands_the_start_over(direct, monkeypatch):
+    """TURBOADB_NO_LAUNCHER=1 was ignored by a shortcut or a pin."""
+    monkeypatch.setenv("TURBOADB_NO_LAUNCHER", "1")
+    assert direct.run() == 0
+    (cmd, kwargs), = direct.done
+    assert cmd[1] == "-c" and kwargs["env"]["TURBOADB_NO_LAUNCHER"] == "1"
+
+
+def test_without_pyqt5_a_copy_hands_the_start_over(direct, monkeypatch):
+    """The GUI is the wheel's executable there, which turboadb-gui starts: a
+    TurboADB.exe shortcut written on such an install opened nothing."""
+    monkeypatch.setattr(launcher, "has_qt", lambda: False)
+    assert direct.run() == 0
+    (cmd, _kwargs), = direct.done
+    assert cmd[1] == "-c"
+
+
+def test_a_copy_without_a_record_of_its_build_hands_the_start_over(direct):
+    os.remove(os.path.join(direct.home, "state.json"))
+    assert direct.run() == 0
+    (cmd, _kwargs), = direct.done
+    assert cmd[1] == "-c"
+
+
+def test_a_copy_that_can_not_hand_over_runs_the_gui_after_all(direct, monkeypatch):
+    monkeypatch.setattr(launcher, "_stamp", lambda: dict(_STAMP, version="4.0.1"))
+
+    def popen(cmd, **kwargs):
+        raise FileNotFoundError(2, "the interpreter is gone", cmd[0])
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+    assert direct.run() == 0 and direct.done == ["gui"]
+
+
+def test_without_pyqt5_a_copy_that_can_not_hand_over_starts_the_wheels_exe_itself(direct, monkeypatch):
+    """There is no GUI of this Python to run in the copy: turboadb-gui's way
+    to the executable in the wheel is taken there."""
+    monkeypatch.setattr(launcher, "has_qt", lambda: False)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda cmd, **kwargs: (_ for _ in ()).throw(OSError(2, "gone")))
+    monkeypatch.setattr(cli, "launch_gui", lambda argv=None: direct.done.append(("launch_gui", argv)) or 5)
+    assert direct.run(["-style", "fusion"]) == 5
+    assert direct.done == [("launch_gui", ["-style", "fusion"])]
+
+
+def test_a_copy_started_by_relaunch_does_not_check_itself_again(direct, monkeypatch):
+    """relaunch() built or checked the copy a moment ago; a copy that took a
+    start it was just handed for out of date would hand it back for ever."""
+    monkeypatch.setattr(launcher, "_stamp", lambda: dict(_STAMP, version="4.0.1"))
+    monkeypatch.setenv(launcher._CHECKED, "1")
+    assert direct.run() == 0 and direct.done == ["gui"]
+    assert launcher._CHECKED not in os.environ  # nothing the GUI starts inherits it
+
+
+def test_relaunch_tells_the_copy_that_it_was_checked(ready):
+    assert launcher.relaunch([]) == 0
+    (_cmd, _flags, kwargs), = ready["started"]
+    assert kwargs["env"][launcher._CHECKED] == "1"
+
+
+def test_the_hand_over_runs_this_turboadb_in_the_real_python(tmp_path):
+    """A source checkout goes first on the path, as python main.py has it; an
+    installed TurboADB is taken from where the interpreter finds it."""
+    root = tmp_path / "checkout"
+    (root / "turboadb").mkdir(parents=True)
+    (root / "turboadb" / "__init__.py").write_text("")
+    (root / "turboadb" / "cli.py").write_text(
+        "import json, sys\n"
+        "def launch_gui(argv):\n"
+        "    print(json.dumps({'argv': argv, 'path': sys.path, 'file': __file__}))\n"
+        "    return 7\n")
+
+    def hand_over(**env):
+        env = dict({k: v for k, v in os.environ.items() if k != "PYTHONPATH"}, **env)
+        # -S: without its site folders this Python has no TurboADB of its own
+        # that a wrong path could start in place of the stand-in
+        out = subprocess.run([sys.executable, "-S", "-c", launcher._HAND_OVER, str(root), "-style", "fusion"],
+                             capture_output=True, text=True, timeout=60, cwd=str(tmp_path), env=env)
+        assert out.returncode == 7, out.stderr
+        return json.loads(out.stdout)
+
+    seen = hand_over()
+    assert seen["argv"] == ["-style", "fusion"] and seen["path"][0] == str(root)
+    assert os.path.dirname(seen["file"]) == str(root / "turboadb")
+    seen = hand_over(PYTHONPATH=str(root))  # on the interpreter's own path, as an installed one is
+    assert seen["path"].count(str(root)) == 1 and os.path.dirname(seen["file"]) == str(root / "turboadb")
+
+
+def test_a_copy_takes_its_python_from_its_own_cfg(monkeypatch, tmp_path):
+    """Before Python 3.11 sys._base_executable names TurboADB.exe itself in
+    the copy, so it looked for pythonw.exe in its own folder and could not
+    tell what it was built of."""
+    home = tmp_path / "copy"
+    home.mkdir()
+    (home / "pyvenv.cfg").write_text("home = C:\\Python38\ninclude-system-site-packages = false\n")
+    monkeypatch.setattr(sys, "_base_executable", str(home / "bin" / "TurboADB.exe"), raising=False)
+    assert launcher._base_dir() == str(home / "bin")  # any other Python: its own
+    monkeypatch.setattr(launcher, "BRANDED", True)
+    monkeypatch.setattr(launcher, "_HOME", str(home))
+    assert launcher._base_dir() == "C:\\Python38"
+
+
 def test_a_program_file_in_use_is_replaced_once_it_is_free(monkeypatch, tmp_path):
     """An update starts the new TurboADB while the old TurboADB.exe closes."""
     tries = []
@@ -284,7 +444,107 @@ def test_copies_for_a_python_that_is_gone_are_removed(tmp_path):
     assert sorted(os.listdir(root)) == ["alive", "junk", "keep"]
 
 
+def _copy_for(folder, name, python, **state):
+    """A launcher copy in ``folder/name`` for the Python in *python*, with
+    *state* in its ``state.json``."""
+    home = folder / name
+    home.mkdir(parents=True)
+    (home / "pyvenv.cfg").write_text(f"home = {python}\ninclude-system-site-packages = false\n")
+    (home / "state.json").write_text(json.dumps(dict({"built": {}, "ok": True}, **state)))
+    return home
+
+
+def test_copies_for_a_deleted_environment_or_checkout_are_removed(tmp_path):
+    """Each environment and each checkout has a copy of its own, and only the
+    ones of an uninstalled Python ever went: those of a deleted venv, a
+    removed worktree or a recycled uvx environment stayed for good."""
+    python = tmp_path / "Python311"
+    python.mkdir()
+    (python / "pythonw.exe").write_bytes(b"MZ")
+    venv, checkout = tmp_path / "venv", tmp_path / "checkout"
+    venv.mkdir()
+    checkout.mkdir()
+    root = tmp_path / "launcher"
+    here = {"prefix": str(venv), "root": str(checkout)}
+    _copy_for(root, "keep", python, **here)
+    _copy_for(root, "alive", python, **here)
+    _copy_for(root, "venv-gone", python, prefix=str(tmp_path / "deleted-venv"), root=str(checkout))
+    _copy_for(root, "checkout-gone", python, prefix=str(venv), root=str(tmp_path / "removed-worktree"))
+    _copy_for(root, "unrecorded", python)
+    kept = ["alive", "keep", "unrecorded"]
+    if os.name == "nt":  # a drive that is not connected says nothing about what is on it
+        import string
+
+        free = next(f"{letter}:/" for letter in reversed(string.ascii_uppercase)
+                    if not os.path.exists(f"{letter}:/"))
+        _copy_for(root, "unplugged", python, prefix=free + "venv", root=free + "checkout")
+        kept.append("unplugged")
+    launcher._forget_orphans(str(root / "keep"))
+    assert sorted(os.listdir(root)) == sorted(kept)
+
+
+def test_a_new_copy_records_its_environment_and_its_turboadb(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    origin = {"executable": sys.executable, "root": str(tmp_path / "checkout"), "path": [], "sites": []}
+    monkeypatch.setattr(launcher, "supported", lambda: True)
+    monkeypatch.setattr(launcher, "_origin", lambda: origin)
+    monkeypatch.setattr(launcher, "_stamp", lambda: {"format": 1, "version": "4.0.0"})
+    monkeypatch.setattr(launcher, "_build", lambda rt: os.makedirs(os.path.dirname(rt.exe)) or open(rt.exe, "wb").close())
+    monkeypatch.setattr(launcher, "_probe", lambda rt: True)
+    monkeypatch.setattr(launcher, "_Lock", lambda home: contextlib.nullcontext())
+    rt = launcher.runtime()
+    assert rt is not None
+    with open(os.path.join(rt.home, "state.json"), encoding="utf-8") as fh:
+        state = json.load(fh)
+    assert state["prefix"] == os.path.abspath(sys.prefix) and state["root"] == origin["root"]
+    assert state["ok"] is True and launcher.runtime(build=False) == rt  # and it is still read as built
+
+
+# the head of turboadb_launch.py as 3.0 and 3.1 wrote it
+_OLDER_SCRIPT = (
+    "# TurboADB's GUI in TurboADB.exe, for {root!r} on Python 3.11.9.\n"
+    "# Generated by turboadb.launcher: edits are overwritten.\n"
+    "import os\n"
+    "import site\n"
+    "import sys\n"
+    "\n"
+    "HOME = {home!r}\n"
+    "EXECUTABLE = {executable!r}\n"
+    "PATH = {path!r}\n"
+    "SITES = {sites!r}\n"
+)
+
+
+def test_a_copy_made_before_the_record_is_judged_by_its_script(tmp_path):
+    """Copies of 3.0 and 3.1 have no record: their script names the
+    interpreter and the TurboADB folder they were made for."""
+    python = tmp_path / "Python311"
+    python.mkdir()
+    (python / "pythonw.exe").write_bytes(b"MZ")
+    venv, checkout = tmp_path / "venv", tmp_path / "checkout"
+    (venv / "Scripts").mkdir(parents=True)
+    checkout.mkdir()
+    root = tmp_path / "launcher"
+
+    def older(name, executable, folder):
+        home = _copy_for(root, name, python)
+        script = launcher._runtime_at(str(home)).script
+        os.makedirs(os.path.dirname(script))
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_OLDER_SCRIPT.format(root=str(folder), home=str(home), executable=str(executable),
+                                          path=[str(folder)], sites=[]))
+
+    older("keep", venv / "Scripts" / "pythonw.exe", checkout)
+    older("alive", venv / "Scripts" / "pythonw.exe", checkout)
+    older("venv-gone", tmp_path / "deleted-venv" / "Scripts" / "pythonw.exe", checkout)
+    older("checkout-gone", venv / "Scripts" / "pythonw.exe", tmp_path / "removed's worktree")
+    launcher._forget_orphans(str(root / "keep"))
+    assert sorted(os.listdir(root)) == ["alive", "keep"]
+
+
 def test_shortcuts_start_turboadb_exe(monkeypatch):
+    monkeypatch.setattr(launcher, "has_qt", lambda: True)  # it runs the GUI of this Python: only with PyQt5
     monkeypatch.setattr(launcher, "gui_command",
                         lambda build=True: ("C:\\t\\bin\\TurboADB.exe", ["-m", "turboadb_launch"], "C:\\t"))
     assert cli._resolve_gui_target() == ("C:\\t\\bin\\TurboADB.exe", "-m turboadb_launch", "C:\\t")
@@ -353,6 +613,24 @@ def test_turboadb_exe_is_built_named_and_started(own_home):
     # pip, the update checks and helper processes run the real Python
     assert os.path.normcase(report["executable"]) == os.path.normcase(windowless_python())
     assert os.path.normcase(report["image"]) == os.path.normcase(rt.exe)
+
+
+@windows_only
+def test_turboadb_exe_sees_what_it_was_built_of_as_its_builder_does(own_home):
+    """Else every start from a shortcut would take the copy for out of date."""
+    rt = launcher.runtime()
+    assert rt is not None, "TurboADB.exe could not be built or did not start"
+    out = subprocess.run([rt.exe, "-m", "turboadb_launch", "--probe"], capture_output=True, text=True,
+                         timeout=60, cwd=rt.home)
+    report = json.loads(next(line for line in out.stdout.splitlines() if line.startswith(launcher._MARK))
+                        [len(launcher._MARK):])
+    with open(os.path.join(rt.home, "state.json"), encoding="utf-8") as fh:
+        state = json.load(fh)
+    assert report["stamp"] == state["built"]["stamp"] == json.loads(json.dumps(launcher._stamp()))
+    import turboadb
+
+    assert state["prefix"] == os.path.abspath(sys.prefix)
+    assert state["root"] == os.path.dirname(os.path.dirname(os.path.abspath(turboadb.__file__)))
 
 
 @windows_only
@@ -435,6 +713,62 @@ def test_shortcuts_carry_the_app_id_and_keep_it_when_their_icon_follows_the_mode
     assert winshell.read_shortcut(older)["icon"] == light
     assert winshell.read_shortcut(other)["icon"] == str(tmp_path / "dark.ico")
     assert winshell.sync_shortcut_icons(light, [ours, older]) == []  # already
+
+
+@windows_only
+def test_a_shortcut_to_a_copy_of_the_exe_is_pointed_at_what_starts_turboadb(tmp_path, monkeypatch):
+    """Up to 3.1 a pin made of the wheel's exe started the copy it ran from,
+    in the temp folder: the old version for as long as that copy was there
+    (which wrote the other shortcuts back to itself), and nothing once it was
+    deleted."""
+    monkeypatch.setattr(winshell, "notify_changed", lambda paths: None)
+    icon = str(tmp_path / "dark.ico")
+    temp, scripts = tmp_path / "temp", tmp_path / "Scripts"
+    for folder in (temp, scripts):
+        folder.mkdir()
+    starter, still_there = scripts / "turboadb-gui.exe", temp / "turboadb-gui-3.1.0-21.exe"
+    for path in (starter, still_there):
+        path.write_bytes(b"MZ")
+    gone = str(temp / "turboadb-gui-3.1.0-20.exe")
+    dead, alive, branded, other = (str(tmp_path / n) for n in ("dead.lnk", "alive.lnk", "branded.lnk", "other.lnk"))
+    assert winshell.write_shortcut(dead, gone, "--x", str(temp), icon, "TurboADB")
+    assert winshell.write_shortcut(alive, str(still_there), "", str(temp), icon, "TurboADB")
+    assert winshell.write_shortcut(branded, str(tmp_path / "gone" / "TurboADB.exe"), "-m turboadb_launch",
+                                   str(tmp_path), icon, "TurboADB")  # not a copy of the exe: not ours to judge
+    assert winshell.write_shortcut(other, str(tmp_path / "gone" / "notepad.exe"), "", str(tmp_path), icon,
+                                   "Other", app_id="Someone.Else")
+    before = {path: winshell.read_shortcut(path) for path in (branded, other)}
+
+    # what starts TurboADB is itself such a copy: nothing to point at
+    assert winshell.revive_shortcuts([dead, alive], str(still_there), "", str(temp)) == []
+    changed = winshell.revive_shortcuts([dead, alive, branded, other], str(starter), "", str(scripts))
+    assert changed == [dead, alive]
+    for path in changed:  # its app ID and icon stay
+        assert winshell.read_shortcut(path) == {"target": str(starter), "args": "", "workdir": str(scripts),
+                                                "icon": icon, "app_id": winshell.APP_ID}
+    assert {path: winshell.read_shortcut(path) for path in before} == before
+    assert winshell.revive_shortcuts([dead, alive, branded, other], str(starter), "", str(scripts)) == []
+
+
+def test_a_pin_made_of_a_window_is_found_beside_the_pinned_shortcuts(tmp_path, monkeypatch):
+    """A pin of a shortcut is kept in User Pinned\\TaskBar.  Of a window whose
+    app ID no Start-menu shortcut has, Windows makes a shortcut of its own in
+    a folder under ImplicitAppShortcuts: there a pin of TurboADB's window
+    never followed the taskbar's mode, and stayed on a copy of the exe that
+    was gone."""
+    pinned = tmp_path / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned"
+    of_shortcuts, of_windows = pinned / "TaskBar", pinned / "ImplicitAppShortcuts"
+    for folder in (of_shortcuts, of_windows / "58dc9c9c4a87b968", of_windows / "d356105fac5527ef"):
+        folder.mkdir(parents=True)
+    wanted = [of_shortcuts / "TurboADB.lnk", of_windows / "58dc9c9c4a87b968" / "TurboADB.lnk",
+              of_windows / "d356105fac5527ef" / "Other.LNK"]
+    for path in wanted + [of_shortcuts / "desktop.ini", of_windows / "notes.txt",
+                          of_windows / "58dc9c9c4a87b968" / "desktop.ini"]:
+        path.write_bytes(b"")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert sorted(winshell.pinned_shortcuts()) == sorted(str(path) for path in wanted)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "no-such-profile"))
+    assert winshell.pinned_shortcuts() == []
 
 
 def test_turboadbs_shortcuts_are_known_with_or_without_the_app_id():

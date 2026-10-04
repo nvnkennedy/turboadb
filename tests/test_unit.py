@@ -1443,6 +1443,8 @@ def test_nested_adb_shell_never_uses_local_path_completion(qapp, tmp_path):
     assert widget._shell_cwd == str(tmp_path)
 
     widget._send(b"exit\n")
+    assert widget._in_adb_shell  # until PowerShell's own prompt shows that it ended
+    widget._feed_from(widget.reader, f"exit\r\nPS {tmp_path}> ".encode("utf-8"))
     assert not widget._in_adb_shell and widget.term._completion_fn is not None
     widget.close_panel()
 
@@ -1601,6 +1603,7 @@ def test_console_paste_clipboard_method(qapp):
 
 
 def test_is_adb_server_alive_and_socket_devices():
+    from turboadb.exceptions import ADBNotFoundError
     from turboadb.tools import is_adb_server_alive
     from turboadb.devices import _list_devices_socket, list_devices
 
@@ -1613,8 +1616,12 @@ def test_is_adb_server_alive_and_socket_devices():
     if alive:
         assert sock_devs is not None
         assert isinstance(sock_devs, list)
-    devs = list_devices()
-    assert isinstance(devs, list)
+    try:
+        devs = list_devices()
+    except ADBNotFoundError:
+        assert not alive  # no server and no adb on this machine: said, not an empty list
+    else:
+        assert isinstance(devs, list)
 
 
 def test_adb_socket_reads_partial_protocol_fields():

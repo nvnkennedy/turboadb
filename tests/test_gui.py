@@ -504,12 +504,14 @@ def test_local_shell_adb_shell_force_pty(qapp):
     w._send(b"ls\r\n")
     assert sent[-1] == b"ls\r\n"
 
-    # Exiting returns to cmd
+    # Exiting returns to cmd: its prompt says so (the word alone may only
+    # have left a shell inside the adb shell)
     w._send(b"exit\r\n")
+    assert w._in_adb_shell is True
+    w._feed_from(w.reader, b"exit\r\n\r\nC:\\w>\x1b]7717;C:\\w\x1b\\")
     assert w._in_adb_shell is False
 
     # once cmd's prompt is back, the next line is a command again
-    w._feed_from(w.reader, b"exit\r\n\r\nC:\\w>\x1b]7717;C:\\w\x1b\\")
     w._send(b"adb -s 12345 shell\r\n")
     assert sent[-1] == b"adb -s 12345 shell -t -t\r\n"
     w.close()

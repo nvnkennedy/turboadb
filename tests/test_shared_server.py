@@ -32,9 +32,11 @@ def task(monkeypatch, home):
     """schtasks, the adb server on the port and its stopper, all fakes.
 
     ``on_run`` is what running the task does; by default nothing (a task whose
-    Python cannot even import turboadb)."""
+    Python cannot even import turboadb).  ``refused`` names the schtasks
+    switches that fail, with ``error`` as what schtasks says."""
     world = types.SimpleNamespace(alive=True, everywhere=True, calls=[], on_run=lambda: None,
-                                  last_result=b"Last Result: 0x1\r\n")
+                                  last_result=b"Last Result: 0x1\r\n", refused=(),
+                                  error=b"ERROR: Access is denied.\r\n")
     monkeypatch.setattr(devices.os, "name", "nt")
     monkeypatch.setattr(devices, "find_adb", lambda p=None: r"C:\Users\me\adb.exe")
     monkeypatch.setattr(devices, "windowless_python", lambda: r"C:\Py\pythonw.exe")
@@ -54,6 +56,8 @@ def task(monkeypatch, home):
 
     def run(cmd, **kw):
         world.calls.append(tuple(cmd[:2]))
+        if any(switch in cmd for switch in world.refused):
+            return types.SimpleNamespace(returncode=1, stdout=b"", stderr=world.error)
         if "/run" in cmd:
             world.on_run()
         out = world.last_result if "/query" in cmd else b""
@@ -113,6 +117,44 @@ def test_uninstalling_the_task_forgets_its_port(task):
     devices._change_sharing(lambda data: data.__setitem__("task_port", 5050))
     assert devices.uninstall_serve_task() is True
     assert "task_port" not in devices._read_sharing()
+
+
+def _scheduler_folder(monkeypatch, tmp_path, registered):
+    """Where the scheduler keeps a file per task, with or without ours."""
+    folder = tmp_path / "Windows" / "System32" / "Tasks"
+    folder.mkdir(parents=True)
+    if registered:
+        (folder / devices._SERVE_TASK).write_text("<Task/>")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+
+
+def test_a_task_that_may_not_be_removed_is_not_taken_for_no_task(task, monkeypatch, tmp_path):
+    """Without administrator rights schtasks refuses to delete the SYSTEM task
+    and even to show it, with the exit code of a task that is not there: Stop
+    sharing said none was installed, and the task shared the devices again at
+    the next boot."""
+    devices._change_sharing(lambda data: data.__setitem__("task_port", 5050))
+    _scheduler_folder(monkeypatch, tmp_path, registered=True)
+    task.refused = ("/delete", "/query")
+    with pytest.raises(RuntimeError, match="still installed.*administrator rights") as err:
+        devices.uninstall_serve_task()
+    assert "Access is denied" in str(err.value)
+    assert devices._task_port() == 5050  # it is still what restarts that port
+
+
+def test_a_task_schtasks_shows_but_will_not_delete_is_still_installed(task, monkeypatch,
+                                                                       tmp_path):
+    _scheduler_folder(monkeypatch, tmp_path, registered=False)
+    task.refused = ("/delete",)
+    with pytest.raises(RuntimeError, match="still installed"):
+        devices.uninstall_serve_task()
+
+
+def test_no_task_is_still_reported_as_none(task, monkeypatch, tmp_path):
+    _scheduler_folder(monkeypatch, tmp_path, registered=False)
+    task.refused = ("/delete", "/query")
+    task.error = b"ERROR: The system cannot find the file specified.\r\n"
+    assert devices.uninstall_serve_task() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +242,35 @@ def test_a_plain_server_that_took_the_port_is_replaced_once(monkeypatch, home):
     monkeypatch.setattr(devices, "_list_devices_socket", lambda *a, **k: [])
     assert "listening on 0.0.0.0:5037" in devices.start_shared_server(5037)
     assert (world.kills, world.launches) == (2, 2)
+
+
+def test_a_shared_server_that_never_answers_is_not_left_running(monkeypatch, home):
+    """The start gave up and said so, but its `adb -a` stayed: it could bind
+    every interface a moment later, with the share reported as failed and no
+    port recorded."""
+
+    class Proc:
+        killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return -9
+
+    proc = Proc()
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: "adb")
+    monkeypatch.setattr(devices.subprocess, "Popen", lambda cmd, **kw: proc)
+    monkeypatch.setattr(tools, "kill_adb_server", lambda adb, port=5037, **kw: None)
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: False)
+    monkeypatch.setattr(devices, "_SHARED_START_S", 0.3)
+    with pytest.raises(RuntimeError, match="did not come up"):
+        devices.start_shared_server(5037)
+    assert proc.killed
+    assert devices.recorded_shared_ports() == []
 
 
 # --------------------------------------------------------------------------- #
@@ -311,3 +382,38 @@ def test_shared_ports_are_recorded_and_forgotten(home, monkeypatch):
     assert devices.recorded_shared_ports() == [5037]
     (home / ".turboadb" / "sharing.json").write_text("not json", encoding="utf-8")
     assert devices.recorded_shared_ports() == []  # a damaged record is only a lost hint
+
+
+# --------------------------------------------------------------------------- #
+# the programs of Windows that sharing starts
+# --------------------------------------------------------------------------- #
+def test_netsh_schtasks_and_powershell_are_started_by_their_full_path(monkeypatch, home):
+    """By its bare name a program is looked for in the current folder before
+    System32: a netsh.exe or schtasks.exe lying in the folder `turboadb serve
+    --startup-task` was run in was started in its place, as Administrator."""
+    started = []
+
+    def run(cmd, **kw):
+        started.append((cmd[0], kw.get("executable")))
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(devices.os, "name", "nt")
+    monkeypatch.setattr(devices, "windows_program", lambda name: "W:\\System32\\" + name)
+    monkeypatch.setattr(devices.subprocess, "run", run)
+    monkeypatch.setattr(devices, "find_adb", lambda p=None: r"C:\Program Files\Android\adb.exe")
+    monkeypatch.setattr(devices, "windowless_python", lambda: r"C:\Py\pythonw.exe")
+    monkeypatch.setattr(devices, "_others_can_change", lambda path: False)
+    monkeypatch.setattr(devices, "_share_keys_with_system", lambda: None)
+    monkeypatch.setattr(devices, "_serve_on", lambda port: None)
+    monkeypatch.setattr(devices, "_wait_shared", lambda port, timeout: True)
+
+    devices.open_firewall((5037,))  # netsh, and PowerShell for the Public networks
+    devices.close_firewall((5037,))
+    devices.install_serve_task(port=5037)
+    devices.restart_shared_server(5037)
+    devices._task_last_result(devices._SERVE_TASK)
+    devices.uninstall_serve_task()
+    own = {"netsh": "W:\\System32\\netsh.exe", "schtasks": "W:\\System32\\schtasks.exe",
+           "powershell": "W:\\System32\\" + tools.POWERSHELL}
+    assert {name for name, _path in started} == set(own)
+    assert [(name, path) for name, path in started if path != own[name]] == []

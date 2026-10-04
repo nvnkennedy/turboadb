@@ -11,6 +11,31 @@ from ..results import OperationResult
 
 _log = logging.getLogger(__name__)
 
+# The first Android whose `input` takes a display (-d): Android 10.
+INPUT_DISPLAY_SDK = 29
+
+
+def input_display(display_id, displays, sdk=None):
+    """The display a key or typed text for *display_id* is sent with, or None
+    for the plain command.
+
+    Android sends a key without a display to whichever display has the focus.
+    On a device with several (*displays* is how many) that need not be display
+    0: Home pressed for the centre screen went to the passenger screen someone
+    had just touched.  So display 0 is named there, like any other display.
+    It keeps the plain command on a device with one display, and on one whose
+    ``input`` takes no display: an Android before 10, or one whose version
+    (*sdk*, its API level) is not known."""
+    try:
+        display_id = int(display_id)
+    except (TypeError, ValueError):
+        display_id = 0
+    if display_id:
+        return display_id
+    if displays > 1 and sdk is not None and sdk >= INPUT_DISPLAY_SDK:
+        return 0
+    return None
+
 
 def command_error(result, rejected: str):
     """Failure text for a device command's result, or None when it worked.

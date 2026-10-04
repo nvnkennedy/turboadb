@@ -43,7 +43,10 @@ turboadb -s @bench info                           # …and use it by name
 ```
 
 `adb` and `scrcpy` download themselves into `~/.turboadb/tools` on first use, so
-they don't need to be on your PATH.
+they don't need to be on your PATH: adb on Windows, macOS and x86-64 Linux,
+scrcpy on Windows. Elsewhere TurboADB uses the ones it finds on PATH. Neither
+is ever taken from the current folder: name one you keep there with its folder
+(`--adb-path .\adb.exe`).
 
 > **Git Bash on Windows** rewrites arguments that look like Unix paths, so
 > `turboadb ls /sdcard` reaches the device as `/C:/Program Files/Git/sdcard`. Run
@@ -66,7 +69,7 @@ put `--` before the words to send them exactly as written.
 | `--adb-port PORT` | adb server port (default `5037`). |
 | `--adb-path PATH` | Use this adb executable (or the folder that holds it). A path with no adb is an error (exit `3`); TurboADB never falls back to another adb or downloads one instead. |
 | `--scrcpy-path PATH` | Use this scrcpy executable. |
-| `--timeout SECONDS` | Timeout for each command (default 60 s) and for `bugreport` (default 15 minutes). A push or pull fails only when nothing has moved for this long (default 600 s), however long it takes in all. `0` means no limit. `shell -- COMMAND` and `adb -- ARGS` run as long as they take unless `--timeout` is given. |
+| `--timeout SECONDS` | Timeout for each command (default 60 s) and for `bugreport` (default 15 minutes). A push or pull fails only when nothing has moved for this long (default 600 s), however long it takes in all. `install`, `cp` and `rm` have longer limits of their own (5 minutes for an install or a delete, 10 for a split install or a copy, and more for a large APK): a longer `--timeout` extends them, a shorter one never cuts them. `0` means no limit. `shell -- COMMAND` and `adb -- ARGS` run as long as they take unless `--timeout` is given. |
 | `--json` | Machine-readable output (see below). |
 | `-V`, `--version` | Print the TurboADB version. |
 
@@ -136,7 +139,9 @@ turboadb doctor --json
 ### `turboadb fetch-tools`
 Download adb (and scrcpy) into `~/.turboadb/tools`. `--adb-only` and
 `--scrcpy-only` are mutually exclusive — asking for both leaves nothing to
-download.
+download. adb is downloaded where Google builds it for the machine (Windows,
+macOS, Linux on x86-64) and scrcpy on Windows; a downloaded adb that does not
+run on the machine is not installed, and the adb in use stays as it is.
 
 | Option | Meaning |
 |---|---|
@@ -187,7 +192,10 @@ the TurboADB installed in this Python, so when another copy runs (a source
 checkout started with `python main.py` while an older release is installed)
 nothing is changed and the reason is printed, with the fix
 (`pip install -e <checkout>`). A shortcut that could not be refreshed is an
-error, not a success.
+error, not a success. Without PyQt5 the shortcuts start `turboadb-gui`, which
+runs the app bundled in the wheel; where nothing could start the app (no PyQt5
+and no bundled app) no shortcut is written, and the command exits `1` and says
+what to install.
 
 | Option | Meaning |
 |---|---|
@@ -210,6 +218,9 @@ turboadb gui
 ### `turboadb devices`
 List the devices on the local adb server, or on another PC's with `--adb-host`
 (or `-s @NAME` for a saved remote target — the list comes from *that* server).
+"No devices found" means the server answered with none: a missing adb exits
+`3`, and an adb server that cannot be started (or reached) exits `1` with the
+reason.
 ```bash
 turboadb devices
 turboadb --adb-host lab-pc-01 devices --json
@@ -387,7 +398,7 @@ finished), and exits `1`.
 |---|---|
 | `--su` | Run it as root: through the device's `su` (`su -c` for Magisk and SuperSU, `su 0 sh -c` for userdebug and eng builds), or as it is when adbd already runs as root. |
 | `--all` | Run the command on every online device, one after another — on the adb server `--adb-host` or `-s @NAME` selects. |
-| `--batch FILE` | Run each line of FILE as a command, in order (blank and `#` lines are skipped). Stops at the first failing command. |
+| `--batch FILE` | Run each line of FILE as a command, in order (blank and `#` lines are skipped). Stops at the first failing command. The file is read as UTF-8, with or without a byte order mark, or as UTF-16 / UTF-32 when it starts with that mark (as Notepad and Windows PowerShell's `>` write it). |
 | `--keep-going` | With `--batch`: carry on after a failing command. |
 | `COMMAND…` | The command and its arguments. |
 
@@ -464,7 +475,7 @@ sets how long it may take (default 15 minutes; `0` for no limit).
 
 | Argument | Meaning |
 |---|---|
-| `PATH` | Optional output file (a `.zip`). |
+| `PATH` | Optional output file (`.zip` is added when the name lacks it) or an existing folder (the file gets the name the device gives it). The command prints the file that was saved. |
 
 ```bash
 turboadb -s SERIAL bugreport
@@ -486,7 +497,10 @@ turboadb -s SERIAL push ./maps /sdcard/maps --timeout 3600
 ```
 
 ### `turboadb pull`
-Download a file or folder from the device, with progress.
+Download a file or folder from the device, with progress. The result counts
+what this pull copied, not what its folder held before. On Windows a name with
+a character Windows forbids (a `:`, say) is saved under a valid one, and a
+warning says which.
 ```bash
 turboadb -s SERIAL pull /sdcard/Download/log.txt .
 turboadb -s SERIAL pull /sdcard/DCIM ./photos --json
@@ -531,7 +545,8 @@ turboadb -s SERIAL rm -r /sdcard/logs
 
 ### `turboadb mv`
 Move or rename a device file or folder. When the destination is an existing
-folder, the item moves into it.
+folder, the item moves into it. A folder given its own name in other letters
+(`Docs` to `docs` on `/sdcard`, which ignores case) is renamed.
 
 | Option | Meaning |
 |---|---|
@@ -569,7 +584,7 @@ access to the file (for system files: `root` and `remount` first).
 
 | Option | Meaning |
 |---|---|
-| `--editor COMMAND` | The editor (default `$VISUAL`, then `$EDITOR`, else Notepad on Windows and `vi` elsewhere). The editor must wait until the file is closed (for VS Code: `"code --wait"`). The program is found on PATH as a console finds it (on Windows `code` is `code.cmd`), and a quoted path may contain spaces (`"\"C:\Program Files\Sublime Text\subl.exe\" -w"`). An editor that can't be found is reported before the file is pulled. |
+| `--editor COMMAND` | The editor (default `$VISUAL`, then `$EDITOR`, else Notepad on Windows and `vi` elsewhere). The editor must wait until the file is closed (for VS Code: `"code --wait"`). The program is found on PATH (on Windows `code` is `code.cmd`), never in the current folder unless it is named with its folder (`.\myedit.cmd`), and a quoted path may contain spaces (`"\"C:\Program Files\Sublime Text\subl.exe\" -w"`). An editor that can't be found is reported before the file is pulled. |
 
 ```bash
 turboadb -s SERIAL edit /data/local/tmp/config.ini
@@ -621,14 +636,16 @@ Uninstall a package.
 | Option | Meaning |
 |---|---|
 | `PACKAGE` | The package name. |
-| `--keep-data` | Keep the app's data and cache. |
+| `--keep-data` | Keep the app's data and cache. `adb uninstall` refuses that option, so the device's own package manager is asked (`cmd package uninstall -k`, or `pm uninstall -k`). |
 
 ```bash
 turboadb -s SERIAL uninstall com.example.app
 ```
 
 ### `turboadb clear`
-Clear an app's data (`pm clear`).
+Clear an app's data (`pm clear`). On a device with several users (Android
+Automotive, where the driver is not user 0) it clears the foreground user's
+copy of the app.
 ```bash
 turboadb -s SERIAL clear com.example.app
 ```
@@ -671,13 +688,15 @@ turboadb -s SERIAL stop com.example.app
 ```
 
 ### `turboadb grant`
-Grant a runtime permission (`pm grant`).
+Grant a runtime permission (`pm grant`), to the foreground user's copy of the
+app on a device with several users (see [`clear`](#turboadb-clear)).
 ```bash
 turboadb -s SERIAL grant com.example.app android.permission.ACCESS_FINE_LOCATION
 ```
 
 ### `turboadb revoke`
-Revoke a runtime permission (`pm revoke`).
+Revoke a runtime permission (`pm revoke`), for the foreground user's copy of
+the app on a device with several users.
 ```bash
 turboadb -s SERIAL revoke com.example.app android.permission.CAMERA
 ```
@@ -726,7 +745,7 @@ saves the file.
 
 | Option | Meaning |
 |---|---|
-| `PATH` | Output `.mp4` file. |
+| `PATH` | Output `.mp4` file, or a folder (one that exists, or a path ending in a separator): the recording is saved there as `recording-YYYYMMDD-HHMMSS.mp4`, and recordings started in the same second each get a file of their own. |
 | `--time-limit SECONDS` | Length (default `30`; Android caps one recording at 180). |
 | `--size WxH` | Video size, for example `1280x720`. |
 | `--bit-rate RATE` | For example `8M`. |
@@ -885,7 +904,8 @@ turboadb -s SERIAL tap-burst 960 360 --count 2000 --display 2 --json
 
 ### `turboadb touch-device`
 The touchscreen `tap-burst` can write to: its input node, size in event units,
-protocol, and whether the adb shell may send events to it.
+protocol, and whether the adb shell may send events to it. It exits `1` when
+no touchscreen is found, with `--json` too (which then prints `null`).
 ```bash
 turboadb -s SERIAL touch-device
 turboadb -s SERIAL touch-device --json
@@ -1102,7 +1122,9 @@ turboadb -s SERIAL end-call
 ```
 
 ### `turboadb call-state`
-The call state: `idle`, `ringing` or `in call`.
+The call state: `idle`, `ringing` or `in call` (every SIM counts), or `unknown`
+when the device answers without one (it has no telephony). A device that could
+not be asked is an error (exit `1`), not `unknown`.
 ```bash
 turboadb -s SERIAL call-state
 ```
@@ -1302,14 +1324,18 @@ a download would put a second adb in another profile and bind port 5037 with it.
 Run `turboadb fetch-tools` (or set `TURBOADB_ADB`) if adb is missing there. The
 startup task and the login launcher run the same adb the server was started
 with (`--adb-path`, or the one TurboADB finds), so they never replace it with
-another version.
+another version. The startup task runs as SYSTEM, so an adb that accounts
+without administrator rights could change (the downloaded one in
+`~/.turboadb/tools`) is copied to `%ProgramFiles%\TurboADB\adb`, where only
+administrators can change it, and the task runs that copy; `--startup-task`
+warns when the Python it runs can be changed without administrator rights.
 
 | Option | Meaning |
 |---|---|
 | `--port PORT` | adb server port (default: `--adb-port`, which is `5037` unless given). |
 | `--startup-task` | Keep sharing across reboots with a headless SYSTEM startup task. |
 | `--install-startup` | Start sharing at login instead. |
-| `--uninstall-startup` | Remove the auto-start again. |
+| `--uninstall-startup` | Remove the auto-start again: the login launcher and the startup task. Removing the task needs Administrator; when it is still installed the command says so and exits `1`. |
 | `--status` | Report whether the adb server is shared. |
 | `--stop` | Stop sharing and go back to a local-only adb server. |
 | `--json` | Print `{"ok": …, "port": …, "messages": [...]}` (and `"errors"` for a step that failed), or with `--status` `{"port": …, "shared": …}`. |
@@ -1324,7 +1350,9 @@ turboadb serve --stop
 ### `turboadb deploy-serve`
 Set up `turboadb serve` on remote Windows PCs from your machine, over WinRM
 (NTLM). Needs `pip install "turboadb[winrm]"`; each target needs WinRM enabled
-(`Enable-PSRemoting -Force`) and an admin account.
+(`Enable-PSRemoting -Force`) and an admin account. A target that has Python
+and TurboADB but no adb gets adb downloaded first, and what `serve` warns about
+there is passed on.
 
 | Option | Meaning |
 |---|---|
@@ -1349,7 +1377,7 @@ turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user" --ssl
 
 | Script | What it does |
 |---|---|
-| `turboadb-gui` | Start the desktop app (on Windows it runs the bundled executable when PyQt5 isn't installed). |
+| `turboadb-gui` | Start the desktop app (on Windows it runs the bundled executable when PyQt5 isn't installed, from a copy in `~/.turboadb/gui`). |
 | `turboadb-docs` | Open the documentation website (or the bundled README offline). |
 | `turboadb-shortcut` | Create Desktop and Start-menu shortcuts (Windows). |
 

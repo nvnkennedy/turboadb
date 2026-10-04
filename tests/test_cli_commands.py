@@ -187,6 +187,27 @@ def test_shell_batch(run, tmp_path):
     assert dev.called("shell_many") == [((["echo 1", "echo 2"],), {"stop_on_error": False, "su": False})]
 
 
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-16-be", "utf-32"])
+def test_shell_batch_reads_files_as_windows_editors_save_them(run, tmp_path, encoding):
+    """Notepad and Windows PowerShell start a UTF-8 file with a byte order
+    mark, and PowerShell's ``>`` writes UTF-16: the mark went to the device
+    in front of the first line (a leading comment ran as a command), and a
+    UTF-16 file could not be read at all."""
+    import codecs
+
+    text = "# set up\r\necho 1\r\n\r\nsetprop debug.x été\r\n"
+    data = text.encode(encoding)
+    if encoding == "utf-16-be":
+        data = codecs.BOM_UTF16_BE + data
+    batch = tmp_path / "cmds.txt"
+    batch.write_bytes(data)
+    dev = FakeDev(shell_many=[_result("1\n"), _result("")])
+    rc, out, _ = run(["shell", "--batch", str(batch)], dev)
+    assert rc == 0 and "$ echo 1" in out
+    assert dev.called("shell_many") == [
+        ((["echo 1", "setprop debug.x été"],), {"stop_on_error": True, "su": False})]
+
+
 def test_shell_all_runs_on_every_online_device(run, monkeypatch, capsys):
     online = types.SimpleNamespace
     monkeypatch.setattr(cli, "list_devices", lambda *a, **k: [
@@ -333,7 +354,7 @@ def test_edit_picks_the_editor_and_reports_the_engine_result(run, monkeypatch):
         return 0
 
     monkeypatch.setattr(cli.subprocess, "call", editor)
-    monkeypatch.setattr("shutil.which", lambda name, *a, **k: "/opt/bin/" + name)
+    monkeypatch.setattr(cli, "_on_path", lambda name: "/opt/bin/" + name)
     dev = _edit_dev()
     rc, out, _ = run(["edit", "/data/x.ini", "--editor", "myeditor"], dev)
     assert rc == 0 and "Saved /data/x.ini" in out
@@ -359,7 +380,7 @@ def test_edit_uses_the_EDITOR_environment_variable(run, monkeypatch):
     monkeypatch.delenv("VISUAL", raising=False)
     monkeypatch.setenv("EDITOR", "nano -w")
     monkeypatch.setattr(cli.subprocess, "call", lambda cmd: seen.setdefault("cmd", cmd) and 0)
-    monkeypatch.setattr("shutil.which", lambda name, *a, **k: "/usr/bin/" + name)
+    monkeypatch.setattr(cli, "_on_path", lambda name: "/usr/bin/" + name)
     assert run(["edit", "/data/x.ini"], _edit_dev())[0] == 0
     assert seen["cmd"][:2] == ["/usr/bin/nano", "-w"]
 
@@ -538,6 +559,32 @@ def test_serve_failures_go_to_stderr(run, monkeypatch):
     assert rc == 1
     assert "access denied" in err and "access denied" not in out
     assert "adb server shared" in out  # the good news still goes to stdout
+
+
+def test_serve_says_when_the_startup_task_could_not_be_removed(run, monkeypatch):
+    """A SYSTEM task that takes administrator rights to delete was reported as
+    "No auto-start was installed", exit 0, and shared the devices again at the
+    next boot."""
+    import turboadb.devices as devices
+
+    def refuse():
+        raise RuntimeError("the SYSTEM startup task is still installed: access is denied")
+
+    monkeypatch.setattr(devices, "uninstall_startup", lambda: True)
+    monkeypatch.setattr(devices, "uninstall_serve_task", refuse)
+    rc, out, err = run(["serve", "--uninstall-startup"])
+    assert rc == 1 and "still installed" in err and "as Administrator" in err
+    assert "login auto-start" in out  # what did go is still said
+    assert "No auto-start was installed" not in out + err
+
+    rc, out, err = run(["serve", "--uninstall-startup", "--json"])
+    doc = json.loads(out)
+    assert rc == 1 and doc["ok"] is False and "still installed" in doc["errors"][0]
+
+    monkeypatch.setattr(devices, "uninstall_serve_task", lambda: False)
+    monkeypatch.setattr(devices, "uninstall_startup", lambda: False)
+    rc, out, _ = run(["serve", "--uninstall-startup"])
+    assert rc == 0 and "No auto-start was installed" in out
 
 
 def test_serve_never_auto_fetches_tools(run, monkeypatch):

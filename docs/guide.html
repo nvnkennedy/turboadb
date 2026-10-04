@@ -108,7 +108,10 @@ dev.connect()</code></pre></div></div>
             shell with TurboADB's <code>adb</code> first on PATH and
             <code>ANDROID_SERIAL</code> set — Python, Git and <code>where</code> work
             like in a normal console, and <b>Stop</b> works like Ctrl+C in a console
-            window: the command stops and the shell keeps its folder and variables.
+            window: the command stops and the shell keeps its folder and variables
+            (a program that answers Ctrl+C, such as a <code>python</code> prompt,
+            keeps running; a shell still waiting for an answer three seconds
+            later gets a fresh shell in the same folder).
             Inside an <code>adb shell</code> typed there,
             <b>Stop</b> stops only the device command and keeps you in adb shell;
             if the command ignores it, Stop again reopens adb shell in the same
@@ -117,9 +120,11 @@ dev.connect()</code></pre></div></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL shell -- getprop ro.build.version.release</code></pre></div></div>
         <div class="mode"><span class="tag py">Python</span>
-          <div class="code"><pre><code>r = dev.shell("getprop ro.product.model")
+          <div class="code"><pre><code>import time
+r = dev.shell("getprop ro.product.model")
 print(r.stdout, r.ok)
-sess = dev.open_shell(); sess.send("ls /sdcard\n"); print(sess.read())</code></pre></div></div>
+sess = dev.open_shell(); sess.send("ls /sdcard\n")
+time.sleep(0.5); print(sess.read())   # read() never waits: it returns what has arrived</code></pre></div></div>
       </article>
 
       <!-- LOGCAT -->
@@ -161,10 +166,13 @@ for line in dev.iter_lines(["logcat", "-v", "threadtime"]):
           any app you pick with <b>Open with…</b>. A device file opens as a copy, and
           each time you save it there it goes back to the device (TurboADB asks first if
           the device file changed meanwhile). Programs are never started; scripts and
-          files no app opens go to the built-in editor.</p>
+          files no app opens go to the built-in editor, which asks the same before
+          it saves over a device file that changed since you opened it.</p>
           <p class="step">Drag beside the names to select a block, <b>Ctrl+A</b> for
           all, <b>Enter</b> to open, <b>Backspace</b> to go up. <b>Delete</b> sends
-          local files to the Recycle Bin, <b>Shift+Delete</b> deletes for good. If the
+          local files to the Recycle Bin, <b>Shift+Delete</b> deletes for good. A PC
+          file or folder whose name ends in a dot or a space (made by WSL, Git Bash
+          or a Linux drive) is left alone, with a message saying why. If the
           device refuses a change, TurboADB offers <b>adb root</b>,
           <b>disable-verity</b> and <b>remount</b>, then tries again.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
@@ -274,7 +282,10 @@ dev.mirror(ScrcpyOptions(video_source="camera", camera_facing="front"))</code></
         <div class="mode"><span class="tag gui">GUI</span>
           <p class="step"><b>Screenshot</b> at the right end of the section tabs;
           <b>Record…</b> in the Device Control screen toolbar. With the screen live, a
-          second, windowless recorder runs beside it and saves a playable MP4.</p></div>
+          second, windowless recorder runs beside it and saves a playable MP4.
+          Closing TurboADB while a recording runs or is still being saved waits for
+          it: a dialog names the file, and <b>Close without saving</b> is the way
+          out.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb -s SERIAL screenshot shot.png
 turboadb -s SERIAL record clip.mp4 --time-limit 20 --size 1280x720</code></pre></div></div>
@@ -313,7 +324,9 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
             host</b>, <b>User</b>, <b>Domain</b> and <b>Password</b>.</li>
             <li><b>Scan cameras</b>, then <b>Start camera</b> — TurboADB uses the same
             WinRM/NTLM path as <code>deploy-serve</code> to launch ffmpeg on the
-            remote and stream its camera back over a direct TCP socket.</li>
+            remote and stream its camera back over a direct TCP socket. Each
+            stream uses a port of its own (28100–28115): open that range in a
+            firewall between the PCs to view more than one.</li>
           </ol>
           <p class="muted">The target needs WinRM on (<code>Enable-PSRemoting
           -Force</code>) and the account a local admin. ffmpeg is downloaded onto the
@@ -321,7 +334,9 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
           <code>%USERPROFILE%\.turboadb\ffmpeg\</code>). The host / user / domain are
           remembered and the password is kept in the Windows Credential vault, never
           in a file. A physical USB camera works headlessly; a
-          camera redirected into an RDP session is only visible inside it.</p></div>
+          camera redirected into an RDP session is only visible inside it.
+          <b>Record</b> encodes on this PC, and offers the one-time ffmpeg download
+          when this PC has none.</p></div>
         <div class="mode"><span class="tag note">Note</span>
           <p class="step">The webcam is a desktop feature (not an adb device op, so
           there's no CLI / Python call). Bring your own ffmpeg via <b>Settings →
@@ -334,10 +349,13 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
         <div class="mode"><span class="tag gui">GUI</span>
           <ol class="steps">
             <li>Open the device's <b>Phone</b> tab. The pill shows <b>Idle</b>,
-            <b>Ringing</b> or <b>In call</b>.</li>
+            <b>Ringing</b> or <b>In call</b>, and <b>Checking…</b> while the device
+            does not answer (it is rebooting or unplugged): the page loads again
+            once the device is back.</li>
             <li>Type a number or use the keypad (hold <b>0</b> for +), then <b>Call</b>,
             <b>End</b> or <b>Answer</b>. <b>Open in dialler</b> (or Enter) only opens
-            the device dialler pre-filled.</li>
+            the device dialler pre-filled. While the pill shows <b>Idle</b>,
+            <b>End</b> sends nothing.</li>
             <li>Switch between <b>Recent calls</b> and <b>Messages</b>. <b>Call back</b>
             fills the dialler; <b>Compose in Messages</b> opens a draft on the device,
             where you press Send.</li>
@@ -395,9 +413,11 @@ dev.connect()</code></pre></div></div>
         <div class="mode"><span class="tag gui">GUI</span>
           <p class="step"><b>ADB server ▾ → Share THIS PC's devices…</b> (<b>Start
           once</b> or <b>Start + run at login</b>; opening the firewall needs
-          Administrator). To undo it, <b>ADB server ▾ → Stop sharing &amp; remove
+          Administrator, and sharing ends on a warning when the firewall may keep
+          other machines out). To undo it, <b>ADB server ▾ → Stop sharing &amp; remove
           auto-start</b> — stops sharing and removes both the login launcher and the
-          SYSTEM startup task.</p>
+          SYSTEM startup task. Removing that task needs Administrator too: TurboADB
+          says so when it is still installed.</p>
           <p class="muted">The shared adb server has no password: anyone who can reach
           its port can control the devices. The firewall rules therefore apply on
           Domain and Private networks only; on a network Windows calls Public nobody
@@ -410,7 +430,7 @@ turboadb serve --uninstall-startup   # stop auto-start again</code></pre></div><
           <div class="code"><pre><code>from turboadb.devices import (start_shared_server, install_serve_task,
                               stop_shared_server, uninstall_serve_task)
 start_shared_server(); install_serve_task()
-# undo:
+# undo (uninstall_serve_task raises RuntimeError when the task could not be removed):
 uninstall_serve_task(); stop_shared_server()</code></pre></div></div>
       </article>
 
@@ -461,7 +481,9 @@ deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password", on_status=p
         <h3>Keep things up to date</h3>
         <div class="mode"><span class="tag gui">GUI</span>
           <p class="step"><b>Tools ▾ → Check for updates…</b> updates TurboADB from
-          PyPI, refreshes adb/scrcpy, and restarts. <b>Tools ▾ → Download and
+          PyPI, refreshes adb/scrcpy, and restarts. The standalone Windows app and
+          a source checkout, which pip cannot update, are told when a newer version
+          is out and how to get it. <b>Tools ▾ → Download and
           reinstall ADB and scrcpy…</b> refreshes only the tools.</p></div>
         <div class="mode"><span class="tag cli">CLI</span>
           <div class="code"><pre><code>turboadb self-update      # TurboADB + adb/scrcpy

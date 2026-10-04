@@ -113,6 +113,47 @@ def test_a_scan_asked_for_meanwhile_on_another_page_is_not_dropped(qapp, monkeyp
         dlg.deleteLater()
 
 
+_UNREACHABLE = (
+    "Could not reach the adb server at 10.0.0.7:5037. On that machine run:  adb -a nodaemon "
+    "server start  (and allow TCP 5037 through its firewall). (* daemon not running; starting "
+    "now at tcp:5037 adb.exe: failed to connect to '10.0.0.7:5037': cannot connect to "
+    "10.0.0.7:5037: No connection could be made because the target machine actively refused "
+    "it. (10061) * failed to start daemon error: cannot connect to daemon at tcp:10.0.0.7:5037)"
+)
+
+
+@pytest.mark.parametrize("page, host", [(0, None), (2, "10.0.0.7")])
+def test_a_failed_scan_does_not_widen_the_dialog(qapp, monkeypatch, page, host):
+    """The status line took the whole error text on one line: the dialog grew
+    to twice the width of the screen, its Connect button out of reach, and
+    stayed that wide."""
+    _Scan.made = []
+    monkeypatch.setattr(connect_dialog, "_ScanThread", _Scan)
+    monkeypatch.setattr(connect_dialog, "park_thread", lambda thread: None)
+    dlg = connect_dialog.ConnectDialog()  # scans USB at once
+    try:
+        dlg.show()  # laid out, on the offscreen platform
+        if host:
+            _Scan.made[0].done.emit([])
+            dlg.rem_host.setCurrentText(host)
+        dlg.mode.setCurrentIndex(page)  # the Remote page scans a known host at once
+        for _ in range(3):
+            qapp.processEvents()
+        width = dlg.width()
+        assert _Scan.made[-1].host == host
+        _Scan.made[-1].fail.emit(_UNREACHABLE)
+        for _ in range(3):
+            qapp.processEvents()
+        status = dlg.rem_status if host else dlg.usb_status
+        assert status.text() == _UNREACHABLE  # all of it, on as many lines as it needs
+        assert status.toolTip() == _UNREACHABLE  # and in reach when the dialog is short
+        assert dlg.width() == width
+        assert dlg.minimumSizeHint().width() <= width
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+
 # --------------------------------------------------------------------------- #
 # starting a shared server from the dialog
 # --------------------------------------------------------------------------- #
@@ -142,6 +183,7 @@ class _Window(QWidget):
         self._timer.start(60000)
         self.tabs = [_Tab()]
         self.polled = 0
+        self.logged = []
 
     def _server_task_running(self):
         return self.busy or (self._share is not None and self._share.isRunning())
@@ -154,6 +196,9 @@ class _Window(QWidget):
 
     def _poll_devices(self):
         self.polled += 1
+
+    def _log(self, text):
+        self.logged.append(text)
 
 
 @pytest.fixture
@@ -238,6 +283,192 @@ def test_a_busy_server_is_not_shared_on_top(qapp, share):
         assert dlg._serve is None and share["asked"] == []
         assert "busy" in dlg.rem_status.text()
     finally:
+        dlg.deleteLater()
+        window.deleteLater()
+
+
+_NO_RULE = ("firewall: could not open ports (run TurboADB/`turboadb serve` as Administrator, "
+            "or open TCP 5037 + 27183-27199 manually)")
+_OPENED = ("firewall: opened TCP 5037, 27183-27199 on Domain and Private networks. The adb "
+           "server has no password: share it on trusted networks only.")
+
+
+@pytest.fixture
+def real_share(monkeypatch):
+    """The dialog's own share, over a stand-in engine: the server starts, and
+    the firewall answers what the test sets as ``world["firewall"]``."""
+    from turboadb import devices, tools
+
+    world = {"firewall": _OPENED}
+    _Scan.made = []
+    monkeypatch.setattr(connect_dialog, "_ScanThread", _Scan)
+    monkeypatch.setattr(connect_dialog, "park_thread", lambda thread: None)
+    monkeypatch.setattr(connect_dialog.QMessageBox, "question",
+                        lambda *args, **kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(devices, "start_shared_server",
+                        lambda port=5037, adb_path=None: f"shared adb server on 0.0.0.0:{port}")
+    monkeypatch.setattr(devices, "open_firewall", lambda ports: world["firewall"])
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda *args, **kwargs: True)
+    return world
+
+
+def _share_from(qapp, dlg):
+    dlg.mode.setCurrentIndex(2)
+    dlg._start_shared()
+    thread = dlg._serve
+    assert thread.wait(5000)
+    for _ in range(5):
+        qapp.processEvents()
+
+
+def _on_screen(dlg):
+    from PyQt5.QtWidgets import QLabel
+
+    return [label.text() for label in dlg.findChildren(QLabel) if not label.isHidden()]
+
+
+def test_what_the_share_did_stays_in_the_dialog_and_goes_to_the_log(qapp, real_share):
+    """Its result was set on the scan's status line and replaced by
+    "scanning…" in the same call, and nothing logged it: a firewall rule that
+    could not be added (no Administrator rights, the usual case) was never
+    seen."""
+    real_share["firewall"] = _NO_RULE
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    try:
+        _share_from(qapp, dlg)
+        assert dlg.rem_host.currentText() == "127.0.0.1" and dlg.rem_status.text() == "scanning…"
+        shown = [text for text in _on_screen(dlg) if _NO_RULE in text]
+        assert len(shown) == 1 and "shared adb server on 0.0.0.0:5037" in shown[0]
+        assert "[OK] shared adb server on 0.0.0.0:5037" in window.logged
+        assert window.logged[-1].startswith("[WARNING] ") and _NO_RULE in window.logged[-1]
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        window.deleteLater()
+
+
+@pytest.mark.parametrize("firewall", [_OPENED, "firewall: not Windows, skipped"])
+def test_a_share_with_nothing_in_its_way_is_logged_as_done(qapp, real_share, firewall):
+    real_share["firewall"] = firewall
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    try:
+        _share_from(qapp, dlg)
+        assert any(firewall in text for text in _on_screen(dlg))
+        assert window.logged == ["[OK] shared adb server on 0.0.0.0:5037", "[INFO] " + firewall]
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        window.deleteLater()
+
+
+def test_the_log_has_the_shares_outcome_after_the_dialog_closed(qapp, real_share, monkeypatch):
+    from turboadb import devices
+
+    real_share["firewall"] = _NO_RULE
+    release = threading.Event()
+
+    def slow_start(port=5037, adb_path=None):
+        release.wait(10)
+        return f"shared adb server on 0.0.0.0:{port}"
+
+    monkeypatch.setattr(devices, "start_shared_server", slow_start)
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    dlg.mode.setCurrentIndex(2)
+    dlg._start_shared()
+    thread = dlg._serve
+    dlg.reject()  # closed while the share still runs
+    release.set()
+    assert thread.wait(5000)
+    for _ in range(5):
+        qapp.processEvents()
+    assert window.logged[-1].startswith("[WARNING] ") and _NO_RULE in window.logged[-1]
+    window.deleteLater()
+
+
+def test_a_share_that_failed_says_so_in_the_dialog_and_the_log(qapp, real_share, monkeypatch):
+    from turboadb import devices
+
+    def refuse(port=5037, adb_path=None):
+        raise RuntimeError("adb server did not come up on port 5037: no response")
+
+    monkeypatch.setattr(devices, "start_shared_server", refuse)
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    try:
+        _share_from(qapp, dlg)
+        assert dlg.rem_status.text() == (
+            "couldn't start server: adb server did not come up on port 5037: no response")
+        assert window.logged == [
+            "[ERROR] share devices: adb server did not come up on port 5037: no response"]
+        assert dlg.btn_serve.isEnabled()
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        window.deleteLater()
+
+
+@pytest.mark.parametrize("firewall", [_OPENED, _NO_RULE], ids=["firewall-open", "no-rule"])
+def test_a_share_whose_login_auto_start_failed_is_shared_all_the_same(
+        qapp, real_share, monkeypatch, firewall):
+    """The server was shared and the firewall open, yet the dialog said
+    "couldn't start server" and the log "[ERROR] share devices": only the
+    launcher for the next login could not be written.  The window's own Share
+    calls that a warning."""
+    from turboadb import devices
+
+    def refuse(port=5037, adb_path=None):
+        raise OSError("the Startup folder can't be written")
+
+    monkeypatch.setattr(devices, "install_startup", refuse)
+    real_share["firewall"] = firewall
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    try:
+        dlg.chk_login.setChecked(True)
+        _share_from(qapp, dlg)
+        # shared: the result is on screen, and its devices are scanned as usual
+        [shown] = [text for text in _on_screen(dlg) if "shared adb server on 0.0.0.0:5037" in text]
+        assert firewall in shown and "couldn't start server" not in " ".join(_on_screen(dlg))
+        assert "login auto-start" in shown and "the Startup folder can't be written" in shown
+        assert dlg.serve_status.property("tone") == "amber"
+        assert dlg.rem_host.currentText() == "127.0.0.1" and dlg.rem_status.text() == "scanning…"
+        assert dlg.btn_serve.isEnabled()
+        # the log: what worked, then the warnings, and nothing called an error
+        assert window.logged[0] == "[OK] shared adb server on 0.0.0.0:5037"
+        assert not any(line.startswith("[ERROR]") for line in window.logged)
+        warned = [line for line in window.logged if line.startswith("[WARNING] ")]
+        assert any("login auto-start" in line and "the Startup folder can't be written" in line
+                   for line in warned)
+        assert window.logged[-1] in warned  # the status bar and the toast end on one
+        assert (firewall in window.logged[-1]) == (firewall is _NO_RULE)
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        window.deleteLater()
+
+
+def test_a_share_with_the_login_auto_start_says_where_it_is(qapp, real_share, monkeypatch):
+    from turboadb import devices
+
+    launcher = "C:/Startup/turboadb-shared-adb.bat"
+    monkeypatch.setattr(devices, "install_startup", lambda port=5037, adb_path=None: launcher)
+    window = _Window()
+    dlg = connect_dialog.ConnectDialog(window)
+    try:
+        dlg.chk_login.setChecked(True)
+        _share_from(qapp, dlg)
+        assert any(f"auto-starts at login ({launcher})" in text for text in _on_screen(dlg))
+        assert dlg.serve_status.property("tone") != "amber"
+        assert window.logged == [
+            "[OK] shared adb server on 0.0.0.0:5037",
+            f"[OK] Auto-start installed (runs at every login): {launcher}",
+            "[INFO] " + _OPENED,
+        ]
+    finally:
+        dlg.close()
         dlg.deleteLater()
         window.deleteLater()
 

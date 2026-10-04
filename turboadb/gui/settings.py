@@ -310,7 +310,9 @@ def _load_cached() -> dict:
         return cached[2]
     data = dict(DEFAULTS)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig: a file edited by hand may start with a byte order mark
+        # (PowerShell 5.1's -Encoding UTF8, an editor's "UTF-8 with BOM")
+        with open(path, "r", encoding="utf-8-sig") as fh:
             saved = json.load(fh)
         if saved is not None:
             if not isinstance(saved, dict):

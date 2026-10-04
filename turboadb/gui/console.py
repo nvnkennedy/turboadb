@@ -43,7 +43,7 @@ from collections import deque
 
 from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal
 from PyQt5.QtGui import (
-    QFont, QFontMetricsF, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QBrush,
+    QFont, QFontMetricsF, QInputMethodEvent, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QBrush,
 )
 from PyQt5.QtWidgets import QAbstractSlider, QPlainTextEdit, QMenu, QApplication, QToolTip
 
@@ -54,8 +54,13 @@ from .scrollback import Scrollback
 
 _ANSI = theme.ANSI_FG
 _BG_ANSI = theme.ANSI_BG
-_LOCAL_PS_PROMPT = re.compile(r"(?m)^(PS )([^\r\n>]*)(> ?)")
-_LOCAL_CMD_PROMPT = re.compile(r"(?m)^([A-Za-z]:[^\r\n>]*)(> ?)")
+# A local shell's own prompt, PowerShell's and cmd's: it starts a line, and
+# nothing follows it in its read but the mark their terminals end every prompt
+# with (an OSC string, see local_terminal.PROMPT_MARK_RE), or the first byte
+# of that mark where the read ends in it.  An output line that only starts
+# like one has text after it.
+_LOCAL_PS_PROMPT = re.compile(r"(?m)^(PS )([^\r\n>]*)(> ?)(?=\x1b\]|\x1b?\Z)")
+_LOCAL_CMD_PROMPT = re.compile(r"(?m)^([A-Za-z]:\\[^\r\n<>|*?\"]*)(> ?)(?=\x1b\]|\x1b?\Z)")
 
 
 def _prompt_sgr(part: str) -> str:
@@ -145,20 +150,67 @@ class _Marker:
 
 
 def _doc_len(text: str) -> int:
-    """Length of *text* in document positions (UTF-16 code units)."""
-    return len(text.encode("utf-16-le")) // 2
+    """Length of *text* in document positions (UTF-16 code units): a
+    character outside the BMP (an emoji) takes two."""
+    if text.isascii():
+        return len(text)
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
-def _is_number(text: str) -> bool:
-    """Whether *text* is a number in ASCII digits, as a CSI's parameters are:
-    ``str.isdigit`` also takes ``²``, which ``int`` refuses."""
-    return text.isdigit() and text.isascii()
+def _char_index(text: str, units: int) -> int:
+    """How many characters of *text* its first *units* document positions
+    hold (one that starts there and ends later counts)."""
+    if text.isascii():
+        return min(units, len(text))
+    pos = 0
+    for index, ch in enumerate(text):
+        if pos >= units:
+            return index
+        pos += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
+def _doc_spans(text: str, spans):
+    """*spans*, ``(start, end, what)`` in characters of *text* (see
+    shell_colors), in document positions."""
+    if text.isascii():
+        return spans
+    return [(_doc_len(text[:start]), _doc_len(text[:end]), what) for start, end, what in spans]
+
+
+# The user state of a line of the view that was cut at AnsiConsole._LINE_MAX:
+# its text goes on in the next line (see AnsiConsole._out_cut).
+_CUT = 1
+
+
+def _has_long_line(text: str, column: int, limit: int) -> bool:
+    """Whether a line of *text*, the first of them starting in *column*, is
+    longer than *limit* characters.  It hops from line break to line break
+    a *limit* at a time, so a read of many short lines costs next to nothing."""
+    pos, room, size = 0, limit - column, len(text)
+    while size - pos > room:
+        pos = text.rfind("\n", pos, pos + max(room, 0) + 1) + 1
+        if not pos:
+            return True
+        room = limit
+    return False
+
+
+def _number(text: str):
+    """*text* as a number when it is one in ASCII digits, as a CSI's
+    parameters are, else None: ``str.isdigit`` also takes ``²``, which ``int``
+    refuses, as it does a number of thousands of digits."""
+    if text.isdigit() and text.isascii():
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    return None
 
 
 def _count(params: str) -> int:
     """The first number of a CSI's parameters, 1 when it is missing or 0."""
-    first = params.split(";", 1)[0].split(":", 1)[0]
-    return int(first) if _is_number(first) and int(first) > 0 else 1
+    return _number(params.split(";", 1)[0].split(":", 1)[0]) or 1
 
 
 def _is_home(params: str) -> bool:
@@ -234,6 +286,8 @@ class AnsiConsole(QPlainTextEdit):
         self._csi = ""
         self._string_len = 0          # characters of an OSC/DCS string so far (see _STRING_MAX)
         self._esc_mid = ""            # an escape's intermediate bytes (``ESC ( 0``)
+        self._form_feed_clears = False  # the shell is cmd (see set_form_feed_clears)
+        self._cut_lines = False       # a line of the view was cut at _LINE_MAX (see _out_cut)
         self._skip_break = False      # a form feed cleared the screen: drop the next line break
         self._cr_pending = False      # a CR not applied yet (see _process)
         self._archive_carry = ""      # an escape split across output chunks
@@ -241,9 +295,17 @@ class AnsiConsole(QPlainTextEdit):
         # cooked line-editing state
         self._line = ""
         self._cpos = 0
-        # The edit region ending the document, as drawn, in characters: the
-        # line break before a synthetic prompt (output stopped mid-line), that
-        # prompt, and the typed line.  _out_end() is where output goes.
+        # What an input method is composing (see inputMethodEvent): shown in
+        # the line as drawn, no part of ``_line`` yet.  Where it starts in
+        # that line and where the input method has its caret in it, both in
+        # document positions.
+        self._preedit = ""
+        self._preedit_pos = 0
+        self._preedit_caret = 0
+        # The edit region ending the document, as drawn, in document positions
+        # (see _doc_len): the line break before a synthetic prompt (output
+        # stopped mid-line), that prompt, and the typed line.  _out_end() is
+        # where output goes.
         self._edit_sep = 0
         self._prompt_len = 0
         self._line_len = 0
@@ -350,6 +412,14 @@ class AnsiConsole(QPlainTextEdit):
     _TYPED_AHEAD_MAX = 20         # typed-ahead lines followed (see forget_typed_line)
     _TICK_BUDGET = 0.030          # seconds of rendering per tick (keeps UI live)
     _SUB = 8 * 1024               # max chars handed to _process at once (~20 ms of work)
+    _SLICE_LINES = 128            # ... and max lines: 8 KB of ``y`` is 2,730 of them
+    # The longest line of the view, in characters: output that goes on past
+    # it continues on the next line, as a terminal wraps at its width (see
+    # _out_cut).  Qt lays a line out again whole for every insert into it
+    # and paints it whole, however little of it shows: a line that never
+    # ended (minified JSON, base64) froze the window for seconds.  No line
+    # short enough to be searched for words (shell_colors) is ever cut.
+    _LINE_MAX = 4096
     # The ON-SCREEN backlog: output waiting to be drawn is capped at about
     # _MAX_LAG_S of drawing (at the rate this console draws), so the view
     # never falls far behind a flood; older undrawn output goes (the saved
@@ -381,6 +451,21 @@ class AnsiConsole(QPlainTextEdit):
             event.accept()
             return
         super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        """A press on the selection starts a new one there, as in a terminal.
+
+        Qt would arm a drag of the selection instead and, the view being
+        editable, drag it out as a move: dropped on a field that takes
+        text, it was deleted from the document behind the edit region's
+        back (output gone from the view, or the typed line gone from it
+        while Enter still ran it).  Shift and a click still extend it."""
+        if self._preedit:
+            QApplication.inputMethod().commit()  # as a click in any text field
+        if (event.button() == Qt.LeftButton and event.modifiers() != Qt.ShiftModifier
+                and self.textCursor().hasSelection()):
+            self.setTextCursor(self.cursorForPosition(event.pos()))
+        super().mousePressEvent(event)
 
     def showEvent(self, event):
         """Reopen a checked terminal at its newest output after view changes."""
@@ -474,7 +559,7 @@ class AnsiConsole(QPlainTextEdit):
         look finished) and never while output still waits to be drawn."""
         if not (self._emulate_prompt and self._alive and self._need_prompt):
             return
-        if self._line or self._inq:
+        if self._line or self._preedit or self._inq:
             return
         wait = self._PROMPT_IDLE_S - (time.monotonic() - max(self._last_feed, self._submitted_at))
         if wait > 0.005:
@@ -519,7 +604,8 @@ class AnsiConsole(QPlainTextEdit):
         """The last line of output, without the edit region."""
         pos = self._out_end()
         block = self.document().findBlock(pos)
-        return block.text()[: pos - block.position()]
+        text = block.text()
+        return text[: _char_index(text, pos - block.position())]
 
     def _remove_range(self, start, end):
         if end > start:
@@ -578,6 +664,7 @@ class AnsiConsole(QPlainTextEdit):
 
         Output still waiting to be drawn goes first, so the screen keeps the
         order in which things happened.  The edit region is empty afterwards."""
+        self._drop_preedit()
         prompt_shown = bool(self._prompt_len)
         if prompt_shown:
             self._need_prompt = True
@@ -879,6 +966,7 @@ class AnsiConsole(QPlainTextEdit):
         super().clear()
         self._wc = QTextCursor(self.document())
         self._cr_pending = False
+        self._cut_lines = False
         self._edit_sep = self._prompt_len = self._line_len = 0
         self._shown_prompt = ""
         self._home_pending = False
@@ -893,7 +981,7 @@ class AnsiConsole(QPlainTextEdit):
         if had_prompt:
             self._need_prompt = True
             self._prompt_if_needed()
-        if self._line:
+        if self._line or self._preedit:
             self._redraw_line()
         self._clear_tab_cycle()
 
@@ -904,7 +992,7 @@ class AnsiConsole(QPlainTextEdit):
             return None
         end = self._out_end()
         cursor = QTextCursor(self.document())
-        cursor.setPosition(end - len(tail))
+        cursor.setPosition(end - _doc_len(tail))
         cursor.setPosition(end, QTextCursor.KeepAnchor)
         return cursor.selection()
 
@@ -1043,6 +1131,14 @@ class AnsiConsole(QPlainTextEdit):
                 self._edit_sep = self._prompt_len = 0
             self._shown_prompt = ""
 
+    def set_form_feed_clears(self, enabled: bool):
+        """Whether a form feed in the output clears the view: for cmd, whose
+        ``cls`` writes nothing else to a pipe.  Anywhere else, and while a
+        device terminal has the output (see :meth:`set_screen_input`), it
+        moves down a line as on a terminal: a file with page breaks wiped
+        everything shown before each of them."""
+        self._form_feed_clears = bool(enabled)
+
     def set_prompt(self, identity, root=False):
         """Show *identity* — the device's ``user@host``, or just a host — in the prompt."""
         self._host = identity or ""
@@ -1066,7 +1162,13 @@ class AnsiConsole(QPlainTextEdit):
 
     @staticmethod
     def _style_local_prompts(text: str) -> str:
-        """Colour the real local-shell prompt without replacing its semantics."""
+        """Colour the real local-shell prompt without replacing its semantics.
+
+        Only a prompt the read ends with, or one with the terminal's mark
+        after it, is one (see _LOCAL_PS_PROMPT): an output line that starts
+        like cmd's (``e: C:\\src\\Foo.kt: ... List<String> but ...``) was
+        drawn as a prompt up to its ``>``, and had none of its words
+        coloured.  So most of a flood is not even looked at."""
         def powershell(match):
             return (
                 f"{_prompt_sgr('host')}{match.group(1)}{_prompt_sgr('path')}{match.group(2)}"
@@ -1076,16 +1178,24 @@ class AnsiConsole(QPlainTextEdit):
         def cmd(match):
             return f"{_prompt_sgr('path')}{match.group(1)}{_prompt_sgr('mark')}{match.group(2)}\x1b[0m"
 
-        text = _LOCAL_PS_PROMPT.sub(powershell, text)
-        return _LOCAL_CMD_PROMPT.sub(cmd, text)
+        start = 0 if "\x1b]" in text else text.rfind("\n") + 1
+        tail = text[start:] if start else text
+        if ">" not in tail:
+            return text
+        tail = _LOCAL_CMD_PROMPT.sub(cmd, _LOCAL_PS_PROMPT.sub(powershell, tail))
+        return text[:start] + tail if start else tail
 
     def _style_local_prompts_stream(self, text: str) -> str:
         """Style prompts in a streamed chunk.
 
         ``(?m)^`` treats the start of every chunk as a line start; when the
         previous chunk ended mid-line, the first (partial) line of this chunk
-        is not a prompt and must be left alone."""
-        if self._feed_at_line_start:
+        is not a prompt and must be left alone.  Nor is anything a device
+        terminal prints: its shell's prompt is the owner's to recognise (see
+        mark_prompt)."""
+        if self._screen_input is not None:
+            styled = text
+        elif self._feed_at_line_start:
             styled = self._style_local_prompts(text)
         else:
             nl = text.find("\n")
@@ -1101,8 +1211,14 @@ class AnsiConsole(QPlainTextEdit):
         if self._archive_carry:
             text = self._archive_carry + text
             self._archive_carry = ""
-        tail = _ESC_TAIL_RE.search(text)
-        if tail is not None and len(text) - tail.start() <= _ESC_CARRY_MAX:
+        # Only a tail that short is kept, and none goes on over the end of a
+        # string (BEL or ST): looked for from the start, a read full of
+        # string starts was gone over once for each of them.
+        start = max(0, len(text) - _ESC_CARRY_MAX)
+        start = max(start, text.rfind("\x07", start) + 1)
+        ended = text.rfind("\x1b\\", start)
+        tail = _ESC_TAIL_RE.search(text, start if ended < 0 else ended + 2)
+        if tail is not None:
             self._archive_carry = text[tail.start():]
             text = text[: tail.start()]
         return strip_ansi(_ARCHIVE_ESC_RE.sub("", text))
@@ -1628,6 +1744,9 @@ class AnsiConsole(QPlainTextEdit):
     def _drain_tick(self):
         if not self._inq:
             self._drain.stop()
+            # All is drawn: what comes next may be faster to draw than what
+            # the rate was measured on, and is not cut by that measure.
+            self._render_rate = max(self._render_rate, self._RENDER_RATE_GUESS)
             if self._emulate_prompt and self._alive and self._need_prompt and not self._line:
                 self._idle.start(self._prompt_idle_ms())
             return
@@ -1655,6 +1774,13 @@ class AnsiConsole(QPlainTextEdit):
                     sub = self._SUB
                     self._inq.extendleft(reversed([item[i:i + sub] for i in range(sub, len(item), sub)]))
                     item = item[:sub]
+                if self._screen is None:
+                    # ... and a slice of short lines again by its lines: a
+                    # line costs about the same to draw however short it is
+                    end = self._slice_end(item)
+                    if end:
+                        self._inq.appendleft(item[end:])
+                        item = item[:end]
                 self._inq_len -= len(item)
                 drawn += len(item)
                 if self._screen is not None:
@@ -1665,8 +1791,12 @@ class AnsiConsole(QPlainTextEdit):
         finally:
             self.setUpdatesEnabled(True)
         spent = time.perf_counter() - started
-        if drawn >= 32 * 1024 and spent > 0.002:
-            # how fast this console draws (see _backlog_cap)
+        if drawn and spent > 0.002 and (self._inq or drawn >= 32 * 1024):
+            # How fast this console draws (see _backlog_cap): from a tick that
+            # ran out of time with output still waiting, however little it
+            # drew (only ticks that drew 32 KB counted once: short lines are
+            # slow to draw, and slow drawing was never measured), or that drew
+            # a lot.  The echo of a typed key says nothing about it.
             self._render_rate = 0.8 * self._render_rate + 0.2 * (drawn / spent)
         screen = self._screen
         if screen is not None:
@@ -1675,6 +1805,16 @@ class AnsiConsole(QPlainTextEdit):
                 self._screen_view.update()
         elif at_bottom:
             sb.setValue(sb.maximum())
+
+    def _slice_end(self, item: str) -> int:
+        """Where the first :attr:`_SLICE_LINES` lines of *item* end, when it
+        has more of them; else 0."""
+        if item.count("\n") <= self._SLICE_LINES:
+            return 0
+        end = -1
+        for _ in range(self._SLICE_LINES):
+            end = item.find("\n", end + 1)
+        return end + 1
 
     def _announce_drop(self):
         """Mark the hole left by an over-full input queue, like the log view.
@@ -1703,21 +1843,45 @@ class AnsiConsole(QPlainTextEdit):
         the parser's states, which the next call resumes.  When the output
         addresses the cursor in a way lines cannot show (see _csi_dispatch),
         the rest of *text* goes to a screen instead (_enter_screen)."""
-        run = []
+        run = []    # the text of the line being read, not drawn yet
+        # Whole lines read before it and not drawn yet either: they have no
+        # colour of their own, and go in with what follows them as ONE
+        # insert.  An insert a line made a flood of short lines (``yes``)
+        # twenty times as slow as the same text in one piece.
+        ready = []
+        # For the tabs of that line: how many pieces of ``run`` the last one
+        # counted, and the column they end in (a tab that counted the whole
+        # line again made a table of tab-separated values many times as slow).
+        tabbed = [0, 0]
 
-        def flush(fmt=None):
+        def flush(fmt=None, at_end=False):
+            # (*at_end*: the cursor is known to end the output; lines that
+            # wait are only ever gathered there)
             if run:
                 chunk = "".join(run)
                 run.clear()
+                tabbed[:] = 0, 0
                 if fmt is None and self._line_fmt is not None and self._fmt_plain:
                     fmt = self._line_fmt  # more of a line shown in its logcat colour
-                self._out(chunk, fmt)
+                if ready:
+                    lines = "".join(ready)
+                    ready.clear()
+                    if fmt is None:
+                        self._out(lines + chunk, None, True)
+                    else:
+                        self._out(lines, None, True)
+                        self._out(chunk, fmt, True)
+                else:
+                    self._out(chunk, fmt, at_end)
                 if fmt is not None and fmt is self._line_fmt:
                     self._line_fmt_end = (self._wc.block(), self._wc.positionInBlock())
                 if fmt is None and not self._fmt_plain:
                     self._line_clean = False  # the line brings colours of its own
                 if self._line_clean and len(self._line_head) < 256:
                     self._line_head += chunk
+            elif ready:
+                self._out("".join(ready), None, True)
+                ready.clear()
 
         def newline(fmt):
             if self._wc.position() == self._out_end():
@@ -1729,7 +1893,7 @@ class AnsiConsole(QPlainTextEdit):
                 if not run:
                     self._pad = 0
                 run.append("\n")
-                flush(fmt)
+                flush(fmt, True)
             else:
                 flush(fmt)
                 self._wc.setPosition(self._out_end())
@@ -1775,19 +1939,28 @@ class AnsiConsole(QPlainTextEdit):
                 if ch == "\r":
                     cr = True
                     continue
+                if ch == "\x0c" and not (self._form_feed_clears and self._screen_input is None):
+                    ch = "\n"  # down a line, as on a terminal (see set_form_feed_clears)
                 if ch == "\n":
                     cr = False
                     fmt, words = self._line_format(run)
                     if words:
                         # the line and its words' colours in one edit, laid out
                         # once: a flood of "Permission denied" stays as fast
-                        line = self._wc.block()
+                        # (its line is the cursor's, or behind those waiting)
+                        line = None if ready else self._wc.block()
                         self._wc.beginEditBlock()
                         try:
                             newline(fmt)
-                            self._colour_words(line)
+                            self._colour_words(self._wc.block().previous() if line is None else line)
                         finally:
                             self._wc.endEditBlock()
+                    elif fmt is None and self._line_fmt is None and not self._pad and (
+                            ready or self._wc.position() == self._out_end()):
+                        run.append("\n")  # it waits for the lines after it (see ready)
+                        ready.extend(run)
+                        run.clear()
+                        tabbed[:] = 0, 0
                     else:
                         newline(fmt)
                     self._start_line()
@@ -1806,8 +1979,27 @@ class AnsiConsole(QPlainTextEdit):
                     flush()
                     self._backspace()
                 elif ch == "\t":
-                    run.append("    ")
-                elif ch == "\x0c" and not self._emulate_prompt:
+                    # To the next tab stop, eight columns apart as on a
+                    # program's screen.  At the end of the output that is
+                    # blanks, which go in with the text around them; over a
+                    # line it is a move, and nothing is erased.  (After a
+                    # tab of this line the cursor has not moved: only the
+                    # text since then is counted.)
+                    counted, column = tabbed
+                    if counted or ready or self._wc.position() >= self._line_end():
+                        if not counted:
+                            column = 0 if ready else self._column()
+                        for piece in run[counted:]:
+                            column += _doc_len(piece)
+                        blanks = 8 - column % 8
+                        run.append(" " * blanks)
+                        tabbed[:] = len(run), column + blanks
+                    else:
+                        flush()
+                        self._line_clean = False
+                        column = self._column()
+                        self._move_to_column(column + 8 - column % 8, clamp=False)
+                elif ch == "\x0c":
                     # A form feed is what cmd's cls writes to a pipe: clear the
                     # screen (the saved history keeps everything).
                     flush()
@@ -1970,8 +2162,9 @@ class AnsiConsole(QPlainTextEdit):
             self._pad -= 1
         elif not self._wc.atBlockStart():
             # A terminal backspace stops at column 0; it never wraps onto
-            # the end of the previous line.
-            self._wc.movePosition(QTextCursor.Left)
+            # the end of the previous line.  Back in the text, not to the
+            # left on screen: in a right-to-left line that is forwards.
+            self._wc.movePosition(QTextCursor.PreviousCharacter)
 
     def _line_format(self, run):
         """How the line that ends now is coloured when all of it was plain
@@ -2027,12 +2220,16 @@ class AnsiConsole(QPlainTextEdit):
         of the line keeps the default colour."""
         if not block.isValid():
             return
-        spans = shell_colors.meaning_spans(block.text())
+        if self._cut_lines and _CUT in (block.userState(), block.previous().userState()):
+            return  # a line the view cut is longer than any that is searched
+        text = block.text()
+        # (_line_format had the quick look at a line short enough to be its own start)
+        spans = shell_colors.meaning_spans(text, len(text) < 256)
         if not spans:
             return
         start = block.position()
         painter = QTextCursor(block)
-        for first, last, kind in spans:
+        for first, last, kind in _doc_spans(text, spans):
             painter.setPosition(start + first)
             painter.setPosition(start + last, QTextCursor.KeepAnchor)
             painter.setCharFormat(self._meaning_format(kind))
@@ -2079,9 +2276,12 @@ class AnsiConsole(QPlainTextEdit):
         end = self._out_end()
         block = self.document().findBlock(end)
         start = block.position()
-        spans = shell_colors.prompt_spans(block.text()[: end - start])
+        text = block.text()
+        text = text[: _char_index(text, end - start)]
+        spans = shell_colors.prompt_spans(text)
         if not spans:
             return
+        spans = _doc_spans(text, spans)
         stop = start + spans[-1][1]
         it = block.begin()
         while not it.atEnd():
@@ -2104,16 +2304,34 @@ class AnsiConsole(QPlainTextEdit):
         """The output cursor's column on its line."""
         return self._wc.positionInBlock() + self._pad
 
-    def _move_to_column(self, column):
+    def _char_edge(self, pos, step=1) -> int:
+        """*pos* on the output cursor's line, or the next position that way
+        (*step* is 1 or -1) when a character goes on over it: never between
+        the two halves of an emoji, or a letter and the accent joined to it."""
+        if self.document().characterAt(pos) < "\x80":
+            return pos  # an ASCII character starts there: it is part of no other
+        block = self._wc.block()
+        start = block.position()
+        end = self._line_end()
+        layout = block.layout()
+        while start < pos < end and not layout.isValidCursorPosition(pos - start):
+            pos += step
+        return pos
+
+    def _move_to_column(self, column, clamp=True):
         """Put the output cursor in *column* of its line (progress bars and
         prompts that redraw one line).  Past the end of the line's text it
-        stands in blank columns, which are filled once text comes there."""
-        cols = self.cell_size()[0]
-        column = max(0, min(column, cols - 1) if cols > 0 else column)
+        stands in blank columns, which are filled once text comes there.
+        *clamp*: never past the view's last column (a tab is not held to
+        that: a line may be longer than the view is wide)."""
+        if clamp:
+            cols = self.cell_size()[0]
+            column = min(column, cols - 1) if cols > 0 else column
+        column = max(0, column)
         start = self._wc.block().position()
         length = self._line_end() - start
         if column <= length:
-            self._wc.setPosition(start + column)
+            self._wc.setPosition(self._char_edge(start + column, -1))
             self._pad = 0
         else:
             self._wc.setPosition(start + length)
@@ -2122,7 +2340,7 @@ class AnsiConsole(QPlainTextEdit):
     def _erase_chars(self, count):
         """ECH: blank *count* characters from the cursor on; nothing moves."""
         pos = self._wc.position()
-        end = min(pos + count, self._line_end())
+        end = self._char_edge(min(pos + count, self._line_end()))
         if self._pad or end <= pos:
             return
         eraser = QTextCursor(self.document())
@@ -2134,7 +2352,7 @@ class AnsiConsole(QPlainTextEdit):
     def _delete_chars(self, count):
         """DCH: remove *count* characters at the cursor; the rest moves left."""
         pos = self._wc.position()
-        end = min(pos + count, self._line_end())
+        end = self._char_edge(min(pos + count, self._line_end()))
         if not self._pad and end > pos:
             self._remove_range(pos, end)
             self._wc.setPosition(pos)
@@ -2156,6 +2374,7 @@ class AnsiConsole(QPlainTextEdit):
         pos = self._wc.position()
         start = self._wc.block().position()
         count = min(pos - start + 1, self._line_end() - start)
+        count = self._char_edge(start + count) - start
         if count > 0:
             eraser = QTextCursor(self.document())
             eraser.setPosition(start)
@@ -2177,7 +2396,10 @@ class AnsiConsole(QPlainTextEdit):
             return False
         return self._screen_input is not None
 
-    def _out(self, s, fmt=None):
+    def _out(self, s, fmt=None, at_end=False):
+        """Write *s* at the output cursor, in *fmt* (the stream's by default).
+        *at_end*: the caller knows that the cursor ends the output, so
+        nothing is written over."""
         if not s:
             return
         if fmt is None:
@@ -2186,20 +2408,61 @@ class AnsiConsole(QPlainTextEdit):
             # the cursor stands past the end of its line: blanks up to it
             self._wc.insertText(" " * self._pad, self._plain_fmt())
             self._pad = 0
-        pos = self._wc.position()
-        room = 0 if pos >= self._out_end() else self._line_end() - pos
-        if room <= 0:
+        column = self._wc.positionInBlock()
+        pos = room = 0
+        if not at_end:
+            pos = self._wc.position()
+            room = 0 if pos >= self._out_end() else self._line_end() - pos
+        if room > 0:
+            # Overwrite mode (the cursor went back over existing text after a
+            # \r): replace everything the new text covers with ONE selection
+            # and ONE insert.  Doing it per character — each with an O(n)
+            # ``rem = rem[1:]`` slice and its own edit — made progress-style
+            # output stutter.  What it covers is counted in positions, never
+            # in cursor steps: a step takes an emoji or a letter and its
+            # accent as one (the steps left over ate the line being typed),
+            # and to the right is backwards in a right-to-left line.
+            covered = _doc_len(s)
+            if covered < room:
+                self._wc.setPosition(self._char_edge(pos + covered), QTextCursor.KeepAnchor)
+                self._wc.insertText(s, fmt)
+                return
+            self._wc.setPosition(pos + room, QTextCursor.KeepAnchor)  # the rest of the line
+        if len(s) > self._LINE_MAX - column and _has_long_line(s, column, self._LINE_MAX):
+            self._out_cut(s, fmt, column)
+        else:
             self._wc.insertText(s, fmt)
-            return
-        # Overwrite mode (the cursor went back over existing text after a \r):
-        # replace everything the new text covers with ONE selection and ONE
-        # insert.  Doing it per character — each with an O(n) ``rem = rem[1:]``
-        # slice and its own edit — made progress-style output stutter.
-        overlap = min(len(s), room)
-        self._wc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, overlap)
-        self._wc.insertText(s[:overlap], fmt)
-        if len(s) > overlap:
-            self._wc.insertText(s[overlap:], fmt)
+
+    def _out_cut(self, s, fmt, column):
+        """Add *s*, a line of which is longer than :attr:`_LINE_MAX` (its
+        first one starts in *column* of the cursor's line): the line is cut
+        there and goes on on the next line of the view.  A line cut is
+        marked, so that a copy has it in one piece again (_selected_text).
+        All of it goes in as one insert, as any text does."""
+        limit = self._LINE_MAX
+        room = max(0, limit - column)
+        pieces, cuts, breaks = [], set(), 0
+        for number, line in enumerate(s.split("\n")):
+            if number:
+                pieces.append("\n")
+                breaks += 1
+                room = limit
+            while len(line) > room:
+                pieces.append(line[:room] + "\n")
+                cuts.add(breaks)
+                breaks += 1
+                line = line[room:]
+                room = limit
+            pieces.append(line)
+        self._wc.insertText("".join(pieces), fmt)
+        self._cut_lines = True
+        block = self._wc.block()
+        for number in range(breaks - 1, -1, -1):  # back from the cursor's line, a line a break
+            block = block.previous()
+            if not block.isValid():
+                break
+            if number in cuts:
+                block.setUserState(_CUT)
 
     # CSI finals that move the cursor to another line or change lines: output
     # drawn line after line can show none of them (see _csi_dispatch)
@@ -2295,7 +2558,7 @@ class AnsiConsole(QPlainTextEdit):
         """A CSI with a private parameter prefix (``?25l``, ``?1049h`` ...)."""
         if params[0] != "?":
             return False  # ">c" (which terminal is this?) and friends: no answer
-        modes = [int(part) for part in params[1:].split(";") if _is_number(part)]
+        modes = [mode for mode in map(_number, params[1:].split(";")) if mode is not None]
         if final == "n":
             if modes[:1] == [6]:
                 self._screen_reply(f"\x1b[?{self._report_row()};{self._column() + 1}R")
@@ -2515,7 +2778,8 @@ class AnsiConsole(QPlainTextEdit):
             while not it.atEnd():
                 fragment = it.fragment()
                 if fragment.isValid() and fragment.position() < stop:
-                    text = fragment.text()[: stop - fragment.position()]
+                    text = fragment.text()
+                    text = text[: _char_index(text, stop - fragment.position())]
                     runs.append((text, self._attr_of(fragment.charFormat())))
                 it += 1
             seeds.append(runs)
@@ -2928,7 +3192,7 @@ class AnsiConsole(QPlainTextEdit):
         self._wc.setPosition(wpos)
         self._edit_sep = sep
         self._shown_prompt = "".join(text for text, _fmt in runs)
-        self._prompt_len = len(self._shown_prompt)
+        self._prompt_len = _doc_len(self._shown_prompt)
         self._need_prompt = False
         if at_bottom:
             scrollbar.setValue(scrollbar.maximum())
@@ -2939,23 +3203,36 @@ class AnsiConsole(QPlainTextEdit):
             return
         cursor = QTextCursor(self.document())
         end = self.document().characterCount() - 1
-        cursor.setPosition(end - self._line_len + max(0, min(self._cpos, self._line_len)))
+        if self._preedit:
+            caret = self._preedit_pos + self._preedit_caret  # the input method's
+        else:
+            caret = _doc_len(self._line[:max(0, self._cpos)])
+        cursor.setPosition(end - self._line_len + min(caret, self._line_len))
         self.setTextCursor(cursor)
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def _redraw_line(self):
-        """Show ``_line`` at the end of the edit region; nothing else changes."""
+        """Show ``_line`` at the end of the edit region; nothing else changes.
+        What an input method is composing shows in it at the caret, underlined."""
         end = self.document().characterCount() - 1
         cursor = QTextCursor(self.document())
         cursor.setPosition(end - self._line_len)
         cursor.setPosition(end, QTextCursor.KeepAnchor)
         wpos = self._wc.position()
-        if self._line:
+        if self._preedit:
+            head = self._line[:self._cpos]
+            composing = self._plain_fmt()
+            composing.setFontUnderline(True)
+            cursor.insertText(head, self._plain_fmt())
+            cursor.insertText(self._preedit, composing)
+            cursor.insertText(self._line[self._cpos:], self._plain_fmt())
+            self._preedit_pos = _doc_len(head)
+        elif self._line:
             cursor.insertText(self._line, self._plain_fmt())
         else:
             cursor.removeSelectedText()
         self._wc.setPosition(wpos)
-        self._line_len = len(self._line)
+        self._line_len = _doc_len(self._line) + _doc_len(self._preedit)
         if not self._line:
             # the line a paste left for review was cleared (Esc, Backspace …)
             self._paste_tail_open = False
@@ -2963,6 +3240,17 @@ class AnsiConsole(QPlainTextEdit):
                     and not self._idle.isActive()):
                 self._idle.start(self._prompt_idle_ms())  # the prompt may be due now
         self._sync_cursor()
+
+    def _drop_preedit(self):
+        """Take what an input method is composing off the edit line, which is
+        about to be run or to become output: it is no part of the line.  (The
+        input method shows it again with its next change.)"""
+        if self._preedit:
+            start = self.document().characterCount() - 1 - self._line_len + self._preedit_pos
+            size = _doc_len(self._preedit)
+            self._remove_range(start, start + size)
+            self._line_len -= size
+            self._preedit = ""
 
     def _erase_input(self):
         self._line = ""
@@ -3008,8 +3296,24 @@ class AnsiConsole(QPlainTextEdit):
         # Use the application's clipboard explicitly.  Calling the inherited
         # ``copy`` is normally equivalent, but this remains reliable when the
         # console owns key handling and does not delegate to QPlainTextEdit.
-        copy_to_clipboard(self, cursor.selectedText().replace("\u2029", "\n"))
+        copy_to_clipboard(self, self._selected_text(cursor))
         return True
+
+    def _selected_text(self, cursor) -> str:
+        """The text *cursor* selects, as it was printed: a line the view cut
+        (see _out_cut) is in one piece again."""
+        lines = cursor.selectedText().split("\N{PARAGRAPH SEPARATOR}")
+        if not self._cut_lines:
+            return "\n".join(lines)
+        block = self.document().findBlock(cursor.selectionStart())
+        parts = []
+        for line in lines[:-1]:
+            parts.append(line)
+            if block.userState() != _CUT:
+                parts.append("\n")
+            block = block.next()
+        parts.append(lines[-1])
+        return "".join(parts)
 
     def _has_selection(self) -> bool:
         if self._screen is not None:
@@ -3030,8 +3334,9 @@ class AnsiConsole(QPlainTextEdit):
         from that command, matching the usual Cut shortcut without allowing a
         user to accidentally erase received terminal output.
         """
-        if self._screen is not None:
-            return self._copy_selection()  # the screen is not editable: a copy
+        if self._screen is not None or self._preedit:
+            # the screen is not editable, nor is a line an input method composes in: a copy
+            return self._copy_selection()
         cursor = self.textCursor()
         if not cursor.hasSelection():
             return False
@@ -3044,10 +3349,11 @@ class AnsiConsole(QPlainTextEdit):
             self._move_caret_end()
             return True
 
-        rel_start = start - input_start
-        rel_end = end - input_start
-        self._line = self._line[:rel_start] + self._line[rel_end:]
-        self._cpos = rel_start
+        # the selection is in document positions, the line in characters
+        first = _char_index(self._line, start - input_start)
+        last = _char_index(self._line, end - input_start)
+        self._line = self._line[:first] + self._line[last:]
+        self._cpos = first
         self._redraw_line()
         return True
 
@@ -3247,15 +3553,34 @@ class AnsiConsole(QPlainTextEdit):
 
     def inputMethodEvent(self, event):
         """Committed input-method text (CJK input, compose and dead keys) goes
-        into the command line like typed keys, never straight into the output."""
+        into the command line like typed keys, never straight into the output.
+
+        What is still being composed shows in the line at the caret,
+        underlined, until it is committed or dropped (composing was typing
+        blind).  It is drawn by the console, not by Qt, whose own way would
+        put it wherever the caret was left in the scrollback; and it is no
+        part of the line: Enter never runs it.  A program's screen takes
+        the committed text only."""
         text = event.commitString()
+        composing = event.preeditString()
         event.accept()
-        if text and self._send and self._alive:
-            if self._screen_takes_keys():
+        if not (self._send and self._alive):
+            return
+        if self._screen_takes_keys():
+            if text:
                 self._screen_send(text.encode("utf-8"))  # typed, not pasted
-                return
+            return
+        shown = bool(self._preedit)
+        self._drop_preedit()  # it is committed, replaced or gone
+        if text:
             self._clear_tab_cycle()
             self._paste_text(text)
+        if composing or shown:
+            size = _doc_len(composing)
+            caret = [a.start for a in event.attributes() if a.type == QInputMethodEvent.Cursor]
+            self._preedit = composing
+            self._preedit_caret = max(0, min(caret[-1], size)) if caret else size
+            self._redraw_line()
 
     def canInsertFromMimeData(self, source):
         return source is not None and source.hasText()

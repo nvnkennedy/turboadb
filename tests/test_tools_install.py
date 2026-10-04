@@ -257,3 +257,56 @@ def test_the_check_and_the_download_read_the_manifest_once(monkeypatch):
     monkeypatch.setattr(toolsdl, "_CHECKED_ARCHIVE", stale)
     assert toolsdl._archive_to_download() == archive  # too old to trust: read again
     assert len(reads) == 3
+
+
+# --------------------------------------------------------------------------- #
+# a tool that was just installed is the one found
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def system_tools(monkeypatch, home, tmp_path):
+    """adb and scrcpy of the system on PATH, nothing managed yet, and downloads
+    that unpack a stand-in for each tool."""
+    folder = tmp_path / "usr-bin"
+    folder.mkdir()
+    found = {}
+    for name in ("adb", "scrcpy"):
+        path = folder / toolsdl._exe(name)
+        path.write_text("")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        found[name] = str(path)
+
+    def extract(zip_path, dest_parent, strip_top_to=None):
+        target = strip_top_to or os.path.join(dest_parent, "platform-tools")
+        os.makedirs(target, exist_ok=True)
+        open(os.path.join(target, toolsdl._exe("scrcpy" if strip_top_to else "adb")), "w").close()
+
+    monkeypatch.setenv("PATH", str(folder))
+    monkeypatch.delenv("TURBOADB_ADB", raising=False)
+    monkeypatch.delenv("TURBOADB_SCRCPY", raising=False)
+    monkeypatch.setattr(tools, "_gui_setting", lambda name: None)
+    monkeypatch.setattr(tools, "_bundled_candidates", lambda name: [])
+    monkeypatch.setattr(toolsdl, "_archive_to_download", lambda: {"url": "https://example/pt.zip"})
+    monkeypatch.setattr(toolsdl, "_scrcpy_assets", lambda: ("https://example/s.zip", "s.zip", None))
+    monkeypatch.setattr(toolsdl, "_download", lambda url, dest, on_progress=None: open(dest, "wb").close())
+    monkeypatch.setattr(toolsdl, "_check_zip", lambda path: None)
+    monkeypatch.setattr(toolsdl, "_verify_platform_tools", lambda path, archive: None)
+    monkeypatch.setattr(toolsdl, "_extract_zip", extract)
+    monkeypatch.setattr(toolsdl, "_sync_scrcpy_adb", lambda: None)
+    tools.clear_tools_cache()
+    yield found
+    tools.clear_tools_cache()
+
+
+def test_the_adb_just_installed_is_the_one_found_from_then_on(system_tools):
+    """find_adb remembers its answer.  A process that had asked before the
+    download (every update check does) went on running the system's adb, and
+    the update's report gave that one's version as the new adb's."""
+    assert os.path.samefile(tools.find_adb(), system_tools["adb"])
+    installed = toolsdl.download_platform_tools(force=True)
+    assert os.path.samefile(tools.find_adb(), installed)
+
+
+def test_the_scrcpy_just_installed_is_the_one_found_from_then_on(system_tools):
+    assert os.path.samefile(tools.find_scrcpy(), system_tools["scrcpy"])
+    installed = toolsdl.download_scrcpy(force=True)
+    assert os.path.samefile(tools.find_scrcpy(), installed)

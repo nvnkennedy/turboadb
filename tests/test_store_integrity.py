@@ -170,6 +170,39 @@ def test_a_corrupt_settings_file_is_kept_before_a_save_replaces_it(files):
     assert settings.load_problem() is None
 
 
+def test_a_settings_file_saved_with_a_byte_order_mark_is_read(files):
+    """PowerShell 5.1's ``Set-Content -Encoding UTF8`` and an editor's "UTF-8
+    with BOM" put a mark in front of the text.  The file then counted as
+    unreadable: defaults were in use, and the next change wrote them over
+    what the user had set."""
+    settings_file, _sessions_file = files
+    saved = {"theme": "light", "adb_path": "D:/sdk/adb.exe", "history_limit_mb": 200}
+    settings_file.write_text(json.dumps(saved), encoding="utf-8-sig")
+    assert settings_file.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert settings.get("theme") == "light"
+    assert settings.get("history_limit_mb") == 200
+    assert settings.load_problem() is None
+    settings.set("term_font_size", 14)
+    data = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert data["adb_path"] == "D:/sdk/adb.exe" and data["term_font_size"] == 14
+    assert glob.glob(str(settings_file) + ".corrupt-*") == []
+
+
+def test_a_targets_file_saved_with_a_byte_order_mark_is_read(files, tmp_path):
+    _settings_file, sessions_file = files
+    sessions_file.write_text(json.dumps([_usb("A", "1"), _usb("B", "2")]), encoding="utf-8-sig")
+    store = sessions.SessionStore()
+    assert store.load_error is None and store.names() == ["A", "B"]
+    store.save(_usb("C", "3"))
+    assert _names(sessions_file) == ["A", "B", "C"]
+    assert glob.glob(str(sessions_file) + ".corrupt-*") == []
+    # and a file to import that was exported, then edited the same way
+    incoming = tmp_path / "in.json"
+    incoming.write_text(json.dumps([_usb("D", "4")]), encoding="utf-8-sig")
+    assert store.import_from(str(incoming)) == 1
+    assert _names(sessions_file) == ["A", "B", "C", "D"]
+
+
 def test_settings_refuse_to_write_when_the_copy_fails(files, monkeypatch):
     settings_file, _sessions_file = files
     settings_file.write_text("{oops", encoding="utf-8")

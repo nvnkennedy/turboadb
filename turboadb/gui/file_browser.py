@@ -49,6 +49,7 @@ from .qtutil import (cached_icon, close_jobs, disconnect_signals, page_toolbar, 
 from .transfer_log import (CANCELLED, DONE, FAILED, TransferLog, _strip_merge, measure_local,
                            measure_remote, transfer_name)
 from .transfer_panel import TransferPanel
+from ..exceptions import ADBError
 from ..remotefs import (  # device file helpers, shared with the engine and CLI
     # _ls_cmd/_rm_cmd/_parse_ls_listing are re-exported: the tests reach them
     # as file_browser.<name>, so they are not dead.
@@ -271,6 +272,57 @@ def _replace_keeps_the_file(path: str) -> bool:
     return st.st_uid == os.geteuid() and os.access(path, os.W_OK)
 
 
+def _swap_keeping_the_file(tmp: str, real: str) -> None:
+    """Windows: put the new file *tmp* in place of *real* with ``ReplaceFileW``.
+
+    A rename over *real* leaves a new file there, without what the old one
+    had besides its text: its other data streams (the mark of a downloaded
+    file), the permissions given to it alone, its creation time.
+    ReplaceFileW hands those to *tmp* first.  The old file is moved aside
+    (to *tmp* + ``.old``) and removed afterwards, so that it can be put back
+    whatever fails half-way."""
+    import ctypes
+    from ctypes import wintypes
+
+    swap = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    swap.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                     wintypes.LPVOID, wintypes.LPVOID]
+    swap.restype = wintypes.BOOL
+    aside = tmp + ".old"
+    done = swap(real, tmp, aside, 0, None, None)
+    error = ctypes.get_last_error()
+    if not done:
+        if not os.path.lexists(real) and os.path.lexists(aside):
+            os.replace(aside, real)  # moved aside, and the new file never took its place
+        raise ctypes.WinError(error)
+    for _attempt in range(5):  # a virus scanner may hold it for a moment
+        try:
+            os.unlink(aside)
+            break
+        except FileNotFoundError:
+            break
+        except OSError:
+            time.sleep(0.05)
+
+
+# ReplaceFileW's answers for a file that is in use or not ours to swap: a
+# rename over it would fail as well, or drop what the swap was refused for.
+_NO_SWAP_ERRORS = (5, 32)  # ACCESS_DENIED, SHARING_VIOLATION
+
+
+def _put_in_place(tmp: str, real: str) -> None:
+    """Put the new file *tmp* in place of *real*; OSError when that can't be."""
+    if os.name == "nt":
+        try:
+            _swap_keeping_the_file(tmp, real)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in _NO_SWAP_ERRORS:
+                raise
+            # a drive that can't swap (some network shares): renamed over it
+    os.replace(tmp, real)
+
+
 def _save_local_text(path: str, text: str) -> None:
     """Worker: save the editor's text over the PC file *path*, never leaving it
     cut short.
@@ -278,10 +330,12 @@ def _save_local_text(path: str, text: str) -> None:
     The text goes to a temporary file beside the real one (beside a symbolic
     link's target, which stays a link), which then replaces it: a full disk,
     a network drive that drops, or a character that can't be written fails
-    with the old file untouched.  A file that replacing would change in other
-    ways (see :func:`_replace_keeps_the_file`), or that another program holds
-    open, is written in place as before - but only when the disk has room for
-    the new text."""
+    with the old file untouched.  On Windows the file keeps its other data
+    streams, its permissions and its creation time (:func:`_put_in_place`).
+    A file that replacing would change in other ways (see
+    :func:`_replace_keeps_the_file`), or that another program holds open, is
+    written in place as before - but only when the disk has room for the new
+    text."""
     data = text.encode("utf-8")  # before anything is touched
     real = os.path.realpath(path)
     if _replace_keeps_the_file(real):
@@ -297,7 +351,7 @@ def _save_local_text(path: str, text: str) -> None:
                     fh.flush()
                     os.fsync(fh.fileno())
                 shutil.copymode(real, tmp)
-                os.replace(tmp, real)
+                _put_in_place(tmp, real)
                 return
             except OSError:
                 pass  # e.g. open elsewhere without delete sharing: in place below
@@ -323,6 +377,11 @@ def _edit_load_result(load):
     except _EditRefused as exc:
         return ("refused", str(exc))
     return ("ok", text, newline, mixed)
+
+
+# What an editor's save returns in place of saving, when the device file is no
+# longer what the editor loaded (see FileBrowser._open_editor).
+_CHANGED_SINCE_LOADED = "changed"
 
 
 def _device_stamp(handler, path: str):
@@ -544,7 +603,10 @@ class _LevelPanes(QObject):
     the file buttons) too.  A row that wraps on one side only (the PC side
     also has the drive list; a pane dragged narrower) moved that side's list
     down, so the lists started at different heights.  The middle column gets
-    the lists' height, so Push and Pull are centred between them."""
+    the lists' height, so Push and Pull are centred between them.
+
+    A pane dragged shut (no width) is left out: the pane beside it has
+    nothing to be level with, and keeps the heights its own width asks for."""
 
     def __init__(self, heads, feet, middle, gap: int):
         super().__init__(middle.parentWidget())
@@ -560,15 +622,22 @@ class _LevelPanes(QObject):
 
     @staticmethod
     def _even(widgets) -> int:
-        tallest = max(max(0, widget.heightForWidth(widget.width())) for widget in widgets)
+        """Make the *widgets* that have width as tall as the tallest of them,
+        and return that height.  One that is alone gets no height to keep,
+        nor does one without width: on its way shut a pane is at its
+        narrowest, and the height its rows took there stayed with both."""
+        open_ = [widget for widget in widgets if widget.width() > 0]
+        tallest = max((max(0, widget.heightForWidth(widget.width())) for widget in open_),
+                      default=0)
         for widget in widgets:
-            if widget.minimumHeight() != tallest:
-                widget.setMinimumHeight(tallest)
+            height = tallest if len(open_) > 1 and widget.width() > 0 else 0
+            if widget.minimumHeight() != height:
+                widget.setMinimumHeight(height)
         return tallest
 
     def level(self):
-        if not all(w.isVisible() and w.width() > 0 for w in self._heads + self._feet):
-            return  # not laid out yet: once shown it is
+        if not all(w.isVisible() for w in self._heads + self._feet):
+            return  # not shown yet: once shown it is laid out, and levelled
         top, bottom = self._even(self._heads), self._even(self._feet)
         self._middle.setContentsMargins(0, top + self._gap, 0, bottom + self._gap)
 
@@ -594,7 +663,8 @@ class _FileTableWidget(QTableWidget):
         self.is_remote = is_remote
         self.base_dir = ""
         self.browser = None  # owning FileBrowser (identifies the device of remote drags)
-        # Listed names that could not be identified exactly (never acted on).
+        # Listed names that could not be identified exactly, or that a path
+        # can't reach on this PC (see _inexact_local_name): never acted on.
         self.unsafe_names = frozenset()
         # Shown in the middle of a folder with nothing to list ("" while loading).
         self.empty_text = ""
@@ -632,6 +702,13 @@ class _FileTableWidget(QTableWidget):
         for column, below in self.NARROW_HIDDEN_COLUMNS:
             if column < self.columnCount() and self.isColumnHidden(column) != (width < below):
                 self.setColumnHidden(column, width < below)
+
+    def inexact_reason(self) -> str:
+        """Why the names in :attr:`unsafe_names` are left alone, for a message."""
+        if self.is_remote:
+            return "unusual characters in the name, or two entries that look the same"
+        return ("Windows ignores a dot or a space at the end of a name, so a path to it "
+                "reaches another item")
 
     # ---- selection ----
     def is_parent_row(self, row: int) -> bool:
@@ -874,6 +951,19 @@ class _FileTableWidget(QTableWidget):
         if not rows:
             return
         items = [self.item(row, 0) for row in rows]
+        if not self.is_remote:
+            # a path to one of these reaches another item: no drag carries it,
+            # to the device pane, another tab or another program
+            data = [it.data(Qt.UserRole) for it in items if it is not None]
+            bad = [d[0] for d in data if isinstance(d, (tuple, list)) and d
+                   and d[0] in self.unsafe_names]
+            if bad:
+                log = getattr(self.browser, "log", None)
+                if log is not None:
+                    preview = ", ".join(repr(n) for n in bad[:4]) + ("…" if len(bad) > 4 else "")
+                    log.emit(f"[ERROR] Drag: refused, {len(bad)} selected name(s) can't be "
+                             f"reached on this PC ({self.inexact_reason()}): {preview}")
+                return
         mime = self.mimeData([it for it in items if it is not None])
         if not mime:
             return
@@ -982,7 +1072,8 @@ class _FileTableWidget(QTableWidget):
         """The folder a drop at *pos* goes to: the folder row under it, else
         the folder shown.  None for a folder whose name the listing could not
         read exactly: its real path is unknown, and a push to the name shown
-        would create a new folder beside it."""
+        would create a new folder beside it.  None too for a PC folder a path
+        can't reach: the drop would go into the folder beside it."""
         target_folder = self.base_dir
         item = self.itemAt(pos)
         if item:
@@ -1017,8 +1108,7 @@ class _FileTableWidget(QTableWidget):
             log = getattr(self.browser, "log", None)
             if it0 is not None and log is not None:
                 log.emit(f"[ERROR] Drop: refused, the folder {it0.text()!r} could not be "
-                         "identified exactly (unusual characters in its name, or two "
-                         "entries that look the same)")
+                         f"identified exactly ({self.inexact_reason()})")
             return
 
         if mime.hasFormat(_MIME):
@@ -1182,6 +1272,20 @@ def _list_local_dir(path: str):
     return path, dirs + files
 
 
+def _inexact_local_name(name: str, windows: Optional[bool] = None) -> bool:
+    """True for a name a path can't reach on Windows, which drops the dots and
+    spaces at the end of a path: ``photos.`` reaches ``photos``, and ``...``
+    the folder itself.  WSL, Git Bash and NTFS-3G make such names and a
+    listing shows them, so a row may carry one: acting on it by its path acts
+    on another item."""
+    if windows is None:
+        windows = os.name == "nt"
+    return bool(windows) and name != name.rstrip(". ")
+
+
+_INEXACT_LOCAL = "Windows can't reach a name that ends in a dot or a space"
+
+
 def _local_dest(src: str, dst_dir: str) -> str:
     return os.path.join(dst_dir, os.path.basename(src.rstrip("/\\")))
 
@@ -1190,25 +1294,46 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+def _local_target_key(dst: str) -> str:
+    """What tells two copy targets apart on this PC."""
+    return os.path.normcase(os.path.abspath(dst))
+
+
 def _find_local_collisions(sources, dst_dir: str) -> List[str]:
     """Names in *dst_dir* a copy of *sources* would overwrite (a file) or merge
     into (a folder).  A file and a folder of the same name are not asked
     about: the copy refuses that pair and says so."""
-    collisions = []
+    collisions, targets = [], set()
     for src in sources:
         dst = _local_dest(src, dst_dir)
+        if _inexact_local_name(os.path.basename(dst)) or _local_target_key(dst) in targets:
+            continue  # not copied at all, and said so then
+        targets.add(_local_target_key(dst))
         if not _same_path(src, dst) and os.path.exists(dst) and \
                 os.path.isdir(src) == os.path.isdir(dst):
             collisions.append(os.path.basename(dst))
     return collisions
 
 
-def _loop_guard(root: str, skipped: List[str]):
-    """A ``copytree`` *ignore* hook for copying *root*: it leaves out every link
-    or junction that leads back to a folder the copy is inside (or above it),
-    and lists them in *skipped*.  Following one copied the tree into itself,
-    level after level, until the path grew too long."""
+def _real(path: str) -> str:
+    """Where *path* really is, for comparing: links, junctions, ``subst`` and
+    mapped drives resolved (what does not exist yet keeps its name)."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _holds(folder: str, path: str) -> bool:
+    """True when *path* is *folder* or inside it (both as :func:`_real` gives them)."""
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def _loop_guard(root: str, dst: str, skipped: List[str]):
+    """A ``copytree`` *ignore* hook for copying *root* to *dst*: it leaves out
+    every link or junction that leads back to a folder the copy is inside (or
+    above it), or to a folder that holds *dst*, and says so in *skipped*.
+    Following one copied the tree into itself, level after level, until the
+    path grew too long."""
     root = os.path.abspath(root)
+    target = _real(dst)
     above = set()
     path = os.path.realpath(root)
     while True:  # the folder copied and every folder above it
@@ -1225,15 +1350,23 @@ def _loop_guard(root: str, skipped: List[str]):
         if relative != os.curdir:
             for part in relative.split(os.sep):  # how the copy got here: links too
                 current = os.path.join(current, part)
-                inside.add(os.path.normcase(os.path.realpath(current)))
+                inside.add(_real(current))
         left_out = []
         for name in names:
             path = os.path.join(folder, name)
             try:
-                if (os.path.islink(path) or _is_junction(path)) and os.path.isdir(path) and \
-                        os.path.normcase(os.path.realpath(path)) in inside:
-                    left_out.append(name)
-                    skipped.append(path)
+                if not ((os.path.islink(path) or _is_junction(path)) and os.path.isdir(path)):
+                    continue
+                real = _real(path)
+                if real in inside:
+                    why = "it links back into the folder being copied"
+                elif _holds(real, target):
+                    # followed, it would hand the copy its own, growing, output
+                    why = "it links to the folder the copy goes into"
+                else:
+                    continue
+                left_out.append(name)
+                skipped.append(f"{path}: not copied - {why}")
             except (OSError, ValueError):
                 continue
         return left_out
@@ -1242,23 +1375,34 @@ def _loop_guard(root: str, skipped: List[str]):
 
 
 def _copy_local_items(sources, dst_dir: str) -> List[str]:
-    """Worker: copy files/folders into *dst_dir*; returns error messages."""
-    errors = []
+    """Worker: copy files/folders into *dst_dir*; returns error messages.
+
+    An item already in *dst_dir* is not copied onto itself, and of two items
+    with the same name (from two folders) only the first is copied: the
+    second would replace it, or merge into it, without anyone being asked."""
+    errors, targets = [], set()
     for src in sources:
         dst = _local_dest(src, dst_dir)
         try:
+            if _inexact_local_name(os.path.basename(dst)):
+                # e.g. dropped from Explorer: the copy would be of another item
+                raise OSError(f"{_INEXACT_LOCAL}, so it was not copied")
+            if _local_target_key(dst) in targets:
+                raise OSError("another item being copied has the same name")
+            targets.add(_local_target_key(dst))
             if _same_path(src, dst):
-                continue
+                raise OSError("it is already in this folder")
             if os.path.isdir(src):
-                src_abs = os.path.normcase(os.path.abspath(src)).rstrip("\\/") + os.sep
-                if os.path.normcase(os.path.abspath(dst)).startswith(src_abs):
+                # by where they really are: the folder shown may be the source's
+                # own subfolder, opened through a junction, a link or another drive
+                if _holds(_real(src), _real(dst)):
                     raise OSError("cannot copy a folder into itself")
                 if os.path.lexists(dst) and not os.path.isdir(dst):
                     raise OSError("a file with that name is already there")
                 skipped = []
-                shutil.copytree(src, dst, dirs_exist_ok=True, ignore=_loop_guard(src, skipped))
-                errors.extend(f"{path}: not copied - it links back into the folder being "
-                              "copied" for path in skipped)
+                shutil.copytree(src, dst, dirs_exist_ok=True,
+                                ignore=_loop_guard(src, dst, skipped))
+                errors.extend(skipped)
             elif os.path.isdir(dst):
                 # copy2 would put the file INSIDE the folder of its name
                 raise OSError("a folder with that name is already there")
@@ -1364,7 +1508,10 @@ def _recycle_local_items(paths) -> List[str]:
         return []
     fo_delete = 3
     flags = 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x4000  # SILENT NOCONFIRMATION ALLOWUNDO NOERRORUI WANTNUKEWARNING
-    names = (ctypes.c_wchar * len(text))(*text)
+    # one c_wchar per UTF-16 unit, not per character: an emoji takes two (and
+    # NTFS allows half of one in a name)
+    data = text.encode("utf-16-le", "surrogatepass")
+    names = (ctypes.c_wchar * (len(data) // 2)).from_buffer_copy(data)
     op = SHFILEOPSTRUCTW()
     op.wFunc = fo_delete
     op.pFrom = ctypes.cast(names, ctypes.c_wchar_p)
@@ -1457,6 +1604,41 @@ def _cancel_leftover(message: str) -> str:
     return (m.group(1) or "").strip()
 
 
+# Printed by a device command that did what it was asked.  Before Android 7
+# (no shell protocol) `adb shell` exits 0 whatever the command did, so a
+# change is judged by this mark, never by the exit code.
+_DONE_MARK = "TURBOADB_DONE"
+
+
+def _marked(command: str) -> str:
+    """*command*, followed by :data:`_DONE_MARK` on a line of its own when it worked."""
+    return f"{{ {command}; }} && echo {_DONE_MARK}"
+
+
+def _marked_done(res) -> bool:
+    """True when the output of a :func:`_marked` command ends with the mark
+    (a line of its own: the device's complaint may name a path that holds it)."""
+    lines = _output_lines(getattr(res, "stdout", ""))
+    return bool(lines) and lines[-1].strip() == _DONE_MARK
+
+
+def _check_removed(handler, paths) -> None:
+    """Worker: raise, in the device's own words, when some of *paths* are
+    still there after the engine deleted them.  On a device that gives no
+    exit status the engine takes a refused ``rm`` for done; what is left is
+    removed once more here, judged by the mark this time."""
+    try:
+        info = _probe_remote(handler, paths)
+    except Exception:
+        return  # can't look: the engine's word stands
+    left = [path for path in paths if info[path][0] != "n"]
+    if not left:
+        return
+    res = handler.shell(_marked(_rm_cmd(left)), timeout=300, safe=False)
+    if not _marked_done(res):
+        raise ADBError(f"{len(left)} of {len(paths)} item(s) not deleted: {_result_error(res)}")
+
+
 def _plan_push(handler, sources, dst_dir: str):
     """Worker: plan local -> device copies into *dst_dir*.
 
@@ -1469,6 +1651,10 @@ def _plan_push(handler, sources, dst_dir: str):
         name = os.path.basename(os.path.normpath(src))
         if not name or name in (".", ".."):
             errors.append(f"{src}: this item can't be pushed")
+            continue
+        if _inexact_local_name(name):
+            # e.g. dropped from Explorer: adb would read another item
+            errors.append(f"{src}: {_INEXACT_LOCAL}, so it was not pushed")
             continue
         if not os.path.lexists(src):
             errors.append(f"{src}: not found")
@@ -2243,6 +2429,9 @@ class FileBrowser(QWidget):
                 if row[0] in seen:
                     unsafe.add(row[0])  # two rows share a name: can't tell them apart
                 seen.add(row[0])
+            if not table.is_remote:
+                # a path to one of these reaches the item beside it instead
+                unsafe.update(name for name in seen if _inexact_local_name(name))
             table.unsafe_names = frozenset(unsafe)
         # (row, date as a number): worked out once, for the date cell and the sort
         listing = [(row, row[8] if len(row) > 8 and row[8] is not None
@@ -2398,7 +2587,7 @@ class FileBrowser(QWidget):
             return
         if name == "..":
             self._up_local()
-        else:
+        elif not self._refuse_unsafe(self.local_table, [name], "Open"):
             self._navigate_local(os.path.join(self.local_cwd, name))
 
     # ---- Navigation: Android Device ----
@@ -2586,16 +2775,32 @@ class FileBrowser(QWidget):
         entries = (self._row_entry(self.local_table, r) for r in self._selected_rows(self.local_table))
         return [(os.path.join(self.local_cwd, name), is_dir) for name, is_dir in entries]
 
+    def _refuse_unsafe_local(self, items, title: str) -> bool:
+        """:meth:`_refuse_unsafe` for the paths :meth:`_selected_local` gives."""
+        return self._refuse_unsafe(self.local_table,
+                                   [os.path.basename(path) for path, _is_dir in items], title)
+
     def _selected_remote(self) -> List[Tuple[str, bool]]:
         return [self._row_entry(self.remote_table, r) for r in self._selected_rows(self.remote_table)]
 
     def _refuse_unsafe(self, table, names, title: str) -> bool:
-        """Refuse (True) when a name could not be identified exactly in the listing."""
+        """Refuse (True) when a name could not be identified exactly in the
+        listing, or is one a path can't reach on this PC."""
         unsafe = getattr(table, "unsafe_names", ())
         bad = [n for n in names if n in unsafe]
         if not bad:
             return False
         preview = ", ".join(repr(n) for n in bad[:4]) + ("…" if len(bad) > 4 else "")
+        if table is self.local_table:
+            self.log.emit(f"[ERROR] {title}: refused for name(s) a path can't reach on this "
+                          f"PC: {preview}")
+            QMessageBox.warning(
+                self, title,
+                f"{len(bad)} selected item(s) can't be reached by name "
+                f"({table.inexact_reason()}): {preview}\n\n"
+                "Nothing was done, so the wrong item can't be affected. Use the program that "
+                "made these names for them (WSL or Git Bash, for example).")
+            return True
         self.log.emit(f"[ERROR] {title}: refused for inexactly listed name(s): {preview}")
         QMessageBox.warning(
             self, title,
@@ -2645,11 +2850,27 @@ class FileBrowser(QWidget):
             return None
         return self.remote_cwd
 
+    def _remote_pane_left(self, folder: str, title: str) -> bool:
+        """True, and said in the log, when the device pane no longer shows
+        *folder*, where the rows of an action were when its dialog opened.
+
+        Events keep running while a dialog is open, and a write-access retry
+        may open another folder meanwhile.  The names taken from the rows
+        belong to *folder*: they are never applied to the folder shown
+        afterwards, and nothing is done to rows that are no longer on screen."""
+        if self.remote_cwd == folder:
+            return False
+        self.log.emit(f"[WARNING] {title} cancelled: the device pane went from {folder} to "
+                      f"{self.remote_cwd} while the dialog was open. Nothing was changed.")
+        return True
+
     # ---- Push / Pull Operations ----
     def push_selected(self):
         items = self._selected_local()
         if not items:
             QMessageBox.information(self, "Push", "Select one or more items on Local PC to push.")
+            return
+        if self._refuse_unsafe_local(items, "Push"):
             return
         dst_dir = self._remote_dir_for_action("Push")
         if dst_dir is not None:
@@ -3062,6 +3283,8 @@ class FileBrowser(QWidget):
     def _local_copy(self):
         items = self._selected_local()
         if items:
+            if self._refuse_unsafe_local(items, "Copy"):
+                return
             self._clipboard = [p for p, _ in items]
             self._clipboard_src = "local"
             self.log.emit(f"[OK] Copied {len(self._clipboard)} local item(s) to clipboard.")
@@ -3095,7 +3318,7 @@ class FileBrowser(QWidget):
 
     def _local_rename(self):
         items = self._selected_local()
-        if len(items) != 1:
+        if len(items) != 1 or self._refuse_unsafe_local(items, "Rename"):
             return
         old_path = items[0][0]
         old_name = os.path.basename(old_path)
@@ -3134,7 +3357,7 @@ class FileBrowser(QWidget):
             self._local_delete_permanently()
             return
         items = self._selected_local()
-        if not items:
+        if not items or self._refuse_unsafe_local(items, "Delete"):
             return
         if QMessageBox.question(self, "Delete Local",
                                 f"Move {len(items)} item(s) to the Recycle Bin?",
@@ -3146,7 +3369,7 @@ class FileBrowser(QWidget):
 
     def _local_delete_permanently(self):
         items = self._selected_local()
-        if not items:
+        if not items or self._refuse_unsafe_local(items, "Delete"):
             return
         if QMessageBox.question(self, "Delete Local",
                                 f"Permanently delete {len(items)} item(s) from Local PC?\n\n"
@@ -3227,14 +3450,17 @@ class FileBrowser(QWidget):
         old_name = self._row_entry(self.remote_table, rows[0])[0]
         if self._refuse_unsafe(self.remote_table, [old_name], "Rename"):
             return
+        folder = self.remote_cwd  # the row's, before the dialog (see _remote_pane_left)
         new_name, ok = QInputDialog.getText(self, "Rename Device Item", "New name:", text=old_name)
         new_name = new_name.strip() if ok else ""
         if not new_name or new_name == old_name:
             return
         if not self._valid_new_name(new_name, "Rename", local=False):
             return
-        src = posixpath.join(self.remote_cwd, old_name)
-        dst = posixpath.join(self.remote_cwd, new_name)
+        if self._remote_pane_left(folder, "Rename"):
+            return
+        src = posixpath.join(folder, old_name)
+        dst = posixpath.join(folder, new_name)
         handler = self.handler
         self._job(lambda: handler.shell(_rename_check_cmd(src, dst), timeout=30, safe=False),
                   lambda res: self._on_rename_checked(old_name, new_name, src, dst, res),
@@ -3266,16 +3492,25 @@ class FileBrowser(QWidget):
             return
         if self._refuse_unsafe(self.remote_table, [name for name, _ in items], "Delete"):
             return
+        # the rows' paths, before the question (see _remote_pane_left)
+        folder = self.remote_cwd
+        targets = [posixpath.join(folder, n) for n, _ in items]
         if QMessageBox.question(self, "Delete Device Items",
                                 f"Permanently delete {len(items)} item(s) from Device?",
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        self._delete_remote_targets([posixpath.join(self.remote_cwd, n) for n, _ in items])
+        if self._remote_pane_left(folder, "Delete"):
+            return
+        self._delete_remote_targets(targets, folder)
 
-    def _delete_remote_targets(self, targets):
+    def _delete_remote_targets(self, targets, folder: str = "", *, again: bool = False):
+        """*folder*: where the targets are (the folder shown, when not given).
+        *again*: the device refused some of them and this is the retry: what
+        the first try did remove is left out, because the engine deletes
+        nothing while one of the paths it is given is missing."""
         label = f"delete {len(targets)} device item(s)"
         handler = self.handler
-        folder = self.remote_cwd
+        folder = folder or self.remote_cwd
 
         def done(_removed):
             self.log.emit(f"[OK] {label}")
@@ -3284,19 +3519,28 @@ class FileBrowser(QWidget):
         def fail(msg):
             self.log.emit(f"[ERROR] {label}: {msg}")
             self.refresh_remote()
-            self._offer_write_access(folder, msg, f"deleting {len(targets)} item(s)",
-                                     lambda: self._delete_remote_targets(targets))
+            self._offer_write_access(
+                folder, msg, f"deleting {len(targets)} item(s)",
+                lambda: self._delete_remote_targets(targets, folder, again=True))
 
         cancel = self._cancel
 
         def work():
+            left = targets
+            if again and not cancel.is_set():
+                try:
+                    info = _probe_remote(handler, targets)
+                    left = [target for target in targets if info[target][0] != "n"]
+                except Exception:
+                    pass  # the engine looks too, and says what is wrong
             removed = []
             # The engine deletes one shell-sized group per `rm`; handing it
             # the groups one by one lets a closed tab stop the rest.
-            for group in _chunks(targets):
+            for group in _chunks(left):
                 if cancel.is_set():
                     break
                 removed += handler.remove(group, recursive=True, safe=False)
+                _check_removed(handler, group)
             return removed
 
         # Deletion belongs to the engine: it refuses '/', refuses a folder
@@ -3318,6 +3562,9 @@ class FileBrowser(QWidget):
         toasts that replaced each other and left a file name on screen
         instead of a result. Failures always surface individually.
 
+        Each command is sent with the mark that says it worked (``_DONE_MARK``),
+        and is judged by it.
+
         Closing the tab stops the batch before its next command (the one
         running finishes: a device shell call can't be interrupted)."""
         handler = self.handler
@@ -3329,11 +3576,12 @@ class FileBrowser(QWidget):
                 if cancel.is_set():
                     break
                 try:
-                    res = handler.shell(cmd, timeout=timeout, safe=False)
+                    res = handler.shell(_marked(cmd), timeout=timeout, safe=False)
                 except Exception as exc:  # reported per command in done()
                     out.append((label, False, f"{type(exc).__name__}: {exc}"))
                     continue
-                out.append((label, bool(res.ok), "" if res.ok else _result_error(res)))
+                ok = _marked_done(res)  # not res.ok: see _DONE_MARK
+                out.append((label, ok, "" if ok else _result_error(res)))
             return out
 
         folder = self.remote_cwd
@@ -3424,7 +3672,10 @@ class FileBrowser(QWidget):
 
     # ---- Edit File ----
     def _open_editor(self, name: str, path: str, text: str, newline: str, mixed: bool, write, refresh):
-        """Show the (window-modal, non-blocking) editor; *write(file_text)* runs on a worker."""
+        """Show the (window-modal, non-blocking) editor; *write(file_text,
+        replace)* runs on a worker.  It returns ``_CHANGED_SINCE_LOADED``
+        without saving when the file is no longer what the editor loaded:
+        the user is asked, and on Yes it runs again with *replace* set."""
         if mixed:
             ending = _LINE_ENDING_NAMES.get(newline, "LF")
             self.log.emit(f"[INFO] {name} has mixed line endings; saving will use {ending} throughout.")
@@ -3433,12 +3684,34 @@ class FileBrowser(QWidget):
         def save_fn(new_text):
             payload = _text_for_save(new_text, newline)
 
-            def done(_result):
+            def done(result):
+                if result == _CHANGED_SINCE_LOADED:
+                    if _alive(dlg):
+                        ask_to_replace()
+                    return
                 if _alive(self) and not self._closing:
                     self.log.emit(f"[OK] Saved {path}")
                     refresh()
                 if _alive(dlg):
                     dlg.complete_async_save(True)
+
+            def ask_to_replace():
+                # The editor is still "saving" while the question is open, so
+                # nothing else can be saved from it meanwhile.
+                answer = QMessageBox.question(
+                    dlg, "Save File",
+                    f"{name} changed on the device since you opened it.\n\n"
+                    f"Replace it on the device with the text in the editor?\n{path}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if not _alive(dlg):
+                    return
+                if answer == QMessageBox.Yes:
+                    start(replace=True)
+                    return
+                if _alive(self) and not self._closing:
+                    self.log.emit(f"[INFO] {name} was not saved: it changed on the device "
+                                  "since you opened it.")
+                dlg.complete_async_save(False, report=False)
 
             def fail(msg):
                 if not _alive(dlg):
@@ -3450,8 +3723,11 @@ class FileBrowser(QWidget):
                 dlg.complete_async_save(False, f"Could not save {name}:\n{msg}",
                                         report=not offered)
 
-            # Not in self._jobs: close_panel must not cut an open editor's save path.
-            run_job(self._save_jobs, lambda: write(payload), done, fail)
+            def start(replace=False):
+                # Not in self._jobs: close_panel must not cut an open editor's save path.
+                run_job(self._save_jobs, lambda: write(payload, replace), done, fail)
+
+            start()
             return None
 
         dlg.on_save = save_fn
@@ -3504,10 +3780,13 @@ class FileBrowser(QWidget):
         if not entry or entry[1]:
             return
         name = entry[0]
+        if self._refuse_unsafe(self.local_table, [name], "Edit File"):
+            return
         path = os.path.join(self.local_cwd, name)
         self._job(lambda: _edit_load_result(lambda: _read_for_edit(path)),
                   lambda result: self._handle_edit_load(
-                      name, path, result, lambda payload: _save_local_text(path, payload),
+                      name, path, result,
+                      lambda payload, _replace=False: _save_local_text(path, payload),
                       self.refresh_local, hint),
                   lambda msg: QMessageBox.critical(self, "Edit File", f"Could not read {name}:\n{msg}"))
 
@@ -3538,8 +3817,10 @@ class FileBrowser(QWidget):
         full_path = posixpath.join(self.remote_cwd, name)
         handler = self.handler
         cancel = self._cancel
-        # Filled by load(): the file a symlink points to and its permission bits.
-        target = {"path": full_path, "mode": ""}
+        # Filled by load(): the file a symlink points to, its permission bits,
+        # and its (size, modified) on the device when the editor read it or
+        # last saved it (None when the device can't say).
+        target = {"path": full_path, "mode": "", "stamp": None}
         self.log.emit(f"Fetching {name} for editing…")
 
         def load():
@@ -3561,6 +3842,8 @@ class FileBrowser(QWidget):
                 # pulling a link to a pipe never ends, and holds an adb slot meanwhile
                 return ("refused", "It is a link to something other than a regular file, so it "
                                    "can't be edited as text.")
+            # before the pull: a change made while it runs is then noticed too
+            target["stamp"] = _device_stamp(handler, target["path"])
             fd, tmp_path = tempfile.mkstemp(prefix="turboadb-edit-")
             os.close(fd)
             try:
@@ -3574,7 +3857,13 @@ class FileBrowser(QWidget):
                 except OSError:
                     pass
 
-        def write(payload):
+        def write(payload, replace=False):
+            expected = target["stamp"]
+            if expected is not None and not replace:
+                now = _device_stamp(handler, target["path"])
+                if now is not None and now != expected:
+                    # another program wrote the file meanwhile: asked about first
+                    return _CHANGED_SINCE_LOADED
             fd, tmp_path = tempfile.mkstemp(prefix="turboadb-edit-")
             os.close(fd)
             try:
@@ -3587,6 +3876,8 @@ class FileBrowser(QWidget):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+            target["stamp"] = _device_stamp(handler, target["path"])
+            return None
 
         self._job(load,
                   lambda result: self._handle_edit_load(name, target["path"], result, write,
@@ -3665,6 +3956,8 @@ class FileBrowser(QWidget):
         if not entry or entry[1]:
             return
         name = entry[0]
+        if self._refuse_unsafe(self.local_table, [name], "Open"):
+            return
         how, hint = self._how_to_open(name, choose, device=False)
         if how == "edit":
             self._local_edit_row(row, hint)

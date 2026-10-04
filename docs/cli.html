@@ -55,7 +55,9 @@
       <article class="feature" id="start">
         <h3>Getting started</h3>
         <p class="desc"><code>adb</code> and <code>scrcpy</code> download themselves on
-        first use. <code>turboadb -h</code> lists the commands and
+        first use (adb on Windows, macOS and x86-64 Linux, scrcpy on Windows; elsewhere
+        the ones on PATH are used), and neither is ever taken from the current folder.
+        <code>turboadb -h</code> lists the commands and
         <code>turboadb &lt;command&gt; -h</code> shows one command's options.</p>
         <div class="code"><pre><code>pip install turboadb
 turboadb doctor                                   # are adb and scrcpy available?
@@ -88,7 +90,7 @@ turboadb -s @bench info                           # …and use it by name</code>
             <tr><td><code>--adb-port PORT</code></td><td>adb server port (default <code>5037</code>).</td></tr>
             <tr><td><code>--adb-path PATH</code></td><td>Use this adb executable (or its folder). A path with no adb is an error — never a silent switch to another adb.</td></tr>
             <tr><td><code>--scrcpy-path PATH</code></td><td>Use this scrcpy executable.</td></tr>
-            <tr><td><code>--timeout SECONDS</code></td><td>Timeout for each command (default 60 s) and for bugreport (default 15 minutes); a push or pull fails only after this long without progress (default 600 s); <code>0</code> for no limit. <code>shell -- COMMAND</code> and <code>adb -- ARGS</code> stream as long as they run unless it is given.</td></tr>
+            <tr><td><code>--timeout SECONDS</code></td><td>Timeout for each command (default 60 s) and for bugreport (default 15 minutes); a push or pull fails only after this long without progress (default 600 s); <code>install</code>, <code>cp</code> and <code>rm</code> have longer limits of their own, which a longer value extends and a shorter one never cuts; <code>0</code> for no limit. <code>shell -- COMMAND</code> and <code>adb -- ARGS</code> stream as long as they run unless it is given.</td></tr>
             <tr><td><code>--json</code></td><td>One JSON document on stdout (progress and warnings go to stderr): data as JSON, actions as <code>{"ok": …, "message": …}</code> (the <code>targets</code> actions, and <code>forward</code>/<code>reverse</code> after Ctrl+C, too), returned values as <code>{"ok": …, "result": …}</code>, saved files as <code>{"ok": …, "path": …}</code>, a <code>--full</code> report as <code>{"ok": …, "report": …}</code>, <code>serve</code> as <code>{"ok": …, "port": …, "messages": […]}</code>. The setup commands take it too; <code>logcat</code> streams plain lines.</td></tr>
             <tr><td><code>-V, --version</code></td><td>Print the TurboADB version.</td></tr>
           </tbody>
@@ -127,10 +129,10 @@ turboadb -s @bench info                           # …and use it by name</code>
           <thead><tr><th>Command</th><th>What it does</th><th>Options</th></tr></thead>
           <tbody>
             <tr data-cmd="doctor"><td><code>doctor</code></td><td>Report whether adb and scrcpy were found, and where; the running adb server (release, protocol, executable — and a warning when another adb's server would keep being restarted); and which TurboADB runs, with a warning when this Python has a different copy installed.</td><td><code>--json</code></td></tr>
-            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>. <code>--adb-only</code> and <code>--scrcpy-only</code> are mutually exclusive.</td><td><code>--adb-only</code> | <code>--scrcpy-only</code> <code>--force</code> <code>--json</code></td></tr>
+            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>: adb where Google builds it for the machine (Windows, macOS, x86-64 Linux), scrcpy on Windows. <code>--adb-only</code> and <code>--scrcpy-only</code> are mutually exclusive.</td><td><code>--adb-only</code> | <code>--scrcpy-only</code> <code>--force</code> <code>--json</code></td></tr>
             <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code> <code>--json</code></td></tr>
             <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from PyPI (exactly the version it offers — a lagging package mirror is reported, not called an update), then adb and scrcpy. A source checkout updates with <code>git pull</code>.</td><td><code>--check</code> <code>--json</code></td></tr>
-            <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows). They start the TurboADB installed in this Python, so a different running copy (a source checkout) changes nothing and says why.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows). They start the TurboADB installed in this Python, so a different running copy (a source checkout) changes nothing and says why. Without PyQt5 they start <code>turboadb-gui</code>; where nothing could start the app, none is written and the command exits <code>1</code>.</td><td><code>--json</code></td></tr>
             <tr data-cmd="gui"><td><code>gui</code></td><td>Launch the desktop app.</td><td></td></tr>
           </tbody>
         </table></div>
@@ -143,7 +145,7 @@ turboadb self-update --check</code></pre></div>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="devices"><td><code>devices</code></td><td>List devices on the local adb server, or the one <code>--adb-host</code> (or <code>-s @NAME</code>) selects.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="devices"><td><code>devices</code></td><td>List devices on the local adb server, or the one <code>--adb-host</code> (or <code>-s @NAME</code>) selects. A missing adb exits <code>3</code>, and a server that cannot be started or reached exits <code>1</code> with the reason, never "No devices found".</td><td><code>--json</code></td></tr>
             <tr data-cmd="info"><td><code>info</code></td><td>Identity and build: model, Android, CPU, device type (phone, tablet, tv, watch, automotive, head unit), telephony, display size.</td><td><code>--json</code></td></tr>
             <tr data-cmd="connect"><td><code>connect</code></td><td><code>adb connect</code> to a network device.</td><td><code>HOST:PORT</code></td></tr>
             <tr data-cmd="disconnect"><td><code>disconnect</code></td><td>Disconnect one network device, or all.</td><td><code>[HOST:PORT]</code> <code>--json</code></td></tr>
@@ -173,11 +175,11 @@ turboadb -s @lab screenshot lab.png</code></pre></div>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="shell"><td><code>shell</code></td><td>Run a command on the device (put <code>--</code> before it), on every device of the selected adb server, or a batch file; no command opens an interactive shell. Output streams as the device writes it (<code>ping</code>, <code>top</code>, <code>logcat</code>), with no time limit unless <code>--timeout</code> is given; <code>--json</code> collects it.</td><td><code>COMMAND…</code> <code>--su</code> <code>--all</code> <code>--batch FILE</code> <code>--keep-going</code> <code>--json</code></td></tr>
+            <tr data-cmd="shell"><td><code>shell</code></td><td>Run a command on the device (put <code>--</code> before it), on every device of the selected adb server, or a batch file; no command opens an interactive shell. Output streams as the device writes it (<code>ping</code>, <code>top</code>, <code>logcat</code>), with no time limit unless <code>--timeout</code> is given; <code>--json</code> collects it. A batch file is read as UTF-8 (with or without a byte order mark) or, by its mark, as UTF-16 or UTF-32.</td><td><code>COMMAND…</code> <code>--su</code> <code>--all</code> <code>--batch FILE</code> <code>--keep-going</code> <code>--json</code></td></tr>
             <tr data-cmd="adb"><td><code>adb</code></td><td>Any adb command for the selected device (<code>-s</code>, <code>--adb-host</code> added for you), attached to your console as adb itself runs: streaming output, byte-exact <code>exec-out</code>, prompts. <code>--timeout</code> limits it; <code>--json</code> collects it.</td><td><code>-- ARGS…</code></td></tr>
             <tr data-cmd="logcat"><td><code>logcat</code></td><td>Stream logcat live, filtered, and save it.</td><td><code>--tag TAG</code> <code>--priority V|D|I|W|E|F</code> <code>--filter TAG:LEVEL</code> (repeat) <code>--buffer NAME</code> (repeat) <code>--crashes</code> <code>--pid PID</code> <code>--package NAME</code> <code>--grep REGEX</code> <code>--match REGEX</code> <code>--stop-on-match</code> <code>--format threadtime</code> <code>--save FILE</code> <code>--clear</code> <code>--dump</code> <code>--tail N</code></td></tr>
             <tr data-cmd="logcat-clear"><td><code>logcat-clear</code></td><td>Clear the logcat buffers.</td><td></td></tr>
-            <tr data-cmd="bugreport"><td><code>bugreport</code></td><td>Capture a full bug report zip (a few minutes; <code>--timeout</code> sets the limit, <code>0</code> for none).</td><td><code>[PATH]</code></td></tr>
+            <tr data-cmd="bugreport"><td><code>bugreport</code></td><td>Capture a full bug report zip (a few minutes; <code>--timeout</code> sets the limit, <code>0</code> for none). <code>PATH</code> is a file (<code>.zip</code> is added when it lacks it) or an existing folder; the file that was saved is printed.</td><td><code>[PATH]</code></td></tr>
           </tbody>
         </table></div>
         <div class="code"><pre><code>turboadb -s SERIAL shell
@@ -196,15 +198,15 @@ turboadb -s SERIAL logcat --filter ActivityManager:I --grep "ANR|FATAL" --save c
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
             <tr data-cmd="push"><td><code>push</code></td><td>Upload a file or folder to the device, with progress.</td><td><code>LOCAL REMOTE</code> <code>--json</code></td></tr>
-            <tr data-cmd="pull"><td><code>pull</code></td><td>Download a file or folder from the device, with progress.</td><td><code>REMOTE LOCAL</code> <code>--json</code></td></tr>
+            <tr data-cmd="pull"><td><code>pull</code></td><td>Download a file or folder from the device, with progress. The result counts what this pull copied; on Windows a name with a character Windows forbids is saved under a valid one.</td><td><code>REMOTE LOCAL</code> <code>--json</code></td></tr>
             <tr data-cmd="ls"><td><code>ls</code></td><td>List a device folder: permissions, owner, size, date, name.</td><td><code>[PATH=/sdcard]</code> <code>--json</code></td></tr>
             <tr data-cmd="mkdir"><td><code>mkdir</code></td><td>Create folders, with any missing parents.</td><td><code>PATH…</code></td></tr>
             <tr data-cmd="touch"><td><code>touch</code></td><td>Create empty files.</td><td><code>PATH…</code></td></tr>
             <tr data-cmd="rm"><td><code>rm</code></td><td>Delete files, and folders with <code>-r</code> (<code>/</code> is always refused).</td><td><code>PATH…</code> <code>-r</code></td></tr>
-            <tr data-cmd="mv"><td><code>mv</code></td><td>Move or rename; into a folder when the destination is one.</td><td><code>SRC DST</code> <code>-f</code></td></tr>
+            <tr data-cmd="mv"><td><code>mv</code></td><td>Move or rename; into a folder when the destination is one (a folder given its own name in other letters is renamed).</td><td><code>SRC DST</code> <code>-f</code></td></tr>
             <tr data-cmd="cp"><td><code>cp</code></td><td>Copy a file or folder; into an existing folder it merges. A link is copied as a link, an item of another kind is never overwritten, and a folder is never copied into itself.</td><td><code>SRC DST</code></td></tr>
             <tr data-cmd="stat"><td><code>stat</code></td><td>Path, real path, type, size and octal mode.</td><td><code>PATH</code> <code>--json</code></td></tr>
-            <tr data-cmd="edit"><td><code>edit</code></td><td>Edit a device text file in a local editor; saved back only when changed, keeping its permissions. The editor is found on PATH as a console finds it (<code>code</code> is <code>code.cmd</code> on Windows).</td><td><code>PATH</code> <code>--editor "code --wait"</code></td></tr>
+            <tr data-cmd="edit"><td><code>edit</code></td><td>Edit a device text file in a local editor; saved back only when changed, keeping its permissions. The editor is found on PATH (<code>code</code> is <code>code.cmd</code> on Windows), never in the current folder.</td><td><code>PATH</code> <code>--editor "code --wait"</code></td></tr>
           </tbody>
         </table></div>
         <div class="code"><pre><code>turboadb -s SERIAL push app.apk /data/local/tmp/
@@ -221,14 +223,14 @@ turboadb -s SERIAL edit /data/local/tmp/config.ini</code></pre></div>
           <tbody>
             <tr data-cmd="packages"><td><code>packages</code></td><td>List installed packages.</td><td><code>[FILTER]</code> <code>--third-party</code> <code>--system</code> <code>--enabled</code> <code>--disabled</code> <code>--path</code> <code>--json</code></td></tr>
             <tr data-cmd="install"><td><code>install</code></td><td>Install one APK, or several as a split install.</td><td><code>APK…</code> <code>--grant</code> <code>--downgrade</code> <code>--no-replace</code> <code>--test</code></td></tr>
-            <tr data-cmd="uninstall"><td><code>uninstall</code></td><td>Uninstall a package.</td><td><code>PACKAGE</code> <code>--keep-data</code></td></tr>
-            <tr data-cmd="clear"><td><code>clear</code></td><td>Clear an app's data.</td><td><code>PACKAGE</code></td></tr>
+            <tr data-cmd="uninstall"><td><code>uninstall</code></td><td>Uninstall a package; <code>--keep-data</code> keeps its data and cache (through the device's package manager, as adb refuses the option).</td><td><code>PACKAGE</code> <code>--keep-data</code></td></tr>
+            <tr data-cmd="clear"><td><code>clear</code></td><td>Clear an app's data (the foreground user's copy on a device with several users, such as Android Automotive).</td><td><code>PACKAGE</code></td></tr>
             <tr data-cmd="start"><td><code>start</code></td><td>Launch an app by package (works on head units too).</td><td><code>PACKAGE</code></td></tr>
             <tr data-cmd="start-activity"><td><code>start-activity</code></td><td>Start an activity with an optional action, data and extras.</td><td><code>PKG/.Activity</code> <code>--action</code> <code>--data</code> <code>--es K V</code> <code>--ei K V</code> <code>--ez K V</code></td></tr>
             <tr data-cmd="activity"><td><code>activity</code></td><td>The activity in the foreground.</td><td></td></tr>
             <tr data-cmd="stop"><td><code>stop</code></td><td>Force-stop an app.</td><td><code>PACKAGE</code></td></tr>
-            <tr data-cmd="grant"><td><code>grant</code></td><td>Grant a runtime permission.</td><td><code>PACKAGE PERMISSION</code></td></tr>
-            <tr data-cmd="revoke"><td><code>revoke</code></td><td>Revoke a runtime permission.</td><td><code>PACKAGE PERMISSION</code></td></tr>
+            <tr data-cmd="grant"><td><code>grant</code></td><td>Grant a runtime permission (to the foreground user's copy of the app).</td><td><code>PACKAGE PERMISSION</code></td></tr>
+            <tr data-cmd="revoke"><td><code>revoke</code></td><td>Revoke a runtime permission (for the foreground user's copy of the app).</td><td><code>PACKAGE PERMISSION</code></td></tr>
             <tr data-cmd="close-apps"><td><code>close-apps</code></td><td>Close background apps.</td><td></td></tr>
           </tbody>
         </table></div>
@@ -247,7 +249,7 @@ turboadb -s SERIAL grant com.example.app android.permission.ACCESS_FINE_LOCATION
           <tbody>
             <tr data-cmd="displays"><td><code>displays</code></td><td>List the device's displays: id, size, name.</td><td><code>--method auto|adb|scrcpy</code> <code>--json</code></td></tr>
             <tr data-cmd="screenshot"><td><code>screenshot</code></td><td>Save a PNG screenshot.</td><td><code>PATH</code> <code>--display N</code></td></tr>
-            <tr data-cmd="record"><td><code>record</code></td><td>Record on the device and pull the MP4 (works over RDP; Ctrl+C stops and saves). <code>--continuous</code> records past the 3-minute cap in parts.</td><td><code>PATH</code> <code>--time-limit 30</code> <code>--size WxH</code> <code>--bit-rate 8M</code> <code>--display N</code> <code>--continuous</code> <code>--json</code></td></tr>
+            <tr data-cmd="record"><td><code>record</code></td><td>Record on the device and pull the MP4 (works over RDP; Ctrl+C stops and saves). <code>--continuous</code> records past the 3-minute cap in parts. <code>PATH</code> may be a folder: the recording is saved there as <code>recording-DATE-TIME.mp4</code>.</td><td><code>PATH</code> <code>--time-limit 30</code> <code>--size WxH</code> <code>--bit-rate 8M</code> <code>--display N</code> <code>--continuous</code> <code>--json</code></td></tr>
             <tr data-cmd="scrcpy"><td><code>scrcpy</code></td><td>Mirror and control the screen, or the device camera. <code>--compat</code> is the profile for head units that won't mirror with the defaults.</td><td><code>--display-id N</code> <code>--compat</code> <code>--max-size PX</code> <code>--bit-rate</code> <code>--max-fps</code> <code>--video-codec h264|h265|av1</code> <code>--crop W:H:X:Y</code> <code>--render-driver</code> <code>--keyboard sdk|uhid|aoa</code> <code>--force-adb-forward</code> <code>--no-audio</code> <code>--audio-source</code> <code>--audio-codec</code> <code>--audio-bit-rate</code> <code>--audio-buffer</code> <code>--audio-output-buffer</code> <code>--audio-dup</code> <code>--record FILE</code> <code>--record-format mp4|mkv</code> <code>--no-playback</code> <code>--turn-screen-off</code> <code>--no-stay-awake</code> <code>--show-touches</code> <code>--no-control</code> <code>--fullscreen</code> <code>--always-on-top</code> <code>--window-borderless</code> <code>--window-title</code> <code>--video-source display|camera</code> <code>--camera-facing</code> <code>--camera-size</code> <code>--log FILE</code> <code>--wait</code> <code>--json</code></td></tr>
             <tr data-cmd="screen"><td><code>screen</code></td><td>Turn the device screen on or off.</td><td><code>on|off</code></td></tr>
           </tbody>
@@ -268,7 +270,7 @@ turboadb -s SERIAL scrcpy --no-playback --record drive.mkv --record-format mkv</
             <tr data-cmd="text"><td><code>text</code></td><td>Type text into the focused field. Options go before the text (<code>--</code> types it exactly as written).</td><td><code>TEXT…</code> <code>--display N</code></td></tr>
             <tr data-cmd="tap"><td><code>tap</code></td><td>Tap a point, or the centre of the screen.</td><td><code>[X Y]</code> <code>--display N</code></td></tr>
             <tr data-cmd="tap-burst"><td><code>tap-burst</code></td><td>Tap one point many times from a single device-side loop (soak and stress testing).</td><td><code>X Y</code> <code>--count 100</code> <code>--rate</code> <code>--duration</code> <code>--display</code> <code>--method auto|input|events</code> <code>--json</code></td></tr>
-            <tr data-cmd="touch-device"><td><code>touch-device</code></td><td>The touchscreen a tap burst can write to, and whether the shell may.</td><td><code>--json</code></td></tr>
+            <tr data-cmd="touch-device"><td><code>touch-device</code></td><td>The touchscreen a tap burst can write to, and whether the shell may. Exits <code>1</code> when none is found, with <code>--json</code> too.</td><td><code>--json</code></td></tr>
             <tr data-cmd="swipe"><td><code>swipe</code></td><td>Swipe from one point to another.</td><td><code>X1 Y1 X2 Y2</code> <code>--ms 200</code> <code>--display N</code></td></tr>
             <tr data-cmd="scroll"><td><code>scroll</code></td><td>Scroll with a swipe.</td><td><code>up|down|left|right</code> <code>--display N</code></td></tr>
             <tr data-cmd="media"><td><code>media</code></td><td>Media control through the active session.</td><td><code>play-pause|play|pause|next|previous|stop|fast-forward|rewind|mute</code></td></tr>
@@ -341,7 +343,7 @@ turboadb -s SERIAL getprop ro.build.fingerprint</code></pre></div>
             <tr data-cmd="call"><td><code>call</code></td><td>Place a call.</td><td><code>NUMBER</code></td></tr>
             <tr data-cmd="answer"><td><code>answer</code></td><td>Answer a ringing call.</td><td></td></tr>
             <tr data-cmd="end-call"><td><code>end-call</code></td><td>Hang up or reject the current call.</td><td></td></tr>
-            <tr data-cmd="call-state"><td><code>call-state</code></td><td>Idle, ringing or in call.</td><td></td></tr>
+            <tr data-cmd="call-state"><td><code>call-state</code></td><td>Idle, ringing or in call (every SIM counts), or unknown on a device without a call state; a device that could not be asked is an error.</td><td></td></tr>
             <tr data-cmd="call-log"><td><code>call-log</code></td><td>Recent calls.</td><td><code>--limit 20</code> <code>--json</code></td></tr>
             <tr data-cmd="sms"><td><code>sms</code></td><td>Recent SMS messages.</td><td><code>--limit 20</code> <code>--json</code></td></tr>
             <tr data-cmd="send-sms"><td><code>send-sms</code></td><td>Open Messages with a draft; you press Send on the device.</td><td><code>NUMBER TEXT…</code></td></tr>
@@ -398,8 +400,8 @@ turboadb -s SERIAL reverse --remove tcp:3000</code></pre></div>
         <div class="table-wrap"><table class="cmds">
           <thead><tr><th>Command</th><th>What it does</th><th>Arguments &amp; options</th></tr></thead>
           <tbody>
-            <tr data-cmd="serve"><td><code>serve</code></td><td>Share this PC's adb server so others can use <code>--adb-host</code> (opens the firewall on Domain and Private networks only, as the server has no password; needs Administrator), check it, or stop sharing. The auto-starts run the adb the server was started with; <code>--port</code> defaults to <code>--adb-port</code>.</td><td><code>--port 5037</code> <code>--startup-task</code> <code>--install-startup</code> <code>--uninstall-startup</code> <code>--status</code> <code>--stop</code> <code>--json</code></td></tr>
-            <tr data-cmd="deploy-serve"><td><code>deploy-serve</code></td><td>Set up <code>serve</code> on remote Windows PCs over WinRM (needs <code>turboadb[winrm]</code>).</td><td><code>HOST…</code> <code>-u USER</code> <code>-p PASSWORD</code> <code>--port 5037</code> <code>--ssl</code> <code>--winrm-port</code> <code>--no-update</code> <code>--test</code> <code>--json</code></td></tr>
+            <tr data-cmd="serve"><td><code>serve</code></td><td>Share this PC's adb server so others can use <code>--adb-host</code> (opens the firewall on Domain and Private networks only, as the server has no password; needs Administrator), check it, or stop sharing. The auto-starts run the adb the server was started with (the SYSTEM startup task a copy of it under Program Files that only administrators can change, where the adb found is not protected); <code>--uninstall-startup</code> exits <code>1</code> and says so when the startup task could not be removed (that needs Administrator); <code>--port</code> defaults to <code>--adb-port</code>.</td><td><code>--port 5037</code> <code>--startup-task</code> <code>--install-startup</code> <code>--uninstall-startup</code> <code>--status</code> <code>--stop</code> <code>--json</code></td></tr>
+            <tr data-cmd="deploy-serve"><td><code>deploy-serve</code></td><td>Set up <code>serve</code> on remote Windows PCs over WinRM (needs <code>turboadb[winrm]</code>). A target without adb gets it downloaded first.</td><td><code>HOST…</code> <code>-u USER</code> <code>-p PASSWORD</code> <code>--port 5037</code> <code>--ssl</code> <code>--winrm-port</code> <code>--no-update</code> <code>--test</code> <code>--json</code></td></tr>
           </tbody>
         </table></div>
         <div class="code"><pre><code># on the PC with the device:
@@ -414,7 +416,9 @@ turboadb deploy-serve lab-pc-01 lab-pc-02 -u "DOMAIN\user" --ssl</code></pre></d
 
       <article class="feature" id="more">
         <h3>More</h3>
-        <p class="desc"><code>turboadb-gui</code> starts the desktop app, <code>turboadb-docs</code>
+        <p class="desc"><code>turboadb-gui</code> starts the desktop app (without PyQt5 on
+        Windows, the executable bundled in the wheel, from a copy in
+        <code>~/.turboadb/gui</code>), <code>turboadb-docs</code>
         opens this site, and <code>turboadb-shortcut</code> creates shortcuts. For shell tab
         completion install <code>turboadb[completion]</code> and run
         <code>eval "$(register-python-argcomplete turboadb)"</code>. The same reference, with

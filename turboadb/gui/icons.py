@@ -138,6 +138,7 @@ ICONS: Dict[str, str] = {
     "help": '<circle cx="12" cy="12" r="9.5"/><path d="M9.2 9a3 3 0 0 1 5.8 1c0 2-3 2.6-3 4.6"/><path d="M12 17.5h.01"/>',
     "info": '<circle cx="12" cy="12" r="9.5"/><path d="M12 11v5.5M12 7.5h.01"/>',
     "more": _dots([(5, 12), (12, 12), (19, 12)], 1.6),
+    "dot": _dots([(12, 12)], 7),  # a state at a glance, in its tone's colour
     "plus": '<path d="M12 5v14M5 12h14"/>',
     "x": '<path d="M18 6 6 18M6 6l12 12"/>',
     "check": '<path d="M20 6 9 17l-5-5"/>',

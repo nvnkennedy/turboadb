@@ -10,7 +10,10 @@ import pytest
 
 pytest.importorskip("PyQt5")
 
-from PyQt5.QtCore import QPoint, Qt  # noqa: E402
+from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
+from PyQt5.QtGui import QMouseEvent  # noqa: E402
+from PyQt5.QtTest import QTest  # noqa: E402
+from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from turboadb.gui import file_browser as fb  # noqa: E402
 
@@ -73,5 +76,61 @@ def test_the_lists_stay_level_when_one_sides_rows_wrap(qapp, tmp_path):
         assert lhead.height() == rhead.height() == rhead.layout().heightForWidth(rhead.width())
         left, right = _rect(browser, browser.local_table), _rect(browser, browser.remote_table)
         assert (left[1], left[3]) == (right[1], right[3])
+    finally:
+        browser.close_panel()
+
+
+def _feet(browser):
+    return browser.local_status.parentWidget(), browser.remote_status.parentWidget()
+
+
+def _drag_handle(qapp, split, index, dx):
+    """Drag the splitter's handle *index* by *dx* pixels with the mouse, in
+    steps, as a hand does: a pane passes through its narrowest width before
+    it snaps shut."""
+    handle = split.handle(index)
+    grip = handle.rect().center()
+    origin = handle.mapToGlobal(grip)
+    QTest.mousePress(handle, Qt.LeftButton, Qt.NoModifier, grip)
+    for moved in range(0, dx, 10 if dx > 0 else -10):
+        to = QPoint(origin.x() + moved, origin.y())
+        QApplication.sendEvent(handle, QMouseEvent(
+            QEvent.MouseMove, QPointF(handle.mapFromGlobal(to)), QPointF(to), Qt.NoButton,
+            Qt.LeftButton, Qt.NoModifier))
+        _settle(qapp)
+    QTest.mouseRelease(handle, Qt.LeftButton, Qt.NoModifier,
+                       handle.mapFromGlobal(QPoint(origin.x() + dx, origin.y())))
+    _settle(qapp)
+
+
+@pytest.mark.parametrize("shut", ["pc", "device"])
+def test_a_pane_dragged_shut_leaves_the_other_its_own_header_and_footer(qapp, tmp_path, shut):
+    """On its way shut a pane is at its narrowest, where its rows wrap the
+    most.  The other pane kept a header and footer that tall, its list lost
+    half its height, and the page could no longer be made lower."""
+    browser = _shown(qapp, tmp_path, 1280)
+    try:
+        split = browser.local_table.parentWidget().parentWidget()
+        lowest = browser.minimumSizeHint().height()
+        gone, kept = (0, 1) if shut == "pc" else (1, 0)
+        _drag_handle(qapp, split, 1 if shut == "pc" else 2, -700 if shut == "pc" else 700)
+        assert split.sizes()[2 * gone] == 0 and split.sizes()[2 * kept] > 0
+
+        head, foot = _heads(browser)[kept], _feet(browser)[kept]
+        table = (browser.local_table, browser.remote_table)[kept]
+        assert head.height() == head.layout().heightForWidth(head.width())
+        assert foot.height() == foot.layout().heightForWidth(foot.width())
+        assert browser.minimumSizeHint().height() <= lowest
+        # Push and Pull stay centred on the list that is left
+        push, pull = _rect(browser, browser.btn_push), _rect(browser, browser.btn_pull)
+        rows = _rect(browser, table)
+        assert abs((push[1] + pull[1] + pull[3]) / 2 - (rows[1] + rows[3] / 2)) <= 1
+
+        split.setSizes([588, 104, 588])  # opened again: the panes are level as before
+        _settle(qapp)
+        left, right = _rect(browser, browser.local_table), _rect(browser, browser.remote_table)
+        assert (left[1], left[3]) == (right[1], right[3])
+        lhead, rhead = _heads(browser)
+        assert lhead.height() == rhead.height()
     finally:
         browser.close_panel()

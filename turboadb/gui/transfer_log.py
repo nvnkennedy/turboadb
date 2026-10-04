@@ -545,7 +545,50 @@ def measure_local(paths: Iterable[str]) -> Dict[str, Tuple[int, int]]:
 
 
 _MEASURE_CHUNK = 100
+# Windows starts no command line longer than 32,767 characters, and a measuring
+# command of 100 paths, each written four times, came to more: no size was
+# ever measured.  One command keeps well below that.
+_MEASURE_CHARS = 24000
 _MEASURE_LINE_RE = re.compile(r"^@@(\d+) ([DFN])(?: (\d+))?\s*$")
+
+
+def _measure_part(index: int, path: str) -> str:
+    """The shell text that prints ``@@index D <KiB>``, ``@@index F <bytes>`` or
+    ``@@index N`` for the device *path* (written once, in a variable)."""
+    quoted = shlex.quote(_strip_merge(path).rstrip("/") or "/")
+    return (
+        f"p={quoted}; if [ -d \"$p\" ]; then echo \"@@{index} D $(du -sk \"$p\" 2>/dev/null"
+        f" | cut -f1)\"; elif [ -e \"$p\" ]; then echo \"@@{index} F $(stat -c %s "
+        f"\"$p\" 2>/dev/null)\"; else echo \"@@{index} N\"; fi"
+    )
+
+
+def _command_line_room(text: str) -> int:
+    """The most characters *text* (and what joins it to the next) takes on a
+    command line."""
+    return len(text) + text.count('"') + text.count("\\") + 2
+
+
+def _measure_commands(paths: Sequence[str]):
+    """``(paths, command)`` pairs that measure *paths*: at most
+    :data:`_MEASURE_CHUNK` paths to a command, and no more text than
+    :data:`_MEASURE_CHARS`, counted as a Windows command line holds it (a
+    double quote or a backslash may take two characters there)."""
+    chunk: List[str] = []
+    parts: List[str] = []
+    used = 0
+    for path in paths:
+        part = _measure_part(len(chunk), path)
+        if chunk and (len(chunk) >= _MEASURE_CHUNK
+                      or used + _command_line_room(part) > _MEASURE_CHARS):
+            yield chunk, "; ".join(parts)
+            chunk, parts, used = [], [], 0
+            part = _measure_part(0, path)
+        chunk.append(path)
+        parts.append(part)
+        used += _command_line_room(part)
+    if chunk:
+        yield chunk, "; ".join(parts)
 
 
 def measure_remote(handler, paths: Sequence[str], *, timeout: float = 120.0
@@ -558,19 +601,9 @@ def measure_remote(handler, paths: Sequence[str], *, timeout: float = 120.0
     out: Dict[str, Tuple[int, bool]] = {}
     if handler is None or not paths:
         return out
-    paths = list(paths)
-    for start in range(0, len(paths), _MEASURE_CHUNK):
-        chunk = paths[start:start + _MEASURE_CHUNK]
-        parts = []
-        for index, path in enumerate(chunk):
-            quoted = shlex.quote(_strip_merge(path).rstrip("/") or "/")
-            parts.append(
-                f"if [ -d {quoted} ]; then echo \"@@{index} D $(du -sk {quoted} 2>/dev/null"
-                f" | cut -f1)\"; elif [ -e {quoted} ]; then echo \"@@{index} F $(stat -c %s "
-                f"{quoted} 2>/dev/null)\"; else echo \"@@{index} N\"; fi"
-            )
+    for chunk, command in _measure_commands(list(paths)):
         try:
-            res = handler.shell("; ".join(parts), timeout=timeout, safe=False)
+            res = handler.shell(command, timeout=timeout, safe=False)
         except Exception:
             continue
         text = getattr(res, "stdout", "") or ""

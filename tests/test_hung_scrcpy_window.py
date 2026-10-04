@@ -23,7 +23,8 @@ pytest.importorskip("PyQt5")
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Win32 windows of another process")
 
 # A hidden window in its own process; "hang <seconds>" on stdin stops its
-# thread from handling messages for that long, "quit" ends it.
+# thread from handling messages for that long, "minimize" shows it minimized,
+# "quit" ends it.
 _STAND_IN = r"""
 import ctypes, sys, threading, time
 from ctypes import wintypes
@@ -41,6 +42,9 @@ u.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes
     wintypes.UINT, wintypes.UINT]
 u.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 u.DispatchMessageW.restype = LRESULT
+u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+set_long = getattr(u, "SetWindowLongPtrW", None) or u.SetWindowLongW
+set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
 k.GetModuleHandleW.restype = wintypes.HMODULE
 k.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 class WNDCLASSW(ctypes.Structure):
@@ -76,6 +80,12 @@ while True:
             print("hanging", flush=True)
             time.sleep(float(order.split()[1]))
             print("awake", flush=True)
+        if order == "minimize":
+            # a tool window nothing activates: no taskbar button, and coming
+            # back never takes the keyboard from whoever runs the tests
+            set_long(hwnd, -20, 0x08000080)
+            u.ShowWindow(hwnd, 7)  # SW_SHOWMINNOACTIVE
+            print("minimized", flush=True)
     time.sleep(0.005)
 """
 
@@ -103,6 +113,11 @@ class _StandIn:
 
     def wait_awake(self):
         assert self.proc.stdout.readline().strip() == "awake"
+
+    def minimize(self):
+        self.proc.stdin.write("minimize\n")
+        self.proc.stdin.flush()
+        assert self.proc.stdout.readline().strip() == "minimized"
 
     def quit(self):
         if self.proc.poll() is None:
@@ -211,6 +226,27 @@ def _timed(fn):
     return result, time.monotonic() - start
 
 
+def _minimized(hwnd) -> bool:
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32")
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    return bool(user32.IsIconic(hwnd))
+
+
+class _Running:
+    """A scrcpy session that runs: the panel's separate window is its window."""
+
+    running = True
+    log_path = None
+
+    def read_log(self):
+        return ""
+
+    def stop(self, timeout=None):
+        self.running = False
+
+
 def test_a_window_that_stops_answering_is_noticed_without_waiting_for_it(mp, stand_in):
     window = stand_in()
     assert mp._answering(window.hwnd)
@@ -277,6 +313,40 @@ def test_the_keyboard_is_never_moved_by_waiting_for_a_hung_scrcpy(mp, stand_in, 
     assert mp._release_child_focus(window.hwnd, parent_window)  # once it answers
 
 
+def test_bringing_back_a_minimized_window_never_waits_for_a_hung_scrcpy(qapp, mp, stand_in):
+    """Restoring a minimized window waits for its thread: the Separate-window
+    button, Record and Stop recording, and the end of a recording all bring
+    scrcpy's own window back, and each froze TurboADB for as long as a
+    minimized scrcpy hung."""
+    window = stand_in()
+    window.minimize()
+    assert _minimized(window.hwnd)
+    panel = mp.MirrorPanel(type("H", (), {"serial": "s", "config": None})(), {"name": "s"})
+    try:
+        panel._scrcpy, panel._embed_on = _Running(), False  # a separate scrcpy window
+        panel._separate_hwnd = window.hwnd
+        window.hang()
+        for bring_back in (
+            panel._popout_mirror,  # the Separate-window button
+            lambda: panel._restore_mirror_focus(direct=True),  # Record, Stop recording
+            panel._restore_mirror_focus,  # a recording that finished
+        ):
+            _result, waited = _timed(bring_back)
+            assert waited < _PROMPT_S
+        assert _minimized(window.hwnd)  # nothing waited for it, so nothing moved it
+        assert "not responding" in panel.status.text()
+        window.wait_awake()
+        # it was asked without waiting: the window comes back once it answers
+        deadline = time.monotonic() + 5
+        while _minimized(window.hwnd) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _minimized(window.hwnd)
+    finally:
+        panel._scrcpy = None
+        panel.close_panel()
+        panel.close()
+
+
 def test_the_window_calls_declare_their_handle_arguments(mp):
     """Without argument types ctypes passes a window handle as a C int, which a
     64-bit handle value does not fit."""
@@ -284,5 +354,5 @@ def test_the_window_calls_declare_their_handle_arguments(mp):
 
     _c, u = mp._win_api()
     for name in ("IsWindow", "IsWindowVisible", "GetClientRect", "GetWindowRect",
-                 "SendMessageTimeoutW", "MoveWindow"):
+                 "SendMessageTimeoutW", "MoveWindow", "ShowWindow", "ShowWindowAsync"):
         assert getattr(u, name).argtypes[0] is wintypes.HWND, name

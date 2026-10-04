@@ -4,9 +4,10 @@
   Personalization > Colors) and the icon that goes with it;
 * :func:`set_window_identity`: a window's AppUserModel properties, its app ID
   and the command, name and icon a taskbar pin relaunches it with;
-* :func:`read_shortcut`, :func:`write_shortcut`, :func:`set_shortcut_icon`:
-  ``.lnk`` files with that app ID, so a Start-menu, Desktop or taskbar pin
-  groups with the running window instead of showing beside it.
+* :func:`read_shortcut`, :func:`write_shortcut`, :func:`set_shortcut_icon`,
+  :func:`retarget_shortcut`: ``.lnk`` files with that app ID, so a Start-menu,
+  Desktop or taskbar pin groups with the running window instead of showing
+  beside it.
 
 Windows only, and nothing here raises: a failure returns None or False, and
 the caller carries on without it (the frozen exe and ``pythonw`` did before).
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import ntpath
 import os
+import re
 import sys
 import uuid
 from typing import Dict, Iterable, List, Optional
@@ -405,14 +407,52 @@ def set_shortcut_icon(path: str, icon: str) -> bool:
         return False
 
 
-def pinned_shortcuts() -> List[str]:
-    """The ``.lnk`` files of the apps pinned to this user's taskbar."""
-    folder = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Internet Explorer",
-                          "Quick Launch", "User Pinned", "TaskBar")
+def retarget_shortcut(path: str, target: str, args: str, workdir: str) -> bool:
+    """Point the shortcut *path* at *target* with *args* in *workdir*, keeping
+    everything else in it (its app ID and its icon)."""
+    if sys.platform != "win32":
+        return False
     try:
-        return [os.path.join(folder, n) for n in os.listdir(folder) if n.lower().endswith(".lnk")]
+        with _Apartment():
+            c = _com()
+            wt = c["wintypes"]
+            link = _new_link()
+            try:
+                persist = _load(link, path, 0x2)  # STGM_READWRITE
+                try:
+                    _call(link, 20, (wt.LPCWSTR,), target)  # SetPath
+                    _call(link, 11, (wt.LPCWSTR,), args or "")  # SetArguments
+                    _call(link, 9, (wt.LPCWSTR,), workdir or "")  # SetWorkingDirectory
+                    _call(persist, 6, (wt.LPCWSTR, wt.BOOL), None, True)  # Save in place
+                finally:
+                    _release(persist)
+            finally:
+                _release(link)
+        return True
+    except Exception:
+        return False
+
+
+def pinned_shortcuts() -> List[str]:
+    """The ``.lnk`` files of the apps pinned to this user's taskbar: a pinned
+    shortcut is in ``User Pinned\\TaskBar``, and what Windows makes of a pinned
+    window whose app ID no Start-menu shortcut has is in a folder of its own
+    under ``ImplicitAppShortcuts``."""
+    pinned = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Internet Explorer",
+                          "Quick Launch", "User Pinned")
+    implicit = os.path.join(pinned, "ImplicitAppShortcuts")
+    folders = [os.path.join(pinned, "TaskBar")]
+    try:
+        folders += [os.path.join(implicit, name) for name in os.listdir(implicit)]
     except OSError:
-        return []
+        pass
+    found = []
+    for folder in folders:
+        try:
+            found += [os.path.join(folder, n) for n in os.listdir(folder) if n.lower().endswith(".lnk")]
+        except OSError:
+            pass  # not a folder, or none there
+    return found
 
 
 def notify_changed(paths: Iterable[str]) -> None:
@@ -443,6 +483,31 @@ def is_turboadb_shortcut(info) -> bool:
     if target.startswith("turboadb-") and target.endswith(".exe"):
         return True  # the one-file exe, TurboADB-3.0.0-win64.exe
     return target in ("pythonw.exe", "python.exe") and "turboadb" in str(info.get("args") or "")
+
+
+_EXE_COPY = re.compile(r"turboadb-gui-[^-]+-\d+\.exe", re.IGNORECASE)  # as cli._staged_exe names them
+
+
+def revive_shortcuts(paths: Iterable[str], target: str, args: str, workdir: str) -> List[str]:
+    """Point every shortcut of *paths* that starts a copy of the wheel's exe
+    at *target* with *args* in *workdir*.  Up to 3.1 a pin made of that exe's
+    window started the copy it ran from, in the temp folder: the version of
+    that day for as long as the copy was there (and that one wrote the other
+    shortcuts back to itself), and nothing once it was deleted.  Returns the
+    ones changed (Explorer and the taskbar are told)."""
+    if _EXE_COPY.fullmatch(ntpath.basename(target)):
+        return []  # itself a copy that will go
+    changed = []
+    for path in paths:
+        info = read_shortcut(path)
+        old = str((info or {}).get("target") or "")
+        if not _EXE_COPY.fullmatch(ntpath.basename(old)):
+            continue
+        if retarget_shortcut(path, target, args, workdir):
+            changed.append(path)
+    if changed:
+        notify_changed(changed)
+    return changed
 
 
 def sync_shortcut_icons(icon: str, paths: Iterable[str]) -> List[str]:

@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QStackedWidget,
     QDialogButtonBox,
+    QSizePolicy,
     QWidget,
     QCheckBox,
     QFrame,
@@ -96,6 +97,37 @@ def _muted(text):
     return label
 
 
+class _StatusLine(QLabel):
+    """A page's status line.  It wraps, and never asks for width: on one line
+    a failed scan's error text made the dialog twice as wide as the screen,
+    with its Connect button out of reach.  A long text is its tooltip too,
+    for a dialog too short to show all of its lines."""
+
+    def __init__(self):
+        super().__init__("")
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text if len(text) > 60 else "")
+
+
+def firewall_warning(status: str) -> str:
+    """The warning a share ends on when ``devices.open_firewall``'s *status*
+    says other machines may be kept out ("" when its rules are in place): no
+    rule could be added (that needs Administrator), a port was left out, or
+    this PC is on a network Windows calls Public, where the rules do not
+    apply.  Elsewhere than on Windows there is no rule to add."""
+    text = str(status or "").lower()
+    if "not windows" in text:
+        return ""
+    if (text.startswith("firewall: opened") and "could not open" not in text
+            and "a public network" not in text):
+        return ""
+    return f"This PC's devices are shared, but other machines may be kept out — {status}"
+
+
 def _endpoint_name(text, port, default_port=None):
     """The endpoint a session built from *text* and the *port* box uses (a port
     typed after the host wins, as in ``_build_session``), written as saved
@@ -138,6 +170,9 @@ class _ScanThread(QThread):
 class _ServeThread(QThread):
     done = pyqtSignal(str)
     fail = pyqtSignal(str)
+    # What it did, as log lines for the window that runs it (run_share_task):
+    # they arrive there even when this dialog has closed meanwhile.
+    msg = pyqtSignal(str)
 
     def __init__(self, port=5037, install_login=False, adb_path=None):
         super().__init__()
@@ -145,6 +180,9 @@ class _ServeThread(QThread):
         self.adb_path = adb_path
         # whether the local adb server (the device tabs') answers afterwards
         self.server_up = False
+        # whether the share ended on a warning: the firewall may keep other
+        # machines out (see firewall_warning), or the login auto-start is missing
+        self.warned = False
 
     def run(self):
         try:
@@ -152,19 +190,36 @@ class _ServeThread(QThread):
             from ..tools import local_adb_port
 
             msg = "Restarting the local ADB server; active sessions may reconnect briefly.  ·  "
-            msg += start_shared_server(port=self.port, adb_path=self.adb_path)
+            started = start_shared_server(port=self.port, adb_path=self.adb_path)
+            self.msg.emit("[OK] " + started)
             # The engine's own firewall spelling of the scrcpy tunnel ports, so
             # the rule can never drift from the ports scrcpy actually uses; the
             # adb port is the one the server listens on (ANDROID_ADB_SERVER_PORT
             # moves the default, and start_shared_server follows it).
-            msg += "  ·  " + open_firewall(
-                (local_adb_port(self.port), TUNNEL_PORT_FIREWALL_RANGE))
+            firewall = open_firewall((local_adb_port(self.port), TUNNEL_PORT_FIREWALL_RANGE))
+            msg += started + "  ·  " + firewall
+            warning = firewall_warning(firewall)
+            # said last, so that the status bar and the toast end on a warning
+            last = ["[WARNING] " + warning if warning else "[INFO] " + firewall]
             if self.install_login:
-                # the launcher runs the adb this server was started with
-                path = install_startup(port=self.port, adb_path=self.adb_path)
-                msg += f"  ·  auto-starts at login ({path})"
+                try:
+                    # the launcher runs the adb this server was started with
+                    path = install_startup(port=self.port, adb_path=self.adb_path)
+                except Exception as exc:
+                    # The server is shared by now; only the auto-start is
+                    # missing: a warning, as for the window's own Share.
+                    msg += f"  ·  the login auto-start could not be set up: {exc}"
+                    last.insert(0 if warning else 1,
+                                f"[WARNING] Could not set up the login auto-start: {exc}")
+                else:
+                    msg += f"  ·  auto-starts at login ({path})"
+                    self.msg.emit(f"[OK] Auto-start installed (runs at every login): {path}")
+            self.warned = any(line.startswith("[WARNING]") for line in last)
+            for line in last:
+                self.msg.emit(line)
             self.done.emit(msg)
         except Exception as exc:
+            self.msg.emit(f"[ERROR] share devices: {exc}")
             self.fail.emit(str(exc))
         finally:
             try:
@@ -267,7 +322,7 @@ class ConnectDialog(QDialog):
         r.setProperty("role", "ghost")
         r.setIcon(icon("refresh", "green"))
         r.clicked.connect(self._scan_usb)
-        self.usb_status = QLabel("")
+        self.usb_status = _StatusLine()
         row.addWidget(r)
         row.addWidget(self.usb_status, 1)
         v.addLayout(row)
@@ -349,13 +404,18 @@ class ConnectDialog(QDialog):
             self.chk_login.hide()
         srv.addStretch(1)
         v.addLayout(srv)
+        # What the share did.  It has a line of its own: the scan that follows
+        # a share reports on the one below, and used to replace it at once.
+        self.serve_status = _StatusLine()
+        self.serve_status.hide()
+        v.addWidget(self.serve_status)
 
         row = QHBoxLayout()
         row.setSpacing(8)
         scan = QPushButton("Scan devices there")
         scan.setIcon(icon("search", "accent"))
         scan.clicked.connect(self._scan_remote)
-        self.rem_status = QLabel("")
+        self.rem_status = _StatusLine()
         row.addWidget(scan)
         row.addWidget(self.rem_status, 1)
         v.addLayout(row)
@@ -428,6 +488,7 @@ class ConnectDialog(QDialog):
         if not self._confirm_share(port):
             return
         self.btn_serve.setEnabled(False)
+        self.serve_status.hide()  # an earlier share's result
         self.rem_status.setText("starting shared adb server here…")
         thread = _ServeThread(port, self.chk_login.isChecked(), self._adb_path)
         self._serve = thread
@@ -438,10 +499,11 @@ class ConnectDialog(QDialog):
         # The window runs it as its own Share (MainWindow.run_share_task): its
         # poll pauses, and so do the device tabs' shells and logcats when the
         # port is theirs.  It gives them back on `finished`, which outlives
-        # this dialog (closing it disconnects only done/fail).
+        # this dialog (closing it disconnects only done/fail), and logs what
+        # the share reports.
         run = getattr(window, "run_share_task", None)
         if callable(run):
-            run(thread, port)
+            run(thread, port, log=True)
         else:
             thread.start()
 
@@ -451,7 +513,14 @@ class ConnectDialog(QDialog):
 
     def _served(self, msg):
         self.btn_serve.setEnabled(True)
-        self.rem_status.setText(msg)
+        # amber when the share ended on a warning (see _ServeThread.warned)
+        warned = bool(getattr(self._serve, "warned", False))
+        self.serve_status.setProperty("tone", "amber" if warned else None)
+        self.serve_status.style().unpolish(self.serve_status)
+        self.serve_status.style().polish(self.serve_status)
+        self.serve_status.setText(msg)
+        self.serve_status.show()
+        self.rem_status.setText("")
         # if we just exposed THIS PC, point the host field at it and scan
         if not self.rem_host.currentText().strip():
             self.rem_host.setCurrentText("127.0.0.1")

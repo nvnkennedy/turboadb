@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 from . import icons
 from .display_controls import DisplayControls
 from .flowlayout import ToolbarFlowLayout
-from .mirror_panel import MirrorPanel, _bitrate_to_bps, display_label
+from .mirror_panel import MirrorPanel, _bitrate_to_bps, delete_when_released, display_label
 
 
 def best_columns(count, width, height, aspect, header=0.0) -> int:
@@ -178,14 +178,18 @@ class DisplayWall(QWidget):
     WALL_BIT_RATE = "16M"
     TILE_MIN_BIT_RATE = "4M"
 
-    def __init__(self, handler, session, automotive=False, dispatcher=None, parent=None):
+    def __init__(self, handler, session, automotive=False, dispatcher=None, parent=None,
+                 sdk=None):
+        """*sdk* is the device's Android API level when it is known (see
+        :meth:`set_sdk`)."""
         super().__init__(parent)
         self.handler = handler
         self.session = session
         self.automotive = bool(automotive)
+        self._sdk = sdk
         self._dispatcher = dispatcher
         self._tiles = []
-        self._retiring = []  # removed tiles, kept alive until their screen stops
+        self._retiring = []  # removed tiles, kept alive until their panels are done
         self._queue = []  # the displays Start all has still to start
         self._waiting = None  # the display Start all waits on to come up
         self._focused = None
@@ -312,6 +316,7 @@ class DisplayWall(QWidget):
                 tile.update_display(display)
             tiles.append(tile)
         self._tiles = tiles
+        self._sync_key_displays()
         self._apply_video_budget()
         self._set_tiles_paused(not self.isVisible())
         count = len(tiles)
@@ -329,7 +334,10 @@ class DisplayWall(QWidget):
         The tile itself is only hidden: the scrcpy window is closed on a parked
         worker thread while it is still a Win32 child of the panel's embed
         container, so destroying the widget here would pull that HWND out from
-        under a live scrcpy. The tile is deleted once the stop reports back.
+        under a live scrcpy. The tile is deleted once its panel is done with
+        it (mirror_panel.delete_when_released): its screen has closed, also
+        the scrcpy of a recording it made itself, and a recording still being
+        stopped and pulled is saved.
         """
         if tile is self._focused:
             self._focused = None  # the others show again (set_displays relayouts)
@@ -343,21 +351,14 @@ class DisplayWall(QWidget):
         self.grid.removeWidget(tile)
         tile.hide()
         self._retiring.append(tile)
-        try:
-            tile.panel.screen_stopped.connect(lambda t=tile: self._tile_retired(t))
-            tile.panel.close_panel()
-        except Exception:
-            pass
-        if not tile.panel.is_active():
-            self._tile_retired(tile)  # nothing was running: nothing to wait for
+        delete_when_released(tile, lambda t=tile: self._tile_retired(t))
 
     def _tile_retired(self, tile) -> None:
-        """Its screen has stopped — the hidden tile can finally be destroyed."""
-        if tile not in self._retiring:
-            return
-        self._retiring.remove(tile)
+        """Its panel is done with it: the hidden tile is destroyed now (by
+        delete_when_released, which calls this first)."""
+        if tile in self._retiring:
+            self._retiring.remove(tile)
         tile.setParent(None)
-        tile.deleteLater()
 
     def tile_bit_rate(self, count=None) -> str:
         """Each tile's scrcpy bit-rate cap: the wall's budget split between
@@ -380,6 +381,19 @@ class DisplayWall(QWidget):
         self.automotive = bool(automotive)
         for tile in self._tiles:
             tile.panel.set_automotive_default(self.automotive)
+
+    def set_sdk(self, sdk) -> None:
+        """The device's Android API level, once its profile has it."""
+        self._sdk = sdk
+        self._sync_key_displays()
+
+    def _sync_key_displays(self) -> None:
+        """Tell every tile's key row and screen how many displays there are:
+        display 0's keys name it only among several (DisplayControls.set_device,
+        MirrorPanel.set_device)."""
+        for tile in self._tiles:
+            tile.controls.set_device(len(self._tiles), self._sdk)
+            tile.panel.set_device(len(self._tiles), self._sdk)
 
     def _sync_buttons(self) -> None:
         """Start all / Stop all follow what the tiles are actually doing, so

@@ -637,6 +637,37 @@ def test_the_physical_display_id_is_parsed_from_real_phone_output():
     assert ivi[2]["unique_id"].startswith("virtual:")
 
 
+# While scrcpy mirrors a screen through a virtual display of its own (scrcpy 3
+# on newer Android), Android lists that display with the device's.
+def _scrcpy_display(owner_uid=2000, unique=True):
+    unique_id = f', uniqueId "virtual:com.android.shell,{owner_uid},scrcpy,0"' if unique else ""
+    return ('Display id 37: DisplayInfo{"scrcpy", displayId 37, displayGroupId 0, '
+            f"FLAG_PRESENTATION, real 1920 x 720, state ON, type VIRTUAL{unique_id}}}\n")
+
+
+@pytest.mark.parametrize("mirror", [
+    _scrcpy_display(),
+    _scrcpy_display(owner_uid=0),  # adbd runs as root
+    _scrcpy_display(unique=False),  # a listing without unique ids
+    ("  Display 37:\n    mDisplayId=37\n"
+     '    mBaseDisplayInfo=DisplayInfo{"scrcpy", displayId 37, real 1920 x 720, type VIRTUAL, '
+     'uniqueId "virtual:com.android.shell,2000,scrcpy,0"}\n'
+     '    mOverrideDisplayInfo=DisplayInfo{"scrcpy", displayId 37, real 1920 x 720, '
+     'type VIRTUAL, uniqueId "virtual:com.android.shell,2000,scrcpy,0"}\n'),
+], ids=["shell", "root", "no-unique-id", "dumpsys"])
+def test_scrcpys_own_mirror_display_is_not_one_of_the_devices_displays(mirror):
+    listed = ADBHandler.parse_display_info(IVI_GET_DISPLAYS + mirror)
+    # the car's own virtual display (the cluster) stays, scrcpy's goes
+    assert [d["id"] for d in listed] == [0, 2, 5]
+    assert listed == ADBHandler.parse_display_info(IVI_GET_DISPLAYS)
+
+
+def test_a_phone_with_a_running_mirror_still_has_one_display(fake_adb):
+    fake_adb.add("get-displays", stdout=PHONE_GET_DISPLAYS + _scrcpy_display())
+    displays = ADBHandler(ADBConfig(serial="x")).list_displays(method="adb")
+    assert [d["id"] for d in displays] == [0]  # no second display, so no Displays tab
+
+
 def test_a_display_screenshot_captures_by_physical_id(fake_adb, tmp_path):
     """Issue: screencap -d took the logical id, which Android 10+ rejects for
     any display whose physical id differs (every IVI secondary display)."""
@@ -687,7 +718,7 @@ def test_tile_controls_send_keys_to_their_display_in_order(qapp):
     from turboadb.gui.display_wall import DisplayWall
 
     queue = Queue()
-    wall = DisplayWall(Handler(), {"name": "ivi"}, automotive=True, dispatcher=queue)
+    wall = DisplayWall(Handler(), {"name": "ivi"}, automotive=True, dispatcher=queue, sdk=34)
     logs = []
     wall.log.connect(logs.append)
     try:
@@ -705,7 +736,8 @@ def test_tile_controls_send_keys_to_their_display_in_order(qapp):
             on_done(fn())
         assert sent == [
             ("back", {"safe": True, "display_id": 2}),
-            ("home", {"safe": True}),  # display 0: the default display, no -d
+            # display 0 of two is named too: the focus may be on the other one
+            ("home", {"safe": True, "display_id": 0}),
             ("vol_mute", {"safe": True, "display_id": 2}),
         ]
         assert passenger.controls.pending == 0

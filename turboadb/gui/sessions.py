@@ -121,7 +121,8 @@ def _read_parts(path: str, *, io_errors: bool = False):
     is not a list of targets (None when it is) and *invalid* which of its
     entries were left out (None when none was)."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig: with or without a byte order mark (see settings._load_cached)
+        with open(path, "r", encoding="utf-8-sig") as fh:
             raw_sessions = json.load(fh)
         if not isinstance(raw_sessions, list):
             raise ValueError("sessions file must contain a list of objects")
@@ -373,7 +374,7 @@ class SessionStore:
         Every entry is checked before any existing target is replaced.  This
         avoids a partially imported file leaving a later GUI action to fail.
         """
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
         if not isinstance(data, list):
             raise ValueError("not a TurboADB targets file (expected a JSON list)")

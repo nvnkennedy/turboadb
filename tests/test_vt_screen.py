@@ -550,6 +550,49 @@ def test_an_unfinished_string_that_never_ends_is_not_kept_forever():
     assert len(s._carry) <= vtscreen._CARRY_MAX
 
 
+@pytest.mark.parametrize("output", [
+    "\x1bP" * 16384,                                   # DCS strings that never end
+    ("\x1bP" * 4095 + "\x1b\\") * 16,                  # ... one ST at the end of every read
+    ("\x1b_" * 4000 + "\x1b\\" + "t" * 190) * 16,      # ... or text after it
+    "\x1bX\x1b]\x1b^" * 5461,                          # every kind of string, none ended
+    "\x1b]" * 16384,                                   # OSC strings that never end
+], ids=["dcs", "dcs ended", "apc ended", "mixed", "osc"])
+def test_a_read_full_of_string_starts_costs_no_more_than_its_length(output):
+    """The end of each string was looked for through the rest of the read,
+    once for every string start in it: a program's screen took seconds for
+    64 KB of such garbage, in the slices the console hands it."""
+    s = screen(rows=3, cols=40)
+    started = time.monotonic()
+    for start in range(0, len(output), 8192):
+        s.feed(output[start:start + 8192])
+    s.feed("\x1b\\\x1b[H\x1b[2Jstill here")
+    assert time.monotonic() - started < 2.0
+    assert s.display()[0] == "still here"
+
+
+# Strings of every kind, a string end that ends nothing, and a DCS that never
+# ends: too far back to be waited for, its start is an escape and its text shows.
+STRINGS = (
+    "a\x1bPq#0;2;0;0;0\x1b\\b\x1b_apc \x1b[1m not a colour\x1b\\c\x1bXsos\x07still sos\x1b\\d"
+    "\x1b\\e\x1b^pm\x1b\\\x1b[31mf\x1b]0;title\x07g\x1b]2;t\x1b\\h\x1bPnever ended \x1b[1mi"
+    + "\x1b[m" * 30 + "j\x1b_cut off"
+)
+
+
+def test_strings_give_the_same_screen_however_they_are_cut(monkeypatch):
+    monkeypatch.setattr(vtscreen, "_CARRY_MAX", 64)  # (a short wait, for a short stream)
+    whole = screen(rows=2, cols=40, text=STRINGS)
+    assert whole.display()[0] == "abcdefghnever ended ij"
+    assert whole.lines[0].attrs[5] == (1, DEFAULT, 0)
+    assert whole.lines[0].attrs[20] == (1, DEFAULT, BOLD) and whole.lines[0].attrs[21] == PLAIN
+    assert whole._carry == "\x1b_cut off"
+    for step in (1, 2, 3, 5, 11, 50):
+        s = screen(rows=2, cols=40)
+        for start in range(0, len(STRINGS), step):
+            s.feed(STRINGS[start:start + step])
+        assert (state(s), s._carry) == (state(whole), whole._carry), step
+
+
 # --------------------------------------------------------------------------- #
 # wide and combining characters
 # --------------------------------------------------------------------------- #

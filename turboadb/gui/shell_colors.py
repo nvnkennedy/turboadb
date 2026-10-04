@@ -197,25 +197,39 @@ _TRIGGER = re.compile(_trie(_TRIGGERS))
 _LONGEST = 4096  # a longer line is not searched (a binary dump, minified text)
 
 
+def _lower(text: str) -> str:
+    """*text* in the lower case the phrases are written in.  In any case
+    their "i" also stands for the Turkish "İ" and "ı" (what Java's
+    toUpperCase() and toLowerCase() make of it where the locale is Turkish)
+    and their "s" for the long "ſ", which ``str.lower`` leaves as they are."""
+    text = text.lower()
+    if not text.isascii():
+        text = text.replace("i\u0307", "i").replace("\u0131", "i").replace("\u017f", "s")
+    return text
+
+
 def may_mean(line: str) -> bool:
     """Whether *line* may have words :func:`meaning_spans` finds: a quick look
     that rules out most output without searching it."""
     if len(line) > _LONGEST:
         return False
-    return "OK" in line or _TRIGGER.search(line.lower()) is not None
+    return "OK" in line or _TRIGGER.search(_lower(line)) is not None
 
 
-def meaning_spans(line: str) -> List[Tuple[int, int, str]]:
+def meaning_spans(line: str, sure: bool = False) -> List[Tuple[int, int, str]]:
     """``(start, end, kind)`` of the words in *line* that say something went
     wrong or was refused (``"error"``), needs attention (``"warning"``) or
-    worked (``"success"``), in order.  See :data:`MEANING_KINDS`."""
-    if not line or not may_mean(line):
+    worked (``"success"``), in order.  See :data:`MEANING_KINDS`.  *sure*:
+    the caller had the quick look (:func:`may_mean`) at all of *line* itself."""
+    if not line or not (sure or may_mean(line)):
         return []
     spans = []
     for match in _MEANING.finditer(line):
         phrase = match.group("phrase")
         if phrase is not None:
-            kind = _KIND[" ".join(phrase.lower().split())]
+            kind = _KIND.get(" ".join(_lower(phrase).split()))
+            if kind is None:
+                continue  # a letter the search takes for a phrase's, and _lower does not
         else:
             kind = "success" if match.group("ok") else "error"
         spans.append((match.start(), match.end(), kind))

@@ -152,3 +152,76 @@ def test_erasing_to_the_cursor_keeps_the_lines_above(qapp, pty):
         assert not term.has_screen()
     finally:
         _close(term)
+
+
+# --------------------------------------------------------------------------- #
+# garbage that must cost no more than its length
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("output", [
+    "\x1b]" * 8192 + "\x07",                      # strings that never end, one BEL at last
+    ("\x1b]" * 1024 + "\x07\r\n") * 8,           # the same, a line at a time
+    "\x1bP" * 8192 + "\x1b\\",                    # DCS strings, one ST at last
+    "\x1b_" * 8192,                               # ... and none at all
+], ids=["osc", "osc lines", "dcs", "apc"])
+def test_a_read_full_of_string_starts_is_taken_in_at_once(qapp, output):
+    """Looking for a sequence cut off at the end of a read went over the
+    whole read once for every string start in it: 16 KB took ten seconds."""
+    term = _console()
+    try:
+        started = time.monotonic()
+        term.feed(output)
+        term.feed("\x1b\\still here\r\n")
+        assert time.monotonic() - started < 2.0
+        _render(term)
+        assert term.toPlainText().endswith("still here\n")
+        assert term._sb.full_text().endswith("still here\n")
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("output", [
+    "\x1bP" * 16384,                      # DCS strings that never end
+    ("\x1bP" * 4095 + "\x1b\\") * 16,     # ... one ST at the end of every slice
+], ids=["dcs", "dcs ended"])
+def test_a_programs_screen_takes_a_read_full_of_string_starts_in_at_once(qapp, output):
+    """A program's screen looked for the end of every string start too, once
+    for each of them: 64 KB held the window for seconds."""
+    term = _console()
+    try:
+        term.feed("\x1b[?1049h\x1b[Hframe")
+        _render(term)
+        assert term.has_screen()
+        started = time.monotonic()
+        term.feed(output)
+        term.feed("\x1b\\\x1b[H\x1b[2Jstill here")
+        _render(term)
+        assert time.monotonic() - started < 2.0
+        assert term.screen().display()[0] == "still here"
+    finally:
+        _close(term)
+
+
+def test_a_sequence_cut_off_by_a_long_read_stays_out_of_the_saved_history(qapp):
+    term = _console()
+    try:
+        for piece in ("one\r\n" + "x" * 6000 + "\x1b]0;ti", "tle\x07two\r\n\x1b[3", "1mthree\x1b[0m\r\n"):
+            term.feed(piece)
+        assert term._sb.full_text() == "one\n" + "x" * 6000 + "two\nthree\n"
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("text, shown", [
+    ("abcdef\r\x1b[" + "9" * 5000 + "Cx", "axcdef"),   # no number int() takes: a count of 1
+    ("abcdef\x1b[" + "9" * 5000 + "Gx", "xbcdef"),
+    ("ab\x1b[?" + "9" * 5000 + "hcd", "abcd"),         # a private mode
+    ("ab\x1b[?25;" + "9" * 5000 + "lcd", "abcd"),
+], ids=["right", "column", "mode", "modes"])
+def test_a_parameter_of_thousands_of_digits_neither_raises_nor_loses_output(qapp, text, shown):
+    term = _console()
+    try:
+        term.feed(text + "\r\nnext line\r\n")
+        _render(term)
+        assert term.toPlainText() == shown + "\nnext line\n"
+    finally:
+        _close(term)

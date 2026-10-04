@@ -260,7 +260,8 @@ class ControlsPanel(QWidget):
         self._compact = compact
         self._on_reboot = on_reboot
         self._owns_dispatcher = dispatcher is None
-        # Which logical display keys and typing go to (None = the default one).
+        # Which logical display keys and typing name (None: none, the plain
+        # command, which Android sends to the display that has the focus).
         self._display_provider = display_provider
         self._dispatcher = dispatcher or DeviceCommandDispatcher()
         self._owns_slow = slow_dispatcher is None
@@ -592,8 +593,9 @@ class ControlsPanel(QWidget):
             return None
 
     def _display_kwargs(self):
-        """``{"display_id": N}`` for a secondary display, else nothing, so the
-        default display keeps the plain command."""
+        """``{"display_id": N}`` for the display the provider names, else
+        nothing: the plain command.  The device tab's provider names display 0
+        too on a device with several (``device_commands.input_display``)."""
         display_id = self._target_display()
         return {} if display_id is None else {"display_id": display_id}
 

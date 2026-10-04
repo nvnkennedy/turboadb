@@ -44,12 +44,20 @@ import logging
 import argparse
 import subprocess
 
-from .config import ADBConfig, ScrcpyOptions, parse_host_port
+from .config import ADBConfig, ScrcpyOptions, parse_host_port, user_path
 from .core import ADBHandler
 from .devices import list_devices
 from .results import CommandResult, TransferResult, StreamResult
 from .exceptions import ADBError, ADBNotFoundError, ADBTimeoutError
-from .tools import NO_WINDOW, adb_available, scrcpy_available, windowless_python
+from .tools import (
+    NO_WINDOW,
+    POWERSHELL,
+    _on_path,
+    adb_available,
+    scrcpy_available,
+    windowless_python,
+    windows_program,
+)
 
 DOCS_URL = "https://pypi.org/project/turboadb/"
 
@@ -112,21 +120,31 @@ def open_docs(argv=None) -> int:
 
 def _resolve_gui_target(build: bool = True):
     """The best way to launch the GUI from a shortcut, always from the CURRENT
-    environment: the frozen exe itself, this environment's TurboADB.exe
-    (:mod:`launcher`; *build* False takes it only when it is ready, for the UI
-    thread), the windowless ``turboadb-gui`` launcher installed next to this
-    interpreter, else ``pythonw -m turboadb gui``. (A ``turboadb-gui`` merely
-    found on PATH may belong to another environment.)"""
+    environment: the frozen exe itself (or the ``turboadb-gui`` that started
+    it, see :func:`_started_by`), this environment's TurboADB.exe
+    (:mod:`launcher`, with PyQt5 only; *build* False takes it only when it is
+    ready, for the UI thread), the windowless ``turboadb-gui`` launcher
+    installed next to this interpreter, else ``pythonw -m turboadb gui``. (A
+    ``turboadb-gui`` merely found on PATH may belong to another environment.)"""
     if getattr(sys, "frozen", False):
-        # running the bundled one-file exe: the exe the user launched is the
-        # stable launcher (NOT the ephemeral _MEIPASS copy)
-        return sys.executable, "", os.path.dirname(sys.executable)
+        # running the bundled one-file exe: what the user launched is the
+        # stable launcher (NOT the ephemeral _MEIPASS copy): turboadb-gui when
+        # that started the exe from its copy, else the exe itself
+        return _started_by() or (sys.executable, "", os.path.dirname(sys.executable))
     from . import launcher
 
-    branded = launcher.gui_command(build=build)
+    # TurboADB.exe runs the GUI of this Python: without PyQt5 it opens nothing,
+    # and turboadb-gui starts the wheel's executable
+    branded = launcher.gui_command(build=build) if launcher.has_qt() else None
     if branded:
         exe, args, folder = branded
         return exe, subprocess.list2cmdline(args), folder
+    return _installed_gui_target()
+
+
+def _installed_gui_target():
+    """``turboadb-gui`` beside this interpreter, else ``pythonw -m turboadb
+    gui``, as ``(program, arguments, folder)``."""
     pydir = os.path.dirname(sys.executable)
     for base in (os.path.join(pydir, "Scripts"), pydir):
         cand = os.path.join(base, "turboadb-gui.exe")
@@ -134,6 +152,43 @@ def _resolve_gui_target(build: bool = True):
             return cand, "", base
     exe = windowless_python()
     return exe, "-m turboadb gui", os.path.dirname(exe)
+
+
+# launch_gui names what started the wheel's executable here, for that exe
+_STARTED_BY = "TURBOADB_GUI_STARTED_BY"
+
+
+def _started_by():
+    """``(program, arguments, folder)`` of the ``turboadb-gui`` that started
+    this one-file exe from a pip install without PyQt5, or None when the exe
+    was started as itself.
+
+    The exe then runs from a copy that the next upgrade replaces and deletes
+    (:func:`_staged_exe`): shortcuts and pins that pointed at it kept starting
+    the old version, and then nothing. What is said of another exe (the
+    variable reaches every process the app starts) does not count."""
+    try:
+        exe, target, args, folder = json.loads(os.environ.get(_STARTED_BY, ""))
+        if all(isinstance(value, str) for value in (exe, target, args, folder)) \
+                and os.path.samefile(exe, sys.executable) and os.path.isfile(target):
+            return target, args, folder
+    except (TypeError, ValueError, OSError):
+        pass
+    return None
+
+
+def _no_gui() -> str | None:
+    """Why nothing starts the GUI in this Python, so a shortcut would open
+    nothing; None when it has PyQt5, is the one-file exe, or (on Windows)
+    the wheel brought its executable."""
+    from . import launcher
+
+    if getattr(sys, "frozen", False) or launcher.has_qt():
+        return None
+    if os.name == "nt" and os.path.isfile(_gui_exe_path()):
+        return None
+    return ('the GUI needs PyQt5 in this Python, so a shortcut would open nothing. '
+            'Install it with:  pip install "turboadb[gui]"')
 
 
 _SHORTCUT_DESCRIPTION = "TurboADB - Android ADB + scrcpy toolkit"
@@ -155,8 +210,9 @@ def _write_shortcut(folder_expr: str, name: str, folder: str | None = None) -> b
     TurboADB's app ID (so a pin made of it groups with the running window).
     Written through COM into *folder*; PowerShell is the fallback, with
     *folder_expr* a PowerShell expression yielding the target directory
-    (e.g. ``[Environment]::GetFolderPath('Desktop')``)."""
-    if os.name != "nt":
+    (e.g. ``[Environment]::GetFolderPath('Desktop')``). Nothing is written
+    where nothing starts the GUI (:func:`_no_gui`)."""
+    if os.name != "nt" or _no_gui():
         return False
     target, args, workdir = _resolve_gui_target()
     icon = _shortcut_icon()
@@ -171,20 +227,25 @@ def _write_shortcut(folder_expr: str, name: str, folder: str | None = None) -> b
         if winshell.write_shortcut(path, target, args, workdir, icon, _SHORTCUT_DESCRIPTION):
             return True
 
-    def q(s):
-        return str(s).replace("'", "''")  # for PS single-quoted strings —
-
-    # a user name / path containing an apostrophe broke the whole script
+    # The values travel in the environment, never in the script: PowerShell
+    # ends a quoted string at an apostrophe and at a typographic quote alike
+    # (C:\Users\O’Brien), so a path broke the script, or ran as part of it.
+    values = {
+        "NAME": name, "TARGET": target, "ARGS": args, "WORKDIR": workdir,
+        "ICON": icon if os.path.exists(icon) else "", "DESCRIPTION": _SHORTCUT_DESCRIPTION,
+    }
+    env = dict(os.environ)
+    env.update({f"TURBOADB_LNK_{key}": str(value) for key, value in values.items() if value})
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$dir = {folder_expr}; "
         "if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; "
-        f"$lnk = $ws.CreateShortcut([IO.Path]::Combine($dir, '{q(name)}.lnk')); "
-        f"$lnk.TargetPath = '{q(target)}'; "
-        + (f"$lnk.Arguments = '{q(args)}'; " if args else "")
-        + f"$lnk.WorkingDirectory = '{q(workdir)}'; "
-        + (f"$lnk.IconLocation = '{q(icon)}'; " if os.path.exists(icon) else "")
-        + f"$lnk.Description = '{q(_SHORTCUT_DESCRIPTION)}'; "
+        "$lnk = $ws.CreateShortcut([IO.Path]::Combine($dir, $env:TURBOADB_LNK_NAME + '.lnk')); "
+        "$lnk.TargetPath = $env:TURBOADB_LNK_TARGET; "
+        + ("$lnk.Arguments = $env:TURBOADB_LNK_ARGS; " if values["ARGS"] else "")
+        + "$lnk.WorkingDirectory = $env:TURBOADB_LNK_WORKDIR; "
+        + ("$lnk.IconLocation = $env:TURBOADB_LNK_ICON; " if values["ICON"] else "")
+        + "$lnk.Description = $env:TURBOADB_LNK_DESCRIPTION; "
         "$lnk.Save()"
     )
     try:
@@ -204,6 +265,9 @@ def _write_shortcut(folder_expr: str, name: str, folder: str | None = None) -> b
             capture_output=True,
             timeout=30,
             creationflags=NO_WINDOW,
+            env=env,
+            # by its bare name, a powershell.exe in the current folder would be started
+            executable=windows_program(POWERSHELL),
         )
         return True
     except Exception:
@@ -311,6 +375,20 @@ def _stale_shortcuts(existing):
             or info.get("app_id") != winshell.APP_ID or norm(info["icon"]) != norm(icon)]
 
 
+def _revive_shortcuts(pins) -> list:
+    """Point those of the taskbar *pins* and of the Desktop and Start-menu
+    shortcuts that start a copy of the wheel's exe at what starts TurboADB
+    here (:func:`winshell.revive_shortcuts`); returns the ones changed.
+
+    Also with shortcut upkeep turned off in Settings, when nothing else
+    rewrites them: the start that deletes the old copy left them opening
+    nothing.  No shortcut is made that is not there."""
+    from . import winshell
+
+    paths = list(pins) + [path for _loc, path, _maker in _shortcut_paths()]
+    return winshell.revive_shortcuts(paths, *_resolve_gui_target(build=False))
+
+
 def ensure_shortcuts(name: str = "TurboADB", force: bool = False) -> dict:
     """Make sure the Desktop and Start-menu shortcuts exist. With *force* (the
     menu's refresh, and ``turboadb shortcut``) it re-creates them so they point
@@ -368,33 +446,67 @@ def create_shortcut(argv=None) -> int:
     reason = _shortcut_blocker()
     if reason:
         return _report(False, "", f"The shortcuts were not changed: {reason}.")
+    reason = _no_gui()
     return _report(
         False, "",
         f"Could not create or refresh the 'TurboADB' shortcut in {' and '.join(failed)}"
-        + (f" (the {' and '.join(ready)} one is fine)." if ready else "."),
+        + (f" (the {' and '.join(ready)} one is fine)" if ready else "")
+        + (f": {reason}" if reason else "."),
     )
 
 
+def _same_bytes(a: str, b: str) -> bool:
+    """Whether the files *a* and *b* hold the same bytes (False when either
+    can't be read)."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(1 << 20), fb.read(1 << 20)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
 def _staged_exe(src: str) -> str:
-    """Return a temp COPY of the bundled exe to actually run.
+    """Return a COPY of the bundled exe to actually run.
 
     A running .exe is locked by Windows, so running the installed one in place
-    would make ``pip install --upgrade`` fail to replace it. The temp name
-    includes the version and size, so a new build lands in a new file instead
-    of clashing with a copy that may still be running. The copies of earlier
-    builds (tens of MB each) are deleted, except one that is still running."""
+    would make ``pip install --upgrade`` fail to replace it. The copy lives in
+    ``~/.turboadb/gui``, which is this user's own: it used to go to the temp
+    folder, where on some machines another account can leave a file under its
+    name. A copy is run again only while it is the packaged exe byte for byte
+    (a damaged one of the right size was kept for good). The name includes the
+    version and size, so a new build lands in a new file instead of clashing
+    with a copy that may still be running. The copies of earlier builds (tens
+    of MB each) are deleted, except one that is still running."""
     import shutil
-    import tempfile
 
     try:
         from . import __version__ as ver
     except Exception:
         ver = "x"
     try:
-        size = os.path.getsize(src)
-        dst = os.path.join(tempfile.gettempdir(), f"turboadb-gui-{ver}-{size}.exe")
-        if not os.path.exists(dst) or os.path.getsize(dst) != size:
-            shutil.copy2(src, dst)
+        dst = user_path("gui", f"turboadb-gui-{ver}-{os.path.getsize(src)}.exe")
+        if not _same_bytes(src, dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            new = f"{dst}.{os.getpid()}.new"  # the name that is run never holds half a copy
+            try:
+                shutil.copy2(src, new)
+                try:
+                    os.replace(new, dst)
+                except OSError:
+                    if not _same_bytes(src, dst):  # not the copy another start just made and runs
+                        raise
+            finally:
+                try:
+                    os.remove(new)
+                except OSError:
+                    pass
     except Exception:
         return src  # fall back to running in place
     _remove_stale_staged_exes(dst)
@@ -402,24 +514,27 @@ def _staged_exe(src: str) -> str:
 
 
 def _remove_stale_staged_exes(keep: str) -> None:
-    """Delete the temp copies :func:`_staged_exe` made of other builds. Best
-    effort: a copy that is still running is locked, and stays until next time."""
+    """Delete the copies :func:`_staged_exe` made of other builds (and those
+    it never finished), in their folder and in the temp folder, where they
+    went up to 3.1.0. Best effort: a copy that is still running is locked, and
+    stays until next time."""
     import re
+    import tempfile
 
-    pattern = re.compile(r"turboadb-gui-[^-]+-\d+\.exe", re.IGNORECASE)
-    folder = os.path.dirname(keep)
-    try:
-        names = os.listdir(folder)
-    except OSError:
-        return
-    for name in names:
-        path = os.path.join(folder, name)
-        if not pattern.fullmatch(name) or os.path.normcase(path) == os.path.normcase(keep):
-            continue
+    pattern = re.compile(r"turboadb-gui-[^-]+-\d+\.exe(\.\d+\.new)?", re.IGNORECASE)
+    for folder in dict.fromkeys((os.path.dirname(keep), tempfile.gettempdir())):
         try:
-            os.remove(path)
+            names = os.listdir(folder)
         except OSError:
-            pass
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if not pattern.fullmatch(name) or os.path.normcase(path) == os.path.normcase(keep):
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def launch_gui(argv=None) -> int:
@@ -430,14 +545,18 @@ def launch_gui(argv=None) -> int:
     On Windows it runs as TurboADB.exe, a copy of this Python's pythonw.exe
     that Task Manager and the taskbar know as TurboADB (:mod:`launcher`).
     Without PyQt5 (e.g. a Python with no PyQt5 wheel) it starts the Windows
-    executable bundled in the wheel, from a temp copy so upgrades never block."""
+    executable bundled in the wheel, from a copy so upgrades never block."""
     args = list(argv) if argv is not None else sys.argv[1:]
     try:
         import PyQt5  # noqa: F401
     except ImportError:
         exe = _gui_exe_path()
         if os.name == "nt" and os.path.isfile(exe):
-            return subprocess.call([_staged_exe(exe)] + args)
+            staged = _staged_exe(exe)
+            # its shortcuts and pins start what starts it here, not the copy (_started_by)
+            env = dict(os.environ)
+            env[_STARTED_BY] = json.dumps([staged] + list(_installed_gui_target()))
+            return subprocess.call([staged] + args, env=env)
         print(
             "The GUI needs PyQt5 (or, on Windows, the executable bundled in the wheel). "
             'Install it with:  pip install "turboadb[gui]".',
@@ -572,9 +691,13 @@ def _handler(args, **overrides) -> ADBHandler:
 
 def _server_devices(cfg: ADBConfig) -> list:
     """The devices on the adb server *cfg* points at — the local one, or the
-    remote server of an ``--adb-host`` / ``-s @saved-remote`` target."""
+    remote server of an ``--adb-host`` / ``-s @saved-remote`` target.
+
+    A local server that cannot start is a ConnectionError saying why (and a
+    missing adb an ADBNotFoundError), never an empty list."""
     return list_devices(
-        cfg.adb_path, server_host=cfg.adb_server_host, server_port=cfg.adb_server_port
+        cfg.adb_path, server_host=cfg.adb_server_host, server_port=cfg.adb_server_port,
+        strict=True,
     )
 
 
@@ -1473,10 +1596,30 @@ def _shell_all(args) -> int:
     return rc
 
 
+def _batch_commands(path: str) -> list:
+    """The commands of a ``--batch`` file: its non-empty lines that are not
+    ``#`` comments.  UTF-8, with or without the byte order mark Notepad and
+    Windows PowerShell start a file with (it is not part of the first line);
+    a file that starts with a UTF-16 or UTF-32 mark, as PowerShell's ``>``
+    writes it, is read as that."""
+    import codecs
+
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    encoding = "utf-8-sig"
+    # UTF-32 first: its little-endian mark begins with UTF-16's
+    for mark, name in ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+                       (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")):
+        if head.startswith(mark):
+            encoding = name
+            break
+    with open(path, encoding=encoding) as fh:
+        return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+
+
 def _shell_batch(dev, args) -> int:
     """`shell --batch FILE`: each non-empty, non-# line as a command, in order."""
-    with open(args.batch, encoding="utf-8") as fh:
-        commands = [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+    commands = _batch_commands(args.batch)
     results = dev.shell_many(commands, stop_on_error=not args.keep_going, su=args.su)
     if _JSON["on"]:
         print(json.dumps([r.as_dict() for r in results], default=str, indent=2))
@@ -1630,22 +1773,29 @@ def _forwarding(dev, args) -> int:
 
 def _editor_command(editor: str) -> list:
     """The argv that starts *editor* (a path, or a command line such as
-    ``code --wait``), with the program found the way a console would find it.
+    ``code --wait``), with the program found in PATH's folders.
 
     On Windows a bare name is looked up with PATHEXT (``code`` is
     ``code.cmd``), which CreateProcess alone never does, and the quotes around
     a quoted path (``"C:\\Program Files\\…\\subl.exe" -w``) are removed —
-    kept, they became part of the program name. Raises ValueError when the
-    program can't be found, before anything is pulled from the device."""
+    kept, they became part of the program name. A bare name is never taken
+    from the current folder, where ``shutil.which`` and CreateProcess look
+    first (see :func:`turboadb.tools._on_path`): a ``notepad.bat`` lying in
+    the folder the command was run in was started with the device's file.
+    Raises ValueError when the program can't be found, before anything is
+    pulled from the device."""
     import shlex
     import shutil
 
-    if os.path.isfile(editor):
+    if os.path.dirname(editor) and os.path.isfile(editor):
         return [editor]
     words = shlex.split(editor, posix=os.name != "nt")
     if os.name == "nt":
         words = [w[1:-1] if len(w) >= 2 and w[0] == w[-1] == '"' else w for w in words]
-    program = shutil.which(words[0]) if words else None
+    program = None
+    if words:
+        # with a folder in it, shutil.which looks the name up as it is written
+        program = shutil.which(words[0]) if os.path.dirname(words[0]) else _on_path(words[0])
     if not program:
         raise ValueError(
             f"editor {words[0] if words else editor!r} not found — pass --editor, or set "
@@ -2230,7 +2380,15 @@ def main(argv=None) -> int:
                 return _done(0)
             if args.uninstall_startup:
                 a = uninstall_startup()
-                b = uninstall_serve_task()
+                try:
+                    b = uninstall_serve_task()
+                except RuntimeError as exc:
+                    # the task is still there: never "no auto-start was installed"
+                    if a:
+                        _say("Removed the login auto-start.")
+                    _say(f"Could not remove auto-start: {exc}. Run this command again "
+                         "as Administrator.", err=True)
+                    return _done(1)
                 _say("Removed auto-start." if (a or b) else "No auto-start was installed.")
                 return _done(0)
             _say(start_shared_server(port=asked, adb_path=args.adb_path))
@@ -2621,10 +2779,10 @@ def main(argv=None) -> int:
             info = dev.touch_device()
             if _JSON["on"]:
                 print(json.dumps(info, indent=2))
-            elif not info:
+            if not info:  # with --json too (it printed `null`): scripts read the exit code
                 print("no touchscreen found in 'getevent -pl'", file=sys.stderr)
                 return 1
-            else:
+            if not _JSON["on"]:
                 print(f"{info['path']}  {info['name']}")
                 print(f"  size:     {info['max_x'] + 1}x{info['max_y'] + 1} event units")
                 print(f"  protocol: {info['protocol']}"

@@ -336,7 +336,7 @@ def _drop_connection_later(handler, after=()) -> None:
 
 
 def _release_connection(handler) -> None:
-    """Let go of a handler no tab took (a cancelled or superseded connect)."""
+    """Let go of a handler no tab took (a cancelled, failed or superseded connect)."""
     drop = _CONNECTIONS.leave(_connection_key(handler), None, handler)
     if drop is not None:
         _drop_connection_later(drop)
@@ -394,6 +394,12 @@ class _ConnectThread(QThread):
                 _release_connection(h)  # only a connection it made, that no tab uses
                 return
             if isinstance(res, OperationResult) and not res.success:
+                # `adb connect` may have made the connection before the connect
+                # failed (a device that never authorised this PC, or stayed
+                # offline).  A retry's is then answered "already connected" and
+                # owns nothing, so this handler remains the one to drop it
+                # with, once the last tab on the device has closed.
+                _release_connection(h)
                 self.fail.emit(str(res.error))
                 return
             if not self.fetch_identity:
@@ -446,7 +452,7 @@ class _ConnectThread(QThread):
 class _ProbeThread(QThread):
     """Run the connect-time :class:`_DeviceProbe` for a tab that was handed a
     handler directly (not through its own connect worker), or again when the
-    first probe got no device profile."""
+    first probe got no device profile, or one without the feature list."""
 
     details = pyqtSignal(object)
 
@@ -508,10 +514,21 @@ class _ReconnectThread(QThread):
         self.initial_delay = initial_delay
         self.poll_interval = poll_interval
         self._cancelled = threading.Event()
+        self._deadline = None  # set once the polling starts
 
     def cancel(self):
-        """Stop waiting; a closed tab must not keep re-connecting its device."""
+        """Stop waiting; a closed tab must not keep re-connecting its device.
+
+        No adb command starts after this (one that is running ends by
+        itself), and nothing is reported: a tab held for an ADB restart ends
+        its wait this way, and its next poll would have made adb start a
+        server of its own."""
         self._cancelled.set()
+
+    def time_left(self) -> float:
+        """Seconds this wait still has; all of them until it starts polling."""
+        deadline = self._deadline
+        return float(self.timeout) if deadline is None else max(0.0, deadline - time.time())
 
     def run(self):
         import time
@@ -522,11 +539,12 @@ class _ReconnectThread(QThread):
         # normally available within a few hundred milliseconds.
         if self.initial_delay and self._cancelled.wait(self.initial_delay):
             return
-        deadline = time.time() + self.timeout
+        deadline = self._deadline = time.time() + self.timeout
         host = getattr(getattr(self.handler, "config", None), "host", None)
         port = getattr(getattr(self.handler, "config", None), "port", 5555)
+        cancelled = self._cancelled.is_set
 
-        while time.time() < deadline and not self._cancelled.is_set():
+        while time.time() < deadline and not cancelled():
             try:
                 if host:
                     try:
@@ -534,17 +552,18 @@ class _ReconnectThread(QThread):
                     except Exception:
                         pass
 
-                if self.handler.get_state() == "device":
+                # (cancel() while one adb command runs: the next is not started)
+                if not cancelled() and self.handler.get_state() == "device" and not cancelled():
                     res = self.handler.shell("echo 1", timeout=3, safe=True)
                     if isinstance(res, OperationResult) and res.success and res.value.ok:
-                        time.sleep(0.5)
-                        self.done.emit(True)
+                        if not self._cancelled.wait(0.5):
+                            self.done.emit(True)
                         return
             except Exception:
                 pass
             if self._cancelled.wait(self.poll_interval):
                 return
-        if not self._cancelled.is_set():
+        if not cancelled():
             self.done.emit(False)
 
 
@@ -842,6 +861,14 @@ class _DeviceProbe:
             return None
         return ADBHandler.parse_display_info("\n".join(self.sections["displays"]))
 
+    def has_feature_list(self) -> bool:
+        """Whether the device listed its features.  One that is still starting
+        (adbd answers, its package service does not yet) lists none, and
+        classifies as a phone whatever it is."""
+        return "displays" in self.sections and any(
+            line.strip().startswith("feature:") for line in self.sections["kind"]
+        )
+
     def result(self) -> dict:
         info = self.device_info()
         error = ""
@@ -855,6 +882,8 @@ class _DeviceProbe:
             "prompt": self.prompt(),
             "displays": self.displays(),
             "error": error,
+            # False: a profile to ask for again (see DeviceTab._on_probe_details)
+            "features": self.has_feature_list(),
         }
 
 
@@ -1334,6 +1363,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
         self.term = AnsiConsole(send_fn=self._send)
         self.term.set_emulate_prompt(False)
+        self.term.set_form_feed_clears(self.shell_type == "cmd")  # what cls writes to a pipe
         self.term.set_completion_fn(self._complete_local_async)
         self.term.set_prompt_provider_fn(self._get_prompt)
         self.term.set_interrupt_fn(self.interrupt)
@@ -1375,11 +1405,13 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._refused_at = 0.0
         self._ps_width = None  # PowerShell's buffer width as last set
         self._grep_probe = {}  # {"gnu": bool} once the session's grep is known
+        self._ls_probe = {}  # {"found": bool} once the session's PATH was searched for an ls
         # Stop on a local command (see interrupt)
         self._stop_pending = False
         self._stop_phase = ""      # "ctrl-c": a console Ctrl+C; "kill": ending processes
         self._ctrl_c_sent = False  # that Ctrl+C reached the shell's console
         self._stop_heard = False   # ... and output came after it
+        self._stop_output_at = 0.0  # when output last came before the Ctrl+C was reported
         self._stop_marked = False  # a "^C" is on screen for this stop
         self._batch_answered = False
         self._stop_timer = QTimer(self)
@@ -1932,10 +1964,12 @@ class _LocalShellWidget(_TerminalWidgetBase):
 
     def _start_probes(self, session) -> None:
         """Off the UI thread, for a new session: warm the PATH command list for
-        the first Tab, and (CMD) learn whether its ``grep`` is GNU grep, which
-        takes ``--line-buffered`` (see :meth:`_pipeline_rewrite`)."""
+        the first Tab, and (CMD) learn whether its PATH has an ``ls`` of its
+        own (see :meth:`_cmd_rewrite`) and whether its ``grep`` is GNU grep,
+        which takes ``--line-buffered`` (see :meth:`_pipeline_rewrite`)."""
         env = getattr(session, "env", None)
         self._grep_probe = probe = {}
+        self._ls_probe = ls_probe = {}
         if not isinstance(env, dict) or not env:
             return  # a stand-in session
 
@@ -1945,8 +1979,9 @@ class _LocalShellWidget(_TerminalWidgetBase):
             except Exception:
                 pass
             if self.shell_type == "cmd":
-                from .local_terminal import gnu_grep
+                from .local_terminal import find_command, gnu_grep
 
+                ls_probe["found"] = find_command("ls", env) is not None
                 probe["gnu"] = gnu_grep(env)
 
         threading.Thread(target=run, name="turboadb-local-shell-probe", daemon=True).start()
@@ -2018,6 +2053,10 @@ class _LocalShellWidget(_TerminalWidgetBase):
             if self._stop_pending:
                 if self._ctrl_c_sent:
                     self._stop_heard = True  # the command answered the Ctrl+C
+                else:
+                    # ... or it has, if the Ctrl+C is raised by now: the
+                    # report says when that was (see _on_ctrl_c_sent)
+                    self._stop_output_at = time.monotonic()
                 self._follow_local_stop()
 
     _PS_PROMPT_TAIL = re.compile(r"(?:^|[\r\n])PS ([^\r\n>]+)> ?$")
@@ -2219,11 +2258,16 @@ class _LocalShellWidget(_TerminalWidgetBase):
             self.adbd_restart_requested.emit(adbd_restart)
 
     def _adb_shell_line(self, line: str) -> None:
-        """A line for the adb shell started here: follow ``cd`` and ``exit``."""
+        """A line for the adb shell started here: follow ``cd``.
+
+        ``exit`` may leave only a shell inside it (``su``, ``sh``, ``run-as``),
+        so the typed word never ends the adb shell here: PowerShell's or
+        CMD's own prompt does, once it shows (:meth:`_track_adb_shell_output`)."""
         # input after a Ctrl+C: the next Stop sends Ctrl+C again
         self._clear_adb_interrupt()
         if line.lower() in ("exit", "exit 0", "logout"):
-            self.reset_adb_shell_context()
+            # also when it was typed before the device prompt ever showed
+            self._adb_answered = True
             return
         self._track_adb_shell_cd(line)
 
@@ -2335,10 +2379,17 @@ class _LocalShellWidget(_TerminalWidgetBase):
         return (line.rstrip().rstrip(";") + ";if($ExecutionContext.SessionState.LanguageMode"
                 " -eq 'FullLanguage'){try{" + _PS_PROMPT_MARK + "}catch{}}")
 
-    @staticmethod
-    def _cmd_rewrite(line: str):
-        """CMD: ``ls`` runs ``dir`` and ``clear`` runs ``cls``."""
+    def _cmd_rewrite(self, line: str):
+        """CMD: ``ls`` runs ``dir`` and ``clear`` runs ``cls``.
+
+        Not when the PATH has an ``ls`` of its own (Git for Windows' Unix
+        tools, MSYS2, busybox; :meth:`_start_probes`): that one runs, as in
+        a cmd window, where ``dir -1`` only said "File Not Found"."""
         low = line.lower()
+        if low == "clear":
+            return "cls"
+        if self._ls_probe.get("found"):
+            return None
         if low == "ls":
             return "dir"
         if low.startswith("ls "):
@@ -2346,8 +2397,6 @@ class _LocalShellWidget(_TerminalWidgetBase):
             if rest in ("-la", "-al", "-l", "-a"):
                 return "dir /a" if "a" in rest else "dir"
             return f"dir {rest}"
-        if low == "clear":
-            return "cls"
         return None
 
     def _pipeline_rewrite(self, line: str):
@@ -2548,7 +2597,8 @@ class _LocalShellWidget(_TerminalWidgetBase):
     ADB_INTERRUPT_WAIT_MS = 3000
 
     def interrupt(self):
-        """Stop the running command (Stop, Ctrl+C).
+        """Stop the running command (Stop, Ctrl+C); the lines of a paste that
+        have not run yet go with it.
 
         Inside an adb shell started here, Ctrl+C goes to the device: the shell
         runs on a device terminal (``-t -t``), so only the device command stops
@@ -2566,14 +2616,15 @@ class _LocalShellWidget(_TerminalWidgetBase):
         processes ended (``kill_command``); if the prompt is still not back
         after another :attr:`LOCAL_STOP_WAIT_MS` (a loop inside PowerShell
         itself), or Stop is pressed once more, a fresh shell replaces it in
-        the same folder.  So does a shell that waits for a line itself
-        (``pause``, ``set /p``, ``Read-Host``, a ``-Confirm`` question, the
-        rest of a ``>>`` block): it notices Ctrl+C only after reading one,
-        and Stop never types an answer for the user.  At an idle prompt
-        Ctrl+C only starts a new prompt line: it used to replace the whole
-        shell, and its background jobs with it."""
+        the same folder.  So does, after the same time in all, a shell that
+        waits for a line itself (``pause``, ``set /p``, ``Read-Host``, a
+        ``-Confirm`` question, the rest of a ``>>`` block): it notices Ctrl+C
+        only after reading one, and Stop never types an answer for the user.
+        At an idle prompt Ctrl+C only starts a new prompt line: it used to
+        replace the whole shell, and its background jobs with it."""
         if self._closing or not (self.session and self.session.running):
             return
+        self.term._cancel_paste()  # the pasted lines were for the stopped command
         if self._in_adb_shell:
             if self._adb_interrupt_pending:
                 self._reopen_adb_shell()
@@ -2605,6 +2656,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._batch_answered = False
         self._ctrl_c_sent = False
         self._stop_heard = False
+        self._stop_output_at = 0.0
         # what the command printed and is not drawn yet goes (Save keeps it)
         self.term.interrupt_output(until_echo=False)
         if self.shell_type == "powershell":
@@ -2650,6 +2702,12 @@ class _LocalShellWidget(_TerminalWidgetBase):
             self._end_local_command(session)  # no console to reach: end the processes
             return
         self._ctrl_c_sent = True
+        if result.at is not None and self._stop_output_at >= result.at:
+            # Output came since the Ctrl+C was raised, before this report of
+            # it: a REPL prints its KeyboardInterrupt and prompt within
+            # milliseconds.  Not counted as its answer, it was ended after
+            # the wait as if it had ignored the Ctrl+C.
+            self._stop_heard = True
         if self._own_prompt:
             # the shell waits at its prompt (it was a background job): it
             # prints no new one by itself
@@ -2660,10 +2718,14 @@ class _LocalShellWidget(_TerminalWidgetBase):
             # Read-Host, a -Confirm question, the rest of a ">>" block) it
             # notices the Ctrl+C only once it has read one, and any line could
             # answer the question (Enter confirms -Confirm, ends a ">>" block
-            # and runs it).  If its prompt is not back soon, only a fresh
-            # shell stops it without answering for the user.
+            # and runs it).  If its prompt is still not back, only a fresh
+            # shell stops it without answering for the user.  It gets as long
+            # for that as a command that ignores Ctrl+C: the prompt of a shell
+            # that did stop can take a while (a prompt function that asks git,
+            # a .NET call that has to return first), and it was replaced with
+            # its variables and history half a second after Stop.
             self._stop_phase = "blocked"
-            self._stop_timer.start(self.LOCAL_STOP_PROBE_MS)
+            self._stop_timer.start(2 * self.LOCAL_STOP_WAIT_MS)
 
     def _emit_command_stopped(self, session, result) -> None:
         """From the stop thread: hand the result to the UI thread."""
@@ -2741,6 +2803,7 @@ class _LocalShellWidget(_TerminalWidgetBase):
         self._stop_phase = ""
         self._ctrl_c_sent = False
         self._stop_heard = False
+        self._stop_output_at = 0.0
         self._stop_timer.stop()
         self._stop_probe_timer.stop()
 
@@ -3064,7 +3127,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         # the shell that runs (see the class docstring)
         self._input = None               # its input, written off the UI thread (_ShellInput)
         self._prompt_seen = False        # it has shown its prompt
-        self._early_lines = deque()      # lines typed before that, sent one per prompt
+        self._early_lines = deque()      # lines typed before that, or behind those: one per prompt
         self._first_prompt = False       # the output due next is that prompt (see _show)
         self._pty = False                # on a device terminal
         self._tty_requested = False      # opened with -t -t
@@ -3453,13 +3516,14 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if match:
             self.term._cwd = match.group(1)
             self.term._cd_revert = None  # the device said where it is
-        if not self._prompt_seen:
-            self._prompt_seen = True
-            self.term.set_typing_ahead(False)
+        self._prompt_seen = True
         if self._early_lines:
             # a line typed before the first prompt: its turn now (the device
             # echoes it after this prompt; the console never drew it)
             self._write(self._terminal_input(self._early_lines.popleft(), sized=False))
+        if not self._early_lines:
+            # none waits any more: a line typed from now on is drawn at once
+            self.term.set_typing_ahead(False)
 
     def _through_hold(self, data: bytes) -> bytes:
         """Output while a terminal shell's first line runs: b"" while it is held
@@ -3700,10 +3764,12 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         if not data:
             return
         self._lines_sent += 1
-        if self._pty and not self._prompt_seen:
+        if self._pty and (not self._prompt_seen or self._early_lines):
             # Before its first prompt the terminal would echo the line in the
             # middle of the shell's start (or it went with the hidden first
-            # line); from its prompt on it is echoed where it runs.
+            # line); from its prompt on it is echoed where it runs.  While
+            # such lines still wait for their prompts, a line typed goes
+            # after them: sent at once it ran ahead of them.
             self._early_lines.append(data)
             return
         if self._pty:
@@ -3856,8 +3922,13 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             if self._interrupt_pending:
                 self._hard_reopen(self._reopened("Stopped"))
                 return
+            # what was typed ahead goes, as on a terminal: the lines still
+            # waiting for their prompt, and input not written yet
+            self._early_lines.clear()
+            if self._prompt_seen:
+                self.term.set_typing_ahead(False)
             if self._input is not None:
-                self._input.discard()  # what was typed ahead goes, as on a terminal
+                self._input.discard()
             if self._write(b"\x03"):
                 # what the command printed before it stopped is not drawn any
                 # more (Save still has it): the output stops at once
@@ -4449,9 +4520,13 @@ class DeviceTab(QWidget):
         self._threads = []
         self._rc = None
         self._automotive = False
+        self._sdk = None  # the device's Android API level, once it has said
         self._reconnecting = False
         self._reboot_in_progress = False
         self._adb_restart_in_progress = False
+        # Seconds a wait for the device still had when an ADB restart ended it
+        # (or would have had, asked for during one): see prepare_for_adb_restart.
+        self._parked_wait = None
         # adb root / unroot / make writable running: terminals are held
         self._adbd_busy = False
         self._access_declined = {}  # device folder -> when its write-access offer was declined
@@ -4460,6 +4535,7 @@ class DeviceTab(QWidget):
         self._fail_box = None  # the "Connect failed" message (see _show_connect_failure)
         # A probe that got no device profile is run once more (see _on_probe_details).
         self._probe_retried = False
+        self._unfinished_profile = None  # a profile without its feature list, held for that repeat
         self._probe_retry_timer = QTimer(self)
         self._probe_retry_timer.setSingleShot(True)
         self._probe_retry_timer.timeout.connect(self._retry_probe)
@@ -4881,10 +4957,21 @@ class DeviceTab(QWidget):
             return
         self._wait_and_reconnect()
 
-    def _wait_and_reconnect(self, *, adb_restart=False, manual=False):
+    def _wait_and_reconnect(self, *, adb_restart=False, manual=False, at_least=None):
+        """Wait for the device and bring the tab back when it answers.
+
+        *at_least*: seconds an earlier wait still had (see
+        :meth:`prepare_for_adb_restart`); this one waits no less."""
         from .qtutil import park_thread, thread_running
 
         if self._reconnecting or not self.handler or self._session_closed:
+            return
+        timeout = max(25 if adb_restart else (60 if manual else 180), at_least or 0)
+        if self._adb_restart_in_progress:
+            # The server is being stopped and started: a wait that polled now
+            # would make adb start one of its own.  finish_adb_restart starts
+            # the one recovery, with the time this wait would have had.
+            self._parked_wait = max(self._parked_wait or 0, timeout)
             return
         self._reconnecting = True
         self.btn_reconnect.hide()
@@ -4904,45 +4991,83 @@ class DeviceTab(QWidget):
         quick = adb_restart or manual
         self._rc = _ReconnectThread(
             self.handler,
-            timeout=25 if adb_restart else (60 if manual else 180),
+            timeout=timeout,
             initial_delay=0.1 if quick else 3.0,
             poll_interval=0.5 if quick else 2.0,
         )
         self._rc.done.connect(self._on_reconnected)
         self._rc.start()
 
-    def _logcat_recovery(self, action, **kwargs):
-        """Tell a built Logcat page the device is going or back (a live capture
-        pauses and resumes with it); a page never shown is left unbuilt."""
-        page = self._built_page("logcat")
+    def _page_recovery(self, key, action, **kwargs):
+        """Call *action* on the page behind *key* if it was built; a page
+        never shown is left unbuilt."""
+        page = self._built_page(key)
         if page is None:
             return
         try:
             getattr(page, action)(**kwargs)
         except Exception as exc:
-            self.log.emit(f"[WARNING] logcat: {exc}")
+            self.log.emit(f"[WARNING] {key}: {exc}")
+
+    def _logcat_recovery(self, action, **kwargs):
+        """Tell a built Logcat page the device is going or back (a live capture
+        pauses and resumes with it); a page never shown is left unbuilt."""
+        self._page_recovery("logcat", action, **kwargs)
+
+    def _phone_recovery(self, action, **kwargs):
+        """Tell a built Phone page that the adb server is going, or that the
+        device is back (it asks nothing meanwhile, then loads again)."""
+        self._page_recovery("phone", action, **kwargs)
 
     def prepare_for_adb_restart(self):
-        """Suspend retrying shell streams before their shared daemon is killed."""
+        """Suspend what runs adb by itself before the shared daemon is killed:
+        the shell streams, a wait for the device and the Phone page.  A plain
+        adb command that finds no server starts one, which TurboADB would not
+        know of (and, during a tools update, from the folder being replaced)."""
         if not self.handler:
             return
         self._adb_restart_in_progress = True
         self.status.setText("Restarting local ADB server…")
         self._enable_actions(False)
+        self._park_reconnect_wait()
         try:
             self.shell.pause_for_adb_restart()
         except Exception:
             pass
         self._logcat_recovery("suspend_for_device_loss")
+        self._phone_recovery("suspend_for_device_loss")
+
+    def _park_reconnect_wait(self) -> None:
+        """End a wait for the device (it rebooted or was unplugged): its polls
+        are ``adb get-state`` and ``adb connect``.  finish_adb_restart starts
+        the one recovery, for at least the time this wait had left."""
+        from .qtutil import park_thread, thread_running
+
+        waiting, self._rc = self._rc, None
+        self._reconnecting = False
+        if waiting is None:
+            return
+        try:
+            waiting.done.disconnect()  # an answer on its way is out of date
+        except Exception:
+            pass
+        if thread_running(waiting):
+            self._parked_wait = max(self._parked_wait or 0, waiting.time_left())
+            waiting.cancel()
+            park_thread(waiting)
 
     def finish_adb_restart(self, success: bool):
         """Recover a paused shell once MainWindow has restarted the daemon."""
         if not self._adb_restart_in_progress:
             return
         self._adb_restart_in_progress = False
+        parked, self._parked_wait = self._parked_wait, None
         if success:
-            self._wait_and_reconnect(adb_restart=True)
+            self._wait_and_reconnect(adb_restart=True, at_least=parked)
             return
+        if parked is not None:
+            # the wait that would have ended the reboot is not coming back
+            self._reboot_in_progress = False
         self.status.setText("ADB restart failed — try Restart ADB again")
         self._enable_actions(True)
         # Nothing reconnects by itself now: Reconnect is the way back (after
@@ -4951,6 +5076,7 @@ class DeviceTab(QWidget):
         shell = getattr(self, "shell", None)
         if shell is not None:
             shell.adb_restart_failed()
+        self._phone_recovery("resume_after_reconnect", reload=False)
 
     def _on_reconnected(self, ok):
         self._reconnecting = False
@@ -4972,9 +5098,11 @@ class DeviceTab(QWidget):
             except Exception as exc:
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
             self._logcat_recovery("resume_after_reconnect")
+            self._phone_recovery("resume_after_reconnect")
         else:
             self.status.setText("Device didn't come back (timed out)")
             self._offer_reconnect()
+            self._phone_recovery("resume_after_reconnect", reload=False)
             self.log.emit(
                 "[ERROR] device did not return to 'device' state (timed out). "
                 "If it's in recovery/bootloader this is expected; otherwise replug and click Reconnect."
@@ -5043,8 +5171,8 @@ class DeviceTab(QWidget):
     def _release_terminals(self) -> None:
         """adbd is back (as root or not): the Android shell reconnects (its
         prompt shows ``#`` as root), PowerShell/CMD reopen their adb shells, a
-        Logcat capture that ended with adbd resumes, and a built Files page
-        lists its folder again."""
+        Logcat capture that ended with adbd resumes, a built Files page lists
+        its folder again and a built Phone page loads again."""
         self._adbd_busy = False
         if self._session_closed:
             return
@@ -5058,6 +5186,8 @@ class DeviceTab(QWidget):
                 self.log.emit(f"[ERROR] shell reconnect: {exc}")
         # the shell-lost path, which resumes it otherwise, waits while adbd is held
         self._logcat_recovery("resume_after_reconnect")
+        # (also a reconnect that ended while adbd was held left the page to here)
+        self._phone_recovery("resume_after_reconnect")
         for page in self._files_pages():
             page.refresh_remote()
 
@@ -5240,6 +5370,7 @@ class DeviceTab(QWidget):
         probe_pending = bool(payload.pop("_probe_pending", False))
         prompt = payload.pop("_prompt", None)
         quick = payload if payload.pop("_quick_identity", False) else {}
+        self._note_sdk(quick.get("sdk"))
         friendly = " ".join(
             bit for bit in (quick.get("manufacturer"), quick.get("model")) if bit
         ).strip()
@@ -5546,6 +5677,9 @@ class DeviceTab(QWidget):
     def _build_phone(self):
         page = PhonePanel(self.handler, adb_gate=self._adb_gate)
         page.log.connect(self.log)
+        if self._adb_restart_in_progress:
+            # first shown while the adb server restarts: it loads after that
+            page.suspend_for_device_loss()
         return page
 
     def _build_webcam(self):
@@ -5554,7 +5688,8 @@ class DeviceTab(QWidget):
         return page
 
     # A probe that got no device profile (adbd refused a second shell right
-    # after connecting, the device served its properties slowly) runs once
+    # after connecting, the device served its properties slowly), or one
+    # without the feature list (the device was still starting), runs once
     # more after this long.  Without it a head unit whose first probe failed
     # was a phone for the whole session: no IVI Displays tab, the phone
     # defaults in Apps and Device Control, no automotive reboot warning.
@@ -5563,10 +5698,18 @@ class DeviceTab(QWidget):
     def _on_probe_details(self, handler, result, *, retried=False) -> None:
         """The connect-time probe finished: device profile, prompt and displays.
 
-        *retried*: the result of the one repeat of a probe that got no profile."""
+        *retried*: the result of the one repeat of a probe that got no profile,
+        or one without the feature list."""
         if self._session_closed or handler is not self.handler:
             return
         result = result if isinstance(result, dict) else {}
+        info = result.get("info")
+        # A device that is still starting (adbd answers, its package and window
+        # services do not yet) sends its properties but lists no features: its
+        # profile says "phone" whatever it is, so it is asked again like one
+        # that sent none.
+        unfinished = info is None or result.get("features") is False
+        again = unfinished and not retried and not self._probe_retried
         shell = getattr(self, "shell", None)
         android = getattr(shell, "android_widget", None)
         if android is not None:
@@ -5575,9 +5718,10 @@ class DeviceTab(QWidget):
                 android.apply_prompt(*prompt)
             else:
                 android.prompt_unavailable()
-            if result.get("info") is None:
-                # No profile is coming: the banner keeps the quick identity and
-                # shows as soon as the Terminal opens, not 2.5 s later.
+            if info is None or again:
+                # No profile is coming (yet): the banner keeps the quick
+                # identity and shows as soon as the Terminal opens, not 2.5 s
+                # later.
                 android.update_identity(android._info)
         mirror = getattr(self, "mirror_tab", None)
         if mirror is not None:
@@ -5590,17 +5734,27 @@ class DeviceTab(QWidget):
                 # The probe did not get that far: the panel's own quiet adb
                 # scan (once: the repeated probe does not start another).
                 mirror.refresh_displays(quiet=True)
-        info = result.get("info")
+        error = result.get("error") or (
+            "no reply" if info is None
+            else "the device listed no features, it may still be starting"
+        )
+        if again:
+            self._probe_retried = True
+            # (kept: should the repeat bring no profile, this one is applied)
+            self._unfinished_profile = info
+            self._probe_retry_timer.start(self.PROBE_RETRY_MS)
+            self.log.emit(
+                f"[INFO] Device details are still unavailable: {error} "
+                "(asking the device again in a moment)"
+            )
+            return
         if info is None:
-            error = result.get("error") or "no reply"
-            if not retried and not self._probe_retried:
-                self._probe_retried = True
-                self._probe_retry_timer.start(self.PROBE_RETRY_MS)
-                self.log.emit(
-                    f"[INFO] Device details are still unavailable: {error} "
-                    "(asking the device again in a moment)"
-                )
-                return
+            # The repeat brought none: the profile the first probe did get is
+            # better than none (a head unit says "automotive" in its build
+            # characteristics, with or without a feature list).
+            info = self._unfinished_profile
+        self._unfinished_profile = None
+        if info is None:
             info = OperationResult(False, "device_info", error=error)
         self._on_device_info(handler, info)
 
@@ -5628,6 +5782,20 @@ class DeviceTab(QWidget):
         self._probe_thread = thread
         thread.start()
 
+    def _note_sdk(self, value) -> None:
+        """Keep the device's Android API level from its identity or profile
+        (it decides whether keys for display 0 can name their display)."""
+        try:
+            self._sdk = int(str(value).strip())
+        except (TypeError, ValueError):
+            return
+        mirror = getattr(self, "mirror_tab", None)
+        if mirror is not None:
+            mirror.set_device(sdk=self._sdk)
+        wall = getattr(self, "display_wall", None)
+        if wall is not None:
+            wall.set_sdk(self._sdk)
+
     def _on_device_info(self, handler, info) -> None:
         """Apply optional build identity without affecting transport readiness."""
         if handler is not self.handler:
@@ -5645,6 +5813,7 @@ class DeviceTab(QWidget):
 
         details = dict(details)
         self._automotive = bool(details.get("automotive"))
+        self._note_sdk(details.get("sdk"))
         kind_label = details.get("kind_label") or ("Automotive" if self._automotive else "")
         kind_reason = details.get("kind_reason")
         self.log.emit(
@@ -5710,6 +5879,7 @@ class DeviceTab(QWidget):
             self.session,
             automotive=self._automotive,
             dispatcher=self._device_dispatcher,
+            sdk=self._sdk,
         )
         wall.log.connect(self.log)
         wall.rescan_requested.connect(lambda: mirror.refresh_displays())
@@ -6056,12 +6226,16 @@ class DeviceTab(QWidget):
         )
         self.mirror_tab.log.connect(self.log)
         self.mirror_tab.video_active_changed.connect(self.screen_active)
+        self.mirror_tab.set_device(sdk=getattr(self, "_sdk", None))
         self.controls = ControlsPanel(
             handler,
             compact=True,
             on_reboot=lambda: self.reboot(None),
             dispatcher=self._device_dispatcher,
-            display_provider=self.mirror_tab.input_display_id,
+            # The display the screen shows, by the rule of the screen's own
+            # keys.  Display 0 of several is named too: Android sends a key
+            # without one to the display in focus.
+            display_provider=self.mirror_tab.key_display_id,
         )
         self.controls.log.connect(self.log)
         m_card = card("", self.mirror_tab, "mirrorView")

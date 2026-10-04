@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 
 from PyQt5.QtCore import Qt, QPoint, QSize, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence
@@ -21,6 +22,7 @@ from ..config import format_host_port, parse_host_port, user_path
 from ..results import OperationResult
 from ..scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 from . import icons, theme
+from .connect_dialog import firewall_warning
 from .log_panel import LogPanel, classify as classify_log_line
 from .sessions import SessionStore, session_identity
 from .session_dialog import SessionDialog
@@ -61,7 +63,7 @@ _LOCAL_ADB_HOST = "127.0.0.1"
 # closeEvent disconnects them all before parking; disconnect_signals ignores the
 # ones a given worker does not have.
 _WORKER_ATTRS = ("_poll", "_tracker", "_adb_init", "_as", "_dl", "_share",
-                 "_unshare", "_deploy", "_sc", "_upd_chk", "_upd_run",
+                 "_unshare", "_deploy", "_sc", "_upd_chk", "_tools_chk", "_upd_run",
                  "_upd_quiet", "_disc", "_bcast", "_pair")
 _WORKER_SIGNALS = ("result", "failed", "ready", "note", "done", "fail", "progress",
                    "stage", "msg", "status", "line", "finished")
@@ -80,6 +82,17 @@ def _network_target(serial):
     """
     host, port = parse_host_port(serial, None)
     return (host, port) if host and port is not None else (None, None)
+
+
+def _target_address(s) -> str:
+    """Where the saved target *s* points: what the sidebar shows beside its
+    name."""
+    kind = s.get("type") or "usb"
+    if kind == "network":
+        return f"{s.get('host')}:{s.get('port')}"
+    if kind == "remote":
+        return f"{s.get('adb_host')}:{s.get('adb_port')} → {s.get('serial') or 'only device'}"
+    return s.get("serial") or "only device"
 
 
 def _discard_dialog(dialog) -> None:
@@ -387,6 +400,16 @@ class _BroadcastThread(QThread):
         super().__init__()
         self.serials, self.command = serials, command
         self.adb_path = adb_path
+        self._called_off = threading.Event()
+
+    def stop(self) -> None:
+        """Call off the commands still running, and those not started yet.
+
+        The window is closing.  Parked, the worker ran on, and the process
+        stayed alive behind the closed window until the last command had
+        ended or timed out; with the adb server left running on exit, so did
+        its adb children."""
+        self._called_off.set()
 
     def _run_one(self, serial) -> str:
         """The log line for *serial*'s result (a worker thread: no Qt here)."""
@@ -394,7 +417,8 @@ class _BroadcastThread(QThread):
         from ..config import ADBConfig
         try:
             h = ADBHandler(ADBConfig(serial=serial, adb_path=self.adb_path), safe=True)
-            outcome = h.shell(self.command, timeout=self.TIMEOUT_S, safe=True)
+            outcome = h.shell(self.command, timeout=self.TIMEOUT_S, cancel=self._called_off,
+                              safe=True)
             if isinstance(outcome, OperationResult):
                 if not outcome.success:
                     return f"[ERROR] {serial}: {outcome.error}"
@@ -435,6 +459,8 @@ class _ToolsDownloadThread(QThread):
     def __init__(self, mode="fetch", force=False):
         super().__init__()
         self.mode, self.force = mode, force
+        # for an upgrade: what the check before it found (see _tools_check_worker)
+        self.checks = None
         # whether the local adb server answers afterwards (replacing adb stops it)
         self.server_up = False
 
@@ -444,7 +470,7 @@ class _ToolsDownloadThread(QThread):
             if self.mode == "ensure":
                 res = ensure_tools(on_progress=self.progress.emit)
             elif self.mode == "upgrade":
-                res = upgrade_tools(on_progress=self.progress.emit)
+                res = upgrade_tools(on_progress=self.progress.emit, checks=self.checks)
             else:
                 res = fetch_tools(adb=True, scrcpy=True, force=self.force,
                                   on_progress=self.progress.emit,
@@ -492,8 +518,12 @@ class _ShareThread(QThread):
             self.msg.emit("[INFO] Restarting the local ADB server to expose it on the LAN; "
                           "active device sessions may reconnect briefly.")
             self.msg.emit("[OK] " + start_shared_server(adb_path=self.adb_path))
-            self.msg.emit("[INFO] " + open_firewall((local_adb_port(),
-                                                     TUNNEL_PORT_FIREWALL_RANGE)))
+            firewall = open_firewall((local_adb_port(), TUNNEL_PORT_FIREWALL_RANGE))
+            # No rule added (that needs Administrator), or a Public network:
+            # said last, as a warning, instead of "can now connect".
+            kept_out = firewall_warning(firewall)
+            if not kept_out:
+                self.msg.emit("[INFO] " + firewall)
             if self.install_startup:
                 try:
                     # the launcher runs the adb this server was started with
@@ -504,8 +534,11 @@ class _ShareThread(QThread):
                 else:
                     self.msg.emit(f"[OK] Auto-start installed (runs at every login): "
                                   f"{path}")
-            self.msg.emit("[OK] Other machines can now connect via TurboADB → "
-                          "Remote using this PC's IP/hostname.")
+            if kept_out:
+                self.msg.emit("[WARNING] " + kept_out)
+            else:
+                self.msg.emit("[OK] Other machines can now connect via TurboADB → "
+                              "Remote using this PC's IP/hostname.")
         except Exception as exc:
             self.msg.emit(f"[ERROR] share devices: {exc}")
 
@@ -532,15 +565,24 @@ class _StopShareThread(QThread):
             from ..devices import (uninstall_startup, uninstall_serve_task,
                                    stop_shared_server)
             removed = []
+            kept = ""
             if uninstall_startup():
                 removed.append("login auto-start launcher")
-            if uninstall_serve_task():
-                removed.append("SYSTEM startup task")
-            self.msg.emit("[OK] removed auto-start: " + (", ".join(removed)
-                          if removed else "none was installed"))
+            try:
+                if uninstall_serve_task():
+                    removed.append("SYSTEM startup task")
+            except RuntimeError as exc:
+                kept = str(exc)  # still installed: it takes Administrator to remove
+            if removed or not kept:
+                self.msg.emit("[OK] removed auto-start: " + (", ".join(removed)
+                              if removed else "none was installed"))
             self.msg.emit("[OK] " + stop_shared_server(adb_path=self.adb_path))
-            self.msg.emit("[OK] This PC no longer shares its devices and will not "
-                          "start the shared server automatically.")
+            if kept:
+                self.msg.emit("[WARNING] This PC stopped sharing its devices for now, but "
+                              f"{kept}. Start TurboADB as Administrator and stop sharing again.")
+            else:
+                self.msg.emit("[OK] This PC no longer shares its devices and will not "
+                              "start the shared server automatically.")
         except Exception as exc:
             self.msg.emit(f"[ERROR] stop sharing: {exc}")
 
@@ -591,37 +633,69 @@ def _shortcut_worker(force=False):
     return FunctionThread(work)
 
 
+def _update_blocker() -> str:
+    """Why pip cannot upgrade this copy of TurboADB (the standalone exe, a
+    source checkout), or "" when it can.
+
+    Never on the UI thread: the first time, the answer takes a fresh Python
+    (``update.running_copy``, up to 20 s), which froze the window while the
+    Upgrade button asked it itself."""
+    from ..update import can_self_update, self_update_blocker
+
+    if can_self_update():
+        return ""
+    return self_update_blocker() or "pip does not manage it"
+
+
 def _update_check_worker(cached=False):
-    """Ask PyPI whether a newer TurboADB exists; ``done`` carries the newer
-    version or "".  *cached=True* uses the once-a-day cache (quiet launch check)."""
+    """Ask PyPI whether a newer TurboADB exists; ``done`` carries ``(latest,
+    blocker)``: the newer version or "", and why pip cannot install it here
+    (see :func:`_update_blocker`), "" when it can.  *cached=True* uses the
+    once-a-day cache (quiet launch check)."""
 
     def work():
         try:
             from ..update import check, check_cached
-            return (check_cached() if cached else check()) or ""
+            latest = (check_cached() if cached else check()) or ""
+            return latest, (_update_blocker() if latest else "")
         except Exception:
-            return ""
+            return "", ""
 
     return FunctionThread(work)
 
 
 def _upgrade_check_worker():
-    """The Upgrade button's check: ``done`` carries ``(can_update, latest)``,
-    whether pip can upgrade this copy of TurboADB (not the standalone exe or
-    a source checkout) and, when it can, the newer version PyPI has, or "".
-
-    Both are asked here, off the UI thread: the first time, whether pip can
-    upgrade this copy runs a fresh Python (``update.running_copy``, up to
-    20 s), which froze the window while the button asked it itself."""
+    """The Upgrade button's check: ``done`` carries ``(can_update, latest,
+    blocker)``: whether pip can upgrade this copy of TurboADB, the newer
+    version PyPI has or "", and, when pip cannot, why not (see
+    :func:`_update_blocker`).  A newer version is reported either way: the
+    standalone exe and a source checkout were never told of one."""
 
     def work():
         try:
-            from ..update import can_self_update, check
-            if not can_self_update():
-                return False, ""
-            return True, check() or ""
+            from ..update import check
+            blocker = _update_blocker()
+            return not blocker, check() or "", blocker
         except Exception:
-            return False, ""
+            return False, "", ""
+
+    return FunctionThread(work)
+
+
+def _tools_check_worker():
+    """Compare adb and scrcpy with the newest published versions; ``done``
+    carries ``(checks, result)``: ``toolsdl.check_updates()``'s answer and
+    what an upgrade reports for it when it has nothing to download.  *result*
+    is None when adb or scrcpy is outdated: the upgrade replaces it, which
+    stops the adb server (see ``MainWindow._run_tools_task``)."""
+
+    def work():
+        from ..toolsdl import check_updates, upgrade_tools
+
+        checks = check_updates()
+        outdated = any(tool.get("supported") and tool.get("upgrade") is True
+                       for tool in checks.values())
+        return checks, (None if outdated else upgrade_tools(checks=checks))
 
     return FunctionThread(work)
 
@@ -826,10 +900,19 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._poll_devices)
         self._start_device_tracker()
         self._poll_devices(socket_only=True)
-        self._begin_adb_startup()
-
-        # if adb is missing, offer to download it once the window is up
-        QTimer.singleShot(500, self._check_tools)
+        if self._adb_awaits_download():
+            # A first launch on a PC without adb: the tools check below
+            # downloads it, and the server starts once it is in.  Started now
+            # it could only fail, with a warning and a red "ADB unavailable"
+            # half a second before the download began.
+            self._cached_devices = []
+            self._set_adb_indicator(self._ADB_AWAITS_DOWNLOAD)
+            self._set_live_message("⬇  Downloading ADB (one-time)…")
+            QTimer.singleShot(500, self._download_adb_first)
+        else:
+            self._begin_adb_startup()
+            # if adb is missing, offer to download it once the window is up
+            QTimer.singleShot(500, self._check_tools)
         # make sure the Desktop + Start-menu shortcuts exist (self-healing)
         QTimer.singleShot(1000, self._ensure_shortcuts)
         # quiet launch check (Settings → Startup, on by default): if PyPI has a
@@ -1199,9 +1282,12 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
         self._sidebar_dock = dock
 
+    # The server's state while a first launch downloads adb (see __init__).
+    _ADB_AWAITS_DOWNLOAD = "waiting for the download of adb"
     # What the ADB chip says, its colour, and whether it pulses, per server state.
     _ADB_STATES = {
         "ready": ("ADB ready", "ok", False),
+        _ADB_AWAITS_DOWNLOAD: ("Downloading ADB…", "warn", True),
         "starting…": ("ADB starting…", "warn", True),
         "restarting…": ("ADB restarting…", "warn", True),
         "scan issue": ("ADB scan issue", "warn", False),
@@ -1259,15 +1345,17 @@ class MainWindow(QMainWindow):
             tip = "Not ready:\n" + "\n".join(waiting) + "\n\n" + tip
         self._status_devices.set_state(text, tone, tooltip=tip)
 
-    def _set_version_indicator(self, latest):
-        """The version chip; *latest* is a newer TurboADB when one was found."""
+    def _set_version_indicator(self, latest, blocker=""):
+        """The version chip; *latest* is a newer TurboADB when one was found,
+        *blocker* why pip cannot install it here ("" when it can)."""
         if not hasattr(self, "_status_version"):
             return
         version = self._version or "—"
         if latest:
+            click = "Click for how to get it." if blocker else "Click to update."
             self._status_version.set_state(
                 f"v{version} · {latest} available", "accent",
-                tooltip=f"TurboADB {latest} is available. Click to update.")
+                tooltip=f"TurboADB {latest} is available. {click}")
         else:
             self._status_version.set_state(
                 f"TurboADB v{version}", "idle", tooltip="Click to check for updates.")
@@ -1547,6 +1635,8 @@ class MainWindow(QMainWindow):
         """Start a cold local daemon once, without blocking the live tracker."""
         if self._closing or thread_running(getattr(self, "_adb_init", None)):
             return
+        if self._adb_state == self._ADB_AWAITS_DOWNLOAD:
+            self._set_adb_indicator("starting…")  # the download is over
         if not retry:
             self._adb_retries_left = self._ADB_RETRIES
         # Do not replace a result which the tracker/socket probe may already
@@ -1789,13 +1879,14 @@ class MainWindow(QMainWindow):
                     )
             self._seen_serials = current_serials
 
-        tokens = theme.palette()
         for d in devices:
             # Keep the clickable label readable in a narrow sidebar.  The
             # serial is still one hover away and retained in UserRole for the
-            # exact session connection; the status dot is the row icon.
+            # exact session connection; the status dot is the row icon, drawn
+            # in the theme's colour each time (a colour fixed here outlived a
+            # theme switch).
             it = QListWidgetItem(f"{d.label or d.model or 'device'}  ·  {d.state}")
-            it.setIcon(theme.emoji_icon("●", tokens["ok_text"] if d.is_online else tokens["warn_text"]))
+            it.setIcon(icons.icon("dot", "ok" if d.is_online else "warn"))
             it.setData(Qt.UserRole, d.serial)
             it.setToolTip(f"{d.label or d.model or 'device'}\n{d.serial}\nState: {d.state}")
             self.live_list.addItem(it)
@@ -1846,13 +1937,7 @@ class MainWindow(QMainWindow):
         for s in self.store.sessions:
             t = s.get("type") or "usb"
             glyph, tone = self._TYPE_ICON.get(t, self._TYPE_ICON["usb"])
-            if t == "network":
-                tgt = f"{s.get('host')}:{s.get('port')}"
-            elif t == "remote":
-                tgt = (f"{s.get('adb_host')}:{s.get('adb_port')} → "
-                       f"{s.get('serial') or 'only device'}")
-            else:
-                tgt = s.get("serial") or "only device"
+            tgt = _target_address(s)
             name = s.get("name") or tgt
             # auto-named targets ARE their address/serial — showing
             # "192.168.1.7:5555 · 192.168.1.7:5555" repeated the name twice
@@ -2328,6 +2413,7 @@ class MainWindow(QMainWindow):
             return
         name = s.get("name")
         if name:                              # a name was given -> also save it
+            name = s["name"] = self._name_to_save_as(s)
             try:
                 self.store.save(s)
             except (OSError, ValueError) as exc:
@@ -2337,6 +2423,29 @@ class MainWindow(QMainWindow):
                 self.refresh_sessions()
         label = name or s.get("serial") or s.get("host") or s.get("adb_host") or "device"
         self._open_session(s, label)
+
+    def _name_to_save_as(self, s) -> str:
+        """The name the Connect dialog's target *s* is saved under: its own,
+        unless a saved target of another device has it.  Saving replaces a
+        target by name, so that one is replaced only when the user says so
+        (the saved-target dialog asks the same); otherwise it stays and *s*
+        gets a numbered name."""
+        name = s["name"]
+        try:
+            saved = SessionStore()  # the file as it is now, not this window's list
+        except Exception:  # an unreadable store must not keep a device from connecting
+            saved = self.store
+        taken = saved.get(name)
+        if taken is None or (self._resolve_identity(session_identity(taken))
+                             == self._resolve_identity(session_identity(s))):
+            return name
+        numbered = saved.unique_name(name)
+        answer = QMessageBox.question(
+            self, "Saved targets",
+            f"A saved target named '{name}' is another device ({_target_address(taken)}).\n\n"
+            f"Replace it? No keeps it and saves this one as '{numbered}'.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return name if answer == QMessageBox.Yes else numbered
 
     def discover_wireless(self):
         """Find Android 11+ Wireless-debugging devices on the LAN (adb mdns) and
@@ -2575,7 +2684,7 @@ class MainWindow(QMainWindow):
         self-update has the adb server: nothing else may stop or start it."""
         return self._server_task_running()
 
-    def run_share_task(self, thread, port=None, *, stop=False) -> None:
+    def run_share_task(self, thread, port=None, *, stop=False, log=False) -> None:
         """Start *thread*, which stops this PC's adb server and starts it again
         to share its devices (with *stop*: to stop sharing them), the way
         Restart ADB server runs.
@@ -2588,9 +2697,13 @@ class MainWindow(QMainWindow):
         reconnect once *thread* has finished (``thread.server_up`` says
         whether that server answers then), instead of retrying against a
         server that is gone; tabs on another server are left alone.  The
-        Connect dialog's share runs through here too."""
+        Connect dialog's share runs through here too, with *log*: what it
+        reports (its ``msg`` signal) is logged here, where it still arrives
+        once that dialog has closed."""
         from ..tools import local_adb_port
 
+        if log:
+            thread.msg.connect(self._log)
         attr = "_unshare" if stop else "_share"
         tabs = []
         for tab in _tabs_on_this_pc(self._device_tabs(), {local_adb_port(port)}):
@@ -2801,6 +2914,29 @@ class MainWindow(QMainWindow):
         self._release_tabs(held, success, "the ADB restart")
 
     # ---- tool download (adb / scrcpy, auto on install/upgrade) ----
+    @staticmethod
+    def _adb_awaits_download() -> bool:
+        """Whether no adb is installed yet and the tools check of this launch
+        downloads it by itself: a first launch on a PC without adb, where
+        Google builds adb for it (elsewhere none is downloaded, and the
+        startup check says that adb is missing)."""
+        try:
+            from ..tools import adb_available
+            from ..toolsdl import adb_download_supported, auto_fetch_enabled
+
+            return auto_fetch_enabled() and adb_download_supported() and not adb_available()
+        except Exception:
+            return False
+
+    def _download_adb_first(self) -> None:
+        """The tools check of a launch without adb (see ``__init__``).  The
+        download it starts ends in the server's start; when it starts none
+        after all, the startup check runs now and says what is wrong."""
+        before = getattr(self, "_dl", None)
+        self._check_tools()
+        if getattr(self, "_dl", None) is before:
+            self._begin_adb_startup()
+
     def _check_tools(self):
         """On startup, auto-fetch the latest adb/scrcpy when enabled (default),
         or fall back to a one-off prompt if auto-fetch is disabled."""
@@ -2834,9 +2970,8 @@ class MainWindow(QMainWindow):
         if thread_running(getattr(self, "_upd_run", None)):
             self._log("[WARNING] An update is already running.")
             return
-        if thread_running(getattr(self, "_dl", None)) or thread_running(
-            getattr(self, "_upd_chk", None)
-        ):
+        if any(thread_running(getattr(self, name, None))
+               for name in ("_dl", "_upd_chk", "_tools_chk")):
             self._log("[WARNING] A tool task is already running.")
             return
         if self._server_task_running():
@@ -2851,38 +2986,61 @@ class MainWindow(QMainWindow):
     def _upgrade_after_appcheck(self, found):
         """What the Upgrade button's check found (see _upgrade_check_worker)."""
         from .. import update as _upd
-        can_update, latest = found
-        if not can_update:
-            # the standalone executable or a source checkout: pip cannot
-            # upgrade it, so only adb and scrcpy are checked
-            self._upgrade_tools_only()
-        elif latest and _upd.is_newer(latest):
+        can_update, latest, blocker = found
+        newer = bool(latest) and _upd.is_newer(latest)
+        if newer and can_update:
             self._do_self_update(latest)        # also updates adb/scrcpy, then restarts
-        else:
+            return
+        if newer:
+            # the standalone executable or a source checkout: pip cannot
+            # install it here, so say how this copy is updated instead
+            self._set_version_indicator(latest, blocker)
+            self._log(self._newer_release_line(latest, blocker))
+            QMessageBox.information(
+                self, "Update available",
+                f"A newer TurboADB is available:\n\n    {self._version}  →  {latest}\n\n"
+                f"pip cannot update this copy: {blocker}.\n\n"
+                "adb and scrcpy are checked next.")
+        elif can_update:
             self._log(
                 f"[OK] TurboADB {self._version} is the latest — now checking "
                 f"adb/scrcpy…")
-            self._upgrade_tools_only()
+        self._upgrade_tools_only()
+
+    def _newer_release_line(self, latest, blocker="") -> str:
+        """The log line about a newer TurboADB, with how to get it: the
+        Upgrade button, or, for a copy pip cannot update, *blocker*."""
+        line = f"[INFO] TurboADB {latest} is available (you have {self._version})"
+        if blocker:
+            return f"{line}, but pip cannot update this copy: {blocker}."
+        return f"{line} — click the 🔄 Upgrade button to update."
+
+    def _tools_dialog(self, text, title):
+        dialog = QProgressDialog(text, None, 0, 100, self)
+        dialog.setWindowTitle(title)
+        dialog.setAutoClose(True)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+        return dialog
 
     def _start_tools_task(self, mode, text, title, on_done, *, force=False,
-                          show_stage=False) -> bool:
-        """Run one adb/scrcpy download or upgrade with a progress dialog."""
-        if thread_running(getattr(self, "_dl", None)):
+                          show_stage=False, checks=None) -> bool:
+        """Run one adb/scrcpy download or upgrade with a progress dialog.
+        *checks*: for an upgrade, what the check before it found."""
+        # (the check before an upgrade shows its progress in self._dlg as well)
+        if thread_running(getattr(self, "_dl", None)) or getattr(self, "_checking_tools", False):
             self._log("[WARNING] A tool task is already running.")
             return False
         if self._server_task_running():
             self._log("[WARNING] The adb server is busy (a restart, a share or an update) "
                       "— download the tools once it has finished.")
             return False
-        self._dlg = QProgressDialog(text, None, 0, 100, self)
-        self._dlg.setWindowTitle(title)
-        self._dlg.setAutoClose(True)
-        self._dlg.setMinimumDuration(0)
-        self._dlg.setValue(0)
+        self._dlg = self._tools_dialog(text, title)
         # Pause the fallback device poll: its `adb devices` can restart the adb
         # server and re-lock adb.exe in the middle of the replace.
         self._timer.stop()
         thread = _ToolsDownloadThread(mode=mode, force=force)
+        thread.checks = checks
         self._dl = thread
         thread.progress.connect(self._dlg.setValue)
         if show_stage:
@@ -2937,27 +3095,78 @@ class MainWindow(QMainWindow):
         self._tabs_awaiting_adb.extend(held)
         self._begin_adb_startup()  # unless one is under way already, which reports too
 
+    # The progress dialog of the adb and scrcpy check and upgrade: text, title.
+    _UPGRADE_DIALOG = (
+        "Checking for newer adb / scrcpy…\nDownloads only if an update is available.",
+        "TurboADB — upgrade",
+    )
+
     def _upgrade_tools_only(self):
-        if self._start_tools_task(
-            "upgrade",
-            "Checking for newer adb / scrcpy…\nDownloads only if an update is available.",
-            "TurboADB — upgrade",
-            self._upgrade_done,
-        ):
-            self._log("Checking for adb/scrcpy updates…")
+        """Check adb and scrcpy, then upgrade what is outdated.
+
+        The check comes first and leaves the device tabs alone.  An upgrade
+        stops this PC's adb server to replace adb, so the tabs on it pause
+        for one (:meth:`_run_tools_task`); paused for the check as well, an
+        answer of "up to date" cost every tab its Android shell, and whatever
+        ran in it."""
+        if any(thread_running(getattr(self, name, None)) for name in ("_dl", "_tools_chk")):
+            self._log("[WARNING] A tool task is already running.")
+            return
+        self._log("Checking for adb/scrcpy updates…")
+        self._dlg = self._tools_dialog(*self._UPGRADE_DIALOG)
+        # A tool task until its answer is in: a download started meanwhile
+        # took the dialog over, and the check then closed the download's.
+        self._checking_tools = True
+        self._tools_chk = _tools_check_worker()
+        self._tools_chk.done.connect(self._upgrade_after_toolscheck)
+        self._tools_chk.fail.connect(self._tools_check_failed)
+        self._tools_chk.start()
+
+    def _upgrade_after_toolscheck(self, found):
+        """What the adb and scrcpy check found (see _tools_check_worker)."""
+        checks, result = found
+        self._checking_tools = False
+        _discard_dialog(getattr(self, "_dlg", None))
+        self._dlg = None
+        if result is not None:
+            self._upgrade_done(result)  # nothing is replaced: no server stops
+        else:
+            self._start_tools_task("upgrade", *self._UPGRADE_DIALOG, self._upgrade_done,
+                                   checks=checks)
+
+    def _tools_check_failed(self, message):
+        self._checking_tools = False
+        _discard_dialog(getattr(self, "_dlg", None))
+        self._dlg = None
+        self._log(f"[WARNING] Could not check adb / scrcpy for updates: {message}")
 
     def _upgrade_done(self, res):
         _discard_dialog(getattr(self, "_dlg", None))
         self._dlg = None
         self._start_poll_timer()              # resume the fallback device poll
         checks = res.get("checks") or {}
+        # the tools TurboADB downloads on this machine (toolsdl.check_updates)
+        managed = [tool for tool in ("adb", "scrcpy")
+                   if (checks.get(tool) or {}).get("supported", True)]
         for tool in ("adb", "scrcpy"):
             c = checks.get(tool) or {}
-            if c:
+            if c and tool in managed:
                 self.log_panel.append(
                     f"[OK] {tool}: installed {c.get('installed')} · "
                     f"latest {c.get('latest')}")
+            elif c:
+                # the system's own: none is downloaded here, so none is "installed"
+                self.log_panel.append(
+                    f"[INFO] {tool}: the system's ({c.get('system') or 'none found'}) · "
+                    f"latest {c.get('latest')}")
         unknown = res.get("unknown") or []
+        if res.get("up_to_date") and not managed:
+            # Neither is downloaded for this machine (no adb build for it, and
+            # scrcpy's is for Windows): nothing was compared, and a download
+            # offered here could only fail, with the device tabs paused for it.
+            self._log("[INFO] TurboADB downloads neither adb nor scrcpy for this machine — "
+                      "update them with the system's package manager.")
+            return
         if res.get("up_to_date"):
             self._log("[OK] adb & scrcpy match latest upstream versions.")
             versions = " · ".join(
@@ -3041,15 +3250,13 @@ class MainWindow(QMainWindow):
 
     def _quiet_update_check(self):
         self._upd_quiet = _update_check_worker(cached=True)  # daily cache
-        self._upd_quiet.done.connect(self._on_quiet_update)
+        self._upd_quiet.done.connect(lambda found: self._on_quiet_update(*found))
         self._upd_quiet.start()
 
-    def _on_quiet_update(self, latest):
-        self._set_version_indicator(latest)
+    def _on_quiet_update(self, latest, blocker=""):
+        self._set_version_indicator(latest, blocker)
         if latest:
-            self._log(
-                f"[INFO] TurboADB {latest} is available (you have "
-                f"{self._version}) — click the 🔄 Upgrade button to update.")
+            self._log(self._newer_release_line(latest, blocker))
 
     def _ensure_shortcuts(self):
         if not settings_mod.get("make_shortcut_first_run"):
@@ -3316,7 +3523,11 @@ class MainWindow(QMainWindow):
             # Forget the deleted panel so View -> Open webcam can reopen it.
             self._webcam_tab = None
         if w is not None:
-            w.deleteLater()
+            # Deleted once its screens have closed: destroying a tab with a
+            # scrcpy window still inside froze the window while scrcpy hung.
+            from .mirror_panel import delete_when_released
+
+            delete_when_released(w)
         self._update_center()
         self._update_status()
 
@@ -3422,6 +3633,11 @@ class MainWindow(QMainWindow):
                 # A tab that cannot close cleanly can leave an orphaned scrcpy
                 # behind; the app still closes, but never silently.
                 self._warn_teardown(f"close {self.tabs.tabText(i)!r}", exc)
+        # A recording still being saved needs its device and the adb server:
+        # the window stays, saying so, until it is on this PC.
+        from .mirror_panel import finish_recordings
+
+        finish_recordings(self)
         super().closeEvent(event)
 
     def _keep_separate_screens(self) -> None:
@@ -3452,6 +3668,11 @@ class MainWindow(QMainWindow):
             worker = getattr(self, attr, None)
             disconnect_signals(worker, _WORKER_SIGNALS)
             park_thread(worker)
+        # A broadcast's adb commands end with the window: each may run for a
+        # minute, and Python waits for them all before the process exits.
+        broadcast = getattr(self, "_bcast", None)
+        if broadcast is not None:
+            broadcast.stop()
 
     def _warn_teardown(self, what: str, exc: BaseException) -> None:
         """Record a non-fatal teardown failure instead of swallowing it."""

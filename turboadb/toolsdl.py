@@ -38,9 +38,11 @@ from contextlib import contextmanager
 
 from .exceptions import ADBError, ADBNotFoundError
 from .tools import (  # noqa: F401  (_exe re-exported for existing importers)
+    ADB_WINDOWS_FILES,
     NO_WINDOW,
     _adb_version_output,
     _exe,
+    clear_tools_cache,
     find_adb,
     find_scrcpy,
     managed_tools_dir,
@@ -76,6 +78,16 @@ def _os_key() -> str:
 def scrcpy_download_supported() -> bool:
     """True where a prebuilt scrcpy can be downloaded (Windows only)."""
     return _os_key() == "windows"
+
+
+def adb_download_supported() -> bool:
+    """True where Google builds platform-tools that this machine can run:
+    Windows, macOS, and Linux on x86-64 (its one Linux build).  An ARM board
+    keeps the adb of its own system."""
+    if _os_key() != "linux":
+        return True
+    # _os_key calls every system that is neither Windows nor macOS "linux"
+    return platform.system() == "Linux" and platform.machine().lower() in ("x86_64", "amd64")
 
 
 def tools_dir() -> str:
@@ -378,6 +390,35 @@ def _chmod_x(path: str) -> None:
             pass
 
 
+_USE_SYSTEM_ADB = (
+    "Install adb with the system's package manager instead, or set TURBOADB_ADB to one."
+)
+
+
+def _require_runnable(adb: str) -> None:
+    """Raise ADBError unless the downloaded *adb* runs on this machine.
+
+    Google's Linux build is for x86-64 with glibc.  Where it cannot execute
+    (musl, NixOS, a 32-bit system) it was installed all the same, and the
+    managed copy comes before the system's adb: every command then failed with
+    "Exec format error" beside a working adb, and each update check, which
+    could read no version from it, downloaded it again."""
+    try:
+        said = _adb_version_output(adb, timeout=30.0)
+    except subprocess.TimeoutExpired:
+        problem = "'adb version' timed out"
+    except (OSError, subprocess.SubprocessError) as exc:
+        problem = str(exc)
+    else:
+        if "Android Debug Bridge" in said:
+            return
+        problem = " ".join(said.split())[:200] or "'adb version' printed nothing"
+    raise ADBError(
+        f"the platform-tools download does not run on this machine ({problem}); "
+        f"nothing was installed. {_USE_SYSTEM_ADB}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # public download functions
 # --------------------------------------------------------------------------- #
@@ -392,10 +433,19 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
 
     The versioned archive named in Google's ``repository2-3.xml`` is preferred
     over the ``-latest-`` alias, because only that one comes with a published
-    size and checksum to verify the download against before the swap."""
+    size and checksum to verify the download against before the swap.
+
+    Nothing is downloaded where Google has no build for this machine
+    (:func:`adb_download_supported`), and a download whose adb does not run
+    here is not installed: the adb in use, and its server, are left alone."""
     existing = managed_adb()
     if existing and not force:
         return existing
+    if not adb_download_supported():
+        raise ADBNotFoundError(
+            "Google builds no adb for this machine "
+            f"({platform.system()} {platform.machine()}). {_USE_SYSTEM_ADB}"
+        )
     archive = _archive_to_download()
     url = archive.get("url") or PLATFORM_TOOLS_URLS[_os_key()]
     if not archive.get("url"):
@@ -413,11 +463,15 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
         staging = os.path.join(tmp, "new")
         _extract_zip(zip_path, staging)
         new_dir = os.path.join(staging, "platform-tools")
-        if not os.path.isfile(os.path.join(new_dir, _exe("adb"))):
+        staged = os.path.join(new_dir, _exe("adb"))
+        if not os.path.isfile(staged):
             raise ADBNotFoundError(
                 "platform-tools downloaded but adb was not "
                 "found in the archive (unexpected layout)."
             )
+        # before anything is stopped or replaced
+        _chmod_x(staged)
+        _require_runnable(staged)
         # unlock adb.exe before the swap
         shared = _kill_adb_server(existing) if existing else []
         try:
@@ -425,6 +479,9 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
         except Exception:
             _restore_shared_server(shared)  # the previous adb is still in place
             raise
+    # find_adb remembers its answer: a process that had found the system's adb
+    # went on running that one beside the copy it had just installed
+    clear_tools_cache()
     adb = managed_adb()
     if not adb:
         _restore_shared_server(shared)
@@ -639,6 +696,7 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
         except Exception:
             _restore_shared_server(shared)
             raise
+    clear_tools_cache()  # as for adb: the copy just installed is the one to find
     scr = managed_scrcpy()
     if not scr:
         _restore_shared_server(shared)
@@ -696,11 +754,12 @@ _ENSURE_LOCK = threading.Lock()
 
 
 def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
-    """Make sure the managed cache has adb (and, where a prebuilt exists,
-    scrcpy). Checks each tool at most once per process and downloads ONLY tools
-    that are missing from the cache — it never upgrades an existing copy, because
-    replacing platform-tools means stopping the running adb server (which drops
-    every device session). Upgrades go through :func:`upgrade_tools`.
+    """Make sure the managed cache has adb and scrcpy, each where a prebuilt
+    exists for this machine. Checks each tool at most once per process and
+    downloads ONLY tools that are missing from the cache — it never upgrades
+    an existing copy, because replacing platform-tools means stopping the
+    running adb server (which drops every device session). Upgrades go
+    through :func:`upgrade_tools`.
 
     Best-effort and never raises — if the network is down, detection simply
     falls back to whatever's already on PATH. Thread-safe: concurrent callers
@@ -741,8 +800,9 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
         errors = {}
         note = "up-to-date"
         try:
-            # adb that an earlier call in this process saw to is not fetched again
-            want_adb = check_adb and managed_adb() is None
+            # adb that an earlier call in this process saw to is not fetched
+            # again, and none is where Google builds none for this machine
+            want_adb = check_adb and adb_download_supported() and managed_adb() is None
             # Requesting scrcpy where no prebuilt exists always "failed", so the
             # stamp was never written and every command retried the network.
             want_scrcpy = bool(scrcpy) and scrcpy_download_supported() and managed_scrcpy() is None
@@ -779,7 +839,7 @@ def _sync_scrcpy_adb() -> None:
     if not m_adb or not os.path.isdir(s_dir):
         return
     pt_dir = os.path.dirname(m_adb)
-    for name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+    for name in ADB_WINDOWS_FILES:
         src = os.path.join(pt_dir, name)
         dst = os.path.join(s_dir, name)
         if os.path.exists(src):
@@ -958,7 +1018,7 @@ def check_updates() -> dict:
             "path": a_path,
             # what a plain `adb` on this machine resolves to, for context only
             "system": None if a_path else installed_adb_version(),
-            "supported": True,
+            "supported": adb_download_supported(),
         },
         "scrcpy": {
             "installed": si,
@@ -977,13 +1037,19 @@ def upgrade_tools(*, on_progress=None, notify=None, checks: dict | None = None) 
     summary dict including the version check and what was updated.
 
     Pass *checks* (a :func:`check_updates` result) to reuse a check that was
-    already made instead of querying the version sources twice. scrcpy is only
-    considered where a prebuilt download exists (Windows)."""
+    already made instead of querying the version sources twice. A tool is only
+    considered where a prebuilt download exists for this machine (scrcpy on
+    Windows; adb see :func:`adb_download_supported`)."""
     if checks is None:
         checks = check_updates()
     updated = {}
     errors = {}
-    tools = ["adb", "scrcpy"] if scrcpy_download_supported() else ["adb"]
+    tools = [
+        tool
+        for tool, downloadable in (("adb", adb_download_supported()),
+                                   ("scrcpy", scrcpy_download_supported()))
+        if downloadable
+    ]
     want_adb = "adb" in tools and checks["adb"]["upgrade"] is True
     want_scrcpy = "scrcpy" in tools and checks["scrcpy"]["upgrade"] is True
     unknown = [t for t in tools if checks[t]["upgrade"] is None]

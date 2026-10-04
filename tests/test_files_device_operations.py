@@ -2,11 +2,17 @@
 names the listing could not read exactly, stopping batches when the tab
 closes, Cancel during planning, F5 with two tabs side by side, and one set
 of rules for copying and editing device files, shared with the engine.
+Also: the editor asking before it saves over a file that changed on the
+device, Delete and Rename when the pane changes folder under their dialog,
+the retry of a partly refused delete, and devices whose shell gives no exit
+status.
 
 Headless (Qt offscreen); device calls go to small fakes or the fake adb."""
 from __future__ import annotations
 
 import os
+import posixpath
+import re
 import shlex
 import stat
 import threading
@@ -24,6 +30,7 @@ from PyQt5.QtWidgets import QApplication, QSplitter, QVBoxLayout, QWidget  # noq
 from turboadb import ADBConfig, ADBHandler, remotefs  # noqa: E402
 from turboadb.exceptions import ADBError, ADBTransferError  # noqa: E402
 from turboadb.gui import file_browser as fb  # noqa: E402
+from turboadb.results import CommandResult  # noqa: E402
 
 
 class _Res:
@@ -236,11 +243,12 @@ def test_closing_the_tab_stops_a_paste_batch(qapp, monkeypatch):
     page._run_shell_batch([("copy a", "cp a"), ("copy b", "cp b"), ("copy c", "cp c")],
                           timeout=600, summary="Pasted")
     job = _new_job(page, before)
-    assert _wait(qapp, lambda: ran == ["cp a"])
+    first = fb._marked("cp a")  # as sent: with the mark that says it worked
+    assert _wait(qapp, lambda: ran == [first])
     page.close_panel()
     release.set()
     assert job.wait(5000)
-    assert ran == ["cp a"]  # the one running finishes; nothing after it starts
+    assert ran == [first]  # the one running finishes; nothing after it starts
 
 
 def test_closing_the_tab_stops_a_long_delete(qapp, monkeypatch):
@@ -378,7 +386,9 @@ def test_paste_and_the_engine_agree_about_a_linked_folder(monkeypatch, fake_adb)
     fake_adb.add("for f in /sdcard/DCIM/link;", stdout="n- \n")
     handler = ADBHandler(ADBConfig(serial="x"))
     assert handler.copy("/sdcard/link", "/sdcard/DCIM") == "/sdcard/DCIM/link"
-    assert fake_adb.argv_after_adb()[-1] == "cp -r -- /sdcard/link /sdcard/DCIM/link"
+    # the same command, sent with the mark that says it worked
+    assert fake_adb.argv_after_adb()[-1] == remotefs._marked(
+        "cp -r -- /sdcard/link /sdcard/DCIM/link")
 
 
 def test_the_engine_never_copies_over_another_kind_of_item(fake_adb):
@@ -499,8 +509,11 @@ def test_the_editor_saves_through_the_engine(qapp, monkeypatch):
         dlg = page._editors[-1]
         dlg.edit.setPlainText("a=2\n")
         dlg._save()
-        assert engine.calls == [("pull", "/data/t/real.conf"),
-                                ("replace_file", "/data/t/real.conf", "600", b"a=2\n")]
+        # what the device has is read before the pull and after the save, so a
+        # later save can tell whether another program wrote the file meanwhile
+        stamp = ("shell", remotefs._stamp_cmd("/data/t/real.conf"))
+        assert engine.calls == [stamp, ("pull", "/data/t/real.conf"),
+                                ("replace_file", "/data/t/real.conf", "600", b"a=2\n"), stamp]
         dlg.done(0)
     finally:
         page.close_panel()
@@ -518,5 +531,573 @@ def test_a_link_to_a_pipe_is_not_pulled_where_stat_is_missing(qapp, monkeypatch)
         page._remote_edit_row(_link_row(page, "fifo-link"))
         assert not any(call[0] == "pull" for call in engine.calls)
         assert shown and "other than a regular file" in shown[-1][1]
+    finally:
+        page.close_panel()
+
+
+# --------------------------------------------------------------------------- #
+# the editor and a device file that another program wrote meanwhile
+# --------------------------------------------------------------------------- #
+class _TextDevice:
+    """A device with one text file: what it holds, when it was last written,
+    and the engine calls the editor makes on it."""
+
+    def __init__(self, path, content):
+        self.path, self.content, self.modified = path, content, 1000
+        self.saves = []
+
+    def stat_path(self, path, safe=None):
+        return {"path": path, "real_path": self.path, "size": len(self.content), "mode": "644",
+                "type": "regular file"}
+
+    def shell(self, command, timeout=None, safe=None):
+        if command == remotefs._stamp_cmd(self.path):
+            return _Res(f"{len(self.content)} {self.modified}\r\n")
+        return _Res("")
+
+    def pull(self, remote, local, cancel_event=None, safe=None, **_kw):
+        with open(local, "wb") as fh:
+            fh.write(self.content)
+
+    def replace_file(self, local, path, mode="", safe=None):
+        with open(local, "rb") as fh:
+            self.written(fh.read())
+        self.saves.append(self.content)
+        return mode
+
+    def written(self, content):
+        """The file is written: by the editor's save, or by an app on the device."""
+        self.content, self.modified = content, self.modified + 60
+
+
+def _queued_jobs(monkeypatch):
+    """Queue the page's jobs instead of starting threads; the function returned
+    runs them in order, each with its callback, and those they start in turn.
+    A save is then still under way when the editor hears of it, as with a
+    worker thread."""
+    waiting = []
+    monkeypatch.setattr(fb, "run_job", lambda jobs, fn, on_done=None, on_fail=None:
+                        waiting.append((fn, on_done, on_fail)))
+
+    def run():
+        while waiting:
+            fn, on_done, on_fail = waiting.pop(0)
+            try:
+                result = fn()
+            except Exception as exc:
+                if on_fail is not None:
+                    on_fail(f"{type(exc).__name__}: {exc}")
+                continue
+            if on_done is not None:
+                on_done(result)
+
+    return run
+
+
+def _edit_volume(page, device, run):
+    rows = [("audio.conf", len(device.content), "9 B", "File", "", "-rw-r--r--", "root:root",
+             False)]
+    page._populate(page.remote_table, rows, parent_row=True)
+    page.remote_cwd = "/data/misc"
+    page._remote_edit_row(1)
+    run()
+    return page._editors[-1]
+
+
+def _type(dlg, text):
+    """Replace the editor's text as typing does (the document counts as changed)."""
+    dlg.edit.selectAll()
+    dlg.edit.insertPlainText(text)
+
+
+def _answers(monkeypatch, answers):
+    asked = []
+
+    def question(*args, **_kw):
+        asked.append(args[2])
+        return answers.pop(0)
+
+    monkeypatch.setattr(fb.QMessageBox, "question", staticmethod(question))
+    return asked
+
+
+def test_the_editor_asks_before_replacing_a_device_file_that_changed(qapp, monkeypatch):
+    """An app rewrote the file while it was open in the editor; Ctrl+S put the
+    editor's text over it without a word."""
+    run = _queued_jobs(monkeypatch)
+    shown = _boxes(monkeypatch)
+    device = _TextDevice("/data/misc/audio.conf", b"volume=3\n")
+    page = _page(monkeypatch, device)
+    try:
+        logs = []
+        page.log.connect(logs.append)
+        dlg = _edit_volume(page, device, run)
+        device.written(b"volume=9\n")  # by an app on the device
+        _type(dlg, "volume=4\n")
+
+        asked = _answers(monkeypatch, [fb.QMessageBox.No])
+        dlg._save()
+        run()
+        assert len(asked) == 1 and "changed on the device" in asked[0]
+        assert device.content == b"volume=9\n" and device.saves == []
+        assert dlg.is_dirty() and not dlg.is_saving()  # the text stays, to save elsewhere
+        assert shown == []  # not an error
+        assert any(line.startswith("[INFO] audio.conf was not saved") for line in logs)
+
+        asked = _answers(monkeypatch, [fb.QMessageBox.Yes])
+        dlg._save()
+        run()
+        assert len(asked) == 1 and device.content == b"volume=4\n"
+        assert not dlg.is_dirty() and not dlg.is_saving()
+        dlg.done(0)
+    finally:
+        page.close_panel()
+
+
+def test_the_editor_only_asks_about_changes_it_did_not_make(qapp, monkeypatch):
+    run = _queued_jobs(monkeypatch)
+    device = _TextDevice("/data/misc/audio.conf", b"volume=3\n")
+    page = _page(monkeypatch, device)
+    try:
+        dlg = _edit_volume(page, device, run)
+        asked = _answers(monkeypatch, [])
+        for text in ("volume=4\n", "volume=5\n"):  # each save is the file's new state
+            _type(dlg, text)
+            dlg._save()
+            run()
+        assert asked == [] and device.saves == [b"volume=4\n", b"volume=5\n"]
+
+        device.written(b"volume=9\n")  # after a Yes the editor's own save is the state again
+        asked = _answers(monkeypatch, [fb.QMessageBox.Yes])
+        for text in ("volume=6\n", "volume=7\n"):
+            _type(dlg, text)
+            dlg._save()
+            run()
+        assert len(asked) == 1 and device.content == b"volume=7\n"
+        dlg.done(0)
+    finally:
+        page.close_panel()
+
+
+def test_save_and_close_keeps_the_editor_open_when_the_answer_is_no(qapp, monkeypatch):
+    run = _queued_jobs(monkeypatch)
+    _boxes(monkeypatch)
+    device = _TextDevice("/data/misc/audio.conf", b"volume=3\n")
+    page = _page(monkeypatch, device)
+    try:
+        dlg = _edit_volume(page, device, run)
+        closed = []
+        dlg.finished.connect(closed.append)
+        device.written(b"volume=9\n")
+        _type(dlg, "volume=4\n")
+        _answers(monkeypatch, [fb.QMessageBox.No])
+        dlg._save_and_close()
+        run()
+        assert closed == [] and device.content == b"volume=9\n"
+        _answers(monkeypatch, [fb.QMessageBox.Yes])
+        dlg._save_and_close()
+        run()
+        assert closed == [fb.QDialog.Accepted] and device.content == b"volume=4\n"
+    finally:
+        page.close_panel()
+
+
+def test_a_save_the_device_refuses_asks_again_about_the_change(qapp, monkeypatch):
+    """Yes was for the save that failed: the next one compares again."""
+    run = _queued_jobs(monkeypatch)
+    shown = _boxes(monkeypatch)
+    device = _TextDevice("/data/misc/audio.conf", b"volume=3\n")
+    page = _page(monkeypatch, device)
+    try:
+        dlg = _edit_volume(page, device, run)
+        device.written(b"volume=9\n")
+        _type(dlg, "volume=4\n")
+        refused = [ADBError("adb: error: failed to copy: connection reset")]
+
+        def replace_file(local, path, mode="", safe=None):
+            if refused:
+                raise refused.pop()
+            return _TextDevice.replace_file(device, local, path, mode)
+
+        monkeypatch.setattr(device, "replace_file", replace_file)
+        asked = _answers(monkeypatch, [fb.QMessageBox.Yes, fb.QMessageBox.No])
+        dlg._save()
+        run()
+        assert [kind for kind, _text in shown] == ["critical"] and device.content == b"volume=9\n"
+        dlg._save()
+        run()
+        assert len(asked) == 2 and device.content == b"volume=9\n"
+        dlg.done(0)
+    finally:
+        page.close_panel()
+
+
+# --------------------------------------------------------------------------- #
+# the pane changes folder while Delete's or Rename's dialog is open
+# --------------------------------------------------------------------------- #
+class _Recorder:
+    """A device that records what it is asked to delete and to run."""
+
+    def __init__(self):
+        self.removed, self.commands = [], []
+
+    def remove(self, paths, *, recursive=False, safe=None):
+        self.removed.append(list(paths))
+        return list(paths)
+
+    def shell(self, command, timeout=None, safe=None):
+        self.commands.append(command)
+        return _Res("free\n")
+
+
+def _listed(page, folder, names):
+    """Show *names* (folders) as the listing of the device *folder*."""
+    page.remote_cwd = page.remote_table.base_dir = folder
+    rows = [(name, 0, "<DIR>", "Folder", "2026-09-01 10:00", "drwxrwx--x", "u0_a1", True)
+            for name in names]
+    page._populate(page.remote_table, rows, parent_row=True)
+
+
+def _select_remote(page, name):
+    table = page.remote_table
+    [row] = [r for r in range(table.rowCount()) if table.item(r, 0).text() == name]
+    table.selectRow(row)
+
+
+def test_a_delete_confirmed_after_the_pane_jumped_deletes_nothing(qapp, monkeypatch):
+    """A write-access retry opened /data/data while "Permanently delete?" was
+    up; Yes then removed the selected name from /data/data, as root."""
+    _sync_jobs(monkeypatch)
+    device = _Recorder()
+    page = _page(monkeypatch, device)
+    try:
+        _listed(page, "/sdcard/Android/data", ["com.example.app"])
+        _select_remote(page, "com.example.app")
+        logs = []
+        page.log.connect(logs.append)
+
+        def question(*_args, **_kw):
+            page._jump_remote("/data/data")  # the retry, while the question is open
+            return fb.QMessageBox.Yes
+
+        monkeypatch.setattr(fb.QMessageBox, "question", staticmethod(question))
+        page._remote_delete()
+        assert device.removed == []
+        assert any("Delete cancelled" in line and "/data/data" in line for line in logs)
+    finally:
+        page.close_panel()
+
+
+def test_a_rename_typed_after_the_pane_jumped_renames_nothing(qapp, monkeypatch):
+    _sync_jobs(monkeypatch)
+    device = _Recorder()
+    page = _page(monkeypatch, device)
+    try:
+        _listed(page, "/sdcard/Android/data", ["com.example.app"])
+        _select_remote(page, "com.example.app")
+        logs = []
+        page.log.connect(logs.append)
+
+        def typed(*_args, **_kw):
+            page._jump_remote("/data/data")
+            return "com.example.old", True
+
+        monkeypatch.setattr(fb.QInputDialog, "getText", staticmethod(typed))
+        page._remote_rename()
+        assert device.commands == []  # neither the check nor the mv
+        assert any("Rename cancelled" in line and "/data/data" in line for line in logs)
+    finally:
+        page.close_panel()
+
+
+def test_delete_and_rename_act_in_the_folder_the_rows_were_in(qapp, monkeypatch):
+    """A refresh of the same folder while the dialog is open changes nothing:
+    the names and their folder were taken before it opened."""
+    _sync_jobs(monkeypatch)
+    device = _Recorder()
+    page = _page(monkeypatch, device)
+    try:
+        def relisted(answer):
+            def dialog(*_args, **_kw):
+                _listed(page, "/sdcard/Android/data", ["other.app"])  # the folder, listed again
+                return answer
+            return staticmethod(dialog)
+
+        _listed(page, "/sdcard/Android/data", ["com.example.app"])
+        _select_remote(page, "com.example.app")
+        monkeypatch.setattr(fb.QMessageBox, "question", relisted(fb.QMessageBox.Yes))
+        page._remote_delete()
+        assert device.removed == [["/sdcard/Android/data/com.example.app"]]
+
+        _listed(page, "/sdcard/Android/data", ["com.example.app"])
+        _select_remote(page, "com.example.app")
+        monkeypatch.setattr(fb.QInputDialog, "getText", relisted(("com.example.old", True)))
+        page._remote_rename()
+        old, new = "/sdcard/Android/data/com.example.app", "/sdcard/Android/data/com.example.old"
+        check, rename = device.commands[-2:]
+        assert check == fb._rename_check_cmd(old, new)
+        assert rename == fb._marked(fb._rename_cmd(old, new))
+    finally:
+        page.close_panel()
+
+
+# --------------------------------------------------------------------------- #
+# a device that refuses changes: what was refused is said, offered and retried
+# --------------------------------------------------------------------------- #
+class _Phone(ADBHandler):
+    """A device with files behind a scripted shell that understands what the
+    Files tab and the engine send: the path probe, rm, mkdir, touch, cp and mv.
+
+    *protected* items can't be removed and *read_only* folders take no change
+    until :attr:`rooted` is set.  With *exit_codes* off every command ends 0
+    with its errors on standard output, as on a device without the shell
+    protocol (before Android 7)."""
+
+    def __init__(self, files, *, exit_codes=True):
+        super().__init__(ADBConfig(serial="x"))
+        self.files = dict(files)  # path -> "d" or "f"
+        self.protected, self.read_only = set(), set()
+        self.rooted = False
+        self.exit_codes = exit_codes
+        self.commands = []
+
+    def shell(self, command, timeout=None, safe=None, **_kw):
+        self.commands.append(command)
+        inner, mark = command, ""
+        head, found, tail = command.rpartition(" && echo ")
+        if found and head.startswith("{ ") and head.endswith("; }"):
+            inner, mark = head[2:-3], tail  # "{ command; } && echo MARK"
+        said = self._run(inner)
+        ok = not said or inner.startswith(("for f in ", "if [ -e "))
+        out = said + "\n" if said else ""
+        if ok and mark:
+            out += mark + "\n"
+        if ok or not self.exit_codes:
+            return CommandResult(command, 0, out, "", 0.0)
+        return CommandResult(command, 1, "", said, 0.0)
+
+    def _run(self, command):
+        """What the command prints: the probe's lines, or a tool's complaint."""
+        if command.startswith("for f in "):
+            paths = shlex.split(command.split("; do ", 1)[0])[3:]
+            return "\n".join(self._probed(path) for path in paths)
+        if command.startswith("if [ -e "):
+            return "free"  # the rename check
+        if command.startswith("rm -rf "):
+            said = [self._remove(path) for path in shlex.split(command)[2:]]
+            return "\n".join(line for line in said if line)
+        if command.startswith("mkdir -p "):
+            return self._create(shlex.split(command)[2], "d", "mkdir")
+        if command.startswith("touch "):
+            return self._create(shlex.split(command)[1], "f", "touch")
+        if command.startswith("cp -r -- "):
+            source, target = shlex.split(command)[3:5]
+            return self._create(target, self.files[source], "cp")
+        moved = re.search(r"mv -n -T -- (\S+) (\S+)", command)
+        if moved:
+            said = self._create(moved.group(2), self.files[moved.group(1)], "mv")
+            return said or self._remove(moved.group(1))
+        return ""
+
+    def _probed(self, path):
+        kind = self.files.get(path, "n")
+        return f"{kind}- {path if kind == 'd' else ''}"
+
+    def _refuses(self, path):
+        folder = posixpath.dirname(path)
+        return not self.rooted and (path in self.protected or folder in self.read_only)
+
+    def _remove(self, path):
+        if self._refuses(path):
+            why = "Read-only file system" if path not in self.protected else "Permission denied"
+            return f"rm: {path}: {why}"
+        for item in [p for p in self.files if p == path or p.startswith(path + "/")]:
+            del self.files[item]
+        return ""
+
+    def _create(self, path, kind, tool):
+        if self._refuses(path):
+            return f"{tool}: '{path}': Read-only file system"
+        self.files[path] = kind
+        return ""
+
+
+def _show(page, phone, folder):
+    """List what *phone* holds in *folder*, as the device pane would."""
+    names = sorted(posixpath.basename(path) for path in phone.files
+                   if posixpath.dirname(path) == folder)
+    rows = [(name, 0, "<DIR>" if phone.files[f"{folder}/{name}"] == "d" else "0 B",
+             "Folder" if phone.files[f"{folder}/{name}"] == "d" else "File",
+             "2026-09-01 10:00", "drwxrwx--x", "root", phone.files[f"{folder}/{name}"] == "d")
+            for name in names]
+    page.remote_cwd = page.remote_table.base_dir = folder
+    page._populate(page.remote_table, rows, parent_row=True)
+
+
+def _yes(monkeypatch):
+    monkeypatch.setattr(fb.QMessageBox, "question",
+                        staticmethod(lambda *_args, **_kw: fb.QMessageBox.Yes))
+
+
+TMP = "/data/local/tmp"
+
+
+def test_a_delete_retried_with_root_removes_what_the_first_try_left(qapp, monkeypatch):
+    """rm removed two files and was refused a root-owned folder.  The retry
+    after adb root asked for all three again, found the first one gone and
+    stopped with "no such file or folder": the folder was never deleted."""
+    _sync_jobs(monkeypatch)
+    _yes(monkeypatch)
+    phone = _Phone({TMP: "d", f"{TMP}/a.log": "f", f"{TMP}/b.log": "f", f"{TMP}/rootdir": "d",
+                    f"{TMP}/rootdir/core": "f"})
+    phone.protected = {f"{TMP}/rootdir"}
+    page = _page(monkeypatch, phone)
+    try:
+        requests, logs = [], []
+        page.write_access_needed.connect(requests.append)
+        page.log.connect(logs.append)
+        _show(page, phone, TMP)
+        page.remote_table.select_all_entries()
+        page._remote_delete()
+        assert sorted(phone.files) == [TMP, f"{TMP}/rootdir", f"{TMP}/rootdir/core"]
+        [request] = requests
+        assert request["path"] == TMP and "Permission denied" in request["error"]
+
+        phone.rooted = True  # adb root, then "try again"
+        logs.clear()
+        request["retry"]()
+        assert sorted(phone.files) == [TMP]
+        assert logs == ["[OK] delete 3 device item(s)"] and len(requests) == 1
+    finally:
+        page.close_panel()
+
+
+# --------------------------------------------------------------------------- #
+# a device whose shell gives no exit status (before Android 7)
+# --------------------------------------------------------------------------- #
+def _new_folder(page, monkeypatch):
+    monkeypatch.setattr(fb.QInputDialog, "getText", staticmethod(lambda *a, **k: ("x", True)))
+    page._remote_mkdir()
+
+
+def _new_file(page, monkeypatch):
+    monkeypatch.setattr(fb.QInputDialog, "getText", staticmethod(lambda *a, **k: ("x", True)))
+    page._remote_newfile()
+
+
+def _paste(page, _monkeypatch):
+    page._clipboard, page._clipboard_src = ["/sdcard/x"], "remote"
+    page._remote_paste()
+
+
+def _rename(page, monkeypatch):
+    monkeypatch.setattr(fb.QInputDialog, "getText", staticmethod(lambda *a, **k: ("x", True)))
+    [row] = [r for r in range(page.remote_table.rowCount())
+             if page.remote_table.item(r, 0).text() == "old"]
+    page.remote_table.selectRow(row)
+    page._remote_rename()
+
+
+@pytest.mark.parametrize("exit_codes", [False, True], ids=["no-exit-status", "shell-protocol"])
+@pytest.mark.parametrize("change, label", [
+    (_new_folder, "mkdir x"), (_new_file, "create x"), (_paste, "copy x"), (_rename, "rename old"),
+])
+def test_a_change_the_device_refused_is_never_reported_as_done(qapp, monkeypatch, change, label,
+                                                              exit_codes):
+    """Before Android 7 `adb shell` ends 0 whatever the command did: New
+    folder, Paste and Rename in a read-only folder logged "[OK]", changed
+    nothing, and adb root / remount was never offered."""
+    _sync_jobs(monkeypatch)
+    _boxes(monkeypatch)
+    phone = _Phone({"/system": "d", "/system/old": "f", "/sdcard": "d", "/sdcard/x": "f"},
+                   exit_codes=exit_codes)
+    phone.read_only = {"/system"}
+    page = _page(monkeypatch, phone)
+    try:
+        requests, logs = [], []
+        page.write_access_needed.connect(requests.append)
+        page.log.connect(logs.append)
+        _show(page, phone, "/system")
+        change(page, monkeypatch)
+        assert "/system/x" not in phone.files
+        [said] = logs
+        assert said.startswith(f"[ERROR] {label}: ") and said.endswith(
+            "'/system/x': Read-only file system")
+        [request] = requests
+        assert request["path"] == "/system" and "Read-only file system" in request["error"]
+
+        phone.rooted = True  # adb root and remount, then "try again"
+        logs.clear()
+        request["retry"]()
+        assert "/system/x" in phone.files
+        assert logs == [f"[OK] {label}"] and len(requests) == 1
+    finally:
+        page.close_panel()
+
+
+@pytest.mark.parametrize("exit_codes", [False, True], ids=["no-exit-status", "shell-protocol"])
+def test_a_delete_the_device_refused_is_never_reported_as_done(qapp, monkeypatch, exit_codes):
+    """…and Delete logged "[OK] delete 2 device item(s)" with both still there."""
+    _sync_jobs(monkeypatch)
+    _yes(monkeypatch)
+    phone = _Phone({TMP: "d", f"{TMP}/a.log": "f", f"{TMP}/rootdir": "d"}, exit_codes=exit_codes)
+    phone.protected = {f"{TMP}/rootdir"}
+    page = _page(monkeypatch, phone)
+    try:
+        requests, logs = [], []
+        page.write_access_needed.connect(requests.append)
+        page.log.connect(logs.append)
+        _show(page, phone, TMP)
+        page.remote_table.select_all_entries()
+        page._remote_delete()
+        assert sorted(phone.files) == [TMP, f"{TMP}/rootdir"]
+        assert len(logs) == 1 and logs[0].startswith("[ERROR] delete 2 device item(s): ")
+        assert f"rm: {TMP}/rootdir: Permission denied" in logs[0]
+        [request] = requests
+        assert request["path"] == TMP and "Permission denied" in request["error"]
+
+        phone.rooted = True
+        logs.clear()
+        request["retry"]()
+        assert sorted(phone.files) == [TMP]
+        assert logs == ["[OK] delete 2 device item(s)"] and len(requests) == 1
+    finally:
+        page.close_panel()
+
+
+def test_a_change_that_worked_is_reported_as_done_without_an_exit_status(qapp, monkeypatch):
+    _sync_jobs(monkeypatch)
+    _yes(monkeypatch)
+    phone = _Phone({TMP: "d", f"{TMP}/a.log": "f"}, exit_codes=False)
+    page = _page(monkeypatch, phone)
+    try:
+        logs = []
+        page.log.connect(logs.append)
+        _show(page, phone, TMP)
+        _new_folder(page, monkeypatch)
+        _show(page, phone, TMP)
+        page.remote_table.select_all_entries()
+        page._remote_delete()
+        assert logs == ["[OK] mkdir x", "[OK] delete 2 device item(s)"]
+        assert sorted(phone.files) == [TMP]
+    finally:
+        page.close_panel()
+
+
+def test_a_name_that_holds_the_mark_does_not_pass_for_success(qapp, monkeypatch):
+    """The device's complaint names the path: only the mark on a line of its
+    own says the command worked."""
+    _sync_jobs(monkeypatch)
+    phone = _Phone({"/system": "d"}, exit_codes=False)
+    phone.read_only = {"/system"}
+    page = _page(monkeypatch, phone)
+    try:
+        logs = []
+        page.log.connect(logs.append)
+        _show(page, phone, "/system")
+        monkeypatch.setattr(fb.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: (fb._DONE_MARK, True)))
+        page._remote_mkdir()
+        assert len(logs) == 1 and logs[0].startswith(f"[ERROR] mkdir {fb._DONE_MARK}: ")
     finally:
         page.close_panel()

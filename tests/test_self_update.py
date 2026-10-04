@@ -111,6 +111,66 @@ def test_children_start_in_the_interpreters_folder(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# a newer release is reported whether or not pip can install it here
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def pypi(monkeypatch, tmp_path):
+    """PyPI has 4.0.0, this is 3.1.0; the daily cache is the test's own."""
+    asked = []
+    monkeypatch.setattr(update, "current_version", lambda: "3.1.0")
+    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: asked.append(1) or "4.0.0")
+    monkeypatch.setattr(update, "_CHECK_CACHE", str(tmp_path / "update-check.json"))
+    return asked
+
+
+def test_the_standalone_exe_is_told_about_a_newer_release(monkeypatch, pypi):
+    """It was never told: the checks answered None before they asked PyPI,
+    because pip cannot upgrade it."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert not update.can_self_update()
+    assert update.check() == "4.0.0"
+    assert update.check_cached() == "4.0.0"
+    assert update.check_cached() == "4.0.0" and len(pypi) == 2  # asked once a day
+    blocker = update.self_update_blocker()
+    assert "releases/latest" in blocker and "pip install -U turboadb" in blocker
+    # the newest one, or a PyPI that can't be reached, reports nothing
+    monkeypatch.setattr(update, "current_version", lambda: "4.0.0")
+    assert update.check() is None and update.check_cached() is None
+    monkeypatch.setattr(update, "current_version", lambda: "3.1.0")
+    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: None)
+    assert update.check() is None
+
+
+def test_a_source_checkout_is_told_about_a_newer_release(monkeypatch, pypi, tmp_path):
+    other = str(tmp_path / "site-packages" / "turboadb" / "__init__.py")
+    _probe(monkeypatch, {"file": other, "version": "2.0.0", "dist_file": other, "editable": False})
+    assert not update.can_self_update() and "git pull" in update.self_update_blocker()
+    assert update.check() == "4.0.0" and update.check_cached() == "4.0.0"
+
+
+@pytest.fixture(scope="module")
+def between_tests():
+    """``update.pypi_latest`` as a thread finds it while no test runs.  A main
+    window asks PyPI 2.5 s after it opens, on a worker of its own: for one
+    that a test left open, that is between two later tests."""
+    return update.pypi_latest
+
+
+def test_a_launch_check_that_runs_between_two_tests_asks_pypi_nothing(between_tests, monkeypatch):
+    """Now that a source checkout asks too, the suite reached pypi.org: the
+    stand-in for it was only there while a test ran."""
+    asked = []
+
+    def urlopen(request, timeout=None):
+        asked.append(request.full_url)
+        raise OSError("no network in the tests")
+
+    monkeypatch.setattr(update.urllib.request, "urlopen", urlopen)
+    assert between_tests() is None
+    assert asked == []
+
+
+# --------------------------------------------------------------------------- #
 # run_upgrade
 # --------------------------------------------------------------------------- #
 @pytest.fixture

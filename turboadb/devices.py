@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import filecmp
 import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 import subprocess
@@ -13,13 +15,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .config import adb_server_args, parse_host_port, user_path, validate_port
+from .exceptions import ADBNotFoundError
 from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
 from .tools import (
+    ADB_WINDOWS_FILES,
     DEFAULT_ADB_SERVER_PORT,
     DETACHED,
     NO_WINDOW,
+    POWERSHELL,
     find_adb,
     windowless_python,
+    windows_program,
 )
 
 _log = logging.getLogger(__name__)
@@ -144,12 +150,13 @@ def list_devices(
     attached to *that* machine. Without it, a non-default *server_port* selects
     a local server on that port.
 
-    Raises :class:`ADBNotFoundError` if adb is missing; returns ``[]`` if adb
+    Raises :class:`ADBNotFoundError` if adb is missing (a server that already
+    runs is asked over its socket, which takes no adb); returns ``[]`` if adb
     runs but nothing is connected. Raises ConnectionError if a remote server is
     requested but unreachable.  With *strict=True*, local server/startup failures
-    (including a hung ``adb devices``) are raised too; the GUI uses that mode to
-    show an actionable status instead of mislabelling a broken daemon as an
-    empty device list.
+    (including a hung ``adb devices``) are raised too, with the reason the
+    server gave; the GUI and the CLI use that mode to show an actionable status
+    instead of mislabelling a broken daemon as an empty device list.
     """
     from .scrcpy import is_local_host
 
@@ -170,23 +177,27 @@ def list_devices(
 
     if is_local:
         try:
-            from .tools import ensure_adb_server
+            from .tools import ensure_adb_server, last_adb_server_error
 
             # ensure_adb_server probes the socket itself before launching.
             if not ensure_adb_server(adb_path, timeout=min(4.0, timeout), port=server_port):
-                message = (
-                    f"ADB server could not start on port {server_port}. Check that the "
-                    "port is not held by another ADB version, then use Device → "
-                    "Restart ADB server."
-                )
+                why = last_adb_server_error()
+                # No adb to start it with is not "no devices", and not a port
+                # another adb holds either: ADBNotFoundError goes out.
+                find_adb(adb_path)
                 if strict:
-                    raise ConnectionError(message)
+                    raise ConnectionError(
+                        f"ADB server could not start on port {server_port}"
+                        + (f": {why}" if why else
+                           ". Check that the port is not held by another ADB version, "
+                           "then use Device → Restart ADB server.")
+                    )
                 return []
             # One retry is enough once we have explicitly started the daemon.
             sock_devs = _list_devices_socket(target_host, server_port, timeout=min(0.5, timeout))
             if sock_devs is not None:
                 return sock_devs
-        except ConnectionError:
+        except (ConnectionError, ADBNotFoundError):
             raise
         except Exception:
             # The CLI fallback below is useful for unusual ADB socket protocol
@@ -555,6 +566,7 @@ def _public_networks() -> list:
             capture_output=True,
             timeout=15,
             creationflags=NO_WINDOW,
+            executable=windows_program(POWERSHELL),
         )
     except Exception:
         return []
@@ -602,6 +614,7 @@ def open_firewall(
                 capture_output=True,
                 timeout=15,
                 creationflags=NO_WINDOW,
+                executable=windows_program("netsh.exe"),
             )
             cmd = [
                 "netsh",
@@ -624,6 +637,7 @@ def open_firewall(
                 text=True,
                 timeout=15,
                 creationflags=NO_WINDOW,
+                executable=windows_program("netsh.exe"),
             )
             (opened if r.returncode == 0 else failed).append(p)
         except Exception:
@@ -653,6 +667,7 @@ def _rule_exists(rule: str) -> bool:
             capture_output=True,
             timeout=15,
             creationflags=NO_WINDOW,
+            executable=windows_program("netsh.exe"),
         )
     except Exception:
         return True  # cannot tell: try to delete it anyway
@@ -675,6 +690,7 @@ def _close_firewall(ports) -> tuple:
                 capture_output=True,
                 timeout=15,
                 creationflags=NO_WINDOW,
+                executable=windows_program("netsh.exe"),
             ).returncode == 0
         except Exception:
             ok = False
@@ -780,7 +796,12 @@ def _start_shared_server(port: int, adb: str, restart: bool) -> str:
     return _launch_shared_server(port, adb)
 
 
+# How long a shared server gets to answer on its port.
+_SHARED_START_S = 10.0
+
+
 def _launch_shared_server(port: int, adb: str) -> str:
+    from .proctree import stop_process
     from .tools import is_adb_server_alive
 
     extra = {}
@@ -795,24 +816,31 @@ def _launch_shared_server(port: int, adb: str) -> str:
         env=_server_env(),
         **extra,
     )
-    deadline = time.monotonic() + 10.0
-    while True:
-        if is_adb_server_alive(port=port, timeout=0.2):
-            break
-        code = proc.poll()
-        if code is not None:
-            if is_adb_server_alive(port=port, timeout=0.2) and _lan_reachable(port) is False:
-                raise _PortTaken(
-                    f"adb server exited with code {code}; another localhost-only adb "
-                    f"server holds port {port}, so this PC is NOT shared"
+    deadline = time.monotonic() + _SHARED_START_S
+    try:
+        while True:
+            if is_adb_server_alive(port=port, timeout=0.2):
+                break
+            code = proc.poll()
+            if code is not None:
+                if is_adb_server_alive(port=port, timeout=0.2) and _lan_reachable(port) is False:
+                    raise _PortTaken(
+                        f"adb server exited with code {code}; another localhost-only adb "
+                        f"server holds port {port}, so this PC is NOT shared"
+                    )
+                raise RuntimeError(
+                    f"adb server exited with code {code} before listening on port {port} "
+                    "(port in use by another adb, or an incompatible adb binary)"
                 )
-            raise RuntimeError(
-                f"adb server exited with code {code} before listening on port {port} "
-                "(port in use by another adb, or an incompatible adb binary)"
-            )
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"adb server did not come up on port {port}: no response")
-        time.sleep(0.1)
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"adb server did not come up on port {port}: no response")
+            time.sleep(0.1)
+    except BaseException:
+        # Given up on before it answered: left running, it bound every
+        # interface a moment later, with the share reported as failed and its
+        # port not recorded.
+        stop_process(proc, grace=0)
+        raise
     if proc.poll() is not None and _lan_reachable(port) is False:
         # our process died but SOMETHING answers on loopback: a localhost-only
         # server grabbed the port first — exactly the old false success
@@ -882,6 +910,7 @@ def restart_shared_server(port: int = DEFAULT_ADB_SERVER_PORT, adb_path: str | N
                 capture_output=True,
                 timeout=30,
                 creationflags=NO_WINDOW,
+                executable=windows_program("schtasks.exe"),
             )
         except Exception:
             ran = None
@@ -1061,6 +1090,7 @@ def _serve_task_installed() -> bool:
             capture_output=True,
             timeout=30,
             creationflags=NO_WINDOW,
+            executable=windows_program("schtasks.exe"),
         )
     except Exception:
         return False
@@ -1078,6 +1108,7 @@ def _task_last_result(task: str) -> str:
             capture_output=True,
             timeout=30,
             creationflags=NO_WINDOW,
+            executable=windows_program("schtasks.exe"),
         )
     except Exception:
         return ""
@@ -1189,6 +1220,176 @@ def _serve_again(kind: Optional[str], port: int, adb: Optional[str]) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# What the startup task runs as SYSTEM: only administrators may change it
+# --------------------------------------------------------------------------- #
+# The accounts that have this PC anyway: what they may change is no way in.
+_TRUSTED_SIDS = frozenset((
+    "S-1-5-18",  # SYSTEM
+    "S-1-5-32-544",  # the Administrators group
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",  # TrustedInstaller
+    "S-1-3-0",  # CREATOR OWNER: stands for whoever creates something later
+))
+# The access rights that let an account alter or replace a file, and those
+# that let it put a file into a folder, or remove, rename or re-secure what is
+# there.  Making a subfolder is not one: every signed-in user may in C:\.
+_CHANGE_FILE = 0x2 | 0x4 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000
+_CHANGE_FOLDER = 0x2 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000
+
+
+def _open_to_others(path: str, rights: int) -> Optional[bool]:
+    """Whether *path* belongs to an account outside :data:`_TRUSTED_SIDS`, or
+    its access list grants one any of *rights*; None when Windows will not
+    say.  Only called on Windows."""
+    import ctypes
+    import struct
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32")
+    kernel = ctypes.WinDLL("kernel32")
+    out = ctypes.POINTER(ctypes.c_void_p)
+    advapi.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                                             out, out, out, out, out]
+    advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, out]
+    advapi.GetAce.restype = wintypes.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, out]
+    advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+
+    def trusted(sid) -> bool:
+        text = ctypes.c_void_p()
+        if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+            return False
+        try:
+            return ctypes.wstring_at(text.value) in _TRUSTED_SIDS
+        finally:
+            kernel.LocalFree(text)
+
+    owner, acl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    # of a file or folder (SE_FILE_OBJECT): its owner and its access list
+    if advapi.GetNamedSecurityInfoW(path, 1, 0x1 | 0x4, ctypes.byref(owner), None,
+                                    ctypes.byref(acl), None, ctypes.byref(descriptor)):
+        return None
+    try:
+        if not owner:
+            return None
+        # an owner may rewrite the list, and no list at all lets everyone in
+        if not trusted(owner) or not acl:
+            return True
+        entries = struct.unpack_from("<BBHHH", ctypes.string_at(acl.value, 8))[3]
+        for index in range(entries):
+            entry = ctypes.c_void_p()
+            if not advapi.GetAce(acl, index, ctypes.byref(entry)):
+                return None
+            kind, flags, _size, mask = struct.unpack_from(
+                "<BBHI", ctypes.string_at(entry.value, 8))
+            # an "allow" entry (0, or 9 with a condition) for this very object
+            # (0x08: only for what is created inside); its account follows
+            if kind in (0, 9) and not flags & 0x08 and mask & rights:
+                if not trusted(entry.value + 8):
+                    return True
+        return False
+    finally:
+        kernel.LocalFree(descriptor)
+
+
+def _others_can_change(path: str) -> Optional[bool]:
+    """Whether an account without administrator rights could alter or replace
+    *path*: the file, or a folder above it, belongs to someone other than
+    SYSTEM and the administrators, or lets such an account write there.  None
+    when that cannot be told: not on Windows, no such path, a list this user
+    may not read."""
+    if sys.platform != "win32":
+        return None
+    told: Optional[bool] = False
+    try:
+        # as it is named and where it really is: a link is as safe as both
+        for step in dict.fromkeys((os.path.abspath(path), os.path.realpath(path))):
+            if not os.path.exists(step):
+                return None
+            rights = _CHANGE_FOLDER if os.path.isdir(step) else _CHANGE_FILE
+            while True:
+                answer = _open_to_others(step, rights)
+                if answer:
+                    return True
+                if answer is None:
+                    told = None
+                parent = os.path.dirname(step)
+                if parent == step:
+                    break
+                step, rights = parent, _CHANGE_FOLDER
+    except Exception:
+        return None
+    return told
+
+
+def _task_code() -> list:
+    """What the startup task's command loads besides adb: the interpreter,
+    this package and, from a virtual environment, the Python it was made of."""
+    paths = [windowless_python(), os.path.dirname(os.path.abspath(__file__))]
+    base = getattr(sys, "base_prefix", sys.prefix)
+    if base != sys.prefix:
+        paths.append(base)
+    return paths
+
+
+def _replace_file(source: str, target: str) -> None:
+    """Copy *source* over *target*.  A *target* that is running (the adb of
+    the task's server) cannot be written over, but Windows lets it be renamed:
+    it is moved aside, and the next copy takes it away."""
+    aside = target + ".old"
+    try:
+        os.remove(aside)
+    except OSError:
+        pass
+    if os.path.exists(target):
+        if filecmp.cmp(source, target, shallow=False):
+            return
+        os.replace(target, aside)
+    shutil.copy2(source, target)
+    try:
+        os.remove(aside)
+    except OSError:
+        pass  # still running
+
+
+def _protected_adb(adb: str) -> str:
+    """Copy *adb* and the DLLs it loads to where only administrators can
+    change them; the path of that copy, for the startup task to run.
+
+    Pinned where it was found (``~/.turboadb/tools``, an SDK in the profile),
+    any program of that user could replace the file and run as SYSTEM from the
+    next start on.  The copy is under Program Files, beside the ffmpeg of the
+    remote webcam; installing the task again brings it up to date."""
+    root = (os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles") or "").strip()
+    if not root:
+        raise RuntimeError("ProgramFiles is not set, so there is no folder to keep the "
+                           "startup task's adb in")
+    folder = os.path.join(root, "TurboADB", "adb")
+    copy = os.path.join(folder, ADB_WINDOWS_FILES[0])
+    try:
+        os.makedirs(folder, exist_ok=True)
+        open_folder = _others_can_change(folder)
+        if not open_folder:
+            for name in ADB_WINDOWS_FILES:
+                source = os.path.join(os.path.dirname(adb), name)
+                if os.path.isfile(source):
+                    _replace_file(source, os.path.join(folder, name))
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not copy adb to {folder}, where only administrators can change it "
+            f"(run as Administrator): {exc}"
+        ) from exc
+    if open_folder or _others_can_change(copy):
+        raise RuntimeError(
+            f"{folder} can be changed by accounts without administrator rights, so the "
+            "startup task's adb would not be safe there"
+        )
+    return copy
+
+
 def install_serve_task(
     port: int = DEFAULT_ADB_SERVER_PORT, *, run_now: bool = True, adb_path: str | None = None,
     ready_timeout: float = 20.0,
@@ -1204,6 +1405,12 @@ def install_serve_task(
     would otherwise bind port 5037 with a different adb binary.  This user's
     adb keys go with it (:func:`_share_keys_with_system`), so the devices it
     already uses need no new authorization.
+
+    What the task runs, it runs as SYSTEM at every start, so none of it may be
+    a file that an account without administrator rights can change.  An adb
+    that is (the one in ``~/.turboadb/tools`` always) is pinned as a copy under
+    Program Files (:func:`_protected_adb`).  A Python or a TurboADB that is
+    cannot be copied: the task is installed, with a warning that names them.
 
     With *run_now*, success means the TASK's server is listening for other
     machines.  ``schtasks /run`` only reports that the task was launched, and
@@ -1222,6 +1429,12 @@ def install_serve_task(
     port = tools.local_adb_port(validate_port(port))
     adb = _pinned_adb(adb_path)
     tr = _serve_launcher(port, adb)
+    open_to_others = [path for path in _task_code() if _others_can_change(path)]
+    if adb and _others_can_change(adb):
+        if os.path.basename(adb).lower() == ADB_WINDOWS_FILES[0]:
+            tr = _serve_launcher(port, _protected_adb(adb))
+        else:
+            open_to_others.append(adb)  # a wrapper script: a copy would protect nothing
     created = subprocess.run(
         [
             "schtasks",
@@ -1241,12 +1454,19 @@ def install_serve_task(
         capture_output=True,
         timeout=30,
         creationflags=NO_WINDOW,
+        executable=windows_program("schtasks.exe"),
     )
     if created.returncode != 0:
         detail = (created.stderr or created.stdout or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(f"could not create Scheduled Task {_SERVE_TASK}: {detail or 'unknown error'}")
     _change_sharing(lambda data: data.__setitem__("task_port", port))
     _share_keys_with_system()
+    if open_to_others:
+        _log.warning(
+            "the startup task runs as SYSTEM what accounts without administrator rights "
+            "can change (%s): any program of theirs could take over this PC through it. "
+            "Install Python and TurboADB for all users (under Program Files), then run  "
+            "turboadb serve --startup-task  again.", ", ".join(open_to_others))
     if run_now:
         before = _serve_on(port)
         if before:
@@ -1256,6 +1476,7 @@ def install_serve_task(
             capture_output=True,
             timeout=30,
             creationflags=NO_WINDOW,
+            executable=windows_program("schtasks.exe"),
         )
         if started.returncode != 0:
             detail = (started.stderr or started.stdout or b"").decode("utf-8", "replace").strip()
@@ -1275,9 +1496,37 @@ def install_serve_task(
     return _SERVE_TASK
 
 
+def _serve_task_registered() -> bool:
+    """Whether the SYSTEM startup task exists, also when this user may not
+    look at it.
+
+    Without administrator rights schtasks answers "access is denied" for that
+    task, with the exit code (and in the language) of "no such task".  The
+    scheduler keeps a file per task under its name, which is there either
+    way, readable or not."""
+    if _serve_task_installed():
+        return True
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    # Sysnative is the real System32 for a 32-bit Python on 64-bit Windows.
+    for system in ("Sysnative", "System32"):
+        try:
+            os.stat(os.path.join(root, system, "Tasks", _SERVE_TASK))
+        except PermissionError:
+            return True
+        except OSError:
+            continue
+        return True
+    return False
+
+
 def uninstall_serve_task() -> bool:
     """Remove the startup Scheduled Task if present (and what was recorded for
-    it: its port, and the adb keys it was given)."""
+    it: its port, and the adb keys it was given).  False when there is none.
+
+    Raises RuntimeError when the task is there and could not be removed.
+    Deleting it takes administrator rights, and a refusal used to count as
+    "no task": Stop sharing then said nothing would start by itself, and the
+    task shared the devices again at the next boot."""
     if os.name != "nt":
         return False
     r = subprocess.run(
@@ -1285,9 +1534,18 @@ def uninstall_serve_task() -> bool:
         capture_output=True,
         timeout=30,
         creationflags=NO_WINDOW,
+        executable=windows_program("schtasks.exe"),
     )
     if r.returncode != 0:
-        return False
+        if not _serve_task_registered():
+            return False
+        detail = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"the SYSTEM startup task {_SERVE_TASK} is still installed and shares this "
+            "PC's devices again at the next start: it could not be removed"
+            + (f" ({detail})" if detail else "")
+            + ", which takes administrator rights"
+        )
     _change_sharing(lambda data: data.pop("task_port", None))
     system_home = _system_home()
     if system_home and "adb_vendor_keys" in _read_sharing(_sharing_path(system_home)):

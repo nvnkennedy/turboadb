@@ -522,3 +522,22 @@ def test_old_copies_are_tidied(tmp_path, monkeypatch):
     os.utime(old, (past, past))
     file_open.forget_old_copies()
     assert not os.path.exists(old) and os.path.isdir(new)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Open with is Windows' own dialog")
+def test_open_with_starts_windows_own_rundll32(monkeypatch, tmp_path):
+    """The dialog shown for a file type without an "Open with" verb comes from
+    System32's rundll32, started by its full path: by its bare name alone,
+    Windows looks in the current folder first."""
+    started = []
+    monkeypatch.setattr(file_open.subprocess, "Popen",
+                        lambda argv, **kwargs: started.append((argv, kwargs)) or object())
+    monkeypatch.setattr(file_open, "_reaped", lambda proc: proc)
+    target = tmp_path / "notes.txt"
+    target.write_text("x")
+    file_open._ask_which_app(str(target))
+    (argv, kwargs), = started
+    assert argv[0] == "rundll32.exe" and argv[-1] == str(target)
+    exe = kwargs.get("executable")
+    assert exe and os.path.isabs(exe) and os.path.basename(exe).lower() == "rundll32.exe"
+    assert os.path.normcase(os.path.dirname(exe)).endswith("system32")

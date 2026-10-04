@@ -93,6 +93,72 @@ def test_ours_while_our_launcher_is_still_reporting(world):
     assert not tools._UNCONFIRMED  # settled, nothing left to watch
 
 
+def _busy_for_one_start(monkeypatch):
+    """The running server misses the two probes of the next start, which so
+    launches another ``adb start-server``."""
+    answers = iter((False, False))
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda **kw: next(answers, True))
+
+
+def test_a_second_launcher_that_found_our_server_running_leaves_it_ours(world, monkeypatch):
+    """It ended without a word (there was nothing to start); the credit had
+    moved to it and went with it, so the exit left TurboADB's own server
+    running."""
+    world.prints = _STARTED
+    assert tools.ensure_adb_server(world.adb, timeout=0.02) is False
+    world.alive = True
+    world.made[0].code = 0
+    assert tools.owned_adb_server() == world.adb
+
+    _busy_for_one_start(monkeypatch)
+    world.prints = b""
+    assert tools.ensure_adb_server(world.adb, timeout=1.0) is True
+    assert len(world.made) == 2
+    world.made[1].code = 0
+    assert tools.owned_adb_server() == world.adb
+    assert not tools._UNCONFIRMED
+
+
+@pytest.mark.parametrize("said, code, ours", [(_STARTED, 0, True), (_LOST_RACE, 1, False)],
+                         ids=["its own", "another program's"])
+def test_a_second_launcher_leaves_the_question_to_the_one_before_it(world, monkeypatch,
+                                                                     said, code, ours):
+    """The first launcher had not said yet whose server answers when the
+    second one ran: it is still the first one's to say."""
+    assert tools.ensure_adb_server(world.adb, timeout=0.02) is False
+    first = world.made[0]
+    world.alive = True
+    assert tools.owned_adb_server() == world.adb  # the first one, still reporting
+
+    _busy_for_one_start(monkeypatch)
+    assert tools.ensure_adb_server(world.adb, timeout=1.0) is True
+    world.made[1].code = 0  # it found a server running: nothing to say
+    assert tools.owned_adb_server() == world.adb
+    first.say(said)
+    first.code = code
+    assert tools.owned_adb_server() == (world.adb if ours else None)
+    assert not tools._UNCONFIRMED
+
+
+def test_a_second_launcher_that_started_a_server_takes_the_credit(world, monkeypatch, tmp_path):
+    """The first server was gone: this is a new one, started with the adb of
+    the second launcher."""
+    world.prints = _STARTED
+    assert tools.ensure_adb_server(world.adb, timeout=0.02) is False
+    world.alive = True
+    world.made[0].code = 0
+    assert tools.owned_adb_server() == world.adb
+
+    other = tmp_path / "sdk" / os.path.basename(world.adb)
+    other.parent.mkdir()
+    other.write_text("")
+    world.adb = str(other)
+    _busy_for_one_start(monkeypatch)
+    assert tools.ensure_adb_server(world.adb, timeout=1.0) is True
+    world.made[1].code = 0
+    assert tools.owned_adb_server() == str(other)
+
+
 def test_a_launcher_whose_daemon_answers_is_left_to_end_by_itself(world):
     """Ending it before its daemon reported to it takes the daemon down (seen
     on a real adb), so the way out only forgets it."""

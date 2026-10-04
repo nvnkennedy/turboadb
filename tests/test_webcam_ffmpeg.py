@@ -7,11 +7,16 @@
 - A cached ffmpeg that failed its checksum but could not be deleted (another
   camera stream runs it) was adopted as an old copy with no record, its hash
   then recorded as trusted.
+- An ffmpeg "on PATH" was asked of ``shutil.which``, which looks in the
+  current folder before PATH on Windows (and for an empty or relative PATH
+  entry anywhere): an ``ffmpeg.bat`` lying in the folder TurboADB was started
+  from was run for the camera scan.
 
 No ffmpeg, camera or network is used.
 """
 
 import os
+import stat
 import subprocess
 import sys
 
@@ -58,7 +63,7 @@ def test_a_cached_ffmpeg_that_fails_its_check_while_in_use_is_not_trusted(tmp_pa
             real_remove(path)
 
     monkeypatch.setattr(ffmpeg_tools, "_remove_quietly", in_use)
-    monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setattr(ffmpeg_tools, "_on_path", lambda name: None)
     with pytest.raises(RuntimeError) as err:
         ffmpeg_tools.find_local_ffmpeg()
     assert "can't be replaced while it runs" in str(err.value)
@@ -67,5 +72,54 @@ def test_a_cached_ffmpeg_that_fails_its_check_while_in_use_is_not_trusted(tmp_pa
         ffmpeg_tools.find_local_ffmpeg()  # ...so it is never adopted later
 
     system = str(tmp_path / "bin" / "ffmpeg.exe")
-    monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda *_a, **_k: system)
+    monkeypatch.setattr(ffmpeg_tools, "_on_path", lambda name: system)
     assert ffmpeg_tools.find_local_ffmpeg() == system  # an ffmpeg on PATH still works
+
+
+def _stand_in(folder, name="ffmpeg"):
+    """A program called *name* in *folder*, as a console finds it there (a
+    batch file on Windows); its path."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (name + (".bat" if os.name == "nt" else ""))
+    path.write_text("")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return str(path)
+
+
+@pytest.fixture
+def no_ffmpeg_yet(tmp_path, monkeypatch):
+    """Neither a Settings path nor a downloaded ffmpeg, and a working folder
+    of the test's own (returned)."""
+    from turboadb.gui import ffmpeg_tools, settings
+
+    monkeypatch.setattr(ffmpeg_tools, "_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(ffmpeg_tools, "_VERIFIED", {})
+    monkeypatch.setattr(settings, "get", lambda key, default=None: default)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    return work
+
+
+def test_an_ffmpeg_in_the_working_folder_is_not_used(no_ffmpeg_yet, tmp_path, monkeypatch):
+    from turboadb.gui import ffmpeg_tools
+
+    _stand_in(no_ffmpeg_yet)
+    _stand_in(no_ffmpeg_yet / "bin")
+    empty = tmp_path / "on-path"
+    empty.mkdir()
+    # "." and an empty entry mean the current folder, as a relative one does
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", "bin", str(empty)]))
+    assert ffmpeg_tools.cached_ffmpeg() is None
+    assert ffmpeg_tools.find_local_ffmpeg() is None
+
+
+def test_an_ffmpeg_in_a_path_folder_is_used_by_its_absolute_path(no_ffmpeg_yet, tmp_path,
+                                                                 monkeypatch):
+    from turboadb.gui import ffmpeg_tools
+
+    _stand_in(no_ffmpeg_yet)  # the one in the working folder loses
+    wanted = _stand_in(tmp_path / "tools")
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(tmp_path / "tools")]))
+    for found in (ffmpeg_tools.cached_ffmpeg(), ffmpeg_tools.find_local_ffmpeg()):
+        assert os.path.isabs(found) and os.path.samefile(found, wanted)

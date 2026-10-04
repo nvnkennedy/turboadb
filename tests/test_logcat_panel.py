@@ -215,6 +215,61 @@ def test_a_hidden_page_loses_nothing_and_shows_every_match(qapp, panel, tmp_path
         stack.deleteLater()
 
 
+def test_a_page_that_is_not_drained_keeps_the_readers_backlog_small(qapp):
+    """Nothing pulls from the reader while its page is hidden or the window
+    minimised.  Every batch stayed in its backlog, emptied but never removed,
+    and each new batch walked them all: a busy log took a whole core within
+    minutes, and more the longer the page stayed hidden."""
+    from turboadb.gui.logcat_view import _LogcatThread
+
+    thread = _LogcatThread(None, ["logcat"])
+    thread._LINES_MAX = 50
+    lines = [_line(i) for i in range(6000)]
+    for start in range(0, len(lines), 3):  # 2,000 batches, none taken
+        thread._publish(lines[start:start + 3], start)
+        assert len(thread._entries_out) <= thread._LINES_MAX
+    batches = thread.take()
+    assert [ln for _start, kept, _dropped in batches for ln in kept] == lines[-50:]
+    assert sum(dropped for _start, _kept, dropped in batches) == 5950
+    assert all(kept for _start, kept, _dropped in batches)
+    assert thread.take() == []
+
+
+def test_lines_dropped_before_a_clear_or_a_new_filter_are_not_counted_as_skipped(panel):
+    """A batch read before the last Clear or filter change is left out, with
+    the lines it had to drop; the count of one that left the backlog must not
+    come back with a later batch."""
+    from turboadb.gui.logcat_view import _LogcatThread
+
+    p = panel()
+    thread = _LogcatThread(None, ["logcat"], capture=p._capture)
+    thread._LINES_MAX = 4
+    for i in range(6):
+        thread._ingest([f"before Clear {i}"])
+    p._clear_view()
+    for i in range(6):
+        thread._ingest([f"after Clear {i}"])
+    assert len(thread._entries_out) <= thread._LINES_MAX
+    p._pull(thread)
+    assert p._pending == [f"after Clear {i}" for i in range(2, 6)]
+    assert p._skipped == 2  # "after Clear 0" and "1", none of the six before it
+
+    p.filt.setText("needle")
+    p._refilter_view()  # nothing matched yet: the view is empty, nothing is owed
+    for i in range(6):
+        thread._ingest([f"needle {i}"])
+    p.filt.setText("needle [0-9]")
+    p._refilter_view()  # the search has redrawn those six
+    for i in range(6):
+        thread._ingest([f"needle {i} again"])
+    p._pull(thread)
+    assert p._skipped == 2
+    p._render_pending()
+    assert _view(p) == [f"needle {i}" for i in range(6)] + [
+        "… (2 matching lines skipped on screen — saved log has all)"] + [
+        f"needle {i} again" for i in range(2, 6)]
+
+
 def test_clear_leaves_out_lines_read_before_it(panel):
     from turboadb.gui.logcat_view import _LogcatThread
 

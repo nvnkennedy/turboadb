@@ -496,14 +496,37 @@ def _system_exe(name: str) -> str:
     return exe if os.path.isfile(exe) else name
 
 
+def find_command(name: str, env: Mapping[str, str]) -> Optional[str]:
+    """The file a shell with *env* runs for the bare command *name* from its
+    ``PATH``: folder by folder, the first *name* with a ``PATHEXT`` extension.
+    None when the ``PATH`` has none.  Looks into every folder (a share may
+    not answer): call it off the UI thread.
+
+    Only the absolute folders of the ``PATH`` are searched, never the current
+    one (``shutil.which`` starts there on Windows): that is TurboADB's own
+    working folder (where the exe was started: Downloads, a cloned
+    repository), not the shell's, and a ``grep.bat`` lying there was run."""
+    lookup = {key.upper(): value for key, value in env.items()}
+    if os.name == "nt":
+        suffixes = [ext for ext in (lookup.get("PATHEXT") or _DEFAULT_PATHEXT).split(";") if ext]
+    else:
+        suffixes = [""]
+    for folder in (lookup.get("PATH") or "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not os.path.isabs(folder):
+            continue
+        for suffix in suffixes:
+            path = os.path.join(folder, name + suffix)
+            if os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
+                return path
+    return None
+
+
 def gnu_grep(env: Mapping[str, str]) -> bool:
     """Whether the ``grep`` a shell with *env* runs is GNU grep (Git for
     Windows, MSYS2, Cygwin), which takes ``--line-buffered``.  Runs ``grep
     --version``: call it off the UI thread."""
-    import shutil
-
-    path = next((value for key, value in env.items() if key.upper() == "PATH"), "")
-    exe = shutil.which("grep", path=path) if path else None
+    exe = find_command("grep", env)
     if not exe:
         return False
     try:
@@ -623,21 +646,26 @@ def _popen_clean_dll_path(argv, **kwargs) -> subprocess.Popen:
                 set_dir(saved)
 
 
-def _console_ctrl_c(pid: int) -> bool:
+def _console_ctrl_c(pid: int) -> Optional[float]:
     """Raise Ctrl+C on the console of the shell *pid*, as pressing it in a
     console window does: every process on that console gets it (the shell,
     the command it runs, a pipeline's programs, a background job), never an
-    adb server (it has no console).  True when the event was raised.  Blocks
-    for a moment: call it off the UI thread.
+    adb server (it has no console).  Returns when the event was raised
+    (``time.monotonic()``), None when it was not.  Blocks for a moment
+    longer than that: call it off the UI thread.
 
     The shells run on hidden consoles of their own (CREATE_NO_WINDOW).
     Without a console of its own, TurboADB attaches to the shell's console
     for the call, ignoring the Ctrl+C itself from then on; with one (a run
     from a terminal) a helper process does it, when there is a Python to run
-    it (not in the one-file exe, which never has a console)."""
+    it (not in the one-file exe, which never has a console).
+
+    The time is taken just before the event (before the helper starts): a
+    command's answer to the Ctrl+C never comes earlier, and it is often out
+    before this call returns."""
     global _ignoring_ctrl_c
     if os.name != "nt" or not pid:
-        return False
+        return None
     try:
         import ctypes
 
@@ -649,7 +677,10 @@ def _console_ctrl_c(pid: int) -> bool:
                 try:
                     if not _ignoring_ctrl_c:
                         _ignoring_ctrl_c = bool(kernel32.SetConsoleCtrlHandler(None, True))
-                    return _ignoring_ctrl_c and bool(kernel32.GenerateConsoleCtrlEvent(_CTRL_C_EVENT, 0))
+                    raised = time.monotonic()
+                    if _ignoring_ctrl_c and kernel32.GenerateConsoleCtrlEvent(_CTRL_C_EVENT, 0):
+                        return raised
+                    return None
                 finally:
                     kernel32.FreeConsole()
                     # AttachConsole may have replaced empty standard handles
@@ -662,15 +693,16 @@ def _console_ctrl_c(pid: int) -> bool:
                     time.sleep(0.2)
             error = ctypes.get_last_error()
         if error != _ERROR_ACCESS_DENIED or getattr(sys, "frozen", False) or not sys.executable:
-            return False  # the shell is gone, or no helper can run
+            return None  # the shell is gone, or no helper can run
+        raised = time.monotonic()
         done = subprocess.run(
             [sys.executable, "-I", "-S", "-c", _CTRL_C_HELPER, str(int(pid))],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=NO_WINDOW, timeout=10,
         )
-        return done.returncode == 0
+        return raised if done.returncode == 0 else None
     except Exception:
-        return False
+        return None
 
 
 def _incomplete_utf8_tail(buf: bytes) -> int:
@@ -685,6 +717,14 @@ def _incomplete_utf8_tail(buf: bytes) -> int:
     return 0
 
 
+def _is_utf8(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 class OutputTranscoder:
     """Normalise shell output to UTF-8 bytes.
 
@@ -692,6 +732,15 @@ class OutputTranscoder:
     PowerShell (after its UTF-8 switch), git and Python write UTF-8.  Each line
     is kept when it is valid UTF-8 and otherwise decoded with *fallback*, so
     ``dir`` of ``café`` no longer renders as ``caf�``.
+
+    A read may end anywhere in a line.  A character it cuts off waits for its
+    rest: the start of a UTF-8 sequence when the line is UTF-8 up to there,
+    else what *fallback* cannot decode yet (the first byte of a character on a
+    double-byte console code page: a Chinese, Japanese or Korean Windows).
+    The rest of a code-page line cut like that, or by the size of the read, is
+    decoded with the code page too, whatever it looks like by itself; what
+    follows a line a program left unended (a ``set /p`` prompt) may be another
+    program's, and is judged by itself.
     """
 
     # How long the tail of a character split across two reads may wait for the
@@ -701,12 +750,16 @@ class OutputTranscoder:
 
     def __init__(self, fallback: str = "oem"):
         try:
-            codecs.lookup(fallback)
+            decoder = codecs.getincrementaldecoder(fallback)
         except LookupError:
             fallback = "latin-1"
+            decoder = codecs.getincrementaldecoder(fallback)
         self.fallback = fallback
+        self._decoder = decoder("replace")
         self._held = b""
         self._held_at = 0.0
+        # the line the last read cut off is in the fallback code page: so is its rest
+        self._line_in_fallback = False
 
     def held_expired(self, grace: Optional[float] = None) -> bool:
         """True when held bytes have waited longer than *grace* for their rest."""
@@ -715,32 +768,61 @@ class OutputTranscoder:
         limit = self.HOLD_GRACE_S if grace is None else grace
         return time.monotonic() - self._held_at >= limit
 
-    def feed(self, data: bytes, final: bool = False) -> bytes:
-        previous_at = self._held_at
+    def feed(self, data: bytes, final: bool = False, more: bool = False) -> bytes:
+        """*data*, the output of one read, as UTF-8.  *final*: the bytes held
+        back wait no longer.  *more*: the read was cut by its size, so the
+        line it ends in goes on in the next one."""
         buf = self._held + data if self._held else data
-        self._held = b""
-        self._held_at = 0.0
-        if not final:
-            cut = _incomplete_utf8_tail(buf)
-            if cut:
-                self._held, buf = buf[-cut:], buf[:-cut]
-                # The clock starts when a tail is first held back; an idle poll
-                # (no new data) must not keep restarting it.
-                self._held_at = time.monotonic() if (data or not previous_at) else previous_at
         if not buf:
             return b""
-        try:
-            buf.decode("utf-8")
-            return buf
-        except UnicodeDecodeError:
-            pass
+        previous_at = self._held_at
+        in_fallback = self._line_in_fallback
+        self._held = b""
+        self._held_at = 0.0
+        self._line_in_fallback = False
+        out = self._transcode(buf, final, more, in_fallback)
+        if self._held:
+            # The clock starts when a tail is first held back; an idle poll
+            # (no new data) must not keep restarting it.
+            self._held_at = time.monotonic() if (data or not previous_at) else previous_at
+        return out
+
+    def _transcode(self, buf: bytes, final: bool, more: bool, in_fallback: bool) -> bytes:
+        """*buf* as UTF-8, less a character cut off at its end (kept in
+        ``_held`` unless *final*).  *in_fallback*: *buf* starts with the rest
+        of a line in the fallback code page."""
+        if not in_fallback:
+            cut = 0 if final else _incomplete_utf8_tail(buf)
+            head = buf[:len(buf) - cut]
+            if _is_utf8(head):
+                self._held = buf[len(head):]
+                return head
         out = []
-        for line in buf.splitlines(True):
-            try:
-                line.decode("utf-8")
-                out.append(line)
-            except UnicodeDecodeError:
-                out.append(line.decode(self.fallback, "replace").encode("utf-8"))
+        lines = buf.splitlines(True)
+        for index, line in enumerate(lines):
+            # only the last line can go on in the next read
+            unended = index == len(lines) - 1 and not line.endswith((b"\n", b"\r"))
+            cut_off = unended and not final
+            if not (in_fallback and index == 0):
+                # A UTF-8 tail is waited for only in a line that is UTF-8 up
+                # to it: the last byte of a double-byte character often looks
+                # like the start of one ("文件" in GBK ends in FE).
+                cut = _incomplete_utf8_tail(line) if cut_off else 0
+                head = line[:len(line) - cut]
+                if _is_utf8(head):
+                    self._held = line[len(head):]
+                    out.append(head)
+                    continue
+            if cut_off:
+                self._decoder.reset()
+                text = self._decoder.decode(line)
+                self._held = self._decoder.getstate()[0]  # what it could not decode yet
+            else:
+                text = line.decode(self.fallback, "replace")
+            # cut inside a character, or by the size of the read: the same
+            # output goes on (a line left unended may be followed by anything)
+            self._line_in_fallback = unended and (more or bool(self._held))
+            out.append(text.encode("utf-8"))
         return b"".join(out)
 
 
@@ -925,7 +1007,8 @@ class LocalShellSession:
         """Available output as UTF-8, without hanging on Windows pipe buffers."""
         raw = self._read_raw(size)
         if raw:
-            return self._transcoder.feed(raw)
+            # a full read: more waits in the pipe, and its last line goes on there
+            return self._transcoder.feed(raw, more=len(raw) >= size)
         # Idle pipe.  A byte held back as a possible split character is released
         # only once its rest has clearly not come, or the shell has exited:
         # forcing the final flush on EVERY empty poll defeated the guard, so a
@@ -958,7 +1041,8 @@ class LocalShellSession:
         its summary), and the shell abandons the rest of the command line,
         script or batch file (cmd then asks ``Terminate batch job (Y/N)?``).
         Unsent input goes too.  *on_done* gets a :class:`CtrlC` on the worker
-        thread.  False when there is no running shell (or no console: not on
+        thread, a moment after the event (:attr:`CtrlC.at` says when that
+        was).  False when there is no running shell (or no console: not on
         Windows)."""
         proc = self._proc
         if os.name != "nt" or self._closed or proc is None or proc.poll() is not None:
@@ -967,7 +1051,8 @@ class LocalShellSession:
 
         def run():
             programs = _runs_programs(proc.pid)
-            result = CtrlC(_console_ctrl_c(proc.pid), programs)
+            raised = _console_ctrl_c(proc.pid)
+            result = CtrlC(raised is not None, programs, raised)
             if on_done is not None:
                 try:
                     on_done(result)
@@ -1028,10 +1113,11 @@ class LocalShellSession:
         With redirected Windows pipes a literal Ctrl+C byte is only input; it
         is not a console-control event.  The tree kill runs on a daemon thread,
         exactly like :meth:`close`: doing it inline froze the window for
-        seconds.
+        seconds.  A shell that has ended by itself is cleaned up after all
+        the same (its pipes, commands it left running).
         """
         proc = self._proc
-        if not proc or proc.poll() is not None:
+        if not proc or self._closed:
             return
         self._closed = True
         self.discard_pending_input()
@@ -1102,12 +1188,16 @@ class CtrlC(tuple):
     """What :meth:`LocalShellSession.send_ctrl_c` did: :attr:`sent`, whether
     the Ctrl+C was raised, and :attr:`programs`, whether the shell was
     running programs at the time (False: the shell itself was busy, e.g.
-    waiting in ``pause``, ``set /p`` or ``Read-Host``; None: unknown)."""
+    waiting in ``pause``, ``set /p`` or ``Read-Host``; None: unknown).
 
-    __slots__ = ()
+    :attr:`at`, beside that pair, is when it was raised (``time.monotonic()``;
+    None when it was not, or that is not known).  The report follows the
+    event a moment later: by then the command may have answered already."""
 
-    def __new__(cls, sent: bool, programs: Optional[bool]):
-        return tuple.__new__(cls, (bool(sent), programs))
+    def __new__(cls, sent: bool, programs: Optional[bool], at: Optional[float] = None):
+        result = tuple.__new__(cls, (bool(sent), programs))
+        result.at = at
+        return result
 
     @property
     def sent(self) -> bool:
@@ -1166,9 +1256,20 @@ def _kill_process_tree(proc, wait_s: float = 2.0) -> None:
     shell; :func:`turboadb.proctree.kill_tree` spares it (``taskkill /T`` took
     it down, and every device tab lost its shell and logcat at once).
     taskkill, by absolute path, remains the fallback when the process table
-    can't be read.  Never raises."""
+    can't be read.  A shell that ended by itself (``exit``) may have left
+    commands running on its hidden console (``start /b ping -t …``): they
+    are ended as well.  Never raises."""
     try:
-        if proc.poll() is None:
+        if proc.poll() is not None:
+            # Windows keeps the PID the shell's own for as long as this Popen
+            # holds its handle, so what it started is still found by it.
+            # (Elsewhere a reaped PID may be another process's already.)
+            if os.name == "nt":
+                try:
+                    proctree.kill_tree(proc.pid, include_root=False)
+                except Exception:
+                    pass
+        else:
             try:
                 killed = proctree.kill_tree(proc.pid)
             except Exception:

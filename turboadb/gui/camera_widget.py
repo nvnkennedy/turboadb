@@ -351,6 +351,32 @@ class _LocalPrep(QThread):
             self.fail.emit(f"{type(exc).__name__}: {exc}")
 
 
+class _FfmpegFetch(QThread):
+    """Get an ffmpeg onto this PC for a recording (the one-time download).
+
+    A remote camera is watched without one: its ffmpeg runs on the remote
+    PC.  Recording encodes here, so Record fetches it when it is first
+    needed.  *cancel* is the setup dialog's Cancel, as in :class:`_LocalPrep`."""
+
+    progress = pyqtSignal(str)
+    done = pyqtSignal(str)  # the ffmpeg path
+    fail = pyqtSignal(str)
+
+    def __init__(self, cancel):
+        super().__init__()
+        self._cancel = cancel
+
+    def run(self):
+        try:
+            self.done.emit(
+                ffmpeg_tools.ensure_local_ffmpeg(
+                    self.progress.emit, should_cancel=self._cancel.is_set
+                )
+            )
+        except Exception as exc:
+            self.fail.emit(f"{type(exc).__name__}: {exc}")
+
+
 class _RemotePrep(QThread):
     """List cameras on a remote Windows/RDP host over WinRM (NTLM), provisioning
     ffmpeg there (one-time download) if it's missing."""
@@ -474,7 +500,11 @@ class _RemoteStart(QThread):
     Ownership of the started stream is handed over under a lock: if the panel
     stopped or closed meanwhile (:meth:`cancel`), the worker tears the remote
     ffmpeg down itself instead of emitting ``ok``; a result emitted just before the
-    cancel is returned by :meth:`cancel` for the caller to discard."""
+    cancel is returned by :meth:`cancel` for the caller to discard.
+
+    *port* is the stream's own (``remote_webcam.claim_stream_port``).  A
+    stream that was handed over keeps it until it is stopped; one that was not
+    gives it back here, after its own teardown."""
 
     ok = pyqtSignal(int, object)  # remote pid, connected socket
     fail = pyqtSignal(str)
@@ -528,10 +558,11 @@ class _RemoteStart(QThread):
         return False
 
     def run(self):
-        pid = None
-        try:
-            from . import remote_webcam
+        from . import remote_webcam
 
+        pid = None
+        handed_over = False
+        try:
             if self.cancelled():
                 return
             pid = remote_webcam.start_remote_stream(
@@ -575,12 +606,15 @@ class _RemoteStart(QThread):
                 raise RuntimeError(msg)
             sock.settimeout(1.0)
             owned, pid = pid, None  # ownership passes to _deliver
-            self._deliver(owned, sock)
+            handed_over = self._deliver(owned, sock)
         except Exception as exc:
             if pid is not None:
                 self._stop_remote(pid)
             if not self.cancelled():
                 self.fail.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            if not handed_over:
+                remote_webcam.release_stream_port(self.port)
 
 
 class CameraPanel(QWidget):
@@ -598,6 +632,7 @@ class CameraPanel(QWidget):
         self._rec_proc = None
         self._rec_writer = None
         self._rec_path = None
+        self._rec_fetch = None  # gets ffmpeg for a recording (_fetch_ffmpeg_to_record)
         self._finalizers = []  # recording finalize threads (several may overlap)
         self._jobs = []  # background stop jobs (remote ffmpeg / firewall cleanup)
         self._prep = None
@@ -1211,6 +1246,15 @@ class CameraPanel(QWidget):
         from . import remote_webcam
 
         self._cancel_starter()
+        try:
+            # A port of this stream's own: another panel's stream (the Webcam
+            # tab and a device tab's Webcam page may show the same PC) is then
+            # never taken for a stale one, nor stopped with this one.
+            port = remote_webcam.claim_stream_port()
+        except RuntimeError as exc:
+            self._set_status("Couldn't start the remote camera", "error")
+            QMessageBox.warning(self, "Remote camera", str(exc))
+            return
         self.start_btn.setEnabled(False)
         self._set_status(f"Starting {cam} on the remote machine…", "info")
         self._stream_gen += 1
@@ -1224,7 +1268,7 @@ class CameraPanel(QWidget):
             w,
             h,
             fps,
-            remote_webcam.DEFAULT_STREAM_PORT,
+            port,
         )
         # the result is claimed via take_result(), so a stale/late one is discarded
         starter.ok.connect(lambda _pid, _sock, s=starter, c=cam, g=gen: self._remote_started(s, c, g))
@@ -1254,7 +1298,12 @@ class CameraPanel(QWidget):
         def stop():
             from . import remote_webcam
 
-            remote_webcam.stop_remote_stream(host, login, pw, pid, stream_port=port)
+            try:
+                remote_webcam.stop_remote_stream(host, login, pw, pid, stream_port=port)
+            finally:
+                # free for the next stream only now: a start on this port
+                # meanwhile would have been ended by this very stop
+                remote_webcam.release_stream_port(port)
 
         track_remote_stop(run_job(self._jobs, stop))
 
@@ -1579,8 +1628,78 @@ class CameraPanel(QWidget):
             return
         ff = ffmpeg_tools.cached_ffmpeg()
         if not ff:
-            QMessageBox.warning(self, "Recording", "ffmpeg isn't ready yet.")
+            self._fetch_ffmpeg_to_record()
             return
+        self._start_record(ff)
+
+    def _fetch_ffmpeg_to_record(self):
+        """Record was pressed and this PC has no ffmpeg: a remote camera is
+        watched without one (its ffmpeg runs there), and nothing else fetches
+        it.  Offer the one-time download Scan cameras makes for Local, with
+        the same setup dialog, and start the recording once it is here."""
+        if thread_running(self._rec_fetch):
+            return
+        if not ffmpeg_tools._auto_download_supported():
+            QMessageBox.warning(
+                self,
+                "Recording",
+                "Recording needs ffmpeg on this PC.\n\nInstall it (so it's on PATH) or "
+                "set its path in Settings → ffmpeg path, then press Record again.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Recording",
+            "Recording needs ffmpeg on this PC, and there is none here yet.\n\n"
+            "Download it now (one time, about 160 MB)? The recording starts "
+            "as soon as it is ready; the camera stays on meanwhile.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._dl_cancel.clear()
+        fetch = _FfmpegFetch(self._dl_cancel)
+        fetch.progress.connect(self._on_progress)
+        fetch.done.connect(lambda ff, t=fetch: self._ffmpeg_fetched(ff, t))
+        fetch.fail.connect(lambda msg, t=fetch: self._ffmpeg_fetch_failed(msg, t))
+        park_thread(fetch)
+        self._rec_fetch = fetch
+        self.rec_btn.setEnabled(False)
+        self._set_status("Getting ffmpeg for the recording…", "info")
+        fetch.start()
+
+    def _ffmpeg_fetched(self, ffmpeg, fetch):
+        if self._closing or fetch is not self._rec_fetch:
+            return
+        self._rec_fetch = None
+        self._close_dl_dialog()
+        if self.reader is None:  # the stream was stopped meanwhile
+            self._set_status("ffmpeg is ready — Start camera, then Record.", "ok")
+            return
+        self.rec_btn.setEnabled(True)
+        if getattr(self, "_viewing_announced", False):
+            self._set_status(f"● Viewing {self._viewing_cam}", "ok")
+        else:  # (the first frame, still to come, says "Viewing")
+            self._set_status("ffmpeg is ready.", "ok")
+        self._start_record(ffmpeg)
+
+    def _ffmpeg_fetch_failed(self, msg, fetch):
+        if self._closing or fetch is not self._rec_fetch:
+            return
+        self._rec_fetch = None
+        self._close_dl_dialog()
+        self.rec_btn.setEnabled(self.reader is not None)
+        if self._dl_cancel.is_set():
+            # The user pressed Cancel in the setup dialog; that is not an error.
+            self._set_status("ffmpeg setup cancelled — Record to try again.", "warn")
+            return
+        self._set_status("Couldn't get ffmpeg for the recording.", "error")
+        QMessageBox.warning(
+            self, "Recording", f"Couldn't get ffmpeg for the recording:\n\n{msg}"
+        )
+
+    def _start_record(self, ff):
         from .fileutil import ask_save_path
 
         path = ask_save_path(
@@ -1777,10 +1896,11 @@ class CameraPanel(QWidget):
         for thread, names in (
             (self._prep, ("progress", "done", "fail", "finished")),
             (self._probe, ("done",)),
+            (self._rec_fetch, ("progress", "done", "fail")),
         ):
             disconnect_signals(thread, names)
             park_thread(thread)
-        self._prep = self._probe = None
+        self._prep = self._probe = self._rec_fetch = None
         close_jobs(self._finalizers, ("done", "progress"))
         close_jobs(self._jobs)
 

@@ -71,45 +71,42 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
-          <h3><span class="ver">v3.1.0</span> Colour that means something</h3>
+          <h3><span class="ver">v4.0.0</span> Terminals, faster and steadier</h3>
           <ul>
-            <li><b>Errors stand out</b> in the terminals: <b>Permission denied</b>,
-            <b>not found</b>, <b>blocked</b> and other errors and denials in red,
-            warnings in amber, successes in green.</li>
-            <li><b>Everything else stays plain</b>: <code>ls</code> and
-            <code>grep</code> are no longer forced into colour, logcat colours only
-            its warnings and errors, and the prompt is one quiet colour.</li>
-            <li><b>Push and Pull line up</b> in Files, centred between two lists
-            that stay level.</li>
+            <li><b>About four times as fast</b> on plain output, and a flood or a
+            line that never ends no longer stalls the window.</li>
+            <li><b>Stop leaves what answered running</b>: a <code>python</code> or
+            <code>node</code> prompt shows KeyboardInterrupt and stays.</li>
+            <li><b>Emoji, input methods and right-to-left text</b> are drawn and
+            typed properly, and tabs line up at tab stops.</li>
+            <li><b>Colour that means something</b> (3.1): errors and denials in
+            red, warnings in amber, successes in green, the rest plain.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v3.0.0</span> Terminals that behave</h3>
+          <h3><span class="ver">v4.0.0</span> Files and screens you can trust</h3>
           <ul>
-            <li><b>A real device terminal</b> for the Android shell: <code>ping</code>,
-            <code>logcat | grep</code> and prompts that wait for input just work, and
-            Stop sends Ctrl+C.</li>
-            <li><b>Full-screen programs</b>: <code>top</code>, <code>vi</code> and
-            <code>less</code> redraw in place and get every key.</li>
-            <li><b>Stop keeps your shell</b> in PowerShell and CMD, variables and
-            all.</li>
-            <li><b>No stray blank lines</b>, and typing never scrambles streaming
-            output.</li>
+            <li><b>Delete and Rename on the device</b> can no longer land in another
+            folder, and the editor asks before saving over a file that changed.</li>
+            <li><b>Closing TurboADB waits</b> for a recording that is still being
+            saved.</li>
+            <li><b>Keys go to the right display</b> on a multi-display head unit, and
+            Clear data acts on the driver's app.</li>
+            <li><b>A scrcpy window that hangs</b> no longer freezes TurboADB when its
+            tab is closed or its window brought back.</li>
           </ul>
         </div>
         <div class="wn">
-          <h3><span class="ver">v3.0.0</span> Leaner and dependable</h3>
+          <h3><span class="ver">v4.0.0</span> Safer and more honest</h3>
           <ul>
-            <li><b>One adb server</b>: no duplicate adb processes, and only the
-            server TurboADB started is stopped on exit.</li>
-            <li><b>IVI displays start stopped</b>: start one, or all, when you need
-            them.</li>
-            <li><b>TurboADB by name</b> in Task Manager and on the taskbar, with an
-            icon that follows Windows' light or dark mode.</li>
-            <li><b>Logcat keeps every line</b>, even while hidden, and its filter
-            searches the whole capture.</li>
-            <li><b>Open files in their apps</b>: a picture, video or text file on
-            the device opens on the PC, and your saves go back to the device.</li>
+            <li><b>Nothing is run from the current folder</b>: adb, scrcpy, ffmpeg
+            and Windows' own tools are taken only from known places.</li>
+            <li><b>Failures are reported as failures</b>: <code>turboadb devices</code>
+            without adb exits 3, and a refused install is never "done".</li>
+            <li><b>Shortcuts that open the app</b> on installs without PyQt5, and
+            after an upgrade.</li>
+            <li><b>Stop sharing says when sharing will come back</b>, and a share
+            the firewall may block ends on a warning.</li>
           </ul>
         </div>
       </div>
@@ -259,7 +256,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-3.1.0-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-4.0.0-win64.exe</code> from the latest release
           and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
           on first run and adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>
@@ -297,7 +294,7 @@
 turboadb -s SERIAL \
   shell -- getprop ro.product.model
 turboadb -s SERIAL screenshot shot.png</code></pre></div>
-          <p class="muted"><a href="cli.html">All 70 commands →</a></p>
+          <p class="muted"><a href="cli.html">All 99 commands →</a></p>
         </div>
         <div>
           <h3>Python</h3>

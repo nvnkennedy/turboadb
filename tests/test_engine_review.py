@@ -710,16 +710,17 @@ def test_scrcpy_local_host_gets_no_remote_env(monkeypatch):
 
     captured = {}
 
-    class Out:
-        stdout, stderr, returncode = "", "--display-id=0 (1920x1080)", 0
+    class FakeScrcpy:
+        def __init__(self, cmd, **kw):
+            captured["cmd"], captured["env"] = cmd, kw.get("env")
+            kw["stdout"].write(b"--display-id=0 (1920x1080)")
 
-    def fake_run(cmd, **kw):
-        captured["cmd"], captured["env"] = cmd, kw.get("env")
-        return Out()
+        def wait(self, timeout=None):
+            return 0
 
     monkeypatch.setattr(scrcpy, "find_scrcpy", lambda path=None: "scrcpy")
     monkeypatch.setattr(scrcpy, "is_local_host", lambda host: True)
-    monkeypatch.setattr(scrcpy.subprocess, "run", fake_run)
+    monkeypatch.setattr(scrcpy.subprocess, "Popen", FakeScrcpy)
     assert scrcpy.list_displays("s", adb_server_host="192.168.1.5") == [{"id": 0, "size": "1920x1080"}]
     assert not any(a.startswith("--tunnel-host") for a in captured["cmd"])
     assert not (captured["env"] or {}).get("ANDROID_ADB_SERVER_ADDRESS")

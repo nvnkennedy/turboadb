@@ -2,9 +2,11 @@
 
 Back, Home and Recents go to that display (``input -d <id> keyevent``), so the
 cluster or passenger screen gets its own navigation instead of whatever
-display Android considers focused. Volume and power keys are device-wide on
-Android; they are sent the same way. Presses run in order on the device
-command dispatcher, off the UI thread; a failure is reported on :attr:`log`.
+display Android considers focused; display 0 is named as well once the device
+has several displays (see :func:`device_commands.input_display`). Volume and
+power keys are device-wide on Android; they are sent the same way. Presses run
+in order on the device command dispatcher, off the UI thread; a failure is
+reported on :attr:`log`.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from __future__ import annotations
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import QHBoxLayout, QToolButton, QWidget
 
-from .device_commands import command_error
+from .device_commands import command_error, input_display
 from .icons import icon
 
 # (label, icon, key name from ADBHandler.KEYS, tone). Navigation is blue and
@@ -44,6 +46,10 @@ class DisplayControls(QWidget):
         super().__init__(parent)
         self.handler = handler
         self.display_id = int(display_id or 0)
+        # How many displays the device has and its Android API level, which
+        # decide whether display 0's keys name it (set_device).
+        self._displays = 1
+        self._sdk = None
         self._dispatcher = dispatcher
         self._pending = 0
         self._warned_full = False
@@ -89,6 +95,13 @@ class DisplayControls(QWidget):
     def pending(self) -> int:
         return self._pending
 
+    def set_device(self, displays, sdk=None) -> None:
+        """The number of displays the device has, and its Android API level
+        (None: not known): on its own, or where ``input`` takes no display,
+        display 0 keeps the plain key."""
+        self._displays = int(displays or 0)
+        self._sdk = sdk
+
     def send_key(self, key, label=None) -> bool:
         """Queue one key press for this display; False when it was not queued."""
         label = label or str(key)
@@ -101,8 +114,8 @@ class DisplayControls(QWidget):
                 )
             return False
         handler = self.handler
-        # display 0 is the default display: no -d (older Android has none)
-        extra = {"display_id": self.display_id} if self.display_id else {}
+        display = input_display(self.display_id, self._displays, self._sdk)
+        extra = {} if display is None else {"display_id": display}
 
         def run():
             return handler.keyevent(key, safe=True, **extra)

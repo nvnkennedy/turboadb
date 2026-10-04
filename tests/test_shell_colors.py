@@ -221,6 +221,35 @@ def test_every_phrase_is_found_in_any_case(kind, phrases):
             assert words(f"x: {text}.") == [(text, kind)], text
 
 
+@pytest.mark.parametrize("line, expected", [
+    # Java's toLowerCase() and toUpperCase() where the locale is Turkish
+    ("E: Install faıled with error 5", [("faıled", "error"), ("error", "error")]),
+    ("ERROR: PERMİSSİON DENİED", [("ERROR", "error"), ("PERMİSSİON DENİED", "error")]),
+    ("Install faıled", [("faıled", "error")]),
+    ("İNSTALLED", [("İNSTALLED", "success")]),
+    ("acce\u017fs denied", [("acce\u017fs denied", "error")]),       # a long s
+    ("bloc\u212aed by policy", [("bloc\u212aed", "error")]),         # the Kelvin sign
+])
+def test_words_in_letters_another_case_folds_to_are_found_too(line, expected):
+    """In any case, "i" also stands for the Turkish "ı" and "İ" (and "s" for
+    the long "ſ"): such a word raised KeyError, and the output after it in
+    the same read was never drawn."""
+    assert may_mean(line)
+    assert words(line) == expected
+
+
+@pytest.mark.parametrize("kind, phrases", [
+    ("error", shell_colors._ERROR_PHRASES),
+    ("warning", shell_colors._WARNING_PHRASES),
+    ("success", shell_colors._SUCCESS_PHRASES),
+])
+def test_every_phrase_is_found_in_turkish_casing(kind, phrases):
+    for phrase in phrases:
+        for text in (phrase.replace("i", "ı"), phrase.upper().replace("I", "İ")):
+            assert may_mean(f"x: {text}."), text
+            assert words(f"x: {text}.") == [(text, kind)], text
+
+
 def test_a_very_long_line_is_not_searched():
     assert may_mean("x " * 1000 + "error")
     assert not may_mean("x" * 5000 + " error")

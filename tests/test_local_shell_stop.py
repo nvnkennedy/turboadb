@@ -184,9 +184,11 @@ def test_exit_and_close_clear_a_pending_ctrl_c(shell, tmp_path):
     shell.interrupt()
     assert shell._adb_interrupt_timer.isActive()
     shell._send(b"exit\r\n")
-    assert not shell._in_adb_shell and not shell._adb_interrupt_timer.isActive()
+    assert not shell._adb_interrupt_timer.isActive()
+    assert shell._in_adb_shell  # exit may only have left a shell inside it
 
-    _output(shell, f"exit\r\nPS {tmp_path}> ")  # the PC prompt is back
+    _output(shell, f"exit\r\nPS {tmp_path}> ")  # the PC prompt is back: it ended
+    assert not shell._in_adb_shell
     shell._send(b"adb shell\r\n")
     shell.interrupt()
     shell.close_panel()

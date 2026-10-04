@@ -149,6 +149,48 @@ def test_the_device_folder_follows_cd_and_the_device_prompt(make):
     assert widget._get_prompt() == "V2318:/data/user/0/com.example/files $ "
 
 
+def test_exit_in_a_nested_shell_keeps_the_adb_shell(make):
+    """``su`` (or ``sh``, ``run-as pkg``) and then ``exit`` ends only that
+    shell.  The typed word used to end the tab's adb shell as well: Stop then
+    ended adb.exe and the whole adb shell, CMD encoded what was typed for its
+    own code page again, and Tab completed PC paths."""
+    widget = make("cmd")
+    cwd = widget._shell_cwd
+    local = f"{cwd}>\x1b]7717;{cwd}\x07"
+    out(widget, local)
+    submit(widget, "adb shell")
+    out(widget, "adb shell -t -t\r\nPD2318:/ $ ")
+    submit(widget, "su")
+    out(widget, "su\r\r\nPD2318:/ # ")
+    submit(widget, "exit")
+    out(widget, "exit\r\r\nPD2318:/ $ ")  # su ended, the adb shell is still open
+    assert widget._in_adb_shell and widget.session.utf8_input
+    assert widget.term._completion_fn == widget._adb_shell_complete
+    assert widget.term._screen_input == widget._screen_write  # full-screen programs keep their keys
+    submit(widget, "logcat")
+    out(widget, "logcat\r\r\n01-01 12:00:00.000 I Tag: hello\r\r\n")
+    widget.interrupt()
+    assert widget.session.sent[-1] == b"\x03"  # Stop still stops the device command only
+    out(widget, "^C\r\r\n130|PD2318:/ $ ")
+
+    submit(widget, "exit")
+    assert widget._in_adb_shell  # until the PC prompt shows that it ended
+    out(widget, "exit\r\r\n\r\n" + local)
+    assert not widget._in_adb_shell and not widget.session.utf8_input
+    assert widget.term._completion_fn == widget._complete_local_async
+
+
+def test_exit_typed_before_the_device_prompt_showed_ends_with_the_pc_prompt(make):
+    widget = make("cmd")
+    cwd = widget._shell_cwd
+    local = f"{cwd}>\x1b]7717;{cwd}\x07"
+    out(widget, local)
+    submit(widget, "adb shell")
+    submit(widget, "exit")  # typed ahead
+    out(widget, "adb shell -t -t\r\nPD2318:/ $ exit\r\r\n\r\n" + local)  # all in one read
+    assert not widget._in_adb_shell
+
+
 def test_ctrl_z_is_refused_inside_adb_shell_only(make):
     widget = make("cmd")
     assert widget.term.send_key(b"\x1a") is True  # e.g. to end a Python prompt

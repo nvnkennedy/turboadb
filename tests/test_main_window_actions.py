@@ -7,7 +7,10 @@ the remote-deploy and share summaries. No test runs adb: the window's
 workers are inert stand-ins."""
 
 import os
+import subprocess
+import sys
 import threading
+import time
 import types
 
 import pytest
@@ -19,6 +22,9 @@ from PyQt5.QtWidgets import QProgressDialog, QWidget  # noqa: E402
 
 import turboadb.gui.main_window as mw  # noqa: E402
 from turboadb.devices import Device  # noqa: E402
+
+# The launch's update check itself: the window fixture below turns it off.
+_QUIET_UPDATE_CHECK = mw.MainWindow._quiet_update_check
 
 
 class _Tracker(QThread):
@@ -167,6 +173,72 @@ def test_a_broadcast_reports_each_device_as_it_finishes(qapp, monkeypatch):
     worker.line.connect(on_line)
     worker.run()
     assert [line.split(":")[0] for line in lines] == ["[OK] fast", "[OK] slow"]
+
+
+@pytest.fixture
+def slow_adb(monkeypatch):
+    """Every adb command is a real process that would sleep for 30 s; the
+    list of them, so a test can check they are gone."""
+    from turboadb import core
+
+    spawned = []
+    real_popen = subprocess.Popen
+
+    class Recording(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(core.subprocess, "Popen", Recording)
+    sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
+    monkeypatch.setattr(core.ADBHandler, "_base", lambda self, target=True: list(sleeper))
+    yield spawned
+    for proc in spawned:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+
+
+def test_closing_the_window_ends_a_running_broadcast(qapp, window, slow_adb):
+    """Closing only parked the worker: its adb commands ran on, each for up
+    to a minute, and TurboADB stayed in the task list until the last one had
+    ended."""
+    window._bcast = mw._BroadcastThread(["A", "B"], "sleep 30")
+    lines = []
+    window._bcast.line.connect(lines.append)
+    window._bcast.start()
+    worker = window._bcast
+    deadline = time.monotonic() + 10
+    while len(slow_adb) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(slow_adb) == 2  # one adb per device, both running
+    started = time.monotonic()
+    window.close()
+    assert worker.wait(8000), "the broadcast ran on after the window closed"
+    assert time.monotonic() - started < 8  # not the 30 s the commands would have taken
+    assert all(proc.poll() is not None for proc in slow_adb)  # no adb left behind
+    qapp.processEvents()
+    assert lines == []  # and nothing is reported to a window that is gone
+
+
+def test_a_shell_command_can_be_called_off(slow_adb):
+    """What the broadcast uses to end its commands: adb is killed at once and
+    the call fails, in either mode."""
+    from turboadb.config import ADBConfig
+    from turboadb.core import ADBHandler
+    from turboadb.exceptions import ADBError
+
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    result = ADBHandler(ADBConfig(serial="A")).shell("sleep 30", timeout=60, cancel=cancel,
+                                                     safe=True)
+    assert not result.success and "cancelled" in str(result.error)
+    assert time.monotonic() - started < 8
+    assert len(slow_adb) == 1 and slow_adb[0].poll() is not None
+    with pytest.raises(ADBError, match="cancelled"):  # already called off: nothing is started
+        ADBHandler(ADBConfig(serial="A")).shell("sleep 30", cancel=cancel, safe=False)
+    assert len(slow_adb) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -371,6 +443,33 @@ def test_a_scan_that_ends_after_a_newer_tracker_report_is_dropped(window):
     assert _rows(window) == ["R58M123"]
 
 
+def _dots(win):
+    """The colour of each sidebar device row's status dot, as it is painted now."""
+    return [win.live_list.item(row).icon().pixmap(16, 16).toImage().pixelColor(8, 8).name()
+            for row in range(win.live_list.count())]
+
+
+def test_the_sidebars_status_dots_follow_a_theme_switch(qapp, window):
+    """They kept the colours of the theme in force when the devices were
+    listed: after Graphite -> Porcelain the amber dot of a waiting device was
+    the dark theme's, close to invisible on the light sidebar, until the
+    device list next changed."""
+    from turboadb.gui import theme
+
+    try:
+        theme.apply_to_app(qapp, "dark")
+        window._on_devices([Device(serial="R58M123", state="device", model="Pixel"),
+                            Device(serial="HU77", state="unauthorized")])
+        dark = theme.palette("dark")
+        assert _dots(window) == [dark["ok_text"], dark["warn_text"]]
+        window._apply_theme("light", persist=False, announce=False)
+        light = theme.palette("light")
+        assert _dots(window) == [light["ok_text"], light["warn_text"]]
+        assert _rows(window) == ["R58M123", "HU77"]
+    finally:
+        theme.apply_to_app(qapp, "dark")
+
+
 # --------------------------------------------------------------------------- #
 # saved targets and settings that can't be written
 # --------------------------------------------------------------------------- #
@@ -498,6 +597,63 @@ def test_connecting_goes_ahead_when_the_target_cannot_be_saved(window, monkeypat
     assert window.logged[-1].startswith("[ERROR] Could not save the target 'Bench': ")
 
 
+def _connect(window, monkeypatch, session, answer=None):
+    """Connect to *session* as the Connect dialog returns it: the tab opened
+    and what was asked first (answered with *answer*)."""
+    from turboadb.gui import connect_dialog
+
+    class Dialog:
+        Accepted = 1
+
+        def __init__(self, parent):
+            pass
+
+        def exec_(self):
+            return self.Accepted
+
+        def session(self):
+            return dict(session)
+
+        def deleteLater(self):
+            pass
+
+    opened, asked = [], []
+    monkeypatch.setattr(connect_dialog, "ConnectDialog", Dialog)
+    monkeypatch.setattr(window, "_open_session",
+                        lambda target, name: opened.append((dict(target), name)))
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *args, **_kw: asked.append(args[2]) or answer))
+    window.open_connect()
+    return opened, asked
+
+
+def test_a_name_typed_in_connect_does_not_replace_another_device_unasked(window, monkeypatch):
+    """"Save this target as" took a name another saved target had, and that
+    target was gone: the phone replaced the head unit without a word."""
+    bench = {"name": "Bench", "type": "network", "host": "10.0.0.7", "port": 5555}
+    phone = {"name": "Bench", "type": "usb", "serial": "R58M123"}
+    window.store.save(bench)
+    opened, asked = _connect(window, monkeypatch, phone, answer=mw.QMessageBox.No)
+    assert len(asked) == 1 and "'Bench'" in asked[0] and "10.0.0.7:5555" in asked[0]
+    assert window.store.get("Bench") == bench  # kept, and the phone is saved beside it
+    assert window.store.get("Bench (2)") == dict(phone, name="Bench (2)")
+    assert opened == [(dict(phone, name="Bench (2)"), "Bench (2)")]
+    assert window.session_list.count() == 2
+
+    # the device a name already stands for, or a name nobody has: nothing to ask
+    opened, asked = _connect(window, monkeypatch, dict(bench, host="10.0.0.7 "))
+    assert asked == [] and opened == [(dict(bench, host="10.0.0.7 "), "Bench")]
+    opened, asked = _connect(window, monkeypatch,
+                             {"name": "Desk", "type": "usb", "serial": "ABC123"})
+    assert asked == [] and window.store.names() == ["Bench", "Bench (2)", "Desk"]
+    assert window.store.get("Bench") == bench
+
+    opened, asked = _connect(window, monkeypatch, phone, answer=mw.QMessageBox.Yes)
+    assert len(asked) == 1
+    assert window.store.get("Bench") == phone  # replaced, as answered
+    assert opened == [(phone, "Bench")]
+
+
 def test_duplicating_twice_keeps_both_copies(window):
     window.store.save({"name": "HU", "type": "network", "host": "10.0.0.5", "port": 5555})
     window.refresh_sessions()
@@ -555,12 +711,13 @@ def test_a_deploy_that_never_reached_a_host_skipped_none(qapp, monkeypatch):
     assert logged[-1] == "[WARNING] Remote deploy finished: 1 host(s) deployed, 1 failed, 1 skipped"
 
 
-def _share_messages(monkeypatch, install_startup):
+def _share_messages(monkeypatch, install_startup, firewall="firewall: opened"):
     from turboadb import devices
 
     monkeypatch.setattr(devices, "start_shared_server", lambda adb_path=None: "shared server up")
-    monkeypatch.setattr(devices, "open_firewall", lambda ports: "firewall: opened")
+    monkeypatch.setattr(devices, "open_firewall", lambda ports: firewall)
     monkeypatch.setattr(devices, "install_startup", install_startup)
+    monkeypatch.setattr(mw, "_server_answers", lambda: True)  # no probe of a real server
     worker = mw._ShareThread(install_startup=True)
     messages = []
     worker.msg.connect(messages.append)
@@ -578,6 +735,38 @@ def test_a_failed_login_auto_start_does_not_fail_the_share(qapp, monkeypatch):
             "written into a batch file") in messages
     assert messages[-1].startswith("[OK] Other machines can now connect")
     assert not any(message.startswith("[ERROR]") for message in messages)
+
+
+_RULES = "firewall: opened TCP 5037, 27183-27199 on Domain and Private networks"
+_NO_PASSWORD = ". The adb server has no password: share it on trusted networks only."
+
+
+@pytest.mark.parametrize("firewall", [
+    # no Administrator rights, the usual case: no rule was added
+    "firewall: could not open ports (run TurboADB/`turboadb serve` as Administrator, "
+    "or open TCP 5037 + 27183-27199 manually)",
+    _RULES.replace(", 27183-27199", "")
+    + "; could NOT open 27183-27199 (run as Administrator to allow those)" + _NO_PASSWORD,
+    _RULES + "; this PC is on 'Airport Wi-Fi', a Public network: make it Private in Windows "
+    "Settings → Network & internet for other PCs there to connect" + _NO_PASSWORD,
+], ids=["no rule added", "a port left out", "on a Public network"])
+def test_a_share_the_firewall_may_block_ends_on_a_warning(qapp, monkeypatch, firewall):
+    """It was an [INFO] line, followed at once by "[OK] Other machines can now
+    connect", which is what the status bar and the toast ended on."""
+    messages = _share_messages(
+        monkeypatch, lambda port=5037, adb_path=None: "turboadb-shared-adb.bat", firewall)
+    assert "[OK] shared server up" in messages
+    assert any(message.startswith("[OK] Auto-start installed") for message in messages)
+    assert messages[-1].startswith("[WARNING] ") and messages[-1].endswith(firewall)
+    assert sum(firewall in message for message in messages) == 1
+    assert not any("can now connect" in message for message in messages)
+    # with its rules in place (or none to add: not Windows) nothing changes
+    for fine in (_RULES + _NO_PASSWORD, "firewall: not Windows, skipped"):
+        messages = _share_messages(
+            monkeypatch, lambda port=5037, adb_path=None: "turboadb-shared-adb.bat", fine)
+        assert "[INFO] " + fine in messages
+        assert messages[-1].startswith("[OK] Other machines can now connect")
+        assert not any(message.startswith("[WARNING]") for message in messages)
 
 
 class _ShareBox:
@@ -683,6 +872,17 @@ def tools_task(monkeypatch):
         task.wait(5000)
 
 
+def _checks(adb=False, scrcpy=False):
+    """What toolsdl.check_updates() answers: which tool has a newer version out."""
+    def tool(name, installed, newer, outdated):
+        return {"installed": installed, "latest": newer if outdated else installed,
+                "upgrade": outdated, "path": f"C:/tools/{name}.exe", "system": None,
+                "supported": True}
+
+    return {"adb": tool("adb", "35.0.0", "36.0.0", adb),
+            "scrcpy": tool("scrcpy", "3.0", "3.1", scrcpy)}
+
+
 @pytest.mark.parametrize("action", ["Download and reinstall ADB", "Check for updates"])
 def test_a_tools_update_pauses_the_device_tabs_as_a_restart_does(
         qapp, window, monkeypatch, tools_task, action):
@@ -690,7 +890,7 @@ def test_a_tools_update_pauses_the_device_tabs_as_a_restart_does(
     ended, their shell-lost and reconnect paths ran plain adb commands, and
     adb started the server again itself, from the folder being replaced (the
     swap then failed), as a server TurboADB never recorded."""
-    from turboadb import update
+    from turboadb import toolsdl, update
 
     local, remote = _ServerTab(), _ServerTab("lab-pc")
     monkeypatch.setattr(window, "_device_tabs", lambda: [local, remote])
@@ -698,8 +898,11 @@ def test_a_tools_update_pauses_the_device_tabs_as_a_restart_does(
         window._run_tools("fetch", "Downloading…", force=True)
     else:
         monkeypatch.setattr(update, "can_self_update", lambda: False)  # adb and scrcpy only
+        monkeypatch.setattr(update, "check", lambda: None)
+        monkeypatch.setattr(toolsdl, "check_updates", lambda: _checks(adb=True))
         window.upgrade_tools_gui()
         _deliver(qapp, window._upd_chk)
+        _deliver(qapp, window._tools_chk)  # a newer adb is out: the upgrade replaces it
     task = window._dl
     assert task in tools_task.made
     assert task.mode == ("fetch" if action.startswith("Download") else "upgrade")
@@ -712,6 +915,184 @@ def test_a_tools_update_pauses_the_device_tabs_as_a_restart_does(
     assert local.events == ["paused"]
     window._adb_init.ready.emit(True, "ADB server active (127.0.0.1:5037)")
     assert local.events == ["paused", ("resumed", True)] and remote.events == []
+
+
+@pytest.fixture
+def blocked_copy(monkeypatch):
+    """A TurboADB pip cannot update (the standalone exe, a source checkout),
+    with adb and scrcpy up to date; ``found`` is what PyPI has that is newer."""
+    from turboadb import toolsdl, update
+
+    state = types.SimpleNamespace(
+        found=None, reason="running the standalone executable — download the new one")
+    monkeypatch.setattr(update, "can_self_update", lambda: False)
+    monkeypatch.setattr(update, "self_update_blocker", lambda: state.reason)
+    monkeypatch.setattr(update, "check", lambda: state.found)
+    monkeypatch.setattr(update, "check_cached", lambda: state.found)
+    monkeypatch.setattr(toolsdl, "check_updates", lambda: _checks())
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *args, **_kw: mw.QMessageBox.No))
+    return state
+
+
+def test_a_check_that_finds_nothing_to_update_leaves_the_device_tabs_alone(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    """Every tab on this PC's adb server was paused before the check ran: its
+    Android shell closed, whatever ran in it ended and Logcat suspended, and
+    then "ADB restarted…" and a reconnect, though nothing had been touched."""
+    local = _ServerTab()
+    monkeypatch.setattr(window, "_device_tabs", lambda: [local])
+    window._start_poll_timer()
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    assert local.events == []  # asking PyPI stops no server
+    assert window._timer.isActive() and not window._server_task_running()
+    _deliver(qapp, window._tools_chk)
+    assert local.events == [] and tools_task.made == []  # nothing replaced, nobody paused
+    assert window._timer.isActive() and not window._server_task_running()
+    assert "[OK] adb & scrcpy match latest upstream versions." in window.logged
+    _free_deleted(qapp)
+    assert window.findChildren(QProgressDialog) == []
+    # a second check may start: the first one is over
+    window.upgrade_tools_gui()
+    assert window.logged[-1] == "Checking for updates…"
+    _deliver(qapp, window._upd_chk)
+    _deliver(qapp, window._tools_chk)
+
+
+def test_a_newer_scrcpy_alone_pauses_the_tabs_too(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    """Its folder carries an adb of its own, which may be the running server:
+    replacing scrcpy stops the adb server as well."""
+    from turboadb import toolsdl
+
+    local = _ServerTab()
+    monkeypatch.setattr(window, "_device_tabs", lambda: [local])
+    monkeypatch.setattr(toolsdl, "check_updates", lambda: _checks(scrcpy=True))
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    _deliver(qapp, window._tools_chk)
+    assert local.events == ["paused"]
+    assert [task.mode for task in tools_task.made] == ["upgrade"]
+    assert tools_task.made[0].checks == _checks(scrcpy=True)  # not asked for a second time
+
+
+def test_check_for_updates_tells_a_copy_pip_cannot_update_about_a_newer_release(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    """The standalone exe and a source checkout went straight on to adb and
+    scrcpy and ended on "match latest upstream versions": not a word about a
+    newer TurboADB, nor about why it is not installed from here."""
+    blocked_copy.found = "99.0.0"
+    offered = []
+    monkeypatch.setattr(window, "_do_self_update", offered.append)
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    assert offered == []  # pip can't install it here
+    told = [line for line in window.logged if "99.0.0" in line]
+    assert len(told) == 1 and told[0].startswith("[INFO] TurboADB 99.0.0 is available")
+    assert blocked_copy.reason in told[0]
+    kind, title, text = window.boxes[-1]
+    assert (kind, title) == ("information", "Update available")
+    assert "99.0.0" in text and blocked_copy.reason in text
+    assert window._status_version.tone() == "accent"
+    assert "99.0.0 available" in window._status_version.text()
+    _deliver(qapp, window._tools_chk)  # adb and scrcpy are checked all the same
+    assert "[OK] adb & scrcpy match latest upstream versions." in window.logged
+
+
+def test_the_launch_check_tells_a_copy_pip_cannot_update_too(qapp, window, blocked_copy):
+    blocked_copy.found = "99.0.0"
+    _QUIET_UPDATE_CHECK(window)
+    _deliver(qapp, window._upd_quiet)
+    assert window._status_version.tone() == "accent"
+    assert "99.0.0 available" in window._status_version.text()
+    assert window.logged[-1].startswith("[INFO] TurboADB 99.0.0 is available")
+    assert blocked_copy.reason in window.logged[-1]
+    assert "Upgrade button" not in window.logged[-1]  # which could not install it
+
+
+def test_a_tools_download_waits_for_a_check_that_is_still_checking(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    """The check shows the tools' progress dialog while it asks for the newest
+    versions, and no longer counted as a tool task.  "Download and reinstall"
+    chosen meanwhile took that dialog over: the check then closed the
+    download's, and its own stayed on screen for good."""
+    from turboadb import toolsdl
+
+    answered = threading.Event()
+
+    def check_updates():
+        answered.wait(10)
+        return _checks()
+
+    monkeypatch.setattr(toolsdl, "check_updates", check_updates)
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    try:
+        assert window._tools_chk.isRunning()
+        window._run_tools("fetch", "Downloading…", force=True)
+        assert tools_task.made == [] and "already running" in window.logged[-1]
+    finally:
+        answered.set()
+    _deliver(qapp, window._tools_chk)
+    assert "[OK] adb & scrcpy match latest upstream versions." in window.logged
+    _free_deleted(qapp)
+    assert window.findChildren(QProgressDialog) == []
+    window._run_tools("fetch", "Downloading…", force=True)  # the check is over
+    assert [task.mode for task in tools_task.made] == ["fetch"]
+
+
+def test_a_check_that_could_not_be_made_says_so_and_is_over(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    from turboadb import toolsdl
+
+    def check_updates():
+        raise OSError("the tools folder can't be read")
+
+    monkeypatch.setattr(toolsdl, "check_updates", check_updates)
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    _deliver(qapp, window._tools_chk)
+    assert window.logged[-1].startswith("[WARNING] Could not check adb / scrcpy for updates: ")
+    assert "the tools folder can't be read" in window.logged[-1]
+    _free_deleted(qapp)
+    assert window.findChildren(QProgressDialog) == [] and tools_task.made == []
+    window._run_tools("fetch", "Downloading…", force=True)  # a download may start again
+    assert [task.mode for task in tools_task.made] == ["fetch"]
+
+
+def test_a_check_where_no_tool_can_be_downloaded_offers_no_download(
+        qapp, window, monkeypatch, tools_task, blocked_copy):
+    """Where Google builds no adb and scrcpy has no download either (ARM
+    Linux), nothing is downloaded any more.  The check still ended on "match
+    latest upstream versions", offered to download both again, paused the
+    device tabs for that and then said to check the network."""
+    from turboadb import toolsdl
+
+    def tool(latest, system):
+        return {"installed": None, "latest": latest, "upgrade": True, "path": None,
+                "system": system, "supported": False}
+
+    monkeypatch.setattr(toolsdl, "adb_download_supported", lambda: False)
+    monkeypatch.setattr(toolsdl, "scrcpy_download_supported", lambda: False)
+    monkeypatch.setattr(toolsdl, "check_updates",
+                        lambda: {"adb": tool("36.0.0", "34.0.5"), "scrcpy": tool("3.3", None)})
+    asked = []
+    monkeypatch.setattr(mw.QMessageBox, "question", staticmethod(
+        lambda *args, **_kw: asked.append(args[2]) or mw.QMessageBox.Yes))
+    local = _ServerTab()
+    monkeypatch.setattr(window, "_device_tabs", lambda: [local])
+    window.upgrade_tools_gui()
+    _deliver(qapp, window._upd_chk)
+    _deliver(qapp, window._tools_chk)
+    assert asked == [] and tools_task.made == [] and local.events == []
+    assert not any("match latest" in line for line in window.logged)
+    assert window.logged[-1].startswith("[INFO] ") and "package manager" in window.logged[-1]
+    # what is in use is the system's own: said, not "installed None"
+    shown = window.log_panel.view.toPlainText()
+    assert "installed None" not in shown and "34.0.5" in shown
+    _free_deleted(qapp)
+    assert window.findChildren(QProgressDialog) == []
 
 
 def test_tabs_resume_at_once_when_the_tools_update_left_the_server_running(

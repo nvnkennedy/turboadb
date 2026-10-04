@@ -405,6 +405,89 @@ def test_mouse_buttons_and_the_wheel_reach_the_device_in_order(qapp):
         view.close()
 
 
+class TypingHandler(StreamHandler):
+    """Also takes typed text."""
+
+    def input_text(self, text, **kwargs):
+        self.calls.append(("text", text, kwargs))
+        return True
+
+
+def test_the_views_keys_name_display_zero_on_a_device_with_several_displays(qapp):
+    """Right click (Back), middle click (Home) and typed keys for display 0
+    went out without a display: Android sent them to the display in focus,
+    which on a head unit need not be the one shown here.  Taps keep the plain
+    command: pointer events go to display 0 by default."""
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtTest import QTest
+
+    handler = TypingHandler([FakeProc([raw_capture(100, 200)])])
+    view = sv.ScreencapView(handler, {"id": 0}, dispatcher=RunNowDispatcher())
+    try:
+        view.resize(100, 200)
+        view.show()
+        view.start()
+        assert _wait(qapp, lambda: view.frame_size() == (100, 200))
+        QTest.mouseClick(view, Qt.RightButton, Qt.NoModifier, QPoint(50, 100))
+        assert handler.calls == [("key", 4, {"safe": True})]  # the only display, so far
+
+        view.set_device(2, 34)  # two displays, Android 14
+        QTest.mouseClick(view, Qt.RightButton, Qt.NoModifier, QPoint(50, 100))
+        QTest.mouseClick(view, Qt.MiddleButton, Qt.NoModifier, QPoint(50, 100))
+        QTest.keyClick(view, Qt.Key_Return)
+        QTest.keyClick(view, Qt.Key_A, Qt.NoModifier)
+        view._batcher.flush()
+        QTest.mouseClick(view, Qt.LeftButton, Qt.NoModifier, QPoint(50, 100))
+        assert handler.calls[1:] == [
+            ("key", 4, {"safe": True, "display_id": 0}),
+            ("key", 3, {"safe": True, "display_id": 0}),
+            ("key", 66, {"safe": True, "display_id": 0}),
+            ("text", "a", {"safe": True, "display_id": 0}),
+            ("tap", 50, 100, {"safe": True}),
+        ]
+
+        view.set_device(2, 28)  # Android 9: its `input` takes no display
+        QTest.mouseClick(view, Qt.RightButton, Qt.NoModifier, QPoint(50, 100))
+        assert handler.calls[-1] == ("key", 4, {"safe": True})
+    finally:
+        view.close_view()
+        view.close()
+
+
+def test_a_panel_tells_its_screencap_view_about_the_device(qapp):
+    """The screen panel knows how many displays the device has and which
+    Android it runs: the view it draws the screen with names display 0 by the
+    same rule as the panel's own keys."""
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtTest import QTest
+    from turboadb.gui.mirror_panel import MirrorPanel
+
+    handler = TypingHandler([FakeProc([raw_capture(100, 200)])])
+    panel = MirrorPanel(handler, {"name": "ivi"}, dispatcher=RunNowDispatcher())
+    try:
+        panel.set_screen_backend("screencap")
+        panel.set_displays([{"id": 0, "size": "100x200"}, {"id": 3, "size": "1280x720"}])
+        panel.set_device(sdk=34)
+        panel.resize(400, 600)
+        panel.show()
+        panel.start()
+        view = panel.screencap_view()
+        assert _wait(qapp, lambda: view.frame_size() == (100, 200))
+        QTest.mouseClick(view, Qt.RightButton, Qt.NoModifier, QPoint(view.width() // 2, view.height() // 2))
+        QTest.keyClick(view, Qt.Key_Return)  # through the panel's own keyboard route
+        assert handler.calls == [
+            ("key", 4, {"safe": True, "display_id": 0}),
+            ("key", 66, {"safe": True, "display_id": 0}),
+        ]
+        # a device whose Android version is learnt only now
+        panel.set_device(sdk=None)
+        QTest.mouseClick(view, Qt.RightButton, Qt.NoModifier, QPoint(view.width() // 2, view.height() // 2))
+        assert handler.calls[-1] == ("key", 4, {"safe": True})
+    finally:
+        panel.close_panel()
+        panel.close()
+
+
 def test_raw_captures_that_cannot_be_read_fall_back_to_png(qapp):
     bad_gzip = FakeProc([gzip.compress(b"\x01\x00\x00\x00" * 40)], block=False)
     png = FakeProc([png_capture(3, 4)])

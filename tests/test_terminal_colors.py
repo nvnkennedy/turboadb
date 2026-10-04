@@ -8,6 +8,8 @@ where it means something, and the command after it untouched.  Output with
 colours of its own keeps them.  Progress bars that move the cursor along
 their line are drawn in place."""
 
+import time
+
 import pytest
 
 pytest.importorskip("PyQt5")
@@ -319,6 +321,20 @@ def test_a_line_that_only_looks_like_a_prompt_is_left_alone(qapp):
         _close(term)
 
 
+def test_a_prompt_with_an_emoji_in_its_path_is_coloured_to_its_end(qapp):
+    term = _console()
+    try:
+        term.feed("1|host:/sdcard/📁 $ ")
+        term.mark_prompt()
+        _render(term)
+        default = _color(theme.TERM_FG)
+        assert _runs(term, 0) == _prompt_colors(
+            ("1|", "status"), ("host", "host"), (":", "colon"), ("/sdcard/📁", "path"),
+        ) + [(" ", default, False)] + _prompt_colors(("$", "mark")) + [(" ", default, False)]
+    finally:
+        _close(term)
+
+
 def test_a_prompt_with_colours_of_its_own_keeps_them(qapp):
     term = _console()
     try:
@@ -363,6 +379,110 @@ def test_every_prompt_is_drawn_in_one_quiet_colour(qapp):
         _render(term)
         prompt = "PS C:\\Users\\dev>"
         assert _shown(term, 0, prompt) == quiet
+    finally:
+        _close(term)
+
+
+# the invisible mark the PowerShell and CMD terminals end every prompt with
+PS_MARK = "\x1b]7717;C:\\w\x07"
+CMD_MARK = "\x1b]7717;C:\\w\x1b\\"
+
+
+@pytest.mark.parametrize("line, word", [
+    ("e: C:\\proj\\app\\src\\Foo.kt: (12, 5): Type mismatch: inferred type is List<String> but Set<String>",
+     None),
+    ("E: mount: /data -> Permission denied", "Permission denied"),
+    ("u:r:zygote:s0 pid 412 <pre-initialized> failed", "failed"),
+    ("C:\\proj\\src\\main.c(12): warning: conversion 'int' -> 'char'", "warning"),
+    ("PS aux > /sdcard/ps.txt: Permission denied", "Permission denied"),
+], ids=["kotlin", "mount", "selinux", "compiler", "ps"])
+@pytest.mark.parametrize("pty", [False, True], ids=["local", "device"])
+def test_output_that_only_looks_like_a_local_prompt_keeps_its_look(qapp, pty, line, word):
+    """A line starting with a letter and a colon was drawn as cmd's prompt up
+    to its first ">", and had none of its words coloured."""
+    term = _console(pty)
+    try:
+        term.feed("first\r\n" + line + "\r\nlast\r\n")
+        term.feed(line)  # ... also where a read ends in the middle of such a line
+        term.feed(" and more\r\n")
+        _render(term)
+        quiet = _color(theme.TERM_PROMPT)
+        for n in (1, 3):
+            looks = {run[1] for run in _runs(term, n)}
+            assert quiet not in looks, _runs(term, n)
+        if word is None:
+            assert set(_chars(term, 1)) == {_plain()}
+        else:
+            assert _shown(term, 1, word) == _meaning("warning" if word == "warning" else "error")
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("output, prompt, lines", [
+    ("dir\r\n file.txt\r\nPS C:\\w> " + PS_MARK, "PS C:\\w>", [2]),          # PowerShell's
+    ("dir\r\n file.txt\r\n\r\nC:\\w>" + CMD_MARK, "C:\\w>", [3]),            # cmd's
+    ("cmd\r\nMicrosoft Windows\r\n\r\nC:\\w>", "C:\\w>", [3]),               # a shell in the shell: no mark
+    ("PS C:\\w> " + PS_MARK + "dir\r\n file.txt\r\nPS C:\\w> " + PS_MARK,   # ... and the echo of a line
+     "PS C:\\w>", [0, 2]),                                                   # typed ahead in the same read
+], ids=["powershell", "cmd", "nested", "typed ahead"])
+def test_a_local_shells_own_prompt_is_still_coloured(qapp, output, prompt, lines):
+    term = _console(pty=False)
+    try:
+        term.feed(output)
+        _render(term)
+        quiet = _color(theme.TERM_PROMPT), False
+        for n in lines:
+            assert _shown(term, n, prompt) == quiet, n
+        assert _shown(term, 1, "file.txt" if "file.txt" in output else "Microsoft") == _plain()
+        if len(lines) == 2:
+            assert _shown(term, 0, "dir") == _plain()  # the command after a prompt
+    finally:
+        _close(term)
+
+
+def test_a_prompt_whose_mark_comes_in_the_next_read_is_coloured_too(qapp):
+    term = _console(pty=False)
+    try:
+        term.feed("done\r\nPS C:\\w> ")
+        term.feed(PS_MARK)
+        _render(term)
+        assert _shown(term, 1, "PS C:\\w>") == (_color(theme.TERM_PROMPT), False)
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("prompt, mark", [("PS C:\\w> ", PS_MARK), ("C:\\w>", CMD_MARK)],
+                         ids=["powershell", "cmd"])
+@pytest.mark.parametrize("cut", [1, 2, 9])
+def test_a_prompt_whose_mark_is_cut_by_the_read_is_coloured_too(qapp, prompt, mark, cut):
+    """A read that ended after the first byte of the mark left the prompt in
+    front of it in the default colour (a read ends anywhere in 4 KB of output)."""
+    term = _console(pty=False)
+    try:
+        term.feed("done\r\n" + prompt + mark[:cut])
+        term.feed(mark[cut:] + "dir\r\n")
+        _render(term)
+        assert term.toPlainText() == "done\n" + prompt + "dir\n"
+        assert _shown(term, 1, prompt.strip()) == (_color(theme.TERM_PROMPT), False)
+        assert _shown(term, 1, "dir") == _plain()
+        assert term._sb.full_text() == "done\n" + prompt + "dir\n"
+    finally:
+        _close(term)
+
+
+def test_a_device_terminal_has_no_local_prompt_to_colour(qapp):
+    """What a device prints is never PowerShell's or cmd's prompt, whatever
+    it looks like: a device shell's own prompt is coloured when its owner
+    recognises it (mark_prompt)."""
+    term = _console(pty=True)
+    try:
+        term.feed("cat notes.txt\r\nPS C:\\w> ")
+        _render(term)
+        assert set(_chars(term, 1)) == {_plain()}
+        term.feed("\r\nV2318:/ $ ")
+        term.mark_prompt()
+        _render(term)
+        assert _shown(term, 2, "V2318") == _prompt_look("host")
     finally:
         _close(term)
 
@@ -434,6 +554,40 @@ def test_a_line_with_colours_of_its_own_has_no_words_coloured(qapp):
         _close(term)
 
 
+def test_words_after_an_emoji_are_coloured_where_they_are(qapp):
+    """A word's place counts characters, the view's positions count an emoji
+    twice: the colour began a character early for every emoji before it."""
+    term = _console()
+    try:
+        term.feed("🔥 build failed\r\n🚀🚀 Done, 0 errors\r\n")
+        _render(term)
+        assert _shown(term, 0, "🔥 build ") == _plain()
+        assert _shown(term, 0, "failed") == _meaning("error")
+        assert _shown(term, 1, "🚀🚀 ") == _plain()
+        assert _shown(term, 1, "Done") == _meaning("success")
+        assert _shown(term, 1, ", ") == _plain()
+        assert _shown(term, 1, "0 errors") == _meaning("success")
+    finally:
+        _close(term)
+
+
+def test_a_word_cased_for_a_turkish_locale_never_stops_the_drawing(qapp):
+    """Java's toLowerCase() makes "faıled" of FAILED there: looking up what
+    it says raised KeyError, and the lines after it were never drawn."""
+    term = _console()
+    try:
+        term.feed("E: Install faıled with error 5\r\nline after 1\r\n"
+                  "ERROR: PERMİSSİON DENİED\r\nline after 2\r\n")
+        _render(term)
+        assert term.toPlainText() == ("E: Install faıled with error 5\nline after 1\n"
+                                      "ERROR: PERMİSSİON DENİED\nline after 2\n")
+        assert _shown(term, 0, "faıled") == _meaning("error")
+        assert _shown(term, 0, " with ") == _plain()
+        assert _shown(term, 2, "PERMİSSİON DENİED") == _meaning("error")
+    finally:
+        _close(term)
+
+
 def test_the_prompt_and_the_command_after_it_have_no_words_coloured(qapp):
     term = _console()
     try:
@@ -488,5 +642,114 @@ def test_moves_also_work_on_a_pipe(qapp):
         _render(term)
         assert term.document().firstBlock().text() == "abc xignored"
         assert not term.has_screen()
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("text, shown", [
+    ("🚀🚀🚀 10%\rab", "ab🚀🚀 10%"),                              # two positions: one emoji
+    ("🚀🚀🚀 10%\ra", "a🚀🚀 10%"),                                # never half of one
+    ("cafe\N{COMBINING ACUTE ACCENT}!\rCAFE", "CAFE!"),           # a letter goes with its accent
+    ("ab🚀\bX", "abX"),                                           # a backspace: back over all of it
+    ("ab🚀cd\x1b[4G\x1b[1X", "ab  cd"),                           # ECH
+    ("ab🚀cd\x1b[3G\x1b[1P", "abcd"),                             # DCH
+    ("🚀🚀x\x1b[2G\x1b[1K", "  🚀x"),                              # EL 1
+    ("🚀🚀x\x1b[2GZ", "Z🚀x"),                                    # a column inside an emoji is its start
+], ids=["two", "one", "accent", "backspace", "ech", "dch", "el1", "column"])
+def test_moves_and_overwrites_take_whole_characters(qapp, text, shown):
+    """An emoji is two positions of the document and a letter with a joined
+    accent is two: none of them is ever cut in half."""
+    term = _console()
+    try:
+        term.feed(text)
+        _render(term)
+        assert term.document().firstBlock().text() == shown
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("text, shown", [
+    ("processor\t: 0", "processor       : 0"),              # /proc/cpuinfo: its colons in column 16
+    ("BogoMIPS\t: 38.40", "BogoMIPS        : 38.40"),       # (a stop is always ahead of the cursor)
+    ("CPU implementer\t: 0x41", "CPU implementer : 0x41"),
+    ("\tat Main.run", "        at Main.run"),
+    ("a\tb\tc", "a       b       c"),
+    ("ab\x1b[3C\tx", "ab      x"),                          # from where a move left the cursor
+    ("\x1b[32mgreen\x1b[0m\tplain", "green   plain"),       # ... or text drawn before
+    ("🚀\tx", "🚀      x"),                                  # an emoji is two columns wide
+    ("0123456789\rab\tcd", "ab234567cd"),                   # over a line: a move, nothing is erased
+    ("0123\rab\tcd", "ab23    cd"),                         # ... and blanks past its end
+    ("0123456789\r\tZ", "01234567Z9"),
+], ids=["cpuinfo", "stop ahead", "one blank", "start", "two", "after a move", "after colour", "emoji",
+        "over", "over and past", "over from the start"])
+@pytest.mark.parametrize("pieces", [1, 2, 3])
+def test_a_tab_moves_to_the_next_tab_stop(qapp, text, shown, pieces):
+    """A tab was four blanks wherever it stood: columns a terminal lines up
+    (``cat /proc/cpuinfo``) were ragged, and over a line it wiped four
+    characters.  The stops are eight columns apart, as on a program's screen."""
+    term = _console()
+    try:
+        size = -(-len(text) // pieces)
+        for start in range(0, len(text), size):  # in one read, or cut in two or three
+            term.feed(text[start:start + size])
+            _render(term)
+        assert term.document().firstBlock().text() == shown
+    finally:
+        _close(term)
+
+
+def test_tabs_line_up_in_every_line_of_a_read(qapp):
+    term = _console(pty=False)
+    try:
+        term.feed("processor\t: 0\r\nBogoMIPS\t: 38.40\r\nCPU implementer\t: 0x41\r\n"
+                  "Features\t: fp asimd\r\n\r\nx\ty\r\n")
+        _render(term)
+        assert term.toPlainText() == ("processor       : 0\nBogoMIPS        : 38.40\n"
+                                      "CPU implementer : 0x41\nFeatures        : fp asimd\n\n"
+                                      "x       y\n")
+    finally:
+        _close(term)
+
+
+@pytest.mark.parametrize("pty", [True, False])
+def test_a_line_of_many_tabs_costs_no_more_than_its_length(qapp, pty):
+    """Every tab counted its line's text again from the start: a table of
+    tab-separated values was drawn ten to seventy times as slowly as with
+    four blanks a tab, and a few lines of a thousand columns held the window."""
+    term = _console(pty)
+    try:
+        row = "\t".join(str(n % 10) for n in range(501))
+        started = time.perf_counter()
+        term.feed((row + "\r\n") * 100)
+        _render(term)
+        assert time.perf_counter() - started < 2.0
+        shown = "".join(f"{n % 10:<8}" for n in range(500)) + "0"
+        assert term.toPlainText() == (shown + "\n") * 100
+    finally:
+        _close(term)
+
+
+# "loading" in Arabic and in Hebrew, written from right to left
+ARABIC = "".join(map(chr, (0x62A, 0x62D, 0x645, 0x64A, 0x644)))
+HEBREW = "".join(map(chr, (0x5D8, 0x5D5, 0x5E2, 0x5DF)))
+
+
+@pytest.mark.parametrize("word", [ARABIC, HEBREW], ids=["arabic", "hebrew"])
+def test_a_right_to_left_line_is_written_over_in_place(qapp, word):
+    """A cursor step to the right goes back in a right-to-left line: its
+    progress was never written over, the end of the line above went
+    instead, and a spinner grew by a character for every backspace."""
+    term = _console()
+    try:
+        term.feed("previous line of output\r\n" + word + " 10%")
+        _render(term)
+        term.feed("\r" + word + " 20%")
+        _render(term)
+        assert term.toPlainText() == "previous line of output\n" + word + " 20%"
+        term.feed("\r\n" + word + " |")
+        for frame in "/-\\":
+            term.feed("\b" + frame)
+            _render(term)
+        assert term.toPlainText() == "previous line of output\n" + word + " 20%\n" + word + " \\"
     finally:
         _close(term)

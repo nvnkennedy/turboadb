@@ -3,10 +3,11 @@
 Every line is classified as INFO / OK (success) / WARN / ERROR — or DEBUG for the
 raw ``adb`` command trace, which is **hidden by default** so the log isn't noisy.
 A "Show" selector reveals more (Verbose shows the adb commands; or narrow to just
-Warnings/Errors). Save writes exactly what's shown, with a timestamped name."""
+Warnings/Errors). Save writes the levels that are shown, with a timestamped name."""
 
 from __future__ import annotations
 
+import heapq
 import re
 import time
 import webbrowser
@@ -88,13 +89,50 @@ def classify(text: str):
     return "INFO", text, None
 
 
+# How many lines the record keeps of each level, and the view at most.
+_KEPT_PER_LEVEL = 20000
+
+
+class _Record:
+    """The log's entries, ``(time, level, message)``, in the order they came.
+
+    Save and a change of "Show" work from here, so it must hold every line
+    the view still shows.  One list for all levels did not: the adb trace,
+    hidden by default and far more frequent than anything else, filled it and
+    pushed out an error that was still on screen.  Each level keeps its own
+    newest *limit* lines instead, and the view holds no more than that many,
+    so whatever "Show" is set to, a line on screen is among the newest of its
+    own level."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._levels = {}  # level -> deque of (number, entry)
+        self._added = 0  # numbers the entries: their order across levels
+
+    def append(self, entry) -> None:
+        kept = self._levels.get(entry[1])
+        if kept is None:
+            kept = self._levels[entry[1]] = deque(maxlen=self.limit)
+        self._added += 1
+        kept.append((self._added, entry))
+
+    def clear(self) -> None:
+        self._levels.clear()
+
+    def __len__(self) -> int:
+        return sum(len(kept) for kept in self._levels.values())
+
+    def __iter__(self):
+        return (entry for _number, entry in heapq.merge(*self._levels.values()))
+
+
 class LogPanel(QGroupBox):
     def __init__(self, parent=None):
         # The dock already titles this panel "Log"; a second group-box title
         # repeated it.
         super().__init__("", parent)
         self.setObjectName("logPanel")
-        self._entries = deque(maxlen=20000)  # (ts, level, msg) — the full record
+        self._entries = _Record(_KEPT_PER_LEVEL)  # (ts, level, msg): the full record
         self._min_rank = 1  # "Normal": hide DEBUG by default
 
         lay = QVBoxLayout(self)
@@ -103,7 +141,8 @@ class LogPanel(QGroupBox):
         self.view = QPlainTextEdit()
         self.view.setReadOnly(True)
         self.view.setFont(QFont("Consolas", 9))
-        self.view.setMaximumBlockCount(80000)
+        # as many lines as the record keeps of one level (and the empty last block)
+        self.view.setMaximumBlockCount(self._entries.limit + 1)
         # the log dock is DARK in both themes so its colour-coding stays readable
         self.view.setObjectName("logBox")  # terminal colours (theme.py)
 
@@ -202,9 +241,13 @@ class LogPanel(QGroupBox):
 
     def _rerender(self):
         self.view.clear()
-        for entry in self._entries:
-            if _LEVELS[entry[1]][0] >= self._min_rank:
-                self._render(entry)
+        # the newest lines of the levels shown: the view holds no more
+        shown = deque(
+            (entry for entry in self._entries if _LEVELS[entry[1]][0] >= self._min_rank),
+            maxlen=self._entries.limit,
+        )
+        for entry in shown:
+            self._render(entry)
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -218,7 +261,8 @@ class LogPanel(QGroupBox):
         self.view.clear()
 
     def _save(self):
-        """Save exactly what is shown, off the UI thread, reporting real errors."""
+        """Save the levels that are shown (every line the record has of them),
+        off the UI thread, reporting real errors."""
         from .fileutil import save_output, write_text_file
 
         text = "".join(

@@ -210,6 +210,46 @@ def test_the_connect_dialogs_share_pins_its_adb_in_the_login_launcher(qapp, pinn
 
 
 # --------------------------------------------------------------------------- #
+# a SYSTEM startup task that this user may not remove
+# --------------------------------------------------------------------------- #
+def test_stop_sharing_says_when_the_startup_task_stays(qapp, monkeypatch):
+    """It logged "removed auto-start: none was installed" and "will not start
+    the shared server automatically" while the task was still there."""
+    stopped, said = [], []
+
+    def refuse():
+        raise RuntimeError("the SYSTEM startup task is still installed: access is denied")
+
+    monkeypatch.setattr(devices, "uninstall_startup", lambda: False)
+    monkeypatch.setattr(devices, "uninstall_serve_task", refuse)
+    monkeypatch.setattr(devices, "stop_shared_server",
+                        lambda port=5037, adb_path=None: stopped.append(adb_path) or "stopped")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda *a, **k: True)
+    worker = mw._StopShareThread(adb_path="C:/tools/adb.exe")
+    worker.msg.connect(said.append)
+    worker.run()  # the worker's body, on this thread
+    assert stopped == ["C:/tools/adb.exe"] and worker.server_up  # sharing stops now all the same
+    text = "\n".join(said)
+    assert "[WARNING]" in text and "still installed" in text and "as Administrator" in text
+    assert "none was installed" not in text
+    assert "will not start the shared server automatically" not in text
+
+
+def test_stop_sharing_without_a_startup_task_says_so_as_before(qapp, monkeypatch):
+    said = []
+    monkeypatch.setattr(devices, "uninstall_startup", lambda: False)
+    monkeypatch.setattr(devices, "uninstall_serve_task", lambda: False)
+    monkeypatch.setattr(devices, "stop_shared_server", lambda port=5037, adb_path=None: "stopped")
+    monkeypatch.setattr(tools, "is_adb_server_alive", lambda *a, **k: True)
+    worker = mw._StopShareThread()
+    worker.msg.connect(said.append)
+    worker.run()
+    assert said == ["[OK] removed auto-start: none was installed", "[OK] stopped",
+                    "[OK] This PC no longer shares its devices and will not start the "
+                    "shared server automatically."]
+
+
+# --------------------------------------------------------------------------- #
 # "at login" in the Connect dialog
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("system, offered", [("nt", True), ("posix", False)])

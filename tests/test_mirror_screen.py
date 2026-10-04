@@ -237,7 +237,9 @@ def test_reparent_lets_clicks_on_scrcpy_notify_the_container(monkeypatch):
 def rec(app, monkeypatch, tmp_path):
     import turboadb.gui.mirror_panel as mp_mod
 
-    ns = types.SimpleNamespace(launches=[], stops=[], discards=[], viewer_stops=[])
+    ns = types.SimpleNamespace(
+        launches=[], stops=[], discards=[], viewer_stops=[], record_closes=[]
+    )
     ns.path = str(tmp_path / "clip.mp4")
 
     class _Thread:
@@ -280,8 +282,17 @@ def rec(app, monkeypatch, tmp_path):
             ns.stops.remove(self)
             ns.viewer_stops.append(self)
 
+    class RecordClose(Stop):
+        """Closes the scrcpy that recorded its own screen."""
+
+        def __init__(self, session, window_title=None, window_handle=None):
+            super().__init__(session)
+            ns.stops.remove(self)
+            ns.record_closes.append(self)
+
     monkeypatch.setattr(mp_mod, "_MirrorLaunchThread", Launch)
     monkeypatch.setattr(mp_mod, "_RecorderStopThread", Stop)
+    monkeypatch.setattr(mp_mod, "_RecWaitThread", RecordClose)
     monkeypatch.setattr(mp_mod, "_RecorderDiscardThread", Discard)
     monkeypatch.setattr(mp_mod, "_MirrorStopThread", ViewerStop)
     monkeypatch.setattr(
@@ -454,6 +465,137 @@ def test_confirmed_parallel_recorder_is_kept_and_saved_when_it_ends(rec):
         _close(panel)
 
 
+_OLD_RECORDING = b"\x00\x00\x00\x20ftypisom" + b"yesterday's drive " * 2000
+
+
+def _recording_from_yesterday(path):
+    """The file the user chose to overwrite: a recording saved a day ago."""
+    with open(path, "wb") as fh:
+        fh.write(_OLD_RECORDING)
+    past = time.time() - 86400
+    os.utime(path, (past, past))
+
+
+def test_a_file_being_overwritten_does_not_confirm_the_recording(rec):
+    """Recording over an existing file: its old size was read as the first
+    video data, so the recording counted as started before scrcpy had written
+    anything, and a recorder that never did was never replaced."""
+    _recording_from_yesterday(rec.path)
+    panel, _live, calls = _live_panel()
+    device, logs = [], []
+    panel._record_device = lambda path, display_id=None: device.append(path)
+    panel.log.connect(logs.append)
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        panel._poll_parallel_record()
+        assert not panel._rec_confirmed  # scrcpy has not opened the file yet
+        assert not any("recording started" in line for line in logs)
+        panel._rec_started_t = time.time() - 60  # and still has not a minute later
+        panel._poll_parallel_record()
+        assert device == [rec.path]  # the device records instead
+        assert [d.session for d in rec.discards] == [recorder]
+        assert calls == []
+    finally:
+        _close(panel)
+
+
+def test_a_recorder_that_wrote_nothing_is_not_saved_as_the_file_it_would_replace(rec):
+    _recording_from_yesterday(rec.path)
+    panel, _live, _calls = _live_panel()
+    device, finished = [], []
+    panel._record_device = lambda path, display_id=None: device.append(path)
+    panel._record_finished = finished.append
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        panel._poll_parallel_record()
+        panel._rec_started_t = time.time() - 30  # well past the start-up grace
+        recorder.running = False  # it ended without ever opening the file
+        panel._poll_parallel_record()
+        assert finished == []  # yesterday's recording is not today's
+        assert device == [rec.path]
+    finally:
+        _close(panel)
+
+
+def test_an_overwritten_file_confirms_the_recording_once_scrcpy_writes_it(rec):
+    _recording_from_yesterday(rec.path)
+    panel, _live, _calls = _live_panel()
+    device, logs = [], []
+    panel._record_device = lambda path, display_id=None: device.append(path)
+    panel.log.connect(logs.append)
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        with open(rec.path, "wb"):
+            pass  # scrcpy opened it: empty until the first video data
+        panel._poll_parallel_record()
+        assert not panel._rec_confirmed
+        with open(rec.path, "wb") as fh:
+            fh.write(b"\x00\x00\x00\x20ftypisom")
+        panel._poll_parallel_record()
+        assert panel._rec_confirmed and device == []
+        assert any("recording started" in line for line in logs)
+    finally:
+        _close(panel)
+
+
+def test_stopping_before_the_recorder_wrote_never_reports_the_old_file_as_saved(
+    rec, monkeypatch
+):
+    import turboadb.gui.mirror_panel as mp_mod
+
+    _recording_from_yesterday(rec.path)
+    saved, warned, logs = [], [], []
+    monkeypatch.setattr(mp_mod, "saved_dialog", lambda *args, **_k: saved.append(args[1]))
+    monkeypatch.setattr(
+        mp_mod.QMessageBox, "warning", lambda *args, **_k: warned.append(args[2])
+    )
+    panel, _live, _calls = _live_panel()
+    panel.log.connect(logs.append)
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        panel._toggle_record()  # Stop recording, before scrcpy had opened the file
+        rec.stops[0].done.emit(True)
+        assert saved == [] and not any(line.startswith("[OK]") for line in logs)
+        assert any(line.startswith("[ERROR]") and "no data" in line for line in logs)
+        assert not any("MP4 index" in line for line in logs)  # (that is the old file's)
+        assert len(warned) == 1 and "has not been changed" in warned[0]
+        with open(rec.path, "rb") as fh:
+            assert fh.read() == _OLD_RECORDING
+        assert not panel._recording and not panel._record_finalizing
+    finally:
+        _close(panel)
+
+
+def test_a_recording_saved_over_an_old_file_is_reported_as_saved(rec, monkeypatch):
+    import turboadb.gui.mirror_panel as mp_mod
+
+    _recording_from_yesterday(rec.path)
+    saved, logs = [], []
+    monkeypatch.setattr(mp_mod, "saved_dialog", lambda *args, **_k: saved.append(args[1]))
+    panel, _live, _calls = _live_panel()
+    panel.log.connect(logs.append)
+    try:
+        panel._begin_record()
+        recorder = _Session()
+        rec.launches[0].done.emit(recorder)
+        with open(rec.path, "wb") as fh:
+            fh.write(b"\x00\x00\x00\x20ftypisom")
+        panel._toggle_record()
+        rec.stops[0].done.emit(True)
+        assert saved == [rec.path]
+        assert any(line == f"[OK] recording saved → {rec.path}" for line in logs)
+    finally:
+        _close(panel)
+
+
 def test_closing_the_tab_mid_parallel_recording_finalises_the_file(rec):
     panel, live, _calls = _live_panel()
     del panel.stop  # the real viewer stop runs on close
@@ -469,6 +611,390 @@ def test_closing_the_tab_mid_parallel_recording_finalises_the_file(rec):
         panel._recording = False
         panel._scrcpy = None
         panel.close()
+
+
+# --------------------------------------------------------------------------- #
+# Record pressed while scrcpy is still starting, or the old screen closing
+# --------------------------------------------------------------------------- #
+def _spin(app):
+    for _ in range(3):  # a queued start runs from the event loop
+        app.processEvents()
+
+
+def test_another_screen_request_never_replaces_a_recording_start_that_waits(rec, app):
+    """Record while scrcpy was still launching, then Device camera: the camera
+    start took the place of the start that carried the recording, and was then
+    refused because a recording was "running". Record stayed on "Starting
+    recording…" and the screen could not be started until the tab was closed."""
+    panel = _panel()
+    try:
+        panel.start()  # scrcpy is launching
+        (launch,) = rec.launches
+        panel._begin_record()
+        assert panel._rec_integrated_starting and panel._queued_start["record"] == rec.path
+        panel._mirror_camera()  # Options → Device camera
+        assert panel._queued_start["record"] == rec.path  # still the recording's start
+        assert "Stop the current recording" in panel.status.text()
+        launch.done.emit(_Session())  # the launch Record cancelled reports
+        (closing,) = rec.viewer_stops
+        closing.done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 2 and rec.launches[1].opts.record == rec.path
+        rec.launches[1].done.emit(_Session())
+        assert panel._recording and not panel._rec_integrated_starting
+        assert panel.btn_record.isEnabled() and panel.btn_record.text() == "Stop recording"
+    finally:
+        _close(panel)
+
+
+def test_a_recording_start_behind_a_closing_screen_survives_another_start(rec, app):
+    panel = _panel()
+    try:
+        panel.start()
+        rec.launches[0].done.emit(_Session())
+        panel.stop()  # the screen is closing
+        (closing,) = rec.viewer_stops
+        assert panel._stopping_mirror
+        panel._begin_record()
+        panel.start(embed=False)  # the tab menu's "Open screen in a separate window"
+        assert panel._queued_start["record"] == rec.path
+        closing.done.emit(True)
+        _spin(app)
+        assert rec.launches[-1].opts.record == rec.path
+    finally:
+        _close(panel)
+
+
+def test_a_retry_never_replaces_a_recording_start_that_waits(rec, app):
+    panel = _panel()
+    try:
+        panel.start()
+        rec.launches[0].done.emit(_Session())
+        panel._scrcpy_window_up = lambda: False
+        panel._start_t = time.time() - 60  # no window in time: closed, to be retried
+        panel._check_alive()
+        assert panel._stopping_mirror and panel._retry_pending
+        panel._begin_record()  # Record takes the retry's place
+        assert not panel._retry_pending
+        panel._retry_start()  # (a retry that fired all the same)
+        assert panel._queued_start["record"] == rec.path
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 2 and rec.launches[1].opts.record == rec.path
+    finally:
+        _close(panel)
+
+
+def test_stop_cancels_a_recording_start_and_leaves_the_panel_usable(rec, app):
+    """Separate window, Record, Stop, Device camera, and then the launch
+    fails: the camera start was taken for the start with the recording."""
+    panel = _panel()
+    try:
+        panel._popout_mirror()  # scrcpy is launching
+        panel._begin_record()
+        panel.stop()  # neither is wanted any more
+        assert not panel._recording and not panel._rec_integrated_starting
+        assert panel.btn_record.isEnabled() and panel.btn_record.text() == "Record…"
+        panel._mirror_camera()  # asked for while the cancelled launch still runs
+        rec.launches[0].fail.emit("adb: device offline")
+        _spin(app)
+        assert not panel._recording and panel.btn_record.isEnabled()
+        assert len(rec.launches) == 2
+        assert rec.launches[1].opts.video_source == "camera"  # what was asked for last
+        assert rec.launches[1].opts.record is None
+    finally:
+        _close(panel)
+
+
+def test_a_cancelled_launch_with_another_start_waiting_still_ends_the_recording_start(rec):
+    """Whatever start waits, only one that carries the recording keeps it."""
+    panel = _panel()
+    try:
+        panel.start()
+        panel._begin_record()
+        panel._queued_start = {"embed": False}  # a start without the recording
+        panel._clear_cancelled_record_start()
+        assert not panel._recording and not panel._rec_integrated_starting
+        assert panel._rec_mode is None
+    finally:
+        _close(panel)
+
+
+# --------------------------------------------------------------------------- #
+# a display picked while a screen start is under way
+# --------------------------------------------------------------------------- #
+_TWO_DISPLAYS = [{"id": 0, "size": "1080x2400"}, {"id": 2, "size": "1920x720"}]
+
+
+def _pick(panel, display_id):
+    """Choose a display in the picker, as a click on its list does."""
+    index = panel.cmb_display.findData(display_id)
+    panel.cmb_display.setCurrentIndex(index)
+    panel._on_display_combo_changed(index)
+
+
+def test_a_display_picked_while_scrcpy_launches_is_the_one_that_starts(rec, app):
+    """The picker moved, but the launch under way went on for the display
+    chosen before: scrcpy came up on one display while the picker showed
+    another."""
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()  # the default display; scrcpy is still launching
+        assert rec.launches[0].opts.display_id is None
+        _pick(panel, 2)
+        assert (panel._queued_start or {}).get("display_id") == 2
+        rec.launches[0].done.emit(_Session())  # the launch for display 0 reports
+        (closing,) = rec.viewer_stops  # ...and is closed again
+        closing.done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 2 and rec.launches[1].opts.display_id == 2
+        assert panel.cmb_display.currentData() == 2
+    finally:
+        _close(panel)
+
+
+def test_a_display_picked_while_the_old_screen_closes_is_the_one_that_starts(rec, app):
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()
+        rec.launches[0].done.emit(_Session())  # display 0 is on screen
+        _pick(panel, 2)  # closes it, display 2 waits for that
+        assert panel._stopping_mirror and panel._queued_start["display_id"] == 2
+        _pick(panel, None)  # back to display 0 meanwhile
+        assert panel._queued_start["display_id"] is None
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 2 and rec.launches[1].opts.display_id is None
+    finally:
+        _close(panel)
+
+
+def test_a_display_picked_while_a_retry_waits_is_the_one_that_starts(rec, app):
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()
+        rec.launches[0].fail.emit("adb: device offline")  # retried in a moment
+        assert panel._retry_pending
+        _pick(panel, 2)
+        assert not panel._retry_pending
+        assert len(rec.launches) == 2 and rec.launches[1].opts.display_id == 2
+    finally:
+        _close(panel)
+
+
+def test_a_display_picked_after_stop_is_only_selected(rec, app):
+    """Stop means stopped: a display picked while the stopped screen is still
+    closing (or its launch still being cancelled) starts nothing by itself."""
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()
+        panel.stop()  # while scrcpy was still launching
+        _pick(panel, 2)
+        rec.launches[0].done.emit(_Session())
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 1 and not panel.is_active()
+        assert panel.cmb_display.currentData() == 2
+
+        panel.start()
+        rec.launches[1].done.emit(_Session())
+        panel.stop()  # a running screen, which is now closing
+        _pick(panel, None)
+        rec.viewer_stops[1].done.emit(True)
+        _spin(app)
+        assert len(rec.launches) == 2 and not panel.is_active()
+        assert panel.cmb_display.currentData() is None
+    finally:
+        _close(panel)
+
+
+def test_recording_another_display_never_moves_the_picker_off_a_starting_screen(
+    rec, app, monkeypatch
+):
+    import turboadb.gui.mirror_panel as mp_mod
+
+    panel = _panel()
+    device = []
+    panel._record_device = lambda path, display_id=None: device.append(display_id)
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()  # display 0 is starting
+        chosen = [("", "")]  # the file dialog, cancelled
+        monkeypatch.setattr(
+            mp_mod.QFileDialog, "getSaveFileName", lambda *_a, **_k: chosen[0]
+        )
+        panel._select_and_record(2)  # the display manager's Record for display 2
+        assert panel.cmb_display.currentData() is None  # display 0 is what starts
+        assert not panel._recording
+
+        # recorded after all: the one scrcpy shows what it records
+        chosen[0] = (rec.path, "MP4 video (*.mp4)")
+        panel._select_and_record(2)
+        assert panel._queued_start["display_id"] == 2 and panel._queued_start["record"]
+        assert panel.cmb_display.currentData() == 2
+    finally:
+        _close(panel)
+
+
+def test_a_pick_refused_for_a_recording_returns_to_the_display_being_recorded(rec, app):
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()  # display 0 is starting
+        panel._select_and_record(2)  # scrcpy will show, and record, display 2 instead
+        assert panel.cmb_display.currentData() == 2
+        _pick(panel, None)  # refused: the recording would end
+        assert "Stop the current recording" in panel.status.text()
+        assert panel.cmb_display.currentData() == 2
+        assert panel._queued_start["record"] == rec.path
+    finally:
+        _close(panel)
+
+
+def test_a_display_picked_while_a_recording_is_saved_stays_with_the_screen(rec, app):
+    """The screen is not restarted until a device recording is on this PC, so
+    the picker must not move off the display that is on screen."""
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()
+        rec.launches[0].done.emit(_Session())  # display 0 is on screen
+        panel._recording, panel._rec_mode = True, "device"
+        panel._stop_record()  # its recording is being pulled
+        _pick(panel, 2)
+        assert panel.cmb_display.currentData() is None
+        assert "finish saving" in panel.status.text()
+        panel._select_and_mirror(2)  # the display manager's Start
+        assert panel.cmb_display.currentData() is None
+        assert rec.viewer_stops == [] and len(rec.launches) == 1  # still on screen
+    finally:
+        panel._record_finalizing = False
+        _close(panel)
+
+
+def test_the_view_that_returns_after_a_recording_is_the_pickers_display(rec, app):
+    """Stop recording closes the scrcpy that recorded and brings the view
+    back on the recorded display: a pick made while it is saved has to wait."""
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        _pick(panel, 2)
+        panel.start()
+        panel._begin_record()  # while scrcpy launches: it will record itself
+        rec.launches[0].done.emit(_Session())
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        rec.launches[1].done.emit(_Session())  # display 2, recording
+        panel._toggle_record()  # Stop recording: the MP4 is being finished
+        assert panel._record_finalizing
+        _pick(panel, None)
+        assert panel.cmb_display.currentData() == 2
+        assert "finish saving" in panel.status.text()
+        with open(rec.path, "wb") as fh:
+            fh.write(b"\x00\x00\x00\x20ftypisom")
+        rec.record_closes[0].done.emit(True)
+        _spin(app)
+        assert rec.launches[-1].opts.display_id == 2 and rec.launches[-1].opts.record is None
+        assert panel.cmb_display.currentData() == 2
+    finally:
+        _close(panel)
+
+
+def test_recording_another_display_while_a_retry_waits_keeps_the_pickers_display(rec, app):
+    panel = _panel()
+    device = []
+    panel._record_device = lambda path, display_id=None: device.append(display_id)
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()
+        rec.launches[0].fail.emit("adb: device offline")  # display 0 is retried
+        panel._select_and_record(2)
+        assert device == [2]  # recorded on the device, beside the screen to come
+        assert panel.cmb_display.currentData() is None
+    finally:
+        _close(panel)
+
+
+@pytest.fixture
+def frames(monkeypatch):
+    """The screencap renderer without its capture worker: the list holds the
+    display of every view that was started."""
+    from turboadb.gui import screencap_view as sv
+
+    started = []
+    monkeypatch.setattr(sv.ScreencapView, "start", lambda view: started.append(view.display_id))
+    return started
+
+
+def test_a_renderer_change_keeps_the_display_picked_while_scrcpy_launches(rec, app, frames):
+    """The renderer was changed (Options, or Settings) while a display picked
+    during the launch waited for it: the restart for the new renderer took the
+    display of the launch under way, and the picker showed another."""
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        panel.start()  # the default display; scrcpy is still launching
+        _pick(panel, 2)  # waits for that launch to be closed
+        panel.set_screen_backend("screencap")
+        assert (panel._queued_start or {}).get("display_id") == 2
+        rec.launches[0].done.emit(_Session())
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert frames == [2] and len(rec.launches) == 1  # screencap frames of display 2
+        assert panel.cmb_display.currentData() == 2
+    finally:
+        _close(panel)
+
+
+def test_a_renderer_change_keeps_a_separate_window_that_waits(rec, app, frames):
+    panel = _panel()
+    try:
+        panel.start()
+        panel._popout_mirror()  # asked for while scrcpy was still launching
+        panel.set_screen_backend("screencap")
+        rec.launches[0].done.emit(_Session())
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert frames == []  # a separate window is scrcpy's
+        assert len(rec.launches) == 2 and panel._launch_spec["embed"] is False
+    finally:
+        _close(panel)
+
+
+def test_a_renderer_change_brings_no_screen_back_after_stop(rec, app, frames):
+    """Stop while scrcpy was still launching, then another renderer: the
+    cancelled launch counted as a running screen and was started again."""
+    panel = _panel()
+    try:
+        panel.start()
+        panel.stop()
+        panel.set_screen_backend("screencap")
+        rec.launches[0].done.emit(_Session())  # the cancelled launch reports
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert frames == [] and len(rec.launches) == 1
+        assert not panel.is_active()
+    finally:
+        _close(panel)
+
+
+def test_a_renderer_change_moves_a_launch_under_way_to_the_new_renderer(rec, app, frames):
+    panel = _panel()
+    try:
+        panel._got_displays(_TWO_DISPLAYS)
+        _pick(panel, 2)
+        panel.start()  # scrcpy is launching for display 2
+        panel.set_screen_backend("screencap")
+        rec.launches[0].done.emit(_Session())
+        rec.viewer_stops[0].done.emit(True)
+        _spin(app)
+        assert frames == [2] and len(rec.launches) == 1
+    finally:
+        _close(panel)
 
 
 def test_mp4_finalised_check_reads_the_box_headers(tmp_path):

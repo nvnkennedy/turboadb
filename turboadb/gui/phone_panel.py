@@ -139,6 +139,16 @@ def _unwrap_flag(res):
     return res if isinstance(res, bool) else None
 
 
+def _says_something(info) -> bool:
+    """Whether a ``phone_support`` answer tells anything about the device. One
+    that was away, busy or still starting answers with nothing known."""
+    if not isinstance(info, dict):
+        return False
+    if info.get("automotive") or info.get("phone_apps"):
+        return True
+    return any(info.get(key) is not None for key in ("telephony", "dialer", "caller", "messages"))
+
+
 def format_when(ms, now=None) -> str:
     """``Today 14:05`` / ``Yesterday 09:12`` / ``12 Sep 14:05`` / ``12 Sep 2024``."""
     try:
@@ -194,7 +204,15 @@ def friendly_failure(message) -> str:
         return "The device did not answer in time."
     if not text:
         return "Unknown error."
-    first = text.splitlines()[0]
+    lines = text.splitlines()
+    first = lines[0]
+    if "Command failed (exit=" in first:
+        # the engine's error for a failed command: its first line only names
+        # the command, adb's reason is on the next ("stderr: error: closed")
+        for line in lines[1:]:
+            if line.startswith("stderr:") and line[len("stderr:"):].strip():
+                first = line[len("stderr:"):].strip()
+                break
     return first if len(first) <= 160 else first[:157] + "…"
 
 
@@ -610,6 +628,9 @@ class PhonePanel(QWidget):
         self._jobs = []
         self._closed = False
         self._loaded = False  # load lazily on first view (keeps connect fast)
+        # The device tab holds the page while the adb server is stopped and
+        # started again (suspend_for_device_loss): nothing asks the device.
+        self._held = False
         self._wide = None
         self._call_state = None
         self._state_busy = False
@@ -836,7 +857,8 @@ class PhonePanel(QWidget):
         # Answer and End stay usable without telephony on this device: they send
         # the standard call key events, which a head unit forwards to the phone
         # paired over Bluetooth.  Nothing to hang up is reported as a hint, not
-        # as an error (see ``_action``).
+        # as an error (see ``_action``); a device known to be idle is sent no
+        # End key at all (see ``_end_call``).
         self.btn_end = self._button(
             "End", "phone-off", "text", role="danger",
             tip="Hang up / reject the current call — sends the End-call key event to the device",
@@ -1200,8 +1222,23 @@ class PhonePanel(QWidget):
     def _end_call(self):
         if self._needs_phone():
             return
-        self._action("end call", lambda h: h.end_call(safe=True), "[OK] End call sent",
-                     then_state=True, expected_without_telephony=True, gated=False)
+        idle = self._call_state == "idle"
+
+        def end(h):
+            # With no call Android takes the End-call key for its power button:
+            # the screen went dark, or the phone locked.  Idle when last
+            # polled: ask once more, so a call that has just come in is ended.
+            if idle and str(unwrap(h.call_state(safe=False)) or "").strip().lower() == "idle":
+                return None
+            return h.end_call(safe=True)
+
+        self._action("end call", end, "[OK] End call sent", then_state=True,
+                     expected_without_telephony=True, gated=False,
+                     on_nothing=self._no_call_to_end)
+
+    def _no_call_to_end(self):
+        self.dial_hint.setText("No call to end.")
+        self.log.emit("[INFO] End: the device has no call to end — nothing was sent")
 
     def use_number(self, number):
         """Fill the dialler with *number* (never places the call)."""
@@ -1303,7 +1340,7 @@ class PhonePanel(QWidget):
         return self._adb_gate.wrap(fn) if self._adb_gate is not None else fn
 
     def _action(self, label, fn, ok_text, *, then_state=False,
-                expected_without_telephony=False, gated=True):
+                expected_without_telephony=False, gated=True, on_nothing=None):
         """Run one device action on a worker and report the outcome.
 
         *expected_without_telephony* marks an action (Answer / End) that is
@@ -1311,13 +1348,18 @@ class PhonePanel(QWidget):
         nothing to answer is a normal condition, so it is reported as a hint
         instead of an error the user has to investigate. *gated* False: the
         action takes no adb slot (a call key must not wait behind a listing).
+        *on_nothing* is called, in place of the *ok_text* report, when the
+        action returned None: it found nothing to do and sent nothing.
         """
         if self._closed:
             return
         handler = self.handler
 
-        def done(_result):
+        def done(result):
             if self._closed:
+                return
+            if result is None and on_nothing is not None:
+                on_nothing()
                 return
             self.log.emit(ok_text)
             if then_state:
@@ -1343,9 +1385,13 @@ class PhonePanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self._held:
+            return  # it loads once the device is back (resume_after_reconnect)
         # Don't query the device on connect — only when the user opens this
         # page, so the initial connect stays fast (esp. over a remote link).
-        if not self._loaded:
+        # A device that could not say what it has when it was asked (it was
+        # busy, away or still starting) is asked again now.
+        if not self._loaded or self._support_unknown():
             self.refresh()
         elif self._call_state not in _NO_CALL_STATE:
             self._poll.start()
@@ -1360,18 +1406,50 @@ class PhonePanel(QWidget):
         self._poll.stop()
         self._link_poll.stop()
 
+    def suspend_for_device_loss(self) -> None:
+        """The adb server is about to be stopped (an ADB restart, a tools
+        update): ask the device nothing until :meth:`resume_after_reconnect`.
+        A poll that ran adb meanwhile made it start a server of its own."""
+        if self._closed:
+            return
+        self._held = True
+        self._poll.stop()
+        self._state_soon.stop()
+        self._link_poll.stop()
+
+    def resume_after_reconnect(self, *, reload: bool = True) -> None:
+        """The device is back: load the page again, which also resumes its
+        polls; a hidden page loads when it is next shown.  *reload* False: it
+        did not come back, so the page stays as it is, unless it was asked to
+        load meanwhile (shown for the first time, Refresh)."""
+        if self._closed:
+            return
+        self._held = False
+        if reload:
+            self._loaded = False
+        if not self._loaded and self.isVisible():
+            self.refresh()
+
+    def _support_unknown(self) -> bool:
+        """True while the device has not said what it offers, though it can be
+        asked: the check has not run, or it failed (see :meth:`_apply_support`)."""
+        return self._support is None and callable(getattr(self.handler, "phone_support", None))
+
     def refresh(self):
         if self._closed:
             return
+        if self._held:
+            self._loaded = False  # asked for meanwhile: it loads when the device is back
+            return
         self._loaded = True
-        probe = getattr(self.handler, "phone_support", None)
-        if self._support is None and callable(probe):
+        if self._support_unknown():
             if self._support_busy:
                 return  # the check that is running loads the page when it answers
             # First find out what the device has: a customised head unit may have
             # no dialler, no call log and no telephony, none of which is an error.
             self._support_busy = True
             self._set_state("checking")
+            probe = self.handler.phone_support
             run_job(
                 self._jobs,
                 self._device_job(lambda: unwrap(probe(safe=True))),
@@ -1388,6 +1466,9 @@ class PhonePanel(QWidget):
         self._load_everything()
 
     def _load_everything(self):
+        if self._held:
+            self._loaded = False  # an answer that arrived meanwhile: load later
+            return
         if self._no_phone():
             self._show_no_phone()
             return
@@ -1443,7 +1524,8 @@ class PhonePanel(QWidget):
     def _update_link_poll(self):
         """Poll a car's phone connection only while the page is visible and the
         answer is known; there is nothing to poll anywhere else."""
-        if self._closed or not self._car or self._phone_link is None or not self.isVisible():
+        if (self._closed or self._held or not self._car or self._phone_link is None
+                or not self.isVisible()):
             self._link_poll.stop()
         elif not self._link_poll.isActive():
             self._link_poll.start()
@@ -1452,7 +1534,7 @@ class PhonePanel(QWidget):
         """Ask a car whether a phone is connected now (``phone_connected``: a
         dumpsys or two, no call log or messages). *reload* loads the page for
         the answer even when it hasn't changed (the Refresh button)."""
-        if self._closed:
+        if self._closed or self._held:
             return
         probe = getattr(self.handler, "phone_connected", None)
         if not callable(probe):
@@ -1504,8 +1586,12 @@ class PhonePanel(QWidget):
     def _apply_support(self, info):
         """Adapt the page to what the device has: disable what it can't do and
         offer its own phone app instead."""
+        # A check that failed, or that the device answered with nothing, is no
+        # answer: Refresh and the next show ask again.  Kept as "checked", a
+        # head unit that was busy when the page first opened was handled as a
+        # phone (its refused call log a warning) for the whole session.
+        self._support = info if _says_something(info) else None
         info = info if isinstance(info, dict) else {}
-        self._support = info  # {} = checked, but the device couldn't say
         self._dial_missing = info.get("dialer") == ""
         self._call_missing = info.get("caller") == ""
         self._sms_missing = info.get("messages") == ""
@@ -1553,7 +1639,7 @@ class PhonePanel(QWidget):
             )
 
     def _load_state(self, quiet=False):
-        if self._closed or self._state_busy or self._no_phone():
+        if self._closed or self._held or self._state_busy or self._no_phone():
             return
         if self._car and (self._support or {}).get("telephony") is False:
             return  # a car without telephony has no call state (e.g. after Answer / End)
@@ -1561,11 +1647,14 @@ class PhonePanel(QWidget):
         if not quiet:
             self._set_state("checking")
         handler = self.handler
+        # A poll that fails is simply asked again (see _state_failed): raw mode
+        # keeps the engine from logging each of those as an error.
+        safe = not quiet
         run_job(
             self._jobs,
-            self._device_job(lambda: unwrap(handler.call_state(safe=True))),
+            self._device_job(lambda: unwrap(handler.call_state(safe=safe))),
             self._state_loaded,
-            self._state_failed,
+            lambda message: self._state_failed(message, quiet),
         )
 
     def _state_loaded(self, value):
@@ -1578,12 +1667,12 @@ class PhonePanel(QWidget):
         if state in ("idle", "ringing", "in call"):
             self._warned["state"] = None
             self._set_state(state)
-            if self.isVisible():
+            if self.isVisible() and not self._held:
                 self._poll.start()
             return
         self._no_telephony("The device reports no call state (telephony.registry has none).")
 
-    def _state_failed(self, message):
+    def _state_failed(self, message, quiet=False):
         self._state_busy = False
         if self._closed or self._no_phone():
             return
@@ -1592,7 +1681,22 @@ class PhonePanel(QWidget):
             self._poll.stop()
             self._set_state("unsupported", tip=friendly_failure(message))
             return
-        self._no_telephony(friendly_failure(message))
+        reason = friendly_failure(message)
+        if is_denied(message):
+            self._no_telephony(reason)  # the device's answer: asking again changes nothing
+            return
+        # adb or the device did not answer: it is rebooting, unplugged or busy,
+        # which says nothing about its telephony.  The poll asks again.  Taken
+        # for "No telephony" it stopped the poll, and the pill stayed wrong
+        # after the device was back.
+        self._set_state(
+            "checking", tip=f"{reason.rstrip('.')} — asking again while this page is open"
+        )
+        if not quiet and self._warned["state"] != reason:
+            self._warned["state"] = reason
+            self.log.emit(f"[WARNING] Call state unavailable — {reason}")
+        if self.isVisible() and not self._held:
+            self._poll.start()
 
     def _no_telephony(self, reason):
         self._poll.stop()
@@ -1618,7 +1722,10 @@ class PhonePanel(QWidget):
                 return
             if self._reload[key]:
                 # a newer load was asked for meanwhile: this answer is stale
-                (self._load_calls if key == "calls" else self._load_sms)()
+                if self._held:
+                    self._loaded = False  # the page loads again afterwards
+                else:
+                    (self._load_calls if key == "calls" else self._load_sms)()
             elif g == self._generation[key]:
                 callback(value)
 

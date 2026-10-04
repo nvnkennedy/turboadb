@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import errno
 import os
+import shutil
 import stat
+import subprocess
 import types
 
 import pytest
@@ -197,6 +199,107 @@ def test_a_file_with_another_hard_link_is_written_in_place(tmp_path):
     assert other.read_text() == "new"
 
 
+def _set_created(path, when):
+    """Windows: set the creation time of *path* (seconds since 1970)."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    kernel32.SetFileTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+                                     wintypes.LPVOID, wintypes.LPVOID]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), 0x100, 7, None, 3, 0x80, None)  # write attributes
+    stamp = int(when) * 10_000_000 + 116444736000000000  # in 100 ns since 1601
+    try:
+        assert kernel32.SetFileTime(handle, ctypes.byref(wintypes.FILETIME(
+            stamp & 0xFFFFFFFF, stamp >> 32)), None, None)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _created(path):
+    info = os.stat(str(path))
+    return getattr(info, "st_birthtime", info.st_ctime)
+
+
+_USERS = "*S-1-5-32-545"  # the Users group, whatever the language of this Windows
+
+
+def _has_an_entry_for_users(path):
+    found = subprocess.run(["icacls", str(path), "/findsid", _USERS], capture_output=True,
+                           text=True, errors="replace")
+    return str(path).lower() in found.stdout.lower()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="data streams, permissions and creation times of NTFS")
+def test_saving_keeps_what_a_new_file_would_not_have(tmp_path):
+    """A downloaded script.ps1, edited and saved, had lost its "from the
+    Internet" mark, a permission given to it alone and its creation time:
+    the save had put a new file in its place."""
+    path = tmp_path / "script.ps1"
+    path.write_text("old")
+    try:
+        with open(f"{path}:Zone.Identifier", "w") as fh:
+            fh.write("[ZoneTransfer]\nZoneId=3\n")
+    except OSError:
+        pytest.skip("this drive keeps no data streams")
+    granted = subprocess.run(["icacls", str(path), "/grant", f"{_USERS}:(R)"],
+                             capture_output=True).returncode == 0
+    if granted and not _has_an_entry_for_users(path):
+        granted = False  # icacls answers in a form this test does not read
+    _set_created(path, 1_000_000_000)  # in 2001
+    created = _created(path)
+
+    fb._save_local_text(str(path), "new")
+
+    assert path.read_text() == "new"
+    with open(f"{path}:Zone.Identifier") as fh:
+        assert "ZoneId=3" in fh.read()
+    assert _created(path) == created
+    if granted:
+        assert _has_an_entry_for_users(path)
+    assert os.listdir(tmp_path) == ["script.ps1"]  # nothing is left beside it
+
+
+def _swap_fails(monkeypatch, winerror):
+    def refuse(_tmp, _real):
+        error = OSError(22, "the drive refused")
+        error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(fb, "_swap_keeping_the_file", refuse)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="how a save replaces a file on Windows")
+def test_a_drive_that_cannot_swap_files_gets_the_new_file_renamed_over_the_old(monkeypatch,
+                                                                              tmp_path):
+    """Some network shares can't: the text still arrives whole or not at all."""
+    path = tmp_path / "a.txt"
+    path.write_text("old")
+    before = os.stat(str(path)).st_ino
+    _swap_fails(monkeypatch, 50)  # "the request is not supported"
+    fb._save_local_text(str(path), "new")
+    assert path.read_text() == "new" and os.stat(str(path)).st_ino != before
+    assert os.listdir(tmp_path) == ["a.txt"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="how a save replaces a file on Windows")
+@pytest.mark.parametrize("winerror", [5, 32], ids=["not-allowed", "in-use"])
+def test_a_file_that_may_not_be_swapped_is_written_in_place(monkeypatch, tmp_path, winerror):
+    """Renaming a new file over it would drop what the swap was refused for."""
+    path = tmp_path / "a.txt"
+    path.write_text("old")
+    before = os.stat(str(path)).st_ino
+    _swap_fails(monkeypatch, winerror)
+    fb._save_local_text(str(path), "new")
+    assert path.read_text() == "new" and os.stat(str(path)).st_ino == before
+    assert os.listdir(tmp_path) == ["a.txt"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="permission bits and links as on Linux and macOS")
 def test_saving_keeps_the_mode_and_a_link(tmp_path):
     real = tmp_path / "real.sh"
@@ -265,6 +368,103 @@ def test_a_link_back_into_the_folder_being_copied_is_left_out(tmp_path):
     copied = dst / "album" / "inner"
     assert sorted(os.listdir(copied)) == ["a.jpg", "other"]
     assert (copied / "other" / "b.jpg").read_text() == "b"  # other links are still followed
+
+
+def _fuse(monkeypatch, limit=20):
+    """End a copy that nests into itself after *limit* folders, where it would
+    otherwise run for minutes, until the path is too long."""
+    real, folders = shutil.copytree, []
+
+    def copytree(src, dst, *args, **kw):  # shutil calls it again for every folder
+        folders.append(src)
+        assert len(folders) <= limit, "the copy nests into itself"
+        return real(src, dst, *args, **kw)
+
+    monkeypatch.setattr(fb.shutil, "copytree", copytree)
+
+
+def test_a_folder_is_never_copied_into_itself_through_a_link(tmp_path, monkeypatch):
+    """J is a junction to A\\sub: A pasted into J went into A\\sub\\A, and from
+    there into itself, level after level, for minutes."""
+    src = tmp_path / "A"
+    (src / "sub").mkdir(parents=True)
+    (src / "top.txt").write_text("top")
+    link, own = tmp_path / "J", tmp_path / "A-again"
+    try:
+        _link_folder(src / "sub", link)
+        _link_folder(src, own)
+    except OSError:
+        pytest.skip("folder links can't be made here")
+    _fuse(monkeypatch)
+    assert fb._find_local_collisions([str(src)], str(link)) == []
+    for target in (link, own):  # into its subfolder, and into itself
+        errors = fb._copy_local_items([str(src)], str(target))
+        assert len(errors) == 1 and "into itself" in errors[0]
+    assert os.listdir(src / "sub") == [] and sorted(os.listdir(src)) == ["sub", "top.txt"]
+
+
+def test_a_link_to_the_folder_the_copy_goes_into_is_left_out(tmp_path, monkeypatch):
+    """A holds a link to "backup"; copied into "backup", the link was followed
+    and the copy, by then inside "backup", was copied into itself."""
+    src = tmp_path / "A"
+    src.mkdir()
+    (src / "a.txt").write_text("a")
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "old.txt").write_text("old")
+    try:
+        _link_folder(backup, src / "out")
+    except OSError:
+        pytest.skip("folder links can't be made here")
+    _fuse(monkeypatch)
+    errors = fb._copy_local_items([str(src)], str(backup))
+    assert len(errors) == 1 and errors[0].startswith(str(src / "out"))
+    assert "not copied" in errors[0] and "the copy goes into" in errors[0]
+    assert os.listdir(backup / "A") == ["a.txt"]
+    assert sorted(os.listdir(backup)) == ["A", "old.txt"]
+
+
+def test_pasting_into_the_same_folder_says_the_item_is_already_there(page, tmp_path):
+    """Ctrl+C then Ctrl+V in one folder logged "[OK] paste 1 item(s)" and
+    copied nothing."""
+    (tmp_path / "a.txt").write_text("a")
+    logs = []
+    page.log.connect(logs.append)
+    page.refresh_local()
+    _select(page, "a.txt")
+    page._local_copy()
+    page._local_paste()
+    pasted = [line for line in logs if "paste" in line]
+    assert len(pasted) == 1 and pasted[0].startswith("[ERROR] paste 1 item(s)")
+    assert "already in this folder" in pasted[0]
+    assert os.listdir(tmp_path) == ["a.txt"]
+
+
+def test_two_items_of_one_name_never_overwrite_each_other(page, monkeypatch, tmp_path):
+    """2024\\report.txt and 2025\\report.txt dropped together (an Explorer
+    search result): nothing was asked, OK was logged for 2 items, and one
+    report.txt was left, the second one's."""
+    for year in ("2024", "2025"):
+        (tmp_path / year / "photos").mkdir(parents=True)
+        (tmp_path / year / "photos" / f"{year}.jpg").write_text(year)
+        (tmp_path / year / "report.txt").write_text(year)
+    target = tmp_path / "target"
+    target.mkdir()
+    sources = [str(tmp_path / year / name) for name in ("report.txt", "photos")
+               for year in ("2024", "2025")]
+    shown = _boxes(monkeypatch)
+    logs = []
+    page.log.connect(logs.append)
+    page._on_local_dropped(sources, True, str(target))
+    assert shown == []  # nothing is there yet: nothing to ask
+    assert (target / "report.txt").read_text() == "2024"
+    assert os.listdir(target / "photos") == ["2024.jpg"]  # the second folder is not merged in
+    errors = [line for line in logs if line.startswith("[ERROR] local copy 4 item(s)")]
+    assert len(errors) == 2 and all("has the same name" in line for line in errors)
+    assert sources[1] in errors[0] and sources[3] in errors[1]
+    assert not any(line.startswith("[OK] local copy") for line in logs)
+    # dropped again, what is there now is asked about once per name
+    assert fb._find_local_collisions(sources, str(target)) == ["report.txt", "photos"]
 
 
 # --------------------------------------------------------------------------- #

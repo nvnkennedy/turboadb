@@ -7,6 +7,7 @@ Save has all of it), on a device terminal also what arrives until the
 terminal echoes the Ctrl+C, and the backlog is capped at about a second of
 drawing."""
 
+import itertools
 import re
 import threading
 import time
@@ -189,6 +190,68 @@ def test_the_drawing_rate_is_measured(qapp):
         _close(term)
 
 
+def _clock(monkeypatch, *ticks):
+    """Give the console a clock whose render ticks read *ticks*, over and over."""
+    from turboadb.gui import console as console_mod
+
+    values = itertools.cycle(ticks)
+
+    class Clock:
+        monotonic = staticmethod(time.monotonic)
+        strftime = staticmethod(time.strftime)
+
+        @staticmethod
+        def perf_counter():
+            return next(values)
+
+    monkeypatch.setattr(console_mod, "time", Clock)
+
+
+def test_the_drawing_rate_is_measured_however_slow_the_drawing_is(qapp, monkeypatch):
+    """Only a tick that drew 32 KB counted, and a slow one draws less: slow
+    drawing left the rate at its first guess, and with it the backlog cap and
+    what Ctrl+C keeps (100,000 characters, seconds of scrolling)."""
+    term = _console()
+    try:
+        term.feed(_flood(2000))
+        guess = term._render_rate
+        with monkeypatch.context() as patch:
+            # each tick: its start, one check that passes, one that fails, its end a second later
+            _clock(patch, 0.0, 0.0, 1.0, 1.0)
+            for _ in range(10):
+                term._drain_tick()
+        assert term._inq  # (the flood was long enough for all ten)
+        assert term._render_rate < guess / 4
+        assert term._little_output() < 30000
+        assert term._backlog_cap() == term._MIN_INQ
+        # once all of it is drawn, output that may be faster to draw is not held to that
+        _render(term)
+        term._drain_tick()
+        assert term._render_rate >= guess
+        term.feed(_flood(15000))  # most of a megabyte in one read
+        assert term._dropped == 0
+    finally:
+        _close(term)
+
+
+def test_a_few_characters_drawn_say_nothing_about_the_rate(qapp, monkeypatch):
+    """The echo of a typed key is no measure of how fast a flood is drawn,
+    however long its tick took: a session of typing must not teach the
+    console that it is slow, or the next burst of output would be cut."""
+    term = _console()
+    try:
+        guess = term._render_rate
+        with monkeypatch.context() as patch:
+            _clock(patch, 0.0, 0.0, 0.05)  # each tick: its start, one check, its end (a busy PC)
+            for _ in range(200):
+                term.feed("x")
+                term._drain_tick()
+        assert term.toPlainText() == "x" * 200
+        assert term._render_rate == guess
+    finally:
+        _close(term)
+
+
 # --------------------------------------------------------------------------- #
 # the Android shell during a logcat flood
 # --------------------------------------------------------------------------- #
@@ -245,7 +308,8 @@ class _Flood:
             self.emit(_flood(2000, n).replace("\r\n", "\n"))
             n += 2000
             time.sleep(0.01)
-        self.emit(_flood(3000, n).replace("\r\n", "\n"))  # already on its way
+        # already on its way, and more than even a fast view draws in a moment
+        self.emit(_flood(100000, n).replace("\r\n", "\n"))
         self.emit("^C\n" + self.prompt(130))
 
     def close(self):

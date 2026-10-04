@@ -254,6 +254,23 @@ def test_untouched_rows_keep_their_colours(qapp):
         _close(term)
 
 
+def test_a_line_typed_after_emoji_stays_off_the_programs_screen(qapp):
+    """The screen starts from the output lines, up to where the typed line
+    begins: behind emoji it took a typed character along for each of them."""
+    term = _console()
+    try:
+        term.feed("🚀🚀 ready")
+        _render(term)
+        for ch in "abc":
+            _key(term, 0, ch)  # typed, not sent yet
+        term.feed("\x1b[A!")  # a move up: a screen
+        _render(term)
+        assert term.has_screen()
+        assert term.screen().display()[0] == "🚀🚀 ready!"
+    finally:
+        _close(term)
+
+
 def test_notices_while_a_screen_shows_come_after_it(qapp):
     term = _console()
     try:

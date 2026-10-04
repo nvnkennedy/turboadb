@@ -141,6 +141,18 @@ def _windows_assoc(ext: str, what: int) -> Optional[str]:
     return buf.value.strip()
 
 
+def _ask_which_app(path: str) -> None:
+    """Windows' own "Open with" dialog for *path* (a file type without that
+    verb).  rundll32 is started by its full path: by its bare name alone,
+    Windows looks in the current folder before System32."""
+    from ..tools import windows_program
+
+    _reaped(subprocess.Popen(
+        ["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path],
+        executable=windows_program("rundll32.exe"),
+    ))
+
+
 def start(path: str, *, choose: bool = False) -> None:
     """Open *path* in its app, or (*choose*) ask the user which app to use.
     Raises OSError when it could not be started."""
@@ -151,7 +163,7 @@ def start(path: str, *, choose: bool = False) -> None:
         try:
             os.startfile(path, "openas")  # type: ignore[attr-defined]
         except OSError:
-            _reaped(subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path]))
+            _ask_which_app(path)
     elif sys.platform == "darwin":
         _reaped(subprocess.Popen(["open", path]))
     else:

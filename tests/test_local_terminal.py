@@ -159,6 +159,87 @@ def test_output_transcoder_keeps_utf8_and_decodes_console_code_page(lt):
     assert tc.feed(b"", final=True).decode("utf-8") == "├"
 
 
+@pytest.mark.parametrize("codec, text", [
+    ("cp936", "文件 Directory of C:\\用户\r\n"),
+    ("cp932", "ソフト 表示\r\n"),
+    ("cp949", "가나다 파일\r\n"),
+    ("cp950", "檔案 目錄\r\n"),
+], ids=["cp936", "cp932", "cp949", "cp950"])
+def test_output_transcoder_keeps_double_byte_characters_whole_across_reads(lt, codec, text):
+    """cmd on a double-byte console code page (a Chinese, Japanese or Korean
+    Windows), its output cut by the end of a read at every byte in turn: in
+    the middle of a character, or after one whose last byte looks like the
+    start of a UTF-8 character ("文件" came out as "文" and two U+FFFD)."""
+    data = text.encode(codec)
+    for cut in range(1, len(data)):
+        for full_read in (False, True):  # written in two pieces, or cut by the read's size
+            tc = lt.OutputTranscoder(codec)
+            shown = tc.feed(data[:cut], more=full_read) + tc.feed(data[cut:])
+            assert shown.decode("utf-8") == text, (cut, full_read)
+
+
+def test_output_transcoder_finishes_a_cut_character_in_its_code_page(lt):
+    """The second byte of a cut character and the line break after it may read
+    as UTF-8 by themselves: GBK "伪" is CE B1, which is "α" in UTF-8."""
+    tc = lt.OutputTranscoder("cp936")
+    data = "文伪\r\n".encode("cp936")
+    assert tc.feed(data[:3]).decode("utf-8") == "文"
+    assert tc.feed(data[3:]).decode("utf-8") == "伪\r\n"
+
+
+def test_output_transcoder_keeps_a_line_cut_by_a_full_read_in_its_code_page(lt):
+    """Output over 4 KB is cut by the size of the read, anywhere in a line.
+    The rest of the line may read as UTF-8 by itself: GBK "系统" (CF B5 CD
+    B3) is two UTF-8 characters."""
+    tc = lt.OutputTranscoder("cp936")
+    line = " 驱动器 C 中的卷是 系统\r\n"
+    data = line.encode("cp936")
+    cut = data.index("系".encode("cp936"))
+    assert (tc.feed(data[:cut], more=True) + tc.feed(data[cut:])).decode("utf-8") == line
+    # the next line is judged by itself again
+    assert tc.feed("git ✓\r\n".encode("utf-8")).decode("utf-8") == "git ✓\r\n"
+
+
+def test_output_transcoder_judges_what_follows_an_unended_line_by_itself(lt):
+    """``set /p`` leaves its prompt unended (the Enter typed is not echoed over
+    a pipe): what the next program prints after it is its own, UTF-8 here."""
+    tc = lt.OutputTranscoder("cp936")
+    assert tc.feed("请输入设备: ".encode("cp936")).decode("utf-8") == "请输入设备: "
+    assert tc.feed("完成 ✓\r\n".encode("utf-8")).decode("utf-8") == "完成 ✓\r\n"
+
+
+def test_a_full_read_tells_the_transcoder_that_its_last_line_goes_on(lt, monkeypatch):
+    from test_local_session import _session
+
+    session = _session(lt, monkeypatch)
+    session._transcoder = lt.OutputTranscoder("cp936")
+    line = " 驱动器 C 中的卷是 系统\r\n"
+    data = line.encode("cp936")
+    cut = data.index("系".encode("cp936"))
+    chunks = [data[:cut], data[cut:]]
+    monkeypatch.setattr(session, "_read_raw", lambda size: chunks.pop(0) if chunks else b"")
+    assert (session.read(cut) + session.read(4096)).decode("utf-8") == line
+    session.close()
+
+
+def test_output_transcoder_releases_a_lead_byte_whose_rest_never_comes(lt):
+    tc = lt.OutputTranscoder("cp932")
+    assert tc.feed(b"abc\x83") == b"abc"  # the first byte of a character
+    assert not tc.held_expired()
+    assert tc.feed(b"") == b"" and not tc.held_expired()  # an idle poll
+    tc.HOLD_GRACE_S = 0.0
+    assert tc.held_expired()
+    assert tc.feed(b"", final=True).decode("utf-8") == "\ufffd"
+    assert tc.feed(b"C:\\>") == b"C:\\>"  # it took nothing of the next output with it
+
+
+def test_output_transcoder_still_waits_for_a_utf8_character_after_code_page_lines(lt):
+    tc = lt.OutputTranscoder("cp936")
+    tick = "✓".encode("utf-8")
+    assert tc.feed("文件\r\ngit ".encode("cp936") + tick[:2]).decode("utf-8") == "文件\r\ngit "
+    assert tc.feed(tick[2:] + b"\r\n").decode("utf-8") == "✓\r\n"
+
+
 def test_session_env_and_argv(lt, monkeypatch, tmp_path):
     captured = {}
 

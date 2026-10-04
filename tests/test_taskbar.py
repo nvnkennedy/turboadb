@@ -87,6 +87,49 @@ def test_a_pin_starts_what_the_shortcuts_start(monkeypatch):
     assert asked == [False]  # the UI thread never builds TurboADB.exe
 
 
+@pytest.mark.skipif(os.name != "nt", reason="shortcut files are Windows-only")
+def test_a_pin_of_a_copy_of_the_exe_that_is_gone_starts_turboadb_again(monkeypatch, tmp_path):
+    """Up to 3.1 a pin made of the wheel's exe started the copy it ran from:
+    the upgrade that deletes that copy points the pin at what starts TurboADB."""
+    from turboadb import cli
+    from turboadb.gui import taskbar
+
+    icon = str(tmp_path / "dark.ico")
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    starter = scripts / "turboadb-gui.exe"
+    starter.write_bytes(b"MZ")
+    pin = str(tmp_path / "TurboADB.lnk")
+    desk, programs = tmp_path / "Desktop", tmp_path / "Programs"
+    monkeypatch.setattr(cli, "_desktop_folder", lambda: str(desk))
+    monkeypatch.setattr(cli, "_programs_folder", lambda: str(programs))
+    programs.mkdir()
+    start_menu = str(programs / "TurboADB.lnk")
+    for link in (pin, start_menu):
+        assert winshell.write_shortcut(link, str(tmp_path / "temp" / "turboadb-gui-3.1.0-20.exe"), "",
+                                       str(tmp_path / "temp"), icon, "TurboADB")
+    asked = []
+
+    def target(build=True):
+        asked.append(build)
+        return str(starter), "", str(scripts)
+
+    monkeypatch.setattr(cli, "_resolve_gui_target", target)
+    monkeypatch.setattr(winshell, "pinned_shortcuts", lambda: [pin])
+    monkeypatch.setattr(winshell, "notify_changed", lambda paths: None)
+    from turboadb.gui import settings
+
+    # with shortcut upkeep turned off nothing else rewrites the Start-menu shortcut
+    monkeypatch.setattr(settings, "get", lambda key, default=None: False)
+    taskbar._sync_shortcut_icons(icon, False)
+    for link in (pin, start_menu):
+        info = winshell.read_shortcut(link)
+        assert info["target"] == str(starter) and info["workdir"] == str(scripts)
+        assert info["app_id"] == winshell.APP_ID and info["icon"] == icon
+    assert asked == [False]  # nothing is built for it
+    assert not desk.exists()  # and no shortcut is made that was not there
+
+
 def test_nothing_is_installed_off_windows(qapp, window, monkeypatch):
     from turboadb.gui import taskbar
 

@@ -503,6 +503,17 @@ def test_cli_touch_device_reports_or_fails(run_cli):
     assert rc == 1 and "no touchscreen" in err
 
 
+def test_cli_touch_device_json_fails_without_a_touchscreen_too(run_cli):
+    """With --json it printed ``null`` and exited 0: a script could not rely
+    on the exit code."""
+    rc, out, err = run_cli(["-s", "S1", "touch-device", "--json"], _Dev(touch_device=None))
+    assert rc == 1 and json.loads(out) is None and "no touchscreen" in err
+    info = {"path": "/dev/input/event3", "name": "goodix-ts", "max_x": 4095, "max_y": 8191,
+            "protocol": "b", "direct": True, "writable": True}
+    rc, out, err = run_cli(["-s", "S1", "touch-device", "--json"], _Dev(touch_device=info))
+    assert rc == 0 and json.loads(out) == info and err == ""
+
+
 def test_cli_stop_server(run_cli):
     rc, out, _err = run_cli(["stop-server"], _Dev())
     assert rc == 0 and "adb server stopped" in out

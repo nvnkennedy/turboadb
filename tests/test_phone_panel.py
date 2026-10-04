@@ -320,11 +320,14 @@ def test_call_state_failure_shows_no_telephony(qapp, make_panel):
 
 
 def test_unexpected_call_state_failure_warns_once(qapp, make_panel):
+    # adb did not reach the device: that says nothing about its telephony, so
+    # the pill does not turn into "No telephony" (the state is asked for again)
     handler = FakePhone(state_error="adb: device offline")
     panel = make_panel(handler)
     panel.refresh()
-    assert _pump(qapp, lambda: panel.call_state_text() == "No telephony")
-    assert panel.state_pill.property("state") == "error"
+    assert _pump(qapp, lambda: any("Call state unavailable" in m for m in panel.logs))
+    assert panel.call_state_text() == "Checking…"
+    assert (panel.state_pill.property("state") or "") == ""
     warnings = [m for m in panel.logs if m.startswith("[WARNING]")]
     assert len(warnings) == 1 and "Call state unavailable" in warnings[0]
     assert not any(m.startswith("[ERROR]") for m in panel.logs)

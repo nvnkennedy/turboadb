@@ -1,9 +1,9 @@
 """Status notices, stream boundaries and screen clears in the terminals.
 
 A notice (Stop, reopen, reconnect, disconnect) is drawn in order after the
-output already received, on a fresh line but never below a blank one.  A form
-feed (what cmd's ``cls`` writes to a pipe) clears the screen instead of
-leaving a blank line."""
+output already received, on a fresh line but never below a blank one.  In
+cmd's terminal a form feed (what its ``cls`` writes to a pipe) clears the
+screen instead of leaving a blank line; anywhere else it is a line feed."""
 
 from __future__ import annotations
 
@@ -16,12 +16,14 @@ PS = "PS C:\\w> "
 ANDROID = "shell@android:/ $ "
 
 
-def _console(*, local=True, sent=None):
+def _console(*, local=True, sent=None, cmd=False):
     from turboadb.gui.console import AnsiConsole
 
     con = AnsiConsole(send_fn=(sent.append if sent is not None else lambda _data: None))
     if local:
         con.set_emulate_prompt(False)
+    if cmd:
+        con.set_form_feed_clears(True)  # as cmd's terminal does
     return con
 
 
@@ -178,7 +180,7 @@ def test_the_banner_never_starts_with_a_blank_line(qapp):
 
 
 def test_a_form_feed_clears_the_screen_but_not_the_history(qapp):
-    con = _console()
+    con = _console(cmd=True)
     try:
         _out(con, CMD)
         _submit(con, "echo before")
@@ -195,7 +197,7 @@ def test_a_form_feed_clears_the_screen_but_not_the_history(qapp):
 
 
 def test_a_form_feed_keeps_the_line_being_typed(qapp):
-    con = _console()
+    con = _console(cmd=True)
     try:
         _out(con, CMD)
         _submit(con, "cls")
@@ -210,11 +212,29 @@ def test_a_form_feed_keeps_the_line_being_typed(qapp):
         _close(con)
 
 
-def test_the_android_pipe_shell_ignores_form_feeds(qapp):
-    con = _console(local=False)
+@pytest.mark.parametrize("shell", ["powershell", "device terminal", "pipe"])
+def test_a_form_feed_is_a_line_feed_where_cmd_is_not_the_shell(qapp, shell):
+    """``cat`` or ``type`` of a file with page breaks wiped everything shown
+    before each of them; on a terminal a form feed only moves down a line."""
+    con = _console(local=shell != "pipe")
     try:
-        _out(con, "page 1\n\x0cpage 2\n")
-        assert con.toPlainText() == "page 1\npage 2\n"
+        if shell == "device terminal":
+            con.set_screen_input(lambda _data: True)
+        _out(con, "line 1\nline 2\npage one\x0cpage two\n\x0c\npage three\n")
+        assert con.toPlainText() == "line 1\nline 2\npage one\npage two\n\n\npage three\n"
+    finally:
+        _close(con)
+
+
+def test_in_cmd_a_device_terminals_form_feed_is_a_line_feed_too(qapp):
+    con = _console(cmd=True)
+    try:
+        con.set_screen_input(lambda _data: True)  # an adb shell typed in cmd
+        _out(con, "V2318:/ $ cat notes\r\npage one\x0cpage two\r\nV2318:/ $ ")
+        assert con.toPlainText() == "V2318:/ $ cat notes\npage one\npage two\nV2318:/ $ "
+        con.set_screen_input(None)  # back in cmd, whose cls clears as ever
+        _out(con, "exit\r\n" + CMD + "cls\r\n\x0c\r\n" + CMD)
+        assert con.toPlainText() == CMD
     finally:
         _close(con)
 
@@ -267,6 +287,19 @@ def test_clear_keeps_the_prompt_and_the_edit_line(qapp):
         _type(con, "ls")
         con.clear()
         assert con.toPlainText() == ANDROID + "ls"
+    finally:
+        _close(con)
+
+
+def test_clear_keeps_a_prompt_with_an_emoji_in_it_whole(qapp):
+    con = _console()
+    try:
+        _out(con, "old output\r\nPS C:\\📁> ")
+        con.clear()
+        assert con.toPlainText() == "PS C:\\📁> "
+        _type(con, "dir")
+        con.clear()
+        assert con.toPlainText() == "PS C:\\📁> dir"
     finally:
         _close(con)
 

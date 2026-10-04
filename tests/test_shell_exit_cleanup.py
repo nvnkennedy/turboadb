@@ -88,3 +88,48 @@ def test_real_closed_shell_and_its_command_are_gone_once_joined(tmp_path):
     assert session.proc.poll() is not None
     table = proctree.snapshot() or {}
     assert not any(pid in table and table[pid].name == "ping.exe" for pid in pings)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="starts a real cmd.exe")
+def test_real_commands_a_shell_left_running_end_when_it_is_closed(tmp_path):
+    """``start /b ping -t 127.0.0.1 >nul`` and then ``exit``: the shell has
+    ended, ping runs on on its hidden console.  Restart shell and closing the
+    tab only closed the pipes of a shell that had exited."""
+    from turboadb import proctree
+    from turboadb.gui import local_terminal as lt
+
+    def running(infos):
+        table = proctree.snapshot() or {}
+        return [info.pid for info in infos if info.pid in table and table[info.pid].name == info.name]
+
+    session = lt.LocalShellSession("cmd", cwd=str(tmp_path), adb_path="__missing__")
+    left = []
+    try:
+        out = ""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not left:
+            if ">" in out and "started" not in out:
+                session.send(b"start /b ping -t 127.0.0.1 >nul\n")
+                out += "started"
+            out += session.read(65536).decode("utf-8", "replace")
+            left = [info for info in proctree.descendants(session.proc.pid)
+                    if info.name == "ping.exe"]
+            time.sleep(0.02)
+        assert left
+        session.send(b"exit\n")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and session.proc.poll() is None:
+            session.read(65536)
+            time.sleep(0.02)
+        assert session.proc.poll() is not None and running(left)  # gone, its command not
+        session.close()
+        assert lt.join_closers(10.0) == 0
+        deadline = time.monotonic() + 5  # a process ended is gone a moment later
+        while running(left) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not running(left)
+    finally:
+        session.close()
+        lt.join_closers(10.0)
+        for info in left:
+            proctree._terminate(info)  # whatever is still running of what this test started

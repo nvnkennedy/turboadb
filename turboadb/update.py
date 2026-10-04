@@ -16,6 +16,8 @@ from .config import user_path
 from .tools import NO_WINDOW, parse_version, windowless_python
 
 PYPI_JSON = "https://pypi.org/pypi/turboadb/json"
+# Where each release's standalone executable is published.
+RELEASES_PAGE = "https://github.com/NVNKENNEDY/turboadb/releases/latest"
 
 # The folder of the turboadb package this process imported.
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -189,7 +191,10 @@ def self_update_blocker() -> str | None:
     process imports), and for a checkout installed in editable mode it would
     replace that install with a release."""
     if getattr(sys, "frozen", False):
-        return "running the standalone executable — upgrade with: pip install -U turboadb"
+        return (
+            "running the standalone executable — download the new one from "
+            f"{RELEASES_PAGE} (or, where pip installed it: pip install -U turboadb)"
+        )
     copy = running_copy()
     if copy["pip_managed"] is not False:
         return None
@@ -214,10 +219,13 @@ def can_self_update() -> bool:
 
 
 def check() -> str | None:
-    """Return the latest version string IF it is newer than what's installed and
-    we're able to self-update; otherwise None."""
-    if not can_self_update():
-        return None
+    """Return the latest version string IF it is newer than the one running;
+    otherwise None.
+
+    Whether pip can install it here is a separate question
+    (:func:`can_self_update`): the standalone executable and a source checkout
+    are told about a newer release too, and :func:`self_update_blocker` says
+    how they get it."""
     latest = pypi_latest()
     return latest if is_newer(latest) else None
 
@@ -241,8 +249,6 @@ def check_cached(max_age: float = 86400) -> str | None:
     """Like :func:`check`, but hits PyPI at most once per *max_age* seconds
     (default: daily) — for the quiet launch check, so starting the app several
     times a day doesn't mean several network round-trips."""
-    if not can_self_update():
-        return None
     import time
 
     cache = check_cache_path()

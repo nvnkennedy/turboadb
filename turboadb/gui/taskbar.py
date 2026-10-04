@@ -77,11 +77,15 @@ def relaunch_command() -> str:
 
 def _sync_shortcut_icons(icon: str, everywhere: bool) -> None:
     """Point TurboADB's pins (with *everywhere* also its Start-menu and Desktop
-    shortcuts, when shortcut upkeep is on) at *icon*."""
+    shortcuts, when shortcut upkeep is on) at *icon*.  A pin or a shortcut
+    left starting a copy of the wheel's exe (:func:`cli._revive_shortcuts`)
+    starts what starts TurboADB now first."""
     try:
         paths = winshell.pinned_shortcuts()
+        from ..cli import _revive_shortcuts, _shortcut_paths
+
+        _revive_shortcuts(paths)
         if everywhere:
-            from ..cli import _shortcut_paths
             from . import settings as settings_mod
 
             if settings_mod.get("make_shortcut_first_run"):

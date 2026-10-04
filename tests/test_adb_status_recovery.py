@@ -130,6 +130,114 @@ def test_retries_are_bounded(window):
     assert len(_Init.made) == 1 + window._ADB_RETRIES
 
 
+class _Download(QThread):
+    """The one-time download of the tools; it ends when the test says so."""
+    progress = pyqtSignal(int)
+    stage = pyqtSignal(str)
+    done = pyqtSignal(dict)
+    made = []
+
+    def __init__(self, mode="fetch", force=False):
+        super().__init__()
+        self.mode, self.server_up = mode, False
+        _Download.made.append(self)
+
+    def run(self):
+        pass
+
+
+@pytest.fixture
+def first_launch(qapp, monkeypatch):
+    """A window opening on a PC without adb, with the automatic download on."""
+    from turboadb import toolsdl
+
+    _Poll.made, _Init.made, _Download.made = [], [], []
+    monkeypatch.setenv("TURBOADB_AUTO_FETCH", "1")
+    monkeypatch.setattr(tools, "adb_available", lambda explicit=None: False)
+    monkeypatch.setattr(tools, "scrcpy_available", lambda explicit=None: False)
+    monkeypatch.setattr(toolsdl, "ensure_tools", lambda **_kw: pytest.fail("a real download"))
+    monkeypatch.setattr(mw, "_DeviceTracker", _Tracker)
+    monkeypatch.setattr(mw, "_DevicesPoll", _Poll)
+    monkeypatch.setattr(mw, "_AdbInitThread", _Init)
+    monkeypatch.setattr(mw, "_ToolsDownloadThread", _Download)
+    for name in ("_ensure_shortcuts", "_quiet_update_check"):
+        monkeypatch.setattr(mw.MainWindow, name, lambda self: None)
+    logged, boxes = [], []
+    monkeypatch.setattr(mw.MainWindow, "_log", lambda self, text: logged.append(text))
+    monkeypatch.setattr(mw.QMessageBox, "warning",
+                        staticmethod(lambda *args, **_kw: boxes.append(args[1])))
+    win = mw.MainWindow()
+    win.logged, win.boxes = logged, boxes
+    yield win
+    win.close()
+    win.deleteLater()
+
+
+def _tools_check_ran(timeout_ms=5000) -> bool:
+    """Wait for the tools check of the launch (half a second after it) to
+    have started its download."""
+    for _ in range(timeout_ms // 20):
+        if _Download.made:
+            return True
+        QTest.qWait(20)
+    return bool(_Download.made)
+
+
+def test_a_first_launch_without_adb_shows_the_download_not_a_failure(qapp, first_launch):
+    """The startup check ran first and failed at once: a warning ("Could not
+    find 'adb'… turboadb fetch-tools"), a red "ADB unavailable" and "ADB
+    unavailable — see the log" in the device list, half a second before the
+    download of the tools began by itself."""
+    window = first_launch
+    assert _Init.made == []  # no server start that could only fail
+    assert window._status_adb.text() == "Downloading ADB…"
+    assert window._status_adb.tone() != "error" and window._status_adb.busy()
+    assert _rows(window) == ["⬇  Downloading ADB (one-time)…"]
+    assert _tools_check_ran()
+    assert [task.mode for task in _Download.made] == ["ensure"]
+    assert _Init.made == []
+    assert not any(line.startswith(("[WARNING]", "[ERROR]")) for line in window.logged)
+    # the download is in: now the server starts, and reports as on any launch
+    assert window._dl.wait(5000)
+    window._tools_done({"adb": "C:/tools/adb.exe", "scrcpy": "C:/tools/scrcpy.exe", "errors": {}})
+    assert len(_Init.made) == 1 and window._status_adb.text() == "ADB starting…"
+    window._adb_init.ready.emit(True, "ADB server active (127.0.0.1:5037)")
+    assert window._status_adb.text() == "ADB ready"
+
+
+def test_a_first_launch_whose_download_fails_says_adb_is_unavailable(qapp, first_launch):
+    window = first_launch
+    assert _tools_check_ran()
+    assert window._dl.wait(5000)
+    window._tools_done({"adb": None, "scrcpy": None, "errors": {"adb": "no network"}})
+    assert window.boxes == ["Download failed"]
+    assert len(_Init.made) == 1  # the startup check, which says what is missing
+    window._adb_init.ready.emit(False, "ADB initialization note: Could not find 'adb'")
+    assert window._status_adb.text() == "ADB unavailable"
+    assert _rows(window) == ["⚠  ADB unavailable — see the log"]
+
+
+@pytest.fixture
+def no_adb_build(monkeypatch):
+    """A machine Google builds no adb for (ARM Linux): none is downloaded."""
+    from turboadb import toolsdl
+
+    monkeypatch.setattr(toolsdl, "adb_download_supported", lambda: False)
+
+
+def test_a_first_launch_where_no_adb_can_be_downloaded_announces_no_download(
+        qapp, no_adb_build, first_launch):
+    """The chip and the device list said "Downloading ADB…" there too, until
+    the tools check had found nothing it could download."""
+    window = first_launch
+    assert len(_Init.made) == 1  # the startup check, which says what is missing
+    assert window._status_adb.text() == "ADB starting…"
+    assert "⬇  Downloading ADB (one-time)…" not in _rows(window)
+    window._adb_init.ready.emit(False, "ADB initialization note: Could not find 'adb'")
+    assert window._status_adb.text() == "ADB unavailable"
+    assert _rows(window) == ["⚠  ADB unavailable — see the log"]
+
+
 def test_a_restart_that_fixes_a_failed_start_starts_the_fallback_poll(window):
     window._on_adb_ready(False, "ADB server did not start: boom")
     window._timer.stop()

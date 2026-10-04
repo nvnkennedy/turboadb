@@ -6,7 +6,9 @@ text; so is now a repeat whose body can match the same text in two ways, such
 as ``(a|aa)+``, while ordinary alternations inside a repeat stay patterns.
 Repeats in a row (``\\w+.*\\w+Exception``) passed both checks and took
 milliseconds per line: a pattern that is too slow on a long line is timed out
-too."""
+too.  So is one whose repeats can share a run of one character
+(``\\s*\\s*x``): only a long run of spaces or dashes slows it down, for a minute
+or more.  The run may be of any character the pattern names (``/+\\s*/+x``)."""
 
 import re
 import time
@@ -46,6 +48,19 @@ ORDINARY = [
     r"Exception",
     r".*Exception.*",
     r"ActivityManager|WindowManager",
+    # one repeat, or several that share no character, goes over a run of one
+    # character once from each start: nothing to refuse
+    r"\s+$",
+    r"\d+\s*(ms|s|us|ns)",
+    r"\s+(error|warn|fail|fatal|crash|exception)",
+    r"-+\s*(beginning|end) of",
+    r"^\s*\w*\s*:",  # from the start of the line only
+    # ... and so over a run of a character they name themselves
+    r"//+\s*TODO",
+    r"x+y+z",
+    r"e.*x",
+    r"/data/\S+/files",
+    r"\t+\w+",
 ]
 
 # Repeats in a row: no nesting and no overlapping choices, but on a 180
@@ -55,6 +70,31 @@ SLOW = [
     r"\w+.*\w+Exception",
     r".* .*timeout",
     r".*.*x",
+]
+
+# Repeats that can share a run of one character.  They search the lines the
+# others are timed on in no time, as nothing there repeats for long.  One log
+# line with 3,500 spaces took 97 s with the first, one with 3,500 dashes 78 s
+# with the second.  ``(pattern, the character of the run)``.
+SHARING_A_RUN = [
+    (r"\s*\s*x", " "),
+    (r"-+\s*-+x", "-"),
+    (r"=+ ?=+x", "="),
+    (r"\d+\d+x", "0"),
+    (r"\.+\.*x", "."),
+    (r"[a-z]+[a-z]*!", "a"),
+    (r"\s*\w*\s*:", " "),
+    (r"\s*\s*$", " "),  # slow when the line goes on after the run
+    # a run of any character the pattern names: a log line can hold one of
+    # slashes, tildes or one letter as well as one of dashes
+    (r"/+\s*/+x", "/"),
+    (r"~+~+x", "~"),
+    (r"x*x*y", "x"),
+    (r"1+1+x", "1"),
+    (r"[/~]+[/~]*!", "~"),
+    (r"\t*\t*x", "\t"),      # named by an escape
+    (r"\x2f+\x2f+!", "/"),   # ... or by its code
+    (r"[:-<]+[:-<]*x", "<"),  # the end of a range
 ]
 
 
@@ -87,6 +127,26 @@ def test_a_pattern_too_slow_for_a_long_line_is_matched_as_plain_text(text):
     for _ in range(200):
         pattern.search(line)
     assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize("text, char", SHARING_A_RUN)
+def test_repeats_that_share_a_run_of_one_character_are_matched_as_plain_text(text, char):
+    started = time.perf_counter()
+    pattern, note = compile_filter(text)
+    assert time.perf_counter() - started < 2.0  # timing it stops at the first slow run
+    assert pattern.pattern == re.escape(text)
+    assert "too long" in note and "plain text" in note
+    started = time.perf_counter()
+    pattern.search(char * 3500 + " end of the line")
+    assert time.perf_counter() - started < 0.5
+
+
+def test_a_run_is_checked_with_match_case_on_too():
+    assert compile_filter(r"[A-Z]+[A-Z]*!", match_case=True)[1]
+    assert compile_filter(r"\s*\s*x", match_case=True)[1]
+    assert compile_filter(r"[A-Z]+\d+", match_case=True)[1] == ""
+    assert compile_filter(r"X+X*!", match_case=True)[1]
+    assert compile_filter(r"X+Y+!", match_case=True)[1] == ""
 
 
 def test_the_check_follows_match_case():

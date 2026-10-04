@@ -172,8 +172,10 @@ class _Overlaps:
 
     def __init__(self, parsed, ignore_case: bool):
         self.ic = ignore_case
-        chars = set(_SAMPLE)
+        chars = set()
         self._collect(parsed, chars)
+        self.named = frozenset(chars)  # what the pattern names (see _too_slow)
+        chars |= _SAMPLE
         if ignore_case:
             chars |= {x for c in chars for x in (c.lower(), c.upper()) if len(x) == 1}
         self.alphabet = frozenset(chars)
@@ -399,11 +401,34 @@ _PROBE_LINES = tuple(
 # Ordinary ones (Exception, .*Exception.*, ActivityManager|WindowManager) need
 # a few milliseconds at most; repeats in a row need tens or thousands.
 _PROBE_BUDGET_S = 0.010
+# Runs of one character, about as long as the longest line logcat prints:
+# padding, a ruler of dashes or stars, the zeros of a dump.  Nothing in the
+# lines above repeats for long, so repeats that can share a run (``\s*\s*x``,
+# ``-+\s*-+x``) search those in no time, but one line with a few thousand
+# spaces for minutes.
+_RUN_LENGTH = 4096
+_RUN_CHARS = " -=.*#_aA0"
+_PROBE_RUNS = tuple(char * _RUN_LENGTH for char in _RUN_CHARS)
+# A class takes one of those characters, a literal only its own: ``/+\s*/+x``
+# is as slow on a line of slashes.  So a run of each character the pattern
+# names is tried too, of this many at most (a filter may be a pasted line).
+_NAMED_RUNS = 64
+_RUN_END = "\0"  # stands for the rest of a line after a run: no pattern names it
+# A search does the same work from every start in a run, so one start is timed.
+# A pattern that fails there for longer than this is too slow: an ordinary one
+# goes over the run once (well under a millisecond), repeats that share it try
+# every way to split it (tens of milliseconds, hundreds for three of them).
+_RUN_BUDGET_S = 0.004
+# One start is short work, and a busy PC stalls the process for longer than
+# its budget: only a start that took this long counts without a second try.
+_RUN_AT_ONCE_S = 1.0
 
 
-def _too_slow(pattern) -> bool:
+def _too_slow(pattern, named="") -> bool:
     """Whether searching a probe line with *pattern* takes longer than
-    ``_PROBE_BUDGET_S``.
+    ``_PROBE_BUDGET_S``, or one start in a run of one character longer than
+    ``_RUN_BUDGET_S``.  *named*: the characters the pattern names, each of
+    which gets a run of its own.
 
     Repeats one after another, such as ``\\w+.*\\w+Exception``, ``.* .*timeout``
     or ``.*.*x``, pass the checks above but try every way to split a line
@@ -414,23 +439,49 @@ def _too_slow(pattern) -> bool:
     growing lengths, so a pattern that is slow on short ones is refused before
     a long one takes seconds, and a slow search is timed once more before it
     counts, so a moment's stall of the process does not refuse an ordinary
-    pattern."""
+    pattern.
+
+    A run is tried from its second character (``^`` and ``\\b`` hold a pattern
+    to one start, and one start costs little), as the end of a line and with
+    the line going on after it (``\\s*\\s*$`` fails only then).  A match there
+    is what a search finds at once, however long it took."""
     clock = time.perf_counter
+
+    def timed(find, *args, budget, at_once):
+        """``(seconds, result)`` of ``find(*args)``, timed once more when it
+        took longer than *budget* (but not *at_once* or longer)."""
+        for _attempt in range(2):
+            started = clock()
+            found = find(*args)
+            spent = clock() - started
+            if spent <= budget or spent > at_once:
+                break
+        return spent, found
+
     length = 32
     while True:
         for line in _PROBE_LINES:
-            text = line[:length]
-            for _attempt in range(2):
-                started = clock()
-                pattern.search(text)
-                spent = clock() - started
-                if spent <= _PROBE_BUDGET_S or spent > 10 * _PROBE_BUDGET_S:
-                    break
+            spent, _found = timed(pattern.search, line[:length],
+                                  budget=_PROBE_BUDGET_S, at_once=10 * _PROBE_BUDGET_S)
             if spent > _PROBE_BUDGET_S:
                 return True
         if length >= _PROBE_LENGTH:
-            return False
+            break
         length = min(2 * length, _PROBE_LENGTH)
+    runs = _PROBE_RUNS + tuple(
+        char * _RUN_LENGTH for char in sorted(set(named) - set(_RUN_CHARS))[:_NAMED_RUNS])
+    length = 32
+    while True:
+        for run in runs:
+            text = run[:length]
+            for line in (text, text[:-1] + _RUN_END):
+                spent, found = timed(pattern.match, line, 1,
+                                     budget=_RUN_BUDGET_S, at_once=_RUN_AT_ONCE_S)
+                if spent > _RUN_BUDGET_S and found is None:
+                    return True
+        if length >= _RUN_LENGTH:
+            return False
+        length = min(2 * length, _RUN_LENGTH)
 
 
 def compile_filter(text: str, match_case: bool = False):
@@ -454,17 +505,20 @@ def compile_filter(text: str, match_case: bool = False):
     except Exception:  # re.error, OverflowError, RecursionError
         note = "Not a valid regular expression, so it is matched as plain text."
     else:
+        named = text  # without the parser: the characters it is written with
         try:
             parsed = _sre_parse.parse(text, flags) if _sre_parse is not None else None
             risk = _regex_risk(parsed) if parsed is not None else ""
             if not risk and parsed is not None:
                 state = getattr(parsed, "state", None)
                 ignore_case = bool((flags | getattr(state, "flags", 0)) & re.IGNORECASE)
-                if _Overlaps(parsed, ignore_case).found(parsed):
+                overlaps = _Overlaps(parsed, ignore_case)
+                named = overlaps.named
+                if overlaps.found(parsed):
                     risk = "overlap"
         except Exception:
             risk = ""
-        if not risk and _too_slow(pattern):
+        if not risk and _too_slow(pattern, named):
             risk = "slow"
         if not risk:
             return pattern, ""
@@ -626,6 +680,9 @@ class _Capture:
         self.seq = 0  # lines archived since the panel opened (never goes back)
         self.base = 0  # seq of the archive's first line (Clear starts a new one)
         self.keep = None  # predicate for lines added from now on; None keeps all
+        # seq at the last filter change or Clear: a reader's batches archived
+        # before it are stale (the redraw, or Clear, accounts for them)
+        self.live_from = 0
 
     def add(self, lines, cancelled=None):
         """Archive *lines*: ``(seq of the first one, the filter to apply)``.
@@ -647,13 +704,14 @@ class _Capture:
         """Keep lines added from now on with *keep*: ``(seq, base)`` of that moment."""
         with self.lock:
             self.keep = keep
+            self.live_from = self.seq
             return self.seq, self.base
 
     def reset(self) -> int:
         """Forget the archived lines (Clear); returns where the new archive starts."""
         with self.lock:
             self.sb.reset()
-            self.base = self.seq
+            self.base = self.live_from = self.seq
             return self.seq
 
     def position(self):
@@ -708,7 +766,7 @@ class _LogcatThread(QThread):
         # reaping adb and reading its last error text, which can take seconds.
         self.ending = False
         self._lock = threading.Lock()
-        self._entries_out = []  # [start seq, kept lines, dropped count] per batch
+        self._entries_out = deque()  # [start seq, kept lines, dropped count] per batch
         self._size = 0
         self._entries = _Entries() if long_entries else None
         # How it ended, for the panel's report and a seamless restart.
@@ -730,8 +788,8 @@ class _LogcatThread(QThread):
         """Everything kept since the last call (thread-safe), as
         ``[start seq, lines, dropped]`` per batch."""
         with self._lock:
-            out, self._entries_out, self._size = self._entries_out, [], 0
-        return out
+            out, self._entries_out, self._size = self._entries_out, deque(), 0
+        return list(out)
 
     def take_lines(self) -> list:
         """All kept lines since the last call (thread-safe)."""
@@ -748,17 +806,28 @@ class _LogcatThread(QThread):
 
     def _publish(self, lines, start: int = 0) -> None:
         with self._lock:
-            self._entries_out.append([start, list(lines), 0])
+            entries = self._entries_out
+            entries.append([start, list(lines), 0])
             self._size += len(lines)
             overflow = self._size - self._LINES_MAX
-            for entry in self._entries_out:
-                if overflow <= 0:
-                    break
+            while overflow > 0:
+                entry = entries[0]
                 cut = min(overflow, len(entry[1]))
                 del entry[1][:cut]
                 entry[2] += cut
                 self._size -= cut
                 overflow -= cut
+                if entry[1] or len(entries) == 1:
+                    break
+                # An emptied batch leaves the backlog: a page that is not
+                # drained (hidden, or the window minimised) kept one per
+                # batch, and every new batch walked them all.  Its count goes
+                # to the batch after it, unless a filter change or Clear has
+                # made it stale: the panel leaves such a batch out, count and
+                # all (see LogcatPanel._pull).
+                entries.popleft()
+                if self.capture is None or entry[0] >= self.capture.live_from:
+                    entries[0][2] += entry[2]
 
     # ---- one batch of lines ----
     def _ingest(self, lines, status: bool = False) -> None:
@@ -1151,7 +1220,6 @@ class LogcatPanel(QWidget):
         self._no_tail_option = False  # this device's logcat has no -T (see _tail_refused)
         self._filter_re = None  # the filter in effect (see _refilter_view)
         self._next_filter = (None, "")  # compiled as typed, applied when typing pauses
-        self._live_from = 0  # live lines archived before this position are stale
         self._search_id = 0
         self._searching = False
         self._jobs = []
@@ -1460,7 +1528,6 @@ class LogcatPanel(QWidget):
         self._filter_re = pattern
         keep = pattern.search if pattern is not None else None
         boundary, base = self._capture.set_keep(keep)
-        self._live_from = boundary
         # queued lines were kept with the old filter; the search covers them
         self._pending = []
         self._skipped = 0
@@ -1893,7 +1960,7 @@ class LogcatPanel(QWidget):
         self._search_id += 1  # a search still running was for the old capture
         self._searching = False
         # clear forgets the archived history too; lines read before it stay out
-        self._live_from = self._capture.reset()
+        self._capture.reset()
         running = thread_running(self.thread)
         self._empty_hint.set_text(_HINT_WAIT if running else self._idle_hint())
         self._empty_hint.show()
@@ -1944,7 +2011,7 @@ class LogcatPanel(QWidget):
         redraw (or Clear) already accounts for them."""
         if thread is None:
             return
-        live_from = self._live_from
+        live_from = self._capture.live_from
         for start, lines, dropped in thread.take():
             if start < live_from:
                 continue

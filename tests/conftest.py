@@ -32,6 +32,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
+# The ports an adb server of this PC may be listening on (the default, and the
+# one its environment names): no test reaches them, see _no_adb_server_of_this_pc.
+ADB_PORTS_OF_THIS_PC = {5037}
+if os.environ.get("ANDROID_ADB_SERVER_PORT", "").isdigit():
+    ADB_PORTS_OF_THIS_PC.add(int(os.environ["ANDROID_ADB_SERVER_PORT"]))
+
 
 class FakeCompleted:
     def __init__(self, args, returncode=0, stdout=b"", stderr=b""):
@@ -47,7 +53,15 @@ class FakeAdb:
     responses: maps a matching function OR a substring (matched against the
     joined argv after the adb path) to (returncode, stdout, stderr). bytes or str
     stdout both accepted. Default: success with empty output.
+
+    For ``adb shell`` it is the device's shell too: a command that ends with
+    the mark of a change that worked (``… && echo TURBOADB_DONE``, see
+    remotefs._marked) prints the mark after an answer whose return code is 0.
+    With ``exit_status = False`` it is a device before Android 7: adb exits 0
+    whatever the command did, and its errors arrive with its output.
     """
+
+    exit_status = True
 
     def __init__(self):
         self.calls = []  # list of argv lists
@@ -78,11 +92,24 @@ class FakeAdb:
         argv = list(cmd)
         self.calls.append(argv)
         rc, out, err = self._answer(argv)
+        if "shell" in argv:
+            rc, out, err = self._as_the_device_shell(str(argv[-1]), rc, out, err)
         text = kw.get("text") or kw.get("universal_newlines")
         if text:
             out = out.decode() if isinstance(out, bytes) else out
             err = err.decode() if isinstance(err, bytes) else err
         return FakeCompleted(argv, rc, out, err)
+
+    def _as_the_device_shell(self, command, rc, out, err):
+        from turboadb.remotefs import DONE_MARK
+
+        done = rc == 0 and command.endswith("&& echo " + DONE_MARK)
+        if not self.exit_status:
+            rc, out, err = 0, out + err, err[:0]  # one stream, and no status
+        if done:  # after everything the command itself said
+            mark = DONE_MARK + "\n"
+            out += mark.encode() if isinstance(out, bytes) else mark
+        return rc, out, err
 
     def last(self):
         return self.calls[-1] if self.calls else None
@@ -158,6 +185,46 @@ def _no_real_device_connect(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _no_adb_server_of_this_pc():
+    """A developer's PC often has an adb server running, with devices
+    attached, and no test may reach it: a connection to its port on this PC
+    is refused, as on a machine where none runs.  (The adb commands the
+    engine starts are faked; this covers the code that asks a server over a
+    socket.)  The tests' own stand-in servers listen on ports of their own."""
+    import errno
+    import socket
+
+    this_pc = {"127.0.0.1", "localhost", "::1"}
+
+    def refused(address):
+        try:
+            host, port = address[0], address[1]
+        except (TypeError, IndexError, KeyError):
+            return False
+        return port in ADB_PORTS_OF_THIS_PC and str(host).lower() in this_pc
+
+    connect, connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def guarded_connect(self, address):
+        if refused(address):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "no test reaches an adb server of this PC")
+        return connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        if refused(address):
+            return errno.ECONNREFUSED
+        return connect_ex(self, address)
+
+    socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    try:
+        yield
+    finally:
+        socket.socket.connect = connect
+        socket.socket.connect_ex = connect_ex
+
+
 @pytest.fixture(autouse=True)
 def _no_real_apps(monkeypatch, tmp_path):
     """Opening a file from the Files tab starts the app this PC has for it
@@ -186,6 +253,37 @@ def _no_ffmpeg_download(monkeypatch):
         yield
         return
     monkeypatch.setattr(ffmpeg_tools, "_auto_download_supported", lambda: False)
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_pypi_lookup():
+    """The update check asks PyPI whichever TurboADB runs: a main window does
+    2.5 s after it opens, "Check for updates" at once.  No test reaches the
+    network for it; those of the check give ``pypi_latest`` an answer of
+    their own.
+
+    For the whole run, not per test: a window that a test leaves open asks
+    later, between two tests, on a worker of its own.  A stand-in that went
+    with each test was gone by then, and the suite reached pypi.org."""
+    from turboadb import update
+
+    stand_in = pytest.MonkeyPatch()
+    stand_in.setattr(update, "pypi_latest", lambda *args, **kwargs: None)
+    yield
+    stand_in.undo()
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_downloads(monkeypatch):
+    """A tools download that a test fakes unpacks a file that is only named
+    adb, on whichever machine the suite runs. The checks that Google builds
+    adb for this machine, and that the downloaded one runs here, would refuse
+    it; the tests of those checks put them back."""
+    from turboadb import toolsdl
+
+    monkeypatch.setattr(toolsdl, "adb_download_supported", lambda: True)
+    monkeypatch.setattr(toolsdl, "_require_runnable", lambda adb: None)
     yield
 
 

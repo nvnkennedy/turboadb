@@ -180,6 +180,49 @@ def test_text_and_keys_keep_their_order(app):
     pump.stop()
 
 
+def test_keys_and_text_go_with_the_display_the_owner_names(app):
+    """The owner says which display the input names: None is the plain
+    command, and display 0 is a display like any other (it is named on a
+    device with several, where the plain command goes to the focused one)."""
+    from turboadb.gui.mirror_panel import _KeyBatcher
+
+    calls = []
+
+    class Handler:
+        def input_text(self, text, **kwargs):
+            calls.append(("text", text, kwargs))
+            return True
+
+        def keyevent(self, code, **kwargs):
+            calls.append(("key", code, kwargs))
+            return True
+
+        def keyevents(self, codes, **kwargs):
+            calls.append(("keys", list(codes), kwargs))
+            return True
+
+    named = {"display": 0}
+    dispatcher = _Dispatcher()
+    pump = _KeyBatcher(Handler(), dispatcher, display_id=lambda: named["display"])
+    pump.push("key", 66)
+    pump.push("text", "a")
+    pump.flush()
+    named["display"] = 3
+    pump.push("key", 4)
+    pump.push("key", 4)
+    named["display"] = None
+    pump.push("text", "b")
+    pump.flush()
+    dispatcher.run_all()
+    assert calls == [
+        ("key", 66, {"safe": True, "display_id": 0}),
+        ("text", "a", {"safe": True, "display_id": 0}),
+        ("keys", [4, 4], {"safe": True, "display_id": 3}),
+        ("text", "b", {"safe": True}),
+    ]
+    pump.stop()
+
+
 def test_pending_commands_are_capped_and_stop_discards_them(app):
     pump, handler, dispatcher = _pump()
     notes = []

@@ -47,6 +47,14 @@ from .ffmpeg_tools import ffmpeg_url
 _log = logging.getLogger(__name__)
 
 DEFAULT_STREAM_PORT = 28100
+# Every stream gets a port of its own, from DEFAULT_STREAM_PORT up.  A stream's
+# ffmpeg is found on the remote by the port it listens on, and its firewall
+# rule is named after it: on one shared port, a second panel's start ended
+# the first panel's ffmpeg as "stale", and stopping either stream ended the
+# other and deleted the rule both used.
+_STREAM_PORTS = range(DEFAULT_STREAM_PORT, DEFAULT_STREAM_PORT + 16)
+_ports_lock = threading.Lock()
+_ports_in_use = set()
 _NET_TIMEOUT_S = 20  # `net use` listing
 _SMB_CONNECT_TIMEOUT_S = 45  # an unreachable host takes ~40 s to fail
 # Pushing ~160 MB over SMB is quick on a LAN; a hung share used to block the
@@ -449,6 +457,28 @@ def list_remote_cameras(host, login, password, *, winrm_port=5985, log=None):
     code, out, err = _run_ps(host, login, password, script, winrm_port)
     cams = parse_dshow_devices(out)
     return cams, ffmpeg, out.strip()
+
+
+def claim_stream_port() -> int:
+    """A stream port that no other stream of this process uses: the lowest
+    free one, held until :func:`release_stream_port`.  Ports are not kept per
+    remote PC (one PC may be reached by several names): no two streams ever
+    share one."""
+    with _ports_lock:
+        for port in _STREAM_PORTS:
+            if port not in _ports_in_use:
+                _ports_in_use.add(port)
+                return port
+    raise RuntimeError(
+        f"{len(_STREAM_PORTS)} remote camera streams are open already; stop one first."
+    )
+
+
+def release_stream_port(port) -> None:
+    """Give back a port from :func:`claim_stream_port`, once its stream's
+    ffmpeg and firewall rule on the remote are gone (or were never made)."""
+    with _ports_lock:
+        _ports_in_use.discard(port)
 
 
 def _listen_url(stream_port):

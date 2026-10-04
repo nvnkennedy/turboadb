@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import QWidget
 
 from ..core import ADBHandler
 from ..results import OperationResult
-from .device_commands import DeviceCommandDispatcher, command_error
+from .device_commands import DeviceCommandDispatcher, command_error, input_display
 from .qtutil import park_thread, thread_running
 
 # --------------------------------------------------------------------------- #
@@ -837,6 +837,8 @@ class ScreencapView(QWidget):
 
     *display* is an entry from ``list_displays`` (``{"id": 0}`` is the default
     display): input goes to its logical id, the capture uses its physical id.
+    Keys for display 0 name it once the view knows the device has several
+    displays (:meth:`set_device`); its taps keep the plain command.
     Keys go through *key_sink* ``(kind, payload, auto_repeat=)`` and
     *key_release* ``(code)`` when given (the owning MirrorPanel's batcher),
     else through a batcher of its own. Commands run in order on *dispatcher*.
@@ -876,6 +878,10 @@ class ScreencapView(QWidget):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.handler = handler
         self.display = dict(display or {"id": 0})
+        # How many displays the device has and its Android API level, which
+        # decide whether display 0's keys name it (set_device).
+        self._displays = 1
+        self._sdk = None
         self.max_fps = max_fps
         self.fmt = fmt
         self._owns_dispatcher = dispatcher is None
@@ -911,6 +917,20 @@ class ScreencapView(QWidget):
     def input_display_id(self):
         """The ``input -d`` id: None for the default display."""
         return self.display_id or None
+
+    def set_device(self, displays, sdk=None) -> None:
+        """The number of displays the device has, and its Android API level
+        (None: not known): on its own, or where ``input`` takes no display,
+        display 0 keeps the plain key."""
+        self._displays = int(displays or 0)
+        self._sdk = sdk
+
+    def key_display_id(self):
+        """The display this view's keys are sent with, or None for the plain
+        command (``device_commands.input_display``).  A key without a display
+        goes to whichever display Android has in focus; a tap without one
+        goes to display 0, so taps keep :attr:`input_display_id`."""
+        return input_display(self.display_id, self._displays, self._sdk)
 
     def frame_size(self):
         """``(width, height)`` of the device's captures, once one arrived."""
@@ -1227,7 +1247,8 @@ class ScreencapView(QWidget):
 
     def _key(self, code, label) -> None:
         handler = self.handler
-        extra = {"display_id": self.input_display_id} if self.input_display_id else {}
+        display = self.key_display_id()
+        extra = {} if display is None else {"display_id": display}
         self._submit(label, lambda: handler.keyevent(code, safe=True, **extra))
 
     def _submit(self, label, run, wheel=False) -> None:
@@ -1256,7 +1277,7 @@ class ScreencapView(QWidget):
             from .mirror_panel import _KeyBatcher
 
             self._batcher = _KeyBatcher(
-                self.handler, self._dispatcher, self, display_id=self.input_display_id
+                self.handler, self._dispatcher, self, display_id=self.key_display_id
             )
             self._batcher.note.connect(self.log)
             self._key_sink, self._key_release = self._batcher.push, self._batcher.release

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from itertools import chain
 from typing import Callable, List, Optional, Sequence, Tuple
 
 # Attribute flags (the third item of an attribute).
@@ -48,14 +49,20 @@ BLOCK, UNDERLINE_CURSOR, BAR = "block", "underline", "bar"
 
 # One token of output: a run of printable characters, a CSI, OSC or other
 # string sequence, another escape, or a single control character.
-_TOKEN = re.compile(
+_TOKENS = (
     r"(?P<text>[^\x00-\x1f\x7f-\x9f]+)"
     r"|\x1b\[(?P<csi>[0-?]*[ -/]*[@-~])"
     r"|\x1b\](?P<osc>[^\x07\x1b]*)(?:\x07|\x1b\\|(?=\x1b))"
-    r"|\x1b[PX^_](?:[^\x1b]|\x1b(?!\\))*\x1b\\"
+    r"%s"
     r"|\x1b(?P<esc>[ -/]*[0-~])"
     r"|(?P<ctl>[\x00-\x1f\x7f-\x9f])"
 )
+_ST = "\x1b\\"  # the end of a string
+_TOKEN = re.compile(_TOKENS % r"|\x1b[PX^_](?:[^\x1b]|\x1b(?!\\))*\x1b\\")
+# ... after the last ST of what arrived: a DCS, SOS, PM or APC string that
+# starts there has no end, so its start is the escape it would be taken for
+# anyway (see Screen.feed).
+_TOKEN_AFTER_ST = re.compile(_TOKENS % "")
 # A sequence cut off at the end of what arrived: kept for the next feed.
 _INCOMPLETE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*\x1b?|[PX^_](?:[^\x1b]|\x1b(?!\\))*\x1b?|[ -/]*)\Z"
@@ -263,11 +270,21 @@ class Screen:
             self._carry = ""
         if not data:
             return
-        tail = _INCOMPLETE.search(data, max(0, len(data) - _CARRY_MAX))
+        # Only a tail that short is kept, and none goes on over the end of a
+        # string (ST): looked for from further back, every string start in
+        # front of an ST was followed up to it.
+        start = max(0, len(data) - _CARRY_MAX)
+        ended = data.rfind(_ST, start)
+        tail = _INCOMPLETE.search(data, start if ended < 0 else ended + len(_ST))
         if tail is not None:
             self._carry = data[tail.start():]
             data = data[:tail.start()]
-        for match in _TOKEN.finditer(data):
+        # Up to its last ST every string start of what is left has an end;
+        # after it none has.  Looking for that end from each of them went
+        # through the rest of a read once for every one in it.
+        ended = data.rfind(_ST)
+        ended = 0 if ended < 0 else ended + len(_ST)
+        for match in chain(_TOKEN.finditer(data, 0, ended), _TOKEN_AFTER_ST.finditer(data, ended)):
             kind = match.lastgroup
             if kind == "text":
                 self._print(match.group("text"))

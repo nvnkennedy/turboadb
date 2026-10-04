@@ -2,6 +2,7 @@
 cleaned up when the program exits under it, and back-to-back parts with no
 gap while the previous part is pulled."""
 import os
+import re
 import threading
 import time
 
@@ -172,6 +173,21 @@ def test_a_signal_that_crosses_the_stop_is_still_a_stop(monkeypatch, tmp_path):
     assert any("kill -INT" in " ".join(c) for c in commands)  # the device recorder got it too
 
 
+def test_a_display_without_an_id_to_record_is_an_adb_error(monkeypatch, tmp_path):
+    recorder = _Recorder()
+    h, commands = _handler(monkeypatch, recorder)
+    pulled = []
+    h._transfer = lambda *args: pulled.append(args)
+    monkeypatch.setattr(h, "_screencap_candidates", lambda display_id: [])
+    with pytest.raises(ADBError, match="display 7"):
+        h.screen_record(str(tmp_path / "clip.mp4"), display_id=7)
+    assert recorder.kwargs is None and not commands and not pulled  # nothing was started
+    with pytest.raises(ADBError, match="display 7"):
+        h.screen_record_continuous(str(tmp_path / "clip.mp4"), display_id=7)
+    failed = h.screen_record(str(tmp_path / "clip.mp4"), display_id=7, safe=True)
+    assert not failed.success and isinstance(failed.error, ADBError)
+
+
 # --------------------------------------------------------------------------- #
 # back-to-back parts
 # --------------------------------------------------------------------------- #
@@ -271,6 +287,206 @@ def test_a_clip_that_could_not_be_pulled_stays_on_the_device(monkeypatch, tmp_pa
         h._save_clip(core._Clip("/sdcard/turboadb_rec_1.mp4", False), str(tmp_path / "c.mp4"))
     assert not any("rm" in a for a in removed)
     assert any("remains on the device at /sdcard/turboadb_rec_1.mp4" in line for line in logged)
+
+
+# --------------------------------------------------------------------------- #
+# recording into a folder
+# --------------------------------------------------------------------------- #
+def _pull_as_adb_does(direction, remote, local, *_rest):
+    """What ``adb pull REMOTE LOCAL`` leaves on this PC: the file as LOCAL, or
+    under its device name inside LOCAL when that is a folder."""
+    assert direction == "pull"
+    if os.path.isdir(local):
+        local = os.path.join(local, os.path.basename(remote))
+    with open(local, "wb") as fh:
+        fh.write(b"video")
+
+
+def _finished_recording(monkeypatch):
+    recorder = _Recorder()
+    recorder.ends.set()  # a clip that reached its time limit
+    h, commands = _handler(monkeypatch, recorder)
+    h._transfer = _pull_as_adb_does
+    return h, commands
+
+
+def test_a_recording_into_a_folder_is_saved_there_under_a_name_of_its_time(monkeypatch,
+                                                                         tmp_path):
+    h, commands = _finished_recording(monkeypatch)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    saved = h.screen_record(str(videos), time_limit=5)
+    assert os.path.dirname(saved) == str(videos)
+    assert re.fullmatch(r"recording-\d{8}-\d{6}\.mp4", os.path.basename(saved))
+    assert os.listdir(videos) == [os.path.basename(saved)]  # and nothing under a device name
+    # saved: the device's copy goes
+    assert commands[-1][:3] == ["shell", "rm", "-f"] and "turboadb_rec_" in commands[-1][3]
+
+
+def test_a_path_that_ends_in_a_separator_is_a_folder_too(monkeypatch, tmp_path):
+    h, _commands = _finished_recording(monkeypatch)
+    saved = h.screen_record(str(tmp_path / "new") + os.sep, time_limit=5)
+    assert os.path.dirname(saved) == str(tmp_path / "new") and saved.endswith(".mp4")
+    assert os.path.getsize(saved) == 5
+
+
+def test_a_recording_never_replaces_another_one_of_the_same_second(monkeypatch, tmp_path):
+    h, _commands = _finished_recording(monkeypatch)
+    now = time.time()
+    earlier = [  # one for this second and each of the next few
+        tmp_path / time.strftime("recording-%Y%m%d-%H%M%S.mp4", time.localtime(now + ahead))
+        for ahead in range(5)
+    ]
+    for path in earlier:
+        path.write_bytes(b"the earlier one")
+    saved = h.screen_record(str(tmp_path), time_limit=5)
+    assert saved.endswith("-2.mp4")
+    assert saved[:-len("-2.mp4")] + ".mp4" in [str(path) for path in earlier]
+    assert all(path.read_bytes() == b"the earlier one" for path in earlier)
+
+
+def test_parts_recorded_into_a_folder_share_the_name_of_the_first(fake_adb, tmp_path,
+                                                                 monkeypatch):
+    h = ADBHandler(ADBConfig(serial="x"))
+    stop = threading.Event()
+    count = [0]
+
+    def record(_limit, **kw):
+        count[0] += 1
+        if count[0] == 2:
+            stop.set()
+        return core._Clip(f"/sdcard/rec{count[0]}.mp4", False)
+
+    monkeypatch.setattr(h, "_record_clip", record)
+    monkeypatch.setattr(h, "_save_clip", lambda clip, path: path)
+    paths = h.screen_record_continuous(str(tmp_path), stop_event=stop)
+    first, second = (os.path.basename(p) for p in paths)
+    assert re.fullmatch(r"recording-\d{8}-\d{6}\.mp4", first)
+    assert second == first[:-len(".mp4")] + "-part02.mp4"
+    assert {os.path.dirname(p) for p in paths} == {str(tmp_path)}
+
+
+def _this_second(monkeypatch):
+    """Every name of the time is of one and the same second from now on."""
+    moment, real = time.localtime(), time.strftime
+    monkeypatch.setattr(core.time, "strftime", lambda fmt, *_when: real(fmt, moment))
+
+
+def test_two_recordings_started_in_the_same_second_get_a_file_each(monkeypatch, tmp_path):
+    """Two displays, or two head units, recorded side by side into one folder:
+    both took the name of that second, the later pull replaced the earlier
+    clip, and both device copies were removed as saved."""
+    _this_second(monkeypatch)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    recorder = _Recorder()
+    recorder.ends.set()
+    first, _commands = _handler(monkeypatch, recorder)
+    second, _commands = _handler(monkeypatch, recorder)
+
+    def pull_of(content):
+        def pull(_direction, _remote, local, *_rest):
+            with open(local, "wb") as fh:
+                fh.write(content)
+        return pull
+
+    first._transfer, second._transfer = pull_of(b"first"), pull_of(b"second")
+    saved = {}
+    record = first._record_clip
+
+    def while_the_second_starts_and_ends(*args, **kwargs):
+        saved["second"] = second.screen_record(str(videos), time_limit=5)
+        return record(*args, **kwargs)
+
+    first._record_clip = while_the_second_starts_and_ends
+    saved["first"] = first.screen_record(str(videos), time_limit=5)
+    assert saved["first"] != saved["second"]
+    assert sorted(os.listdir(videos)) == sorted(os.path.basename(p) for p in saved.values())
+    with open(saved["first"], "rb") as one, open(saved["second"], "rb") as other:
+        assert (one.read(), other.read()) == (b"first", b"second")
+
+
+@pytest.mark.parametrize("fails", ["recording", "pull"])
+def test_a_recording_into_a_folder_that_fails_leaves_no_file_there(monkeypatch, tmp_path, fails):
+    h, _commands = _finished_recording(monkeypatch)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+
+    def refuse(*_args, **_kwargs):
+        raise ADBTransferError("adb pull failed (exit 1): error: device offline")
+
+    monkeypatch.setattr(h, "_record_clip" if fails == "recording" else "_transfer", refuse)
+    with pytest.raises(ADBError, match="device offline"):
+        h.screen_record(str(videos), time_limit=5)
+    assert os.listdir(videos) == []
+
+
+def test_parts_recorded_into_a_folder_get_a_name_nobody_else_has(fake_adb, tmp_path, monkeypatch):
+    _this_second(monkeypatch)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    h = ADBHandler(ADBConfig(serial="x"))
+    names = []
+
+    def record(_limit, **_kw):
+        # while this one records, another recording starts in the same second
+        names.append(os.path.basename(h._recording_file(str(videos))))
+        return core._Clip("/sdcard/rec.mp4", False)
+
+    monkeypatch.setattr(h, "_record_clip", record)
+    monkeypatch.setattr(h, "_save_clip", lambda clip, path: path)
+    (path,) = h.screen_record_continuous(str(videos))
+    assert names == [os.path.basename(path)[:-len(".mp4")] + "-2.mp4"]
+    assert os.listdir(videos) == names  # the first one's own name was only held, not left
+
+
+def test_a_first_part_that_fails_leaves_no_file_in_the_folder(fake_adb, tmp_path, monkeypatch):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    h = ADBHandler(ADBConfig(serial="x"))
+
+    def record(_limit, **_kw):
+        raise ADBError("screenrecord: not found")
+
+    monkeypatch.setattr(h, "_record_clip", record)
+    with pytest.raises(ADBError, match="not found"):
+        h.screen_record_continuous(str(videos))
+    assert os.listdir(videos) == []
+
+
+def test_a_name_still_held_when_the_program_exits_is_given_back(fake_adb, tmp_path, monkeypatch):
+    """A second Ctrl+C ends ``turboadb record FOLDER`` under its recording:
+    the empty file that held the name stayed in the folder."""
+    monkeypatch.setattr(core, "_TRACKED", {})
+    monkeypatch.setattr(core, "_HELD_NAMES", set())
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    held = ADBHandler(ADBConfig(serial="x"))._recording_file(str(videos))
+    assert os.path.getsize(held) == 0 and os.listdir(videos) == [os.path.basename(held)]
+    core._end_tracked_children()  # what the interpreter runs at its exit
+    assert os.listdir(videos) == []
+
+
+def test_a_held_name_that_has_content_is_never_removed(fake_adb, tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "_HELD_NAMES", set())
+    held = ADBHandler(ADBConfig(serial="x"))._recording_file(str(tmp_path) + os.sep)
+    with open(held, "wb") as fh:
+        fh.write(b"video")
+    core._free_name(held)
+    assert os.path.getsize(held) == 5 and core._HELD_NAMES == set()
+
+
+def test_a_folder_that_cannot_be_written_to_is_said_before_anything_is_recorded(
+        monkeypatch, tmp_path):
+    h, commands = _finished_recording(monkeypatch)
+
+    def refuse(path, flags, mode=0o777):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(core.os, "open", refuse)
+    with pytest.raises(PermissionError):
+        h.screen_record(str(tmp_path), time_limit=5)
+    assert commands == []  # no recording was started for it
 
 
 # --------------------------------------------------------------------------- #

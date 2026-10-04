@@ -190,6 +190,22 @@ def test_a_pulled_folder_counts_only_what_this_pull_wrote(tmp_path, fake_adb):
     assert watch._moved() == 1250
 
 
+def test_a_file_adb_still_writes_in_a_pulled_folder_counts_at_its_size_now(tmp_path, fake_adb):
+    # A Windows folder lists a file at the size it had when it was last
+    # closed: 0 for the one adb holds open, however much it has written.
+    folder = tmp_path / "DCIM"
+    folder.mkdir()
+    (folder / "old.jpg").write_bytes(b"o" * 700)
+    watch = core._TransferWatch(ADBHandler(ADBConfig(serial="x")), "pull", str(folder),
+                                "/sdcard/DCIM/.")
+    with open(folder / "clip.mp4", "wb", buffering=0) as held:
+        held.write(b"v" * 4000)
+        assert watch._moved() == 4000
+        held.write(b"v" * 6000)
+        assert watch._moved() == 10000
+    assert watch._moved() == 10000
+
+
 def test_a_pushed_folder_is_measured_where_adb_puts_it(tmp_path, fake_adb, monkeypatch):
     local = tmp_path / "maps"
     local.mkdir()
@@ -224,6 +240,55 @@ def test_merge_sources_keep_their_dot(tmp_path, fake_adb):
 
 
 # --------------------------------------------------------------------------- #
+# measuring must not cost more than the copy
+# --------------------------------------------------------------------------- #
+def _pauses_between_looks(monkeypatch, tmp_path, *, window, look_takes, looks=3):
+    """Run the watch against a clock of its own, where every look at the
+    sizes takes *look_takes* seconds; returns its pauses after each look."""
+    clock = [0.0]
+    monkeypatch.setattr(core.time, "monotonic", lambda: clock[0])
+    watch = core._TransferWatch(ADBHandler(ADBConfig(serial="x")), "pull",
+                                str(tmp_path / "DCIM"), "/sdcard/DCIM", window=window,
+                                percent=False)
+
+    def look():
+        clock[0] += look_takes
+        return 0
+
+    waits = []
+
+    class _Stop:
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            waits.append(seconds)
+            return len(waits) > looks
+
+    monkeypatch.setattr(watch, "_moved", look)
+    monkeypatch.setattr(watch, "_stop", _Stop())
+    watch._run()
+    return waits[1:]  # the first wait is the delay before anything is measured
+
+
+def test_slow_looks_at_the_sizes_are_spaced_out_under_the_default_stall_limit(
+        fake_adb, monkeypatch, tmp_path):
+    # a destination with a great many files, or a big device folder during a push
+    assert _pauses_between_looks(monkeypatch, tmp_path, window=600, look_takes=1.0) == [4.0] * 3
+    assert _pauses_between_looks(monkeypatch, tmp_path, window=None, look_takes=1.0) == [4.0] * 3
+
+
+def test_quick_looks_keep_their_usual_pace(fake_adb, monkeypatch, tmp_path):
+    assert _pauses_between_looks(monkeypatch, tmp_path, window=600, look_takes=0.01) == [0.5] * 3
+
+
+def test_a_short_stall_limit_still_gets_several_looks(fake_adb, monkeypatch, tmp_path):
+    # four looks within the limit, however long one takes
+    assert _pauses_between_looks(monkeypatch, tmp_path, window=2, look_takes=1.0) == [0.5] * 3
+    assert _pauses_between_looks(monkeypatch, tmp_path, window=600, look_takes=100) == [150] * 3
+
+
+# --------------------------------------------------------------------------- #
 # a stall limit, not a deadline
 # --------------------------------------------------------------------------- #
 def test_a_slow_copy_that_keeps_moving_outlasts_the_timeout(fake_adb, monkeypatch, tmp_path,
@@ -239,6 +304,33 @@ def test_a_slow_copy_that_keeps_moving_outlasts_the_timeout(fake_adb, monkeypatc
     res = ADBHandler(ADBConfig(serial="x")).pull("/sdcard/drive.mp4", str(target), timeout=1.5)
     assert time.monotonic() - started > 3.0  # twice the timeout, and still fine
     assert res.size_bytes == 100_000
+
+
+def test_a_folder_pull_of_one_slow_file_keeps_moving_past_the_timeout(fake_adb, monkeypatch,
+                                                                    tmp_path, quick):
+    folder = tmp_path / "DCIM"
+    held = []
+
+    def moved(done):  # as adb writes it: one file, open until it is whole
+        if not held:
+            folder.mkdir()
+            held.append(open(folder / "drive.mp4", "wb", buffering=0))
+        held[0].write(b"v" * (done - held[0].tell()))
+        if done == 100_000:
+            held[0].close()
+
+    adb = _Adb(100_000, moved, steps=13, pause=0.25)
+    monkeypatch.setattr(core.subprocess, "Popen", adb)
+    _device(fake_adb, monkeypatch, _sizes_of(100_000))
+    seen = []
+    try:
+        res = ADBHandler(ADBConfig(serial="x")).pull("/sdcard/DCIM", str(folder), timeout=1.5,
+                                                     on_progress=seen.append)
+    finally:
+        if held:
+            held[0].close()
+    assert res.size_bytes == 100_000 and res.files == 1
+    assert len(seen) >= 3 and seen[-1] == 100  # followed while the file was open
 
 
 def test_a_copy_that_stops_moving_times_out_and_removes_its_unfinished_file(

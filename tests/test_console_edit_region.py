@@ -147,6 +147,30 @@ def test_a_carriage_return_overwrite_continues_while_the_user_types(qapp):
         _close(con)
 
 
+@pytest.mark.parametrize("old", [
+    "🚀🚀🚀 10%",                                 # each emoji is two positions of the document
+    "cafe\N{COMBINING ACUTE ACCENT} 10%",        # ... and an accent a position of its own
+    "🇮🇳 10%",
+], ids=["emoji", "accent", "flag"])
+def test_an_overwrite_never_reaches_into_the_typed_line(qapp, old):
+    """What new text covers was counted in cursor steps, which take an emoji
+    or a letter and its accent as one: the steps left over ate the line
+    being typed."""
+    con = _console(local=True)
+    try:
+        _out(con, old)
+        _type(con, "pwd")
+        _out(con, "\rdownloading 20%")
+        assert con.toPlainText() == "downloading 20%pwd"
+        assert con._line == "pwd"
+        _out(con, "\rdone\r\n")
+        assert con.toPlainText() == "doneloading 20%\npwd"
+        _type(con, "x")
+        assert con.toPlainText() == "doneloading 20%\npwdx"
+    finally:
+        _close(con)
+
+
 def test_line_and_screen_erases_stop_at_the_edit_line(qapp):
     con = _console(local=True)
     try:
@@ -476,3 +500,269 @@ def test_output_above_a_typed_line_renders_in_linear_time(qapp):
 
     small, big = render(2000), render(16000)
     assert big < 20 * small + 0.5, (small, big)  # linear: ~8x; the old way: ~50x
+
+
+def _mouse(con, kind, position, mods=None, dx=0):
+    """A left-button mouse event at the place of a document *position* (plus *dx* pixels)."""
+    from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent, QTextCursor
+    from PyQt5.QtWidgets import QApplication
+
+    cursor = QTextCursor(con.document())
+    cursor.setPosition(position)
+    point = QPointF(con.cursorRect(cursor).center() + QPoint(dx, 0))
+    kind = {"press": QEvent.MouseButtonPress, "move": QEvent.MouseMove,
+            "release": QEvent.MouseButtonRelease, "double": QEvent.MouseButtonDblClick}[kind]
+    button = Qt.NoButton if kind == QEvent.MouseMove else Qt.LeftButton
+    buttons = Qt.NoButton if kind == QEvent.MouseButtonRelease else Qt.LeftButton
+    QApplication.sendEvent(con.viewport(), QMouseEvent(kind, point, button, buttons, mods or Qt.NoModifier))
+
+
+def _select(con, start, end):
+    from PyQt5.QtGui import QTextCursor
+
+    cursor = con.textCursor()
+    cursor.setPosition(start)
+    cursor.setPosition(end, QTextCursor.KeepAnchor)
+    con.setTextCursor(cursor)
+
+
+@pytest.mark.parametrize("what", ["the typed line", "output"])
+def test_selected_text_is_never_dragged_out_of_the_terminal(qapp, what):
+    """Qt drags a selection out of an editable view as a move: dropped on a
+    field that takes text, it was deleted from the document behind the edit
+    region's back (the output gone from the view, or the typed line gone
+    from it while Enter still ran it).  As in a terminal, a press on the
+    selection starts a new one."""
+    from PyQt5.QtGui import QDrag
+
+    con = _console(local=True)
+    try:
+        con.resize(500, 200)
+        con.show()
+        _out(con, "some output line\r\n" + CMD)
+        _type(con, "rm -rf build")
+        end = con.document().characterCount() - 1
+        start, stop = (end - 12, end) if what == "the typed line" else (0, 16)
+        _select(con, start, stop)
+        _mouse(con, "press", start + 6)
+        assert not con.textCursor().hasSelection()
+        _mouse(con, "move", start + 6, dx=90)  # far enough to start a drag
+        assert con.findChildren(QDrag) == []
+        selected = con.textCursor()
+        assert selected.hasSelection() and selected.selectionStart() == start + 6  # a new selection
+        _mouse(con, "release", start + 6, dx=90)
+        assert con.toPlainText() == "some output line\n" + CMD + "rm -rf build"
+        assert con._line == "rm -rf build"
+    finally:
+        _close(con)
+
+
+def test_the_mouse_still_selects_as_before(qapp):
+    from PyQt5.QtCore import Qt
+
+    con = _console(local=True)
+    try:
+        con.resize(500, 200)
+        con.show()
+        _out(con, "first line of output\r\nsecond line of output\r\n" + CMD)
+        _select(con, 6, 10)
+        _mouse(con, "press", 14, Qt.ShiftModifier)  # Shift and a click: the selection grows
+        _mouse(con, "release", 14, Qt.ShiftModifier)
+        cursor = con.textCursor()
+        assert (cursor.selectionStart(), cursor.selectionEnd()) == (6, 14)
+        _mouse(con, "press", 8)  # a click on it: gone, the caret is there
+        _mouse(con, "release", 8)
+        cursor = con.textCursor()
+        assert not cursor.hasSelection() and cursor.position() == 8
+        _mouse(con, "press", 8)  # a double click: the word
+        _mouse(con, "release", 8)
+        _mouse(con, "double", 8)
+        _mouse(con, "release", 8)
+        assert con.textCursor().selectedText() == "line"
+        _mouse(con, "press", 8)  # a third one: the whole line
+        _mouse(con, "release", 8)
+        assert con.textCursor().selectedText().strip("\N{PARAGRAPH SEPARATOR}") == "first line of output"
+    finally:
+        _close(con)
+
+
+def _underlined(con, position):
+    """Whether the character before a document *position* is underlined."""
+    from PyQt5.QtGui import QTextCursor
+
+    cursor = QTextCursor(con.document())
+    cursor.setPosition(position)
+    return cursor.charFormat().fontUnderline()
+
+
+def test_what_an_input_method_composes_shows_at_the_caret(qapp):
+    """Only committed text ever showed: composing Japanese, Chinese or
+    Korean was typing blind.  What is being composed is drawn in the line
+    at the caret, underlined, and is no part of the line until committed."""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QInputMethodEvent
+
+    sent = []
+    con = _console(local=True, sent=sent)
+    try:
+        _out(con, CMD)
+        _type(con, "echo  x")
+        _key(con, Qt.Key_Left)
+        _key(con, Qt.Key_Left)  # the caret between the two blanks
+        con.inputMethodEvent(QInputMethodEvent("にほ", []))
+        assert con.toPlainText() == CMD + "echo にほ x"
+        assert con._line == "echo  x"
+        start = len(CMD) + 5
+        assert [_underlined(con, start + n) for n in range(4)] == [False, True, True, False]
+        assert con.textCursor().position() == start + 2  # behind what is composed
+        _out(con, "\r\nbackground\r\n")  # output still lands above the line
+        assert con.toPlainText() == CMD + "\nbackground\necho にほ x"
+        caret = QInputMethodEvent.Attribute(QInputMethodEvent.Cursor, 1, 1, None)
+        con.inputMethodEvent(QInputMethodEvent("にほん", [caret]))
+        assert con.toPlainText() == CMD + "\nbackground\necho にほん x"
+        end = con.document().characterCount() - 1
+        assert con.textCursor().position() == end - 2 - 2  # where the input method has its caret
+        _ime_commit(con, "日本")
+        assert con._line == "echo 日本 x"
+        assert con.toPlainText() == CMD + "\nbackground\necho 日本 x"
+        end = con.document().characterCount() - 1
+        assert not any(_underlined(con, end - n) for n in range(9))
+        assert con.textCursor().position() == end - 2
+        con.inputMethodEvent(QInputMethodEvent("ご", []))
+        assert con.toPlainText().endswith("\necho 日本ご x")
+        con.inputMethodEvent(QInputMethodEvent())  # dropped in the input method: gone
+        assert con.toPlainText() == CMD + "\nbackground\necho 日本 x"
+        assert con._line == "echo 日本 x" and sent == []
+    finally:
+        _close(con)
+
+
+def test_text_still_being_composed_is_never_run_or_kept(qapp):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QInputMethodEvent
+
+    sent = []
+    con = _console(local=True, sent=sent)
+    try:
+        _out(con, CMD)
+        _type(con, "dir")
+        con.inputMethodEvent(QInputMethodEvent("にほ", []))
+        assert con.toPlainText() == CMD + "dirにほ"
+        _enter(con)
+        assert sent == [b"dir\r\n"]
+        assert con.toPlainText() == CMD + "dir\n"
+        con.inputMethodEvent(QInputMethodEvent("にほん", []))  # the input method goes on
+        assert con.toPlainText() == CMD + "dir\nにほん" and con._line == ""
+        _out(con, "dir\r\n file.txt\r\n" + CMD)
+        assert con.toPlainText() == CMD + "dir\n file.txt\n" + CMD + "にほん"
+        _key(con, Qt.Key_Escape)  # the line is cleared, what is composed is the input method's
+        assert con.toPlainText() == CMD + "dir\n file.txt\n" + CMD + "にほん"
+        con.set_alive(False, show_disconnect_notice=False)
+        assert con.toPlainText() == CMD + "dir\n file.txt\n" + CMD
+        con.inputMethodEvent(QInputMethodEvent("にほん", []))  # no shell: nothing to type into
+        assert con.toPlainText() == CMD + "dir\n file.txt\n" + CMD
+    finally:
+        _close(con)
+
+
+def _ime_commit(con, text):
+    from PyQt5.QtGui import QInputMethodEvent
+
+    event = QInputMethodEvent()
+    event.setCommitString(text)
+    con.inputMethodEvent(event)
+
+
+def test_an_emoji_in_the_typed_line_keeps_the_edit_region_whole(qapp):
+    """An emoji is one character of the line and two positions of the
+    document: every later key left a stray character in front of the line,
+    and output landed inside it."""
+    from PyQt5.QtCore import Qt
+
+    sent = []
+    con = _console(local=True, sent=sent)
+    try:
+        _out(con, CMD)
+        _type(con, "echo ")
+        _ime_commit(con, "😀")  # as the Windows emoji panel sends it
+        _type(con, " hi")
+        assert con.toPlainText() == CMD + "echo 😀 hi"
+        _out(con, "\r\n[1] + Done\r\n")
+        assert con.toPlainText() == CMD + "\n[1] + Done\necho 😀 hi"
+        end = con.document().characterCount() - 1
+        assert con.textCursor().position() == end
+        for _ in range(4):
+            _key(con, Qt.Key_Left)
+        assert con.textCursor().position() == end - 5  # in front of the emoji, not inside it
+        _type(con, "X")
+        assert con._line == "echo X😀 hi" and con.toPlainText().endswith("\necho X😀 hi")
+        _key(con, Qt.Key_Delete)
+        _key(con, Qt.Key_Backspace)
+        assert con.toPlainText().endswith("\necho  hi")
+        con._paste_text("🚀🚀")
+        assert con.toPlainText().endswith("\necho 🚀🚀 hi")
+        _out(con, "more\r\n")
+        assert con.toPlainText() == CMD + "\n[1] + Done\nmore\necho 🚀🚀 hi"
+        _enter(con)
+        assert sent == ["echo 🚀🚀 hi\r\n".encode("utf-8")]
+        assert con.toPlainText() == CMD + "\n[1] + Done\nmore\necho 🚀🚀 hi\n"
+    finally:
+        _close(con)
+
+
+def test_cut_takes_whole_characters_out_of_a_line_with_emoji(qapp):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QTextCursor
+
+    con = _console(local=True)
+    try:
+        _out(con, CMD)
+        con._paste_text("say 😀😀 twice")
+        end = con.document().characterCount() - 1
+        cursor = con.textCursor()
+        cursor.setPosition(end - 8)  # the second emoji and " twice"
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        con.setTextCursor(cursor)
+        _key(con, Qt.Key_X, "", Qt.ControlModifier)
+        assert con._line == "say 😀"
+        assert con.toPlainText() == CMD + "say 😀"
+        _type(con, "!")
+        assert con.toPlainText() == CMD + "say 😀!"
+    finally:
+        _close(con)
+
+
+def test_the_output_ends_where_the_typed_line_starts_behind_an_emoji_too(qapp):
+    """The shell's prompt on the last output line is found with a line typed
+    after it: the typed characters were taken for output, one per emoji."""
+    con = _console(local=True)
+    try:
+        _out(con, "PS C:\\📁> ")
+        assert con.shell_at_prompt()
+        _type(con, "dir")
+        assert con._output_tail_line() == "PS C:\\📁> "
+        assert con.shell_at_prompt()
+    finally:
+        _close(con)
+
+
+def test_an_emoji_in_the_synthetic_prompt_goes_with_it(qapp):
+    con = _console(local=False)
+    try:
+        con._apply_cd("cd /sdcard/📁")
+        con.show_prompt()
+        prompt = "shell@android:/sdcard/📁 $ "
+        assert con.toPlainText() == prompt
+        con.notice("device back", new_stream=False)  # drawn above the prompt, not inside it
+        assert con.toPlainText() == "device back\n" + prompt
+        _type(con, "ls")
+        assert con.toPlainText() == "device back\n" + prompt + "ls"
+        _out(con, "late output\n")  # output after all: the prompt goes, the line stays
+        assert con.toPlainText() == "device back\nlate output\nls"
+        con.show_prompt()
+        assert con.toPlainText() == "device back\nlate output\n" + prompt + "ls"
+        con.set_emulate_prompt(False)
+        assert con.toPlainText() == "device back\nlate output\nls"
+    finally:
+        _close(con)

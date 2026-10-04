@@ -1,6 +1,7 @@
 """Engine methods added for the complete CLI, against the fake adb."""
 import io
 import os
+import re
 import shlex
 import sys
 import threading
@@ -32,6 +33,16 @@ def device_words(fake_adb, index=-1):
     spaces and runs them through `sh -c`, which shlex.split imitates."""
     argv = fake_adb.argv_after_adb(index)
     return shlex.split(" ".join(argv[argv.index("shell") + 1:]))
+
+
+def change_words(fake_adb, index=-1):
+    """The words of a change to the device's files, which is sent with the
+    mark that says it worked after it (``remotefs._marked``)."""
+    argv = fake_adb.argv_after_adb(index)
+    sent = " ".join(argv[argv.index("shell") + 1:])
+    head, tail = "{ ", f"; }} && echo {remotefs.DONE_MARK}"
+    assert sent.startswith(head) and sent.endswith(tail), sent
+    return shlex.split(sent[len(head):-len(tail)])
 
 
 def test_open_url_accepts_shortcut_names(fake_adb):
@@ -133,6 +144,31 @@ def test_move_missing_source_changes_nothing(fake_adb):
     assert len(fake_adb.calls) == 1  # only the probe ran
 
 
+def test_a_folder_moved_to_its_own_name_in_other_letters_is_renamed(fake_adb):
+    # /sdcard ignores case: "docs" there is the folder Docs itself, not a
+    # folder to move it into ("cannot move to a subdirectory of itself")
+    fake_adb.add("for f in", stdout="d- /storage/emulated/0/Docs\nd- /storage/emulated/0/docs\n")
+    fake_adb.add("echo same", stdout="same\n")
+    assert handler().move("/sdcard/Docs", "/sdcard/docs") == "/sdcard/docs"
+    sent = joined(fake_adb)[-1]
+    assert "/sdcard/docs/Docs" not in sent
+    assert remotefs._rename_cmd("/sdcard/Docs", "/sdcard/docs") in sent
+
+
+def test_two_folders_named_in_other_letters_are_still_two_folders(fake_adb):
+    # storage that tells Docs from docs: a move into the other folder, as ever
+    fake_adb.add("for f in", stdout="d- /data/Docs\nd- /data/docs\n")
+    fake_adb.add("echo same", stdout="dir\n")
+    assert handler().move("/data/Docs", "/data/docs") == "/data/docs/Docs"
+    assert "/data/docs/Docs" in joined(fake_adb)[-1]
+
+
+def test_a_move_into_a_folder_of_another_name_asks_the_device_nothing_more(fake_adb):
+    fake_adb.add("for f in", stdout="d- /sdcard/Docs\nd- /sdcard/Archive\n")
+    assert handler().move("/sdcard/Docs", "/sdcard/Archive") == "/sdcard/Archive/Docs"
+    assert len(fake_adb.calls) == 2  # the probe and the mv
+
+
 def test_copy_a_file_to_a_new_name(fake_adb):
     fake_adb.add("for f in", stdout="f- \nn- \n")
     assert handler().copy("/sdcard/a.txt", "/sdcard/b.txt") == "/sdcard/b.txt"
@@ -143,6 +179,82 @@ def test_file_command_failure_is_an_error(fake_adb):
     fake_adb.add("mkdir", stderr="mkdir: '/system/x': Read-only file system", returncode=1)
     with pytest.raises(ADBError, match="Read-only"):
         handler().make_dir("/system/x")
+
+
+@pytest.mark.parametrize("exit_status", [True, False], ids=["exit-status", "no-exit-status"])
+def test_a_change_the_device_refused_is_an_error_whatever_adb_exits_with(fake_adb, exit_status):
+    """Before Android 7 adb exits 0 whatever the device did: a change is done
+    when it printed its mark, not when adb says 0."""
+    fake_adb.exit_status = exit_status
+    fake_adb.add("for f in /sdcard/a;", stdout="f- \n")
+    fake_adb.add("for f in /sdcard/a /sdcard/b;", stdout="f- \nn- \n")
+    fake_adb.add("{ ", stderr="sh: Read-only file system\n", returncode=1)  # every change
+    h = handler()
+    changes = {
+        "mkdir /sdcard/a": lambda: h.make_dir("/sdcard/a"),
+        "touch /sdcard/a": lambda: h.touch("/sdcard/a"),
+        "chmod 600 /sdcard/a": lambda: h.chmod("/sdcard/a", "600"),
+        "rm /sdcard/a": lambda: h.remove("/sdcard/a"),
+        "mv /sdcard/a /sdcard/b": lambda: h.move("/sdcard/a", "/sdcard/b"),
+        "cp /sdcard/a /sdcard/b": lambda: h.copy("/sdcard/a", "/sdcard/b"),
+    }
+    for label, change in changes.items():
+        with pytest.raises(ADBCommandError, match="Read-only file system") as refused:
+            change()
+        assert refused.value.command == label and not refused.value.result.ok
+    failed = h.make_dir("/sdcard/a", safe=True)
+    assert not failed.success and "Read-only file system" in str(failed.error)
+
+
+@pytest.mark.parametrize("said", [
+    "ls: /data/: Permission denied",      # toybox
+    "opendir failed, Permission denied",  # the old toolbox ls
+    "/data/gone/: No such file or directory",
+])
+def test_a_listing_the_device_refused_is_an_error_without_an_exit_status(fake_adb, said):
+    """Before Android 7 a folder that could not be listed came back as an
+    empty one, and a mistyped path became the Files tab's folder."""
+    fake_adb.exit_status = False
+    fake_adb.add("ls -la", stderr=said + "\n", returncode=1)
+    with pytest.raises(ADBError, match="could not list /data: .*" + re.escape(said)):
+        handler().list_dir("/data")
+    rows, error = remotefs._list_remote_dir(handler(), "/data")
+    assert list(rows) == [] and error == said
+
+
+def test_an_empty_folder_is_an_empty_folder_on_every_device(fake_adb):
+    for exit_status in (True, False):
+        fake_adb.exit_status = exit_status
+        for listing in ("", "total 0\n", "total 8\n"
+                        "drwxrwx--x 2 root sdcard_rw 4096 2026-01-01 00:00 .\n"
+                        "drwxrwx--x 9 root sdcard_rw 4096 2026-01-01 00:00 ..\n",
+                        "\x1b[0mtotal 0\x1b[0m\r\n",
+                        # the old toolbox ls lists no "." and "..": all there is of an
+                        # empty folder is what the tool says about itself
+                        "WARNING: linker: /system/bin/ls has text relocations.\n"):
+            fake_adb.rules.clear()
+            fake_adb.add("ls -la", stdout=listing)
+            assert handler().list_dir("/sdcard/empty") == []
+
+
+def test_a_folder_copied_onto_its_own_name_in_other_letters_is_refused(fake_adb):
+    # /sdcard ignores case: "docs" there is Docs itself, and cp -r would copy it into itself
+    fake_adb.add("for f in", stdout="d- /storage/emulated/0/Docs\nd- /storage/emulated/0/docs\n")
+    fake_adb.add("echo same", stdout="same\n")
+    with pytest.raises(ADBError, match="/sdcard/Docs: the source and destination are the same"):
+        handler().copy("/sdcard/Docs", "/sdcard/docs")
+    assert not any("cp -r" in command for command in joined(fake_adb))
+
+
+def test_a_change_that_worked_is_done_on_a_device_without_exit_status(fake_adb):
+    fake_adb.exit_status = False
+    fake_adb.add("for f in", stdout="f- \n")
+    h = handler()
+    assert h.make_dir("/sdcard/a/b") == "/sdcard/a/b"
+    assert h.touch("/sdcard/a/b/c.txt") == "/sdcard/a/b/c.txt"
+    assert h.chmod("/sdcard/a/b/c.txt", "600") is True
+    assert h.remove("/sdcard/a/b/c.txt") == ["/sdcard/a/b/c.txt"]
+    assert change_words(fake_adb) == ["rm", "-rf", "/sdcard/a/b/c.txt"]
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +272,7 @@ def test_remote_paths_keep_their_spaces():
 def test_remove_deletes_the_name_with_the_trailing_space(fake_adb):
     fake_adb.add("for f in", stdout="f- \n")
     assert handler().remove("/sdcard/dup ") == ["/sdcard/dup "]
-    assert device_words(fake_adb) == ["rm", "-rf", "/sdcard/dup "]
+    assert change_words(fake_adb) == ["rm", "-rf", "/sdcard/dup "]
 
 
 def test_output_lines_strips_shell_colours():
@@ -172,7 +284,7 @@ def test_probe_replies_survive_a_colourising_shell(fake_adb):
     # "unexpected", so rm/mv/cp refused to run at all.
     fake_adb.add("for f in", stdout="\x1b[0;32mf-\x1b[0m /sdcard/a.txt\n")
     assert handler().remove("/sdcard/a.txt") == ["/sdcard/a.txt"]
-    assert device_words(fake_adb) == ["rm", "-rf", "/sdcard/a.txt"]
+    assert change_words(fake_adb) == ["rm", "-rf", "/sdcard/a.txt"]
 
 
 def test_touch_fallback_never_truncates_an_existing_file():

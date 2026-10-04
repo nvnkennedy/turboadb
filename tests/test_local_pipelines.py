@@ -193,6 +193,52 @@ def test_clear_while_a_command_runs_is_input(make, tmp_path):
     assert "Name: cls" in widget.term.toPlainText()
 
 
+def test_cmd_ls_runs_dir_only_when_the_path_has_no_ls(make):
+    """With Git for Windows' Unix tools (or MSYS2, busybox) on the PATH,
+    ``ls -1`` works in a cmd window.  Here it printed "File Not Found": cmd
+    ran ``dir -1``, while the screen still showed ``ls -1``."""
+    prompt = "\r\nC:\\w>" + MARK.format("C:\\w")
+    widget = make("cmd")  # no ls anywhere: the convenience
+    for typed, sent in (("ls", "dir"), ("ls -la", "dir /a"), ("ls *.txt", "dir *.txt")):
+        out(widget, prompt)
+        assert run(widget, typed) == sent
+    real = make("cmd")
+    real._ls_probe = {"found": True}
+    for typed in ("ls", "ls -1", "ls -lh", "ls *.txt | wc -l"):
+        out(real, prompt)
+        assert run(real, typed) == typed
+        assert real.term._pending_echo == typed  # cmd echoes what was typed
+    out(real, prompt)
+    assert run(real, "clear") == "cls"
+
+
+def test_a_new_cmd_session_looks_for_an_ls_on_its_path(make, tmp_path):
+    import os
+    import time
+
+    def probed(env):
+        class Session:
+            pass
+
+        Session.env = env
+        widget._start_probes(Session())
+        probe = widget._ls_probe
+        deadline = time.monotonic() + 10
+        while "found" not in probe and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return probe
+
+    widget = make("cmd")
+    assert widget._ls_probe == {}  # a stand-in session: nothing to look in
+    tools = tmp_path / "usr" / "bin"
+    tools.mkdir(parents=True)
+    assert probed({"PATH": str(tools), "PATHEXT": ".EXE"}) == {"found": False}
+    ls = tools / ("ls.exe" if os.name == "nt" else "ls")
+    ls.write_text("")
+    ls.chmod(0o755)
+    assert probed({"PATH": str(tools), "PATHEXT": ".EXE"}) == {"found": True}
+
+
 def test_cmd_clear_runs_cls_and_its_form_feed_clears(make, tmp_path):
     widget = make("cmd")
     prompt = f"{tmp_path}>" + MARK.format(tmp_path)
@@ -202,3 +248,15 @@ def test_cmd_clear_runs_cls_and_its_form_feed_clears(make, tmp_path):
     assert run(widget, "clear") == "cls"
     out(widget, "cls\r\n\x0c\r\n" + prompt)
     assert widget.term.toPlainText() == f"{tmp_path}>"
+
+
+def test_a_page_break_in_powershell_output_clears_nothing(make, tmp_path):
+    """Only cmd's cls clears with a form feed: ``type`` of a file with page
+    breaks left nothing of what was shown before them."""
+    widget = make("powershell")
+    prompt = f"PS {tmp_path}> \x1b]7717;{tmp_path}\x07"
+    out(widget, prompt)
+    submit(widget, "type COPYING")
+    out(widget, "type COPYING\npage one\r\n\x0c\r\npage two\r\n" + prompt)
+    assert widget.term.toPlainText().endswith(
+        f"PS {tmp_path}> type COPYING\npage one\n\n\npage two\nPS {tmp_path}> ")

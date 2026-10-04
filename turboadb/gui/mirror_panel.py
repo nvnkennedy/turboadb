@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import itertools
+import logging
 import os
 import re
 import threading
@@ -37,17 +38,20 @@ from PyQt5.QtWidgets import (
     QAction,
     QDialog,
     QGridLayout,
+    QProgressBar,
 )
 
 from ..config import ScrcpyOptions
 from ..results import OperationResult
 from ..scrcpy import is_remote_session
 from . import settings as settings_mod
-from .device_commands import DeviceCommandDispatcher, command_error
+from .device_commands import DeviceCommandDispatcher, command_error, input_display
 from .fileutil import download_dir, saved_dialog
 from .flowlayout import ToolbarFlowLayout
 from .icons import icon as _icon
 from .qtutil import FunctionThread, park_thread, thread_running
+
+_log = logging.getLogger(__name__)
 
 _IS_WIN = os.name == "nt"
 
@@ -75,6 +79,7 @@ def _win_api():
         wintypes.BOOL,
     ]
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    u.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
     # declare argtypes explicitly: without them ctypes defaults the HWND arg to
     # a 32-bit int and truncates a 64-bit handle on win64
     u.GetWindowRect.restype = wintypes.BOOL
@@ -719,6 +724,19 @@ def _mp4_is_finalised(path) -> bool:
     return False
 
 
+def _file_stamp(path):
+    """``(size, modified)`` of the file at *path*, or None when there is none.
+
+    Taken of the file a recording is about to overwrite: until it changes,
+    what is at that path is the old file, not the recording.
+    """
+    try:
+        info = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    return info.st_size, info.st_mtime_ns
+
+
 def _record_size_for_active_view(displays, display_id, max_edge=1280):
     """Return a proportional screenrecord size capped for concurrent viewing.
 
@@ -1333,8 +1351,9 @@ class _KeyBatcher(QObject):
     *display_id* (a number, or a callable returning one) sends the input to
     that display with ``input -d``: without it Android delivers keys to
     whichever display it considers focused, which on a multi-display head
-    unit is often not the screen the user is typing on.  None or 0 is the
-    default display.
+    unit is often not the screen the user is typing on.  None is the plain
+    command; the owner decides whether display 0 is named
+    (``device_commands.input_display``).
     """
 
     note = pyqtSignal(str)
@@ -1418,10 +1437,10 @@ class _KeyBatcher(QObject):
             return len(self._commands)
 
     def display_id(self):
-        """The display keys go to now (None = the default display)."""
+        """The display keys are sent with now (None: the plain command)."""
         value = self._display_id() if callable(self._display_id) else self._display_id
         try:
-            return int(value) or None
+            return int(value)
         except (TypeError, ValueError):
             return None
 
@@ -1474,8 +1493,7 @@ class _KeyBatcher(QObject):
             return
         handler = self.handler
         display = self.display_id()
-        # only a non-default display adds -d: older Android has no such option
-        extra = {"display_id": display} if display else {}
+        extra = {} if display is None else {"display_id": display}
         if command.kind == "text":
             rejected = "text was rejected by the device"
         else:
@@ -1796,6 +1814,9 @@ class MirrorPanel(QWidget):
         self._recording = False
         self._record_finalizing = False
         self._rec_path = None
+        self._rec_overwrites = None  # _file_stamp of a file already at _rec_path
+        self._rec_error = ""  # why the last recording failed, for the exit's report
+        self._rec_abandoned = False  # the exit was told not to wait for its save
         self._rec_thread = None
         self._rec_stop = None
         self._rec_mode = None  # "integrated" (scrcpy's recorder) | "device" (screenrecord)
@@ -1806,6 +1827,11 @@ class MirrorPanel(QWidget):
         self._closing = False  # guards deferred callbacks (retry timers)
         self._displays = []  # cached [{id,size,name}] from the last list
         self._displays_loaded = False
+        # What decides whether keys for display 0 name it (set_device): the
+        # number of displays when this panel cannot count them itself, and
+        # the device's Android API level.
+        self._device_displays = None
+        self._sdk = None
         self._quiet_scan = False
         self._fixed_display = False  # a tile locked to one display (all-displays tab)
         self._video_aspect = None  # real width / height of the embedded video, once seen
@@ -2420,9 +2446,19 @@ class MirrorPanel(QWidget):
         if not (self._recording and self._rec_mode == "integrated"):
             return False
         if restore_selection:
-            self._sync_display_selection((self._launch_spec or {}).get("display_id"))
+            self._sync_display_selection(self._screen_display())
         self.status.show()
         self.status.setText(message)
+        return True
+
+    def _recording_save_blocks(self) -> bool:
+        """True (with a status hint) while a recording is being saved that a
+        screen start waits for. A parallel recorder finishes on its own; it
+        never blocks the screen."""
+        if not (self._record_finalizing and self._rec_mode != "parallel"):
+            return False
+        self.status.show()
+        self.status.setText("Wait for the recording to finish saving before restarting the screen.")
         return True
 
     def _send_key(self, kind, payload, auto_repeat=False):
@@ -2432,7 +2468,7 @@ class MirrorPanel(QWidget):
             return
         if self._key_batcher is None:
             self._key_batcher = _KeyBatcher(
-                self.handler, self._dispatcher, self, display_id=self.input_display_id
+                self.handler, self._dispatcher, self, display_id=self.key_display_id
             )
             self._key_batcher.note.connect(self.log)
         self._key_batcher.push(kind, payload, auto_repeat)
@@ -2449,6 +2485,33 @@ class MirrorPanel(QWidget):
             return int(value) or None
         except (TypeError, ValueError):
             return None
+
+    def set_device(self, displays=None, sdk=None) -> None:
+        """How many displays the device has, and its Android API level (None:
+        not known).  *displays* None: as many as this panel lists itself; a
+        tile locked to one display is told by the displays tab."""
+        self._device_displays = None if displays is None else int(displays)
+        self._sdk = sdk
+        self._sync_view_device()
+
+    def _display_count(self) -> int:
+        if self._device_displays is not None:
+            return self._device_displays
+        return len(self._displays)
+
+    def _sync_view_device(self) -> None:
+        """A screencap view sends its own keys: it names display 0 by the
+        same rule as :meth:`key_display_id`."""
+        view = self._screencap
+        if view is not None:
+            view.set_device(self._display_count(), self._sdk)
+
+    def key_display_id(self):
+        """The display this panel's keys and typed text are sent with, or
+        None for the plain command.  Display 0 is named too on a device with
+        several displays: Android sends a key without one to the display in
+        focus (``device_commands.input_display``)."""
+        return input_display(self.input_display_id(), self._display_count(), self._sdk)
 
     def _release_key(self, code):
         """A device key was released: drop its queued, unstarted repeats."""
@@ -2821,6 +2884,12 @@ class MirrorPanel(QWidget):
         running = self._running_backend()
         if self._closing or running is None or self._stopping_mirror:
             return
+        if self._queued_start is not None or not self._screen_wanted():
+            # A start that waits (a display picked, or a separate window asked
+            # for, while scrcpy launches) picks its renderer when it begins;
+            # restarted from the launch under way, its display was lost.  A
+            # launch that Stop cancelled is no screen to bring back.
+            return
         spec = dict(self._launch_spec or {})
         if self._recording and self._rec_mode == "integrated":
             return
@@ -2912,6 +2981,7 @@ class MirrorPanel(QWidget):
         view.ended.connect(self._on_screencap_ended)
         view.stats_changed.connect(self._sync_renderer_chip)
         self._screencap = view
+        self._sync_view_device()
         self._launch_spec = dict(requested)
         self._retry_count = 0
         self._became_ready = False
@@ -3258,6 +3328,13 @@ class MirrorPanel(QWidget):
                 return
             self._separate_hwnd = hwnd
             _ctypes, user32 = _win_api()
+            if not _answering(hwnd):
+                # Restoring a minimized window waits for scrcpy to handle it,
+                # for as long as it hangs: ask without waiting (it comes back
+                # once scrcpy answers again) and leave the focus where it is.
+                user32.ShowWindowAsync(hwnd, 9)
+                self.status.setText("The separate scrcpy window is not responding.")
+                return
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE, if minimized
             if focus_keyboard:
                 # Called directly from a user click, while Windows still lets
@@ -3428,6 +3505,7 @@ class MirrorPanel(QWidget):
             key=lambda d: int(d.get("id", 0) or 0),
         )
         self._displays_loaded = True
+        self._sync_view_device()
         keep = self.cmb_display.currentData()  # preserve the user's choice
         self.cmb_display.blockSignals(True)
         try:
@@ -3458,9 +3536,14 @@ class MirrorPanel(QWidget):
         """Apply a display chosen in the picker to the selection and the mirror."""
         if self._integrated_recording_blocks(restore_selection=True):
             return
+        if self._screen_wanted() and self._recording_save_blocks():
+            # (start() would refuse: the picker stays with what is on screen)
+            self._sync_display_selection(self._screen_display())
+            return
         self._sync_display_selection(disp_id)
-        if self._scrcpy is not None or self._screencap is not None:
-            # start() stops the running viewer and launches the new display.
+        if self._screen_wanted():
+            # start() stops the running viewer and launches the new display,
+            # or takes the place of the start that is under way.
             self.start(display_id=disp_id)
 
     def _show_display_manager(self):
@@ -3724,6 +3807,59 @@ class MirrorPanel(QWidget):
             or self._retry_pending
         )
 
+    def still_closing(self) -> bool:
+        """After :meth:`close_panel`: True while this panel is still needed.
+
+        scrcpy's window may still be inside it (a session is starting or
+        closing; also the session of a recording scrcpy made itself, which
+        :meth:`is_active` does not count), or a recording is still being
+        stopped and saved.  Destroying the panel earlier destroys that window
+        with it, which waits for as long as scrcpy does not answer, and
+        leaves a session that had only just started with nobody to stop it.
+        """
+        return bool(
+            self.is_active()
+            or (self._record_finalizing and self._rec_mode == "integrated")
+            or self.recording_threads()
+            or thread_running(self._rec_launch_thread)
+        )
+
+    def recording_threads(self) -> list:
+        """The workers that still stop and save this panel's recording (none
+        once the exit was told not to wait for it: see finish_recordings)."""
+        if self._rec_abandoned:
+            return []
+        return [t for t in (self._rec_thread, self._rec_wait) if thread_running(t)]
+
+    def _screen_wanted(self) -> bool:
+        """True while a screen shows or one is on its way: launching, about
+        to be retried, waiting for the previous session to close, or coming
+        back once the recording scrcpy made itself is saved.  Unlike
+        :meth:`is_active`, not while a screen the user stopped is still
+        closing, or its launch still being cancelled: nothing comes after it.
+        """
+        if self._scrcpy is not None or self._screencap is not None or self._retry_pending:
+            return True
+        if self._launch_pending:
+            return not self._cancel_launch or self._queued_start is not None
+        if self._stopping_mirror:
+            return self._queued_start is not None
+        return bool(
+            self._record_finalizing
+            and self._rec_mode == "integrated"
+            and self._rec_restore_after_finish
+            and self._rec_restore_spec
+        )
+
+    def _screen_display(self):
+        """The display of the screen that shows, or of the one on its way (a
+        start that waits says where it goes; one that names no display takes
+        the picker's)."""
+        queued = self._queued_start
+        if queued is not None:
+            return queued.get("display_id", self.cmb_display.currentData())
+        return (self._launch_spec or {}).get("display_id")
+
     def set_fixed_display(self, display) -> None:
         """Lock this panel to one display — a tile in the all-displays tab.
 
@@ -3758,6 +3894,8 @@ class MirrorPanel(QWidget):
     def _select_and_mirror(self, disp_id):
         if self._integrated_recording_blocks():
             return
+        if self._screen_wanted() and self._recording_save_blocks():
+            return  # (start() would refuse: the screen and the picker stay)
         self._sync_display_selection(disp_id)
         if self._scrcpy is not None:
             self.stop()
@@ -3769,8 +3907,8 @@ class MirrorPanel(QWidget):
     def _select_and_record(self, disp_id):
         # A running screen keeps showing its own display while another one is
         # recorded beside it (a second scrcpy, or screenrecord), so the picker
-        # and the screen's shape stay with what is on screen.
-        if self._scrcpy is None and self._screencap is None:
+        # and the screen's shape stay with what is on screen, or about to be.
+        if not self._screen_wanted():
             self._sync_display_selection(disp_id)
         self._begin_record(display_id=disp_id)
 
@@ -3850,6 +3988,8 @@ class MirrorPanel(QWidget):
         if not path.lower().endswith(".mp4"):
             path += ".mp4"
         self._rec_path = path
+        self._rec_overwrites = _file_stamp(path)
+        self._rec_error, self._rec_abandoned = "", False
         self._rec_display_id = disp_id
         self._recording = True
         self._record_finalizing = False
@@ -3870,7 +4010,10 @@ class MirrorPanel(QWidget):
             self._rec_restore_spec = {
                 key: value for key, value in spec.items() if key not in ("record", "record_format")
             }
+            self._cancel_retry()  # (a retry of the plain screen would take this start's place)
             self._queued_start = spec
+            # the one scrcpy shows the display it records: the picker follows
+            self._sync_display_selection(disp_id)
             if self._launch_pending:
                 self._cancel_launch = True
             self._set_record_status("Starting one integrated scrcpy recording…")
@@ -4012,10 +4155,7 @@ class MirrorPanel(QWidget):
             return
         ran = time.time() - self._rec_started_t
         if not self._rec_confirmed:
-            try:
-                self._rec_confirmed = os.path.getsize(self._rec_path) > 0
-            except (OSError, TypeError):
-                self._rec_confirmed = False
+            self._rec_confirmed = self._recording_written(self._rec_path)
             if self._rec_confirmed:
                 self.log.emit("[OK] recording started; the live screen was not restarted")
         if not session.running:
@@ -4076,7 +4216,7 @@ class MirrorPanel(QWidget):
         self._rec_wait = None
         path = self._rec_path
         self._retire_rec_log()
-        if path and os.path.isfile(path) and not _mp4_is_finalised(path):
+        if self._recording_written(path) and not _mp4_is_finalised(path):
             self.log.emit(
                 "[WARNING] scrcpy did not finish the MP4 index; the recording "
                 f"may not play → {path}"
@@ -4259,16 +4399,37 @@ class MirrorPanel(QWidget):
         self.status.setText(text)
         return True
 
+    def _recording_written(self, path) -> bool:
+        """True when *path* holds video data of this recording.
+
+        A file that was already there (the user chose to overwrite it) is not
+        the recording until it has changed: its old size was once taken for a
+        recorder that works, and the old file reported as the saved recording.
+        """
+        stamp = _file_stamp(path)
+        if stamp is None or stamp[0] <= 0:
+            return False
+        return not (path == self._rec_path and stamp == self._rec_overwrites)
+
     def _record_finished(self, parts):
         self._reset_record_state()
         # The save is done: "Recording stopped. Saving the MP4…" must not stay
         # under a live screen. The result is reported by the saved dialog (or,
         # on a display tile, as its own status line below).
         self._clear_record_status()
-        parts = [p for p in (parts or []) if p and os.path.exists(p) and os.path.getsize(p) > 0]
+        parts = [p for p in (parts or []) if p and self._recording_written(p)]
         if not parts:
             bad = self._rec_path or ""
-            self.log.emit(f"[ERROR] recording file is empty → {bad}")
+            old_kept = (
+                self._rec_overwrites is not None and _file_stamp(bad) == self._rec_overwrites
+            )
+            if old_kept:
+                self.log.emit(
+                    f"[ERROR] the recording saved no data; the file already at {bad} "
+                    "has not been changed"
+                )
+            else:
+                self.log.emit(f"[ERROR] recording file is empty → {bad}")
             if self._closing:
                 return
             if self._tile_notice("The recording saved no data — this display may block it."):
@@ -4277,7 +4438,8 @@ class MirrorPanel(QWidget):
                 self,
                 "Recording",
                 f"The recording didn't save any data:\n{bad}\n\n"
-                "Some head units block screenrecord (secure "
+                + ("The file that was already there has not been changed.\n\n" if old_kept else "")
+                + "Some head units block screenrecord (secure "
                 "surface). Try a screenshot instead.",
             )
             return
@@ -4302,6 +4464,7 @@ class MirrorPanel(QWidget):
     def _record_failed(self, msg):
         self._reset_record_state()
         self._clear_record_status()
+        self._rec_error = str(msg)
         self.log.emit(f"[ERROR] recording: {msg}")
         if self._closing:
             return
@@ -4429,10 +4592,14 @@ class MirrorPanel(QWidget):
             "record_format": record_format,
             "camera": camera,
         }
-        # A parallel recorder finishes on its own; it never blocks the screen.
-        if self._record_finalizing and self._rec_mode != "parallel":
-            self.status.show()
-            self.status.setText("Wait for the recording to finish saving before restarting the screen.")
+        if self._recording_save_blocks():
+            return
+        # scrcpy itself records, or is about to: the start that carries the
+        # recording may still be queued below, where any other start would
+        # take its place and leave Record on "Starting recording…" for good.
+        if record is None and self._integrated_recording_blocks(
+            "Stop the current recording before changing the screen mode."
+        ):
             return
         # Starting is a replace operation. Queue exactly one requested launch,
         # cancel an in-flight launch, and wait for the previous process to close
@@ -4455,10 +4622,6 @@ class MirrorPanel(QWidget):
             self.status.show()
             self.status.setText("Stopping the current display before restarting…")
             self._refresh_buttons()
-            return
-        if record is None and self._integrated_recording_blocks(
-            "Stop the current recording before changing the screen mode."
-        ):
             return
         if self._scrcpy is not None:
             self._queued_start = requested
@@ -4576,11 +4739,12 @@ class MirrorPanel(QWidget):
     def _clear_cancelled_record_start(self):
         """Reset an integrated recording whose scrcpy launch was cancelled.
 
-        A queued start still carries the recording (Record pressed while a
-        mirror was launching), so only a cancel with nothing queued ends it.
+        A queued start may still carry the recording (Record pressed while a
+        mirror was launching), so only a cancel with no such start waiting
+        ends it.
         Without this the Record button stayed disabled on "Starting recording…".
         """
-        if not self._rec_integrated_starting or self._queued_start is not None:
+        if not self._rec_integrated_starting or (self._queued_start or {}).get("record"):
             return
         self._recording = False
         self._record_finalizing = False
@@ -5288,6 +5452,10 @@ class MirrorPanel(QWidget):
         if self._launch_pending:
             self._queued_start = None
             self._cancel_launch = True
+            # (a recording that start was to carry goes with it, now: what is
+            # asked for next is not held up by a recording nobody wants)
+            self._clear_cancelled_record_start()
+            self._refresh_buttons()
             self.status.show()
             self.status.setText("Cancelling screen start…")
             return
@@ -5394,3 +5562,214 @@ class MirrorPanel(QWidget):
         if self._owns_dispatcher and self._dispatcher.isRunning():
             threads.append(self._dispatcher)
         return threads
+
+
+# How often a closed tab that is kept for its screens is looked at again.
+_RELEASE_POLL_MS = 250
+
+
+def delete_when_released(widget, released=None) -> None:
+    """Delete *widget* (a closed tab, or a display tile taken off its wall)
+    once its screen panels are done with it.
+
+    A stop worker leaves a scrcpy that does not answer attached to its
+    panel's container until the process has been ended.  Destroying the
+    container before that destroys scrcpy's window with it, which waits for
+    the hung window: closing such a tab froze the whole of TurboADB for as
+    long as the stop took.  So the widget is only hidden until every panel
+    in it reports :meth:`MirrorPanel.still_closing` false.  A recording that
+    is still being saved keeps its panel as well: the panel reports the
+    result, and the exit can find the recording to wait for it (see
+    :func:`finish_recordings`).
+
+    *released* is called once, just before the delete: an owner that lists
+    what it keeps (DisplayWall) takes the widget off its list.
+    """
+    panels = widget.findChildren(MirrorPanel)
+
+    def kept() -> bool:
+        return any(panel.still_closing() for panel in widget.findChildren(MirrorPanel))
+
+    for panel in panels:
+        try:
+            panel.close_panel()  # (closed already, unless the tab's own close failed)
+        except Exception:
+            pass
+    if not kept():
+        if released is not None:
+            released()
+        widget.deleteLater()
+        return
+    widget.hide()
+    timer = QTimer(widget)
+
+    def look_again():
+        if not timer.isActive() or kept():
+            return  # (released already, or still needed)
+        timer.stop()
+        if released is not None:
+            released()
+        widget.deleteLater()
+
+    timer.timeout.connect(look_again)
+    timer.start(_RELEASE_POLL_MS)
+    for panel in panels:
+        # a screen that has closed says so: no need to wait for the next look
+        panel.screen_stopped.connect(look_again)
+
+
+class _SavingDialog(QDialog):
+    """On the way out: the recordings that are still being saved.
+
+    :func:`finish_recordings` closes it once they are saved.  Only its button
+    gives up the wait: Esc, or closing the dialog, must not throw a recording
+    away.
+    """
+
+    def __init__(self, saves, parent=None):
+        super().__init__(parent)
+        self.saves = saves  # [(panel, path)], kept up to date by the caller
+        self.skipped = False
+        self.setWindowTitle("TurboADB — saving the recording")
+        self.setWindowModality(Qt.WindowModal)
+        self.setWindowFlags(
+            self.windowFlags() & ~Qt.WindowContextHelpButtonHint & ~Qt.WindowCloseButtonHint
+        )
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.PlainText)
+        self.label.setWordWrap(True)
+        lay.addWidget(self.label)
+        busy = QProgressBar()
+        busy.setRange(0, 0)
+        busy.setTextVisible(False)
+        lay.addWidget(busy)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.btn_skip = QPushButton("Close without saving")
+        self.btn_skip.setProperty("role", "danger")
+        self.btn_skip.setAutoDefault(False)
+        self.btn_skip.setToolTip("Close TurboADB now; a recording that is not saved yet is lost")
+        self.btn_skip.clicked.connect(self._skip)
+        row.addWidget(self.btn_skip)
+        lay.addLayout(row)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # (not on the button: a stray Space must not throw the recording away)
+        self.setFocus(Qt.OtherFocusReason)
+
+    def refresh(self) -> None:
+        """Name what is being saved, and how much of each file has arrived."""
+        count = len(self.saves)
+        lines = [
+            "Saving the screen recording to your PC…"
+            if count == 1
+            else f"Saving {count} screen recordings to your PC…"
+        ]
+        for panel, path in self.saves:
+            stamp = _file_stamp(path) if panel._recording_written(path) else None
+            megabytes = stamp[0] // (1024 * 1024) if stamp else 0
+            lines.append(f"{path}  ({megabytes} MB so far)" if megabytes else path)
+        lines.append("")
+        lines.append("TurboADB closes as soon as it is saved.")
+        self.label.setText("\n".join(lines))
+
+    def _skip(self):
+        self.skipped = True
+        super().reject()
+
+    def reject(self):
+        """Esc and a close request: the wait goes on (see the class note)."""
+
+
+def _recordings_being_saved(root) -> list:
+    """``[(panel, path)]`` for the screen panels under *root* whose recording
+    is still being stopped and saved (the panels of a closed tab that
+    :func:`delete_when_released` keeps included)."""
+    found = []
+    for panel in root.findChildren(MirrorPanel):
+        try:
+            if panel.recording_threads():
+                found.append((panel, panel._rec_path or ""))
+        except RuntimeError:  # a panel being destroyed
+            continue
+    return found
+
+
+_SAVE_POLL_MS = 100
+
+
+def finish_recordings(window) -> bool:
+    """Before TurboADB exits: wait until every recording is saved.
+
+    Closing the window used to go straight on to the exit.  The adb server
+    was then stopped under the pull of a device recording, and the engine's
+    exit clean-up removed the unfinished file (and the clip on the device);
+    a scrcpy still writing its MP4 index got the exit's five seconds instead
+    of the fifteen to twenty its own worker allows.  So this runs while the
+    window, the device connections and the adb server are still there: a
+    dialog names the files being saved until their workers have finished,
+    each within its own limits (scrcpy's close timeout; a pull that makes no
+    progress fails after the engine's stall limit).  Its button gives up the
+    wait.  Returns False when it was used; a recording that turned out not
+    to be saved is reported before the app goes.
+    """
+    for panel in window.findChildren(MirrorPanel):
+        try:
+            if panel._recording or panel.recording_threads():
+                # (closed already, unless its tab's own close failed: a
+                # recording nobody told to stop would be waited for without end)
+                panel.close_panel()
+        except Exception:
+            pass
+    saves = _recordings_being_saved(window)
+    if not saves:
+        return True
+    if window.isMinimized():
+        # a minimized window hides its dialogs with it: show what it waits for
+        window.setWindowState(window.windowState() & ~Qt.WindowMinimized)
+    dialog = _SavingDialog(saves, window)
+    timer = QTimer(dialog)
+
+    def look():
+        running = _recordings_being_saved(window)
+        # (a recorder that had only just started is stopped by its own worker)
+        saves.extend(save for save in running if save not in saves)
+        if running:
+            dialog.refresh()
+        else:
+            dialog.accept()
+
+    timer.timeout.connect(look)
+    timer.start(_SAVE_POLL_MS)
+    started = time.monotonic()
+    dialog.exec_()
+    timer.stop()
+    dialog.deleteLater()
+    if dialog.skipped:
+        for panel, _path in saves:
+            panel._rec_abandoned = True  # (not waited for again by a second close)
+        _log.warning("closed without waiting for %d recording(s) to be saved", len(saves))
+        return False
+    lost = [(panel, path) for panel, path in saves if not panel._recording_written(path)]
+    _log.info(
+        "waited %.1f s for %d recording(s) on exit; %d not saved",
+        time.monotonic() - started, len(saves), len(lost),
+    )
+    if lost:
+        QMessageBox.warning(
+            window,
+            "Recording",
+            "The screen recording was not saved:\n\n"
+            + "\n".join(
+                f"{path}" + (f"\n({panel._rec_error})" if panel._rec_error else "")
+                for panel, path in lost
+            ),
+        )
+    return True

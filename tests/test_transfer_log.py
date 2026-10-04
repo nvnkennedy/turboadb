@@ -1,6 +1,8 @@
 """The Files page's transfer history model — pure Python, no Qt, no device."""
 
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -386,6 +388,84 @@ def test_measure_remote_chunks_long_lists(monkeypatch):
     assert len(handler.commands) == 3
     assert result == {"/sdcard/0": (1, True), "/sdcard/1": (2, True), "/sdcard/2": (1, True),
                       "/sdcard/3": (2, True), "/sdcard/4": (1, True)}
+
+
+class WindowsAdb:
+    """A device behind adb on Windows: a command line of more than 32,767
+    characters can't be started at all, and every size asked for is 7 bytes."""
+
+    LIMIT = 32767
+
+    def __init__(self):
+        self.lengths = []
+
+    def shell(self, command, timeout=None, safe=None):
+        line = subprocess.list2cmdline(
+            ["C:\\Users\\me\\.turboadb\\tools\\platform-tools\\adb.exe", "-s", "0123456789ABCDEF",
+             "shell", command])
+        self.lengths.append(len(line))
+        if len(line) > self.LIMIT:
+            raise OSError(206, "The filename or extension is too long")
+        asked = command.count("@@") // 3  # three echoes per path
+        return type("R", (), {"stdout": "".join(f"@@{i} F 7\n" for i in range(asked))})()
+
+
+def test_measuring_a_hundred_photos_fits_a_windows_command_line():
+    """One command for 100 photos came to 34,000 characters, which Windows
+    refuses: their sizes were never measured, so a pull of a camera folder
+    showed no bytes done and no time left."""
+    paths = [f"/sdcard/DCIM/Camera/PXL_20260914_1830{i:05d}.NIGHT.RAW-01.COVER.jpg"
+             for i in range(250)]
+    device = WindowsAdb()
+    result = measure_remote(device, paths)
+    assert result == {path: (7, True) for path in paths}
+    assert max(device.lengths) <= WindowsAdb.LIMIT
+    assert len(device.lengths) == 3  # and still 100 paths to a command
+
+
+def test_measuring_awkward_names_fits_a_windows_command_line():
+    """Quotes and backslashes take more room on the command line than in the name."""
+    paths = [f"/sdcard/it's \"{i}\" \\\" " + "'\"\\" * 60 + ".txt" for i in range(120)]
+    device = WindowsAdb()
+    assert measure_remote(device, paths) == {path: (7, True) for path in paths}
+    assert max(device.lengths) <= WindowsAdb.LIMIT
+
+
+def _device_like_sh():
+    """A POSIX sh on this machine whose ``stat -c`` and ``du -sk`` work as a
+    device's do (not the BSD ones), or None."""
+    sh = shutil.which("sh") or shutil.which("bash")
+    if sh is None:
+        return None
+    try:
+        tried = subprocess.run([sh, "-c", "stat -c %s . && du -sk . | cut -f1"],
+                               capture_output=True)
+    except OSError:
+        return None
+    return sh if tried.returncode == 0 else None
+
+
+_SH = _device_like_sh()
+
+
+@pytest.mark.skipif(_SH is None, reason="needs a POSIX sh with du and stat -c")
+def test_the_measuring_command_measures_in_a_real_shell(tmp_path):
+    (tmp_path / "it's a film.mp4").write_bytes(b"x" * 300)
+    (tmp_path / "album" / "sub").mkdir(parents=True)
+    (tmp_path / "album" / "sub" / "1.jpg").write_bytes(b"y" * 5000)
+
+    class Shell:
+        def shell(self, command, timeout=None, safe=None):
+            done = subprocess.run([_SH, "-c", f'cd "{tmp_path.as_posix()}" || exit; ' + command],
+                                  capture_output=True, text=True)
+            return type("R", (), {"stdout": done.stdout})()
+
+    result = measure_remote(Shell(), ["it's a film.mp4", "album/.", "album/sub/", "gone.bin"])
+    assert result["it's a film.mp4"] == (300, True)
+    for folder in ("album/.", "album/sub/"):  # du counts blocks: an estimate, never zero here
+        size, exact = result[folder]
+        assert size >= 4096 and size % 1024 == 0 and exact is False
+    assert "gone.bin" not in result
 
 
 def test_measure_remote_without_a_device_or_with_a_failing_shell():

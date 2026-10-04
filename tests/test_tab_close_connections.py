@@ -266,3 +266,52 @@ def test_a_cancelled_connect_racing_the_tab_close_still_drops_its_connection(tab
     assert _never(made)
     tab.close_session()  # the tab never got a handler, yet the connection goes
     assert made.done.wait(5)
+
+
+# --------------------------------------------------------------------------- #
+# a connect that failed after its `adb connect` had made the connection
+# --------------------------------------------------------------------------- #
+def _failed_connect(handler, reason="Device 10.0.0.5:5555 is 'unauthorized', not ready."):
+    """Run a connect worker whose handler made (or found) the connection and
+    then failed: the device never authorised this PC, or stayed offline."""
+    from turboadb.exceptions import ADBConnectionError
+    from turboadb.gui.device_tab import _ConnectThread
+    from turboadb.results import OperationResult
+
+    handler.connect = lambda **_kw: OperationResult(
+        False, "connect", error=ADBConnectionError(reason))
+    worker = _ConnectThread(ADBConfig(host="10.0.0.5"), fetch_identity=False)
+    failures = []
+    worker.fail.connect(failures.append)
+    _run_connect(worker, handler)
+    assert failures == [reason]
+    return handler
+
+
+def test_a_failed_connect_leaves_its_connection_to_the_tab_that_retries(tabs):
+    """The retry's `adb connect` is answered "already connected" and owns
+    nothing, so closing the tab left the device connected in the adb server."""
+    tab = _connecting(tabs())  # the tab uses 10.0.0.5:5555 while it connects
+    made = _failed_connect(_NetHandler(owns=True))
+    assert _never(made)  # the tab is still open: Reconnect may yet get through
+
+    retry = _NetHandler(owns=False)  # "already connected"
+    tab._on_connected(retry, {"_probe_pending": True})
+    assert _never(made, 0.1)
+    tab.close_session()  # the last user: the connection the first attempt made goes
+    assert made.done.wait(5)
+    assert len(made.disconnects) == 1 and retry.disconnects == []
+
+
+def test_closing_the_tab_after_a_failed_connect_drops_what_it_made(tabs):
+    tab = _connecting(tabs())
+    made = _failed_connect(_NetHandler(owns=True))
+    tab.close_session()  # never connected: the tab has no handler of its own
+    assert made.done.wait(5)
+
+
+def test_a_failed_connect_that_made_no_connection_drops_none(tabs):
+    tab = _connecting(tabs())
+    found = _failed_connect(_NetHandler(owns=False))  # someone else's connection
+    tab.close_session()
+    assert _never(found)

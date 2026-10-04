@@ -3,6 +3,7 @@ explicit tool paths, serve's ports and adb, options that need each other, the
 editor command, and which adb server discovery asks."""
 import json
 import os
+import stat
 import types
 
 import pytest
@@ -187,9 +188,9 @@ def test_mdns_devices_runs_on_the_given_server(monkeypatch):
 # --------------------------------------------------------------------------- #
 # the editor command
 # --------------------------------------------------------------------------- #
-def test_the_editor_program_is_looked_up_like_a_console_would(monkeypatch, tmp_path):
+def test_the_editor_program_is_looked_up_on_path(monkeypatch, tmp_path):
     found = {"code": "/opt/vscode/bin/code"}
-    monkeypatch.setattr("shutil.which", lambda name, *a, **k: found.get(name))
+    monkeypatch.setattr(cli, "_on_path", found.get)
     assert cli._editor_command("code --wait") == ["/opt/vscode/bin/code", "--wait"]
     with pytest.raises(ValueError, match="'subl' not found"):
         cli._editor_command("subl -w")
@@ -198,8 +199,45 @@ def test_the_editor_program_is_looked_up_like_a_console_would(monkeypatch, tmp_p
     assert cli._editor_command(str(exe)) == [str(exe)]
 
 
+def _program(folder, name):
+    """A program called *name* in *folder*, as a console finds it there (a
+    batch file on Windows); its path."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (name + (".bat" if os.name == "nt" else ""))
+    path.write_text("")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return str(path)
+
+
+def test_an_editor_named_without_a_folder_is_never_taken_from_the_working_folder(monkeypatch, tmp_path):
+    """The name was asked of shutil.which, which looks in the current folder
+    before PATH on Windows (and for an empty or relative PATH entry anywhere):
+    a notepad.bat lying in the folder `turboadb edit` was run in was started
+    with the device's file."""
+    work = tmp_path / "work"
+    _program(work, "notepad")
+    (work / "notepad").write_text("")  # and a file of exactly that name
+    _program(work / "bin", "notepad")
+    monkeypatch.chdir(work)
+    empty = tmp_path / "on-path"
+    empty.mkdir()
+    # "." and an empty entry mean the current folder, as a relative one does
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", "bin", str(empty)]))
+    with pytest.raises(ValueError, match="'notepad' not found"):
+        cli._editor_command("notepad")
+    wanted = _program(tmp_path / "tools", "notepad")
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(tmp_path / "tools")]))
+    program, option = cli._editor_command("notepad -w")
+    assert os.path.isabs(program) and os.path.samefile(program, wanted) and option == "-w"
+    # with a folder in it, the name is a path: the user's own choice of that file
+    chosen = _program(work / "mine", "edit")
+    relative = os.path.join("mine", os.path.basename(chosen))
+    assert cli._editor_command(relative) == [relative]
+    assert cli._editor_command(relative + " -w") == [relative, "-w"]
+
+
 def test_an_editor_that_is_not_there_stops_before_the_pull(run, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda name, *a, **k: None)
+    monkeypatch.setattr(cli, "_on_path", lambda name: None)
     dev = FakeDev()
     rc, _out, err = run(["edit", "/data/x.ini", "--editor", "no-such-editor"], dev)
     assert rc == 1 and "'no-such-editor' not found" in err

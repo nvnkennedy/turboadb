@@ -14,6 +14,8 @@ is TurboADB.
 
 The copy lives in ``~/.turboadb/launcher/<environment>/`` and is rebuilt when
 Python, TurboADB or the icon change; each build is checked by starting it once.
+A shortcut or a pin starts TurboADB.exe itself, so the copy also checks what it
+was built of, and hands the start back to the real Python when that changed.
 When anything fails the GUI runs in-process as before, and
 ``TURBOADB_NO_LAUNCHER=1`` keeps it there (the test suite sets it).
 """
@@ -23,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -40,6 +43,7 @@ _IN_USE_WAIT_S = 8.0  # for the TurboADB.exe an update is closing
 _PROBE_TIMEOUT_S = 30.0
 _BREAKAWAY = 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
 _OPT_OUT = "TURBOADB_NO_LAUNCHER"
+_CHECKED = "TURBOADB_LAUNCHER_CHECKED"  # for the TurboADB.exe relaunch() starts: see run_branded
 _MARK = "TURBOADB-LAUNCHER:"
 RT_ICON, RT_GROUP_ICON, RT_VERSION = 3, 14, 16
 
@@ -65,10 +69,45 @@ def _runtime_at(home: str) -> Runtime:
                    os.path.join(home, "Lib", "site-packages", _MODULE + ".py"))
 
 
+def _python_home(home: str) -> Optional[str]:
+    """The Python installation the copy in *home* runs: the ``home`` of its
+    ``pyvenv.cfg`` ('' when it names none, None when there is no such file)."""
+    try:
+        with open(os.path.join(home, "pyvenv.cfg"), encoding="utf-8") as fh:
+            for line in fh:
+                key, _eq, value = line.partition("=")
+                if key.strip() == "home":
+                    return value.strip()
+    except OSError:
+        return None
+    return ""
+
+
 def _base_dir() -> str:
     """The folder of the Python installation this interpreter (or its venv) runs."""
+    if BRANDED and _HOME:
+        # TurboADB.exe: before Python 3.11 sys._base_executable names the copy itself
+        base = _python_home(_HOME)
+        if base:
+            return base
     exe = getattr(sys, "_base_executable", None) or sys.executable or ""
     return os.path.dirname(os.path.abspath(exe))
+
+
+def _turned_off() -> bool:
+    return os.environ.get(_OPT_OUT, "").strip() not in ("", "0")
+
+
+def has_qt() -> bool:
+    """Whether this Python has PyQt5 (found, not imported): the GUI in
+    TurboADB.exe needs it, and without it ``turboadb-gui`` starts the wheel's
+    executable instead."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("PyQt5") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def supported() -> bool:
@@ -77,7 +116,7 @@ def supported() -> bool:
     not turned off with ``TURBOADB_NO_LAUNCHER``."""
     if sys.platform != "win32" or getattr(sys, "frozen", False):
         return False
-    if os.environ.get(_OPT_OUT, "").strip() not in ("", "0"):
+    if _turned_off():
         return False
     return os.path.isfile(os.path.join(_base_dir(), "pythonw.exe"))
 
@@ -283,9 +322,42 @@ def _build(rt: Runtime) -> None:
             _replace(dst + ".new", dst)
 
 
+_SCRIPT_ROOT = re.compile(r"^# TurboADB's GUI in TurboADB\.exe, for (.+) on Python [\d.]+\.$", re.M)
+_SCRIPT_EXECUTABLE = re.compile(r"^EXECUTABLE = (.+)$", re.M)
+
+
+def _made_for(home: str) -> List[str]:
+    """The folders the copy in *home* was made for, beside its Python: its
+    environment and the folder holding its TurboADB, as ``state.json`` records
+    them.  A copy of 3.0 or 3.1 has no record: its script names the
+    environment's interpreter and that folder."""
+    state = _read_state(home)
+    folders = [state.get("prefix"), state.get("root")]
+    if all(isinstance(folder, str) and folder for folder in folders):
+        return folders
+    import ast
+
+    try:
+        with open(_runtime_at(home).script, encoding="utf-8") as fh:
+            text = fh.read()
+        executable = ast.literal_eval(_SCRIPT_EXECUTABLE.search(text).group(1))
+        return [os.path.dirname(executable), ast.literal_eval(_SCRIPT_ROOT.search(text).group(1))]
+    except Exception:
+        return []
+
+
+def _deleted(folder: str) -> bool:
+    """Whether *folder* is gone for good: not there, on a drive or share that
+    is (one that is not connected says nothing about what it holds)."""
+    drive = os.path.splitdrive(os.path.abspath(folder))[0]
+    return not os.path.isdir(folder) and os.path.isdir(drive + os.sep)
+
+
 def _forget_orphans(keep: str) -> None:
-    """Remove the copies made for Python installations that are gone (a
-    ``pyvenv.cfg`` whose ``home`` no longer holds a pythonw.exe)."""
+    """Remove the copies nothing can start any more: those of a Python
+    installation that is gone (a ``pyvenv.cfg`` whose ``home`` no longer holds
+    a pythonw.exe), of a deleted environment (a venv, a recycled ``uvx`` one)
+    and of a removed TurboADB folder (a checkout, a worktree)."""
     root = os.path.dirname(keep)
     try:
         names = os.listdir(root)
@@ -295,24 +367,20 @@ def _forget_orphans(keep: str) -> None:
         home = os.path.join(root, name)
         if os.path.normcase(home) == os.path.normcase(keep):
             continue
-        try:
-            with open(os.path.join(home, "pyvenv.cfg"), encoding="utf-8") as fh:
-                base = next((line.split("=", 1)[1].strip() for line in fh
-                             if line.split("=", 1)[0].strip() == "home"), "")
-        except (OSError, IndexError):
-            continue
-        if base and not os.path.isfile(os.path.join(base, "pythonw.exe")):
+        base = _python_home(home)
+        if base is None:
+            continue  # not a copy
+        if (base and not os.path.isfile(os.path.join(base, "pythonw.exe"))) \
+                or any(_deleted(folder) for folder in _made_for(home)):
             shutil.rmtree(home, ignore_errors=True)
 
 
 def _probe(rt: Runtime) -> bool:
     """Start the copy once: it must run, as TurboADB.exe, and import this very
     ``turboadb`` (and PyQt5, when this Python has it)."""
-    import importlib.util
-
     import turboadb
 
-    qt = importlib.util.find_spec("PyQt5") is not None
+    qt = has_qt()
     try:
         r = subprocess.run([rt.exe] + rt.args + ["--probe"] + (["--qt"] if qt else []),
                            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S, cwd=rt.home)
@@ -363,7 +431,9 @@ def runtime(build: bool = True) -> Optional[Runtime]:
             os.makedirs(os.path.dirname(rt.script), exist_ok=True)
             _write_text(rt.script, script)
             ok = _probe(rt)
-            _write_text(os.path.join(rt.home, "state.json"), json.dumps({"built": wanted, "ok": ok}))
+            # what it was made for goes in too: _forget_orphans removes the copy once that is gone
+            _write_text(os.path.join(rt.home, "state.json"), json.dumps(
+                {"built": wanted, "ok": ok, "prefix": os.path.abspath(sys.prefix), "root": origin["root"]}))
         _forget_orphans(rt.home)
         return rt if ok else None
     except Exception:
@@ -387,19 +457,11 @@ def relaunch(argv) -> Optional[int]:
     rt = runtime()
     if rt is None:
         return None
-    env = {k: v for k, v in os.environ.items() if k != "__PYVENV_LAUNCHER__"}
-    cmd = [rt.exe] + rt.args + [str(a) for a in argv]
-    options = dict(cwd=rt.home, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, close_fds=True)
-    try:
-        proc = subprocess.Popen(cmd, creationflags=_BREAKAWAY, **options)
-        free = True
-    except OSError:  # a job that allows no breakaway
-        try:
-            proc = subprocess.Popen(cmd, **options)
-        except OSError:
-            return None
-        free = False
+    # the copy was built or checked just now: it need not check itself (run_branded)
+    started = _start([rt.exe] + rt.args + [str(a) for a in argv], rt.home, **{_CHECKED: "1"})
+    if started is None:
+        return None
+    proc, free = started
     try:
         code = proc.wait(timeout=_EARLY_EXIT_S)
     except subprocess.TimeoutExpired:
@@ -409,16 +471,91 @@ def relaunch(argv) -> Optional[int]:
     return 0 if code == 0 else None
 
 
+def _start(cmd: List[str], cwd: str, **env: str):
+    """Start *cmd* in *cwd*, with *env* added to this process's environment,
+    free of the job this process is in: ``(process, True)``, or
+    ``(process, False)`` inside a job that allows no breakaway.  None when it
+    could not be started."""
+    environ = {k: v for k, v in os.environ.items() if k != "__PYVENV_LAUNCHER__"}
+    environ.update(env)
+    options = dict(cwd=cwd, env=environ, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, close_fds=True)
+    try:
+        return subprocess.Popen(cmd, creationflags=_BREAKAWAY, **options), True
+    except OSError:  # a job that allows no breakaway
+        try:
+            return subprocess.Popen(cmd, **options), False
+        except OSError:
+            return None
+
+
 def run_branded(argv: List[str], home: str) -> int:
     """TurboADB.exe's work, called by its generated script: the GUI, or with
-    ``--probe`` the report a build is checked with."""
+    ``--probe`` the report a build is checked with.
+
+    A shortcut or a pin starts TurboADB.exe itself, with nothing before it to
+    look at the copy.  So unless :func:`relaunch` started it, it checks itself
+    first (:func:`_stale`) and hands a start it must not take to the real
+    Python (:func:`_hand_over`)."""
     global BRANDED, _HOME
     BRANDED, _HOME = True, home
     if argv[:1] == ["--probe"]:
         return _report("--qt" in argv)
+    # popped: nothing this GUI starts inherits it
+    if os.environ.pop(_CHECKED, None) is None and _stale(home) and _hand_over(argv, home):
+        return 0
+    if not has_qt():
+        # no GUI of this Python to run here: turboadb-gui's way to the wheel's executable
+        from .cli import launch_gui
+
+        return launch_gui(argv)
     from .gui.app import main
 
     return main()
+
+
+def _stale(home: str) -> bool:
+    """Whether the copy in *home* must not run the GUI as it is: the launcher
+    is turned off, the copy failed its check or was built of another Python,
+    TurboADB or icon than these (a ``pip install -U`` or a Python update
+    since), or PyQt5 is not installed, where the GUI is the wheel's
+    executable."""
+    try:
+        state = _read_state(home)
+        if _turned_off() or not state.get("ok") or (state.get("built") or {}).get("stamp") != _stamp():
+            return True
+    except Exception:
+        return True
+    return not has_qt()
+
+
+# Runs in the real interpreter: launch_gui of the TurboADB that TurboADB.exe
+# runs.  A source checkout goes first on the path, as python main.py has it;
+# an installed one is found where the interpreter finds it (as _origin tells).
+_HAND_OVER = (
+    "import os, sys\n"
+    "root = sys.argv.pop(1)\n"
+    "if os.path.normcase(root) not in [os.path.normcase(os.path.abspath(p)) for p in sys.path if p]:\n"
+    "    sys.path.insert(0, root)\n"
+    "from turboadb.cli import launch_gui\n"
+    "sys.exit(launch_gui(sys.argv[1:]))\n"
+)
+
+
+def _hand_over(argv: List[str], home: str) -> bool:
+    """Start the GUI as ``turboadb-gui`` does, in the real interpreter, in
+    place of this TurboADB.exe, which ends (a rebuild replaces its file).
+    There the GUI comes up in a TurboADB.exe built anew, in that Python when
+    the launcher is turned off, or as the wheel's executable when PyQt5 is not
+    installed, and the shortcuts are brought in line.  False when it could not
+    be started."""
+    import turboadb
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(turboadb.__file__)))
+    try:
+        return _start([sys.executable, "-c", _HAND_OVER, root] + [str(a) for a in argv], home) is not None
+    except Exception:
+        return False
 
 
 def _report(qt: bool) -> int:
@@ -429,6 +566,10 @@ def _report(qt: bool) -> int:
     buf = ctypes.create_unicode_buffer(32768)
     ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
     out = {"turboadb": turboadb.__file__, "image": buf.value, "executable": sys.executable}
+    try:
+        out["stamp"] = _stamp()  # what a start from a shortcut compares with the build's
+    except Exception as exc:
+        out["stamp"] = repr(exc)
     if qt:
         try:
             import PyQt5.QtWidgets  # noqa: F401

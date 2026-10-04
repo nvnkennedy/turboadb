@@ -3,6 +3,293 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 4.0.0
+
+### New
+
+- **A faster terminal that never stalls on output.** Plain output is drawn
+  about four times as fast. A flood of short lines (`yes`, `seq`) no longer
+  makes the terminal stutter or run far behind. A line that never ends
+  (minified JSON, base64) no longer freezes the window: after 4,096 characters
+  it continues on the next line, and Copy gives it back in one piece.
+- **Input methods in the terminal.** Text being composed with an input method
+  (Japanese, Chinese, Korean) shows in the line, underlined, while you type it.
+- **Closing TurboADB waits for a recording.** When a screen recording is
+  running or still being saved, a dialog names the file and waits for it, with
+  **Close without saving** as the way out, instead of losing the recording.
+- **The standalone app tells you about new versions.** The exe and a source
+  checkout are told when a newer TurboADB is out (at launch, on the version
+  chip and by **Check for updates**), with how to get it.
+- **`--timeout` reaches the long commands.** `install`, `cp` and `rm` follow
+  it (a longer value extends them, `0` lifts the limit), and a large APK gets
+  more time by itself, also from the Apps page.
+- **Recording into a folder.** `turboadb record FOLDER` saves
+  `recording-DATE-TIME.mp4` there; recordings started at the same moment each
+  get a file of their own.
+- **Remote webcam recording sets itself up.** Record offers the one-time
+  ffmpeg download for this PC (or says how to install it) instead of "ffmpeg
+  isn't ready yet."
+
+### Changed
+
+This is a release of fixes and hardening across the terminals, Files,
+mirroring, the command line and the Windows app. It is a major version because
+of the first item below: some commands and API calls now report failures they
+used to pass over.
+
+- **Failures are reported as failures**, on the command line and in the API:
+  - `turboadb devices` exits 3 when adb is missing and reports an adb server
+    that cannot start with the reason, instead of "No devices found";
+    `list_devices()` raises `ADBNotFoundError`, as documented.
+  - An install or uninstall counts as done only when adb ends well and the
+    package manager answers `Success`: an APK named `SuccessFactors.apk` that
+    was refused is no longer reported as installed.
+  - `call_state()` reports a device that could not be asked as an error;
+    "unknown" now only means the device answered without a call state.
+  - An adb that cannot be started (locked, quarantined, mid-update) is an
+    `ADBError` from push, pull, logcat, streams and interactive shells too.
+  - `turboadb touch-device --json` exits 1 when no touchscreen is found, as it
+    does without `--json`.
+  - `turboadb shortcut` writes nothing and exits 1 where nothing could start
+    the app (no PyQt5 and no bundled app), and says what to install.
+  - `turboadb serve --uninstall-startup` exits 1 and says so when the startup
+    task could not be removed; `uninstall_serve_task()` raises.
+- **Programs are taken only from known places**, never from the folder a
+  command is run in: adb and scrcpy (nor from `\usr` or `\opt` of the current
+  drive on Windows), ffmpeg for the webcam, the editor of `turboadb edit`, and
+  Windows' own netsh, schtasks, PowerShell and rundll32. Name a program you
+  keep in the current folder with its folder (`--adb-path .\adb.exe`,
+  `--editor .\myedit.cmd`).
+- **Terminal behaviour.** Tabs line up at 8-column tab stops. A page break
+  (form feed) in output is a line feed: only the Command Prompt tab's `cls`
+  clears on one, so a batch file's `cls` run from the PowerShell tab leaves an
+  empty line (PowerShell's own `cls` / `Clear-Host` clears as before).
+  Selected text can no longer be dragged out of the terminal (Copy remains).
+  In CMD, `ls` runs your own `ls` when one is on the PATH and becomes `dir`
+  only when there is none.
+- **Stop is more patient with a shell that is busy with itself.** A PowerShell
+  whose prompt takes a moment to come back (oh-my-posh, posh-git, a .NET call
+  that has to finish) gets three seconds before it is replaced; a second Stop
+  still replaces it at once.
+- **Files leaves names Windows cannot address alone.** A PC file or folder
+  whose name ends in a dot or a space (made by WSL, Git Bash or a Linux drive)
+  is not acted on, with a message saying why.
+- **The log panel keeps what it shows.** Its view holds 20,000 lines (it was
+  80,000), and **Save log…** has every one of them.
+- **The app bundled in the wheel runs from `~/.turboadb/gui`**, not from the
+  temp folder, and replaces a damaged copy by itself.
+- **Each remote webcam stream uses a port of its own** (28100–28115; all used
+  28100). Open that range in a firewall between the PCs to view more than one.
+- **The sharing startup task runs a protected copy of adb** under Program
+  Files that only administrators can change, and warns when the Python it runs
+  can be changed without administrator rights.
+- **Android Automotive: Clear data, grant and revoke act on the driver's
+  app**, not on the hidden system user.
+
+### Fixed
+
+#### Terminals
+
+- **Stop leaves a program that answered running.** In PowerShell and CMD a
+  `python` or `node` prompt shows KeyboardInterrupt and stays, instead of
+  being ended a second and a half later.
+- The Stop button in PowerShell and CMD drops the rest of a multi-line paste,
+  as Ctrl+C always did.
+- Typing `exit` in `su`, `sh` or `run-as` inside an `adb shell` in PowerShell
+  or CMD leaves only that shell: Stop, Tab and typed text keep going to the
+  device.
+- Android shell: lines typed before the first prompt run in the order typed,
+  and Stop drops the ones that have not run yet.
+- CMD output on Chinese, Japanese and Korean Windows is no longer garbled
+  where a long listing is read in pieces.
+- Opening the Command Prompt tab no longer runs a `grep` that happens to lie
+  in the folder TurboADB was started from.
+- Restart shell and closing a tab end commands that a Command Prompt left
+  running after `exit` (for example `start /b ping -t`).
+- **Colours on lines with emoji or in Turkish casing.** Output such as
+  `faıled` or `PERMİSSİON DENİED` is coloured like any other error instead of
+  raising an error and losing the lines after it, and word and prompt colours
+  sit in the right place on lines with emoji.
+- An emoji in the line you type, or in the folder shown in the prompt, no
+  longer leaves stray characters or lets output land inside your line.
+- Progress lines with emoji or accents no longer eat what you are typing, and
+  progress bars and spinners redraw in place in Arabic and Hebrew lines.
+- Output lines that merely start like a cmd or PowerShell prompt are no longer
+  drawn as one, and keep their word colours.
+- Garbage output full of unfinished escape strings or absurdly long numbers no
+  longer freezes the terminal (a full-screen program's screen included) or
+  loses output.
+
+#### Files
+
+- **Device Delete and Rename can no longer land in another folder** when the
+  device pane changes folder (after an adb root retry) while their dialog is
+  open: the action is cancelled and the log says so.
+- The built-in editor asks before saving over a device file that something
+  else changed since it was opened.
+- A folder pasted or dropped into its own subfolder through a junction, a
+  link, a `subst` or a mapped drive is refused instead of nesting into itself.
+- Delete to the Recycle Bin works for names with an emoji.
+- After a device delete that was partly refused, "make writable and try
+  again" deletes what is left instead of failing on the items already gone.
+- On devices before Android 7, a New folder, New file, Paste, Rename or Delete
+  that the device refused is reported as an error and adb root / remount is
+  offered, instead of "OK".
+- Pulling a hundred files or more on Windows shows bytes done, speed and time
+  left again.
+- Saving a PC file in the built-in editor keeps its "downloaded from the
+  Internet" mark, its own permissions and its creation time.
+- Pasting PC items into the folder they are already in says so instead of
+  "OK", and two items of the same name copied together no longer replace each
+  other.
+- Saving a file back to the device checks for room first; if the write is cut
+  short anyway, the complete copy stays on the device and the message names it.
+- Dragging one Files pane shut no longer leaves the other with a tall header
+  and footer and half its list.
+
+#### Screen, recording and webcam
+
+- Closing a tab whose embedded screen has stopped responding, or bringing back
+  a minimized separate scrcpy window that has hung, no longer freezes
+  TurboADB.
+- Recording beside a live screen over an existing file no longer takes the old
+  file for the new recording: a recorder that writes nothing falls back to
+  recording on the device, and the old file is never reported as saved.
+- Record pressed while the screen is still starting or closing is no longer
+  lost to another request: it no longer sticks on "Starting recording…", and
+  Stop cancels it at once.
+- A display picked while the screen is still starting or switching is the one
+  that starts, and the picker stays with the display that is on screen.
+  Changing the renderer meanwhile keeps that display, or the separate window
+  that was asked for, and brings no screen back after Stop.
+- A display removed by Rescan while its recording is still being saved keeps
+  the recording: it is reported, and quitting waits for it.
+- Two webcam views of the same remote PC no longer end each other's stream.
+- Listing displays through scrcpy keeps to its timeout on Windows and no
+  longer shows "no displays" when adb's output has characters outside the
+  system code page.
+- The display list no longer includes scrcpy's own display while a screen is
+  mirrored.
+
+#### Devices, displays and Phone
+
+- **Keys go to the display they are meant for.** Back, Home, the other keys
+  and typed text for the centre display of a multi-display head unit (its
+  tile, Device Control showing the default display, keys typed on the screen
+  itself, and right-click Back / middle-click Home on a screencap screen) go
+  to that display, not to whichever screen was touched last.
+- Restart ADB and a tools update no longer trip over a tab whose device is
+  away or whose Phone page is open: nothing asks adb while the server is down,
+  and the tab reconnects once it is back.
+- The call state covers every SIM: a call or ring on the second SIM shows.
+- The Phone page no longer shows a red "No telephony" after the phone
+  rebooted or was unplugged: it keeps asking, and loads again once the device
+  is back. Opened while the device was busy, it asks again what the device
+  offers instead of treating a head unit as a phone for the session. Its
+  "unavailable" warnings give adb's reason (for example "device offline").
+- End on the Phone page no longer puts an idle device to sleep: with no call
+  in progress nothing is sent.
+- A network device TurboADB connected is disconnected again when its tab
+  closes, also after a reconnect or a first connect that failed.
+- A head unit that was still starting when its tab opened is asked again a
+  moment later instead of being treated as a phone for the session.
+
+#### Command line and engine
+
+- On Windows a folder pull of a large file shows progress again and is no
+  longer ended as stalled while it is copying; a push or pull involving a very
+  large folder no longer spends its time measuring sizes.
+- `turboadb uninstall PKG --keep-data` works: it asks the device's package
+  manager, since adb refuses `-k`.
+- A failed push or pull says why (for example "Read-only file system") instead
+  of adb's "1 file pushed" summary, so the offer to make the device writable
+  appears again.
+- `turboadb bugreport NAME` without `.zip`, or into an existing folder,
+  reports the file that was saved instead of failing after the capture.
+- A pull into a folder that already holds files reports only what it copied.
+- On Windows, pulling a file whose name has a character Windows forbids (a
+  `:`, say) saves it under a valid name and says so, instead of hiding the
+  data in an NTFS stream. A destination typed with a trailing dot or space is
+  saved as Windows reads the name, and `turboadb edit` opens a device file
+  whose ending Windows cannot store.
+- On devices before Android 7, `turboadb mkdir`, `touch`, `cp`, `mv`, `rm` and
+  the same API calls report a change the device refused as an error instead of
+  done, and a folder that cannot be listed as an error instead of an empty
+  folder.
+- `turboadb shell --batch FILE` reads files saved as "UTF-8 with BOM" or
+  UTF-16 (Notepad, Windows PowerShell's `Out-File` and `>`).
+- Renaming a device file or folder to its own name in other letters (`a.txt`
+  to `A.txt`) works on `/sdcard`, also for a folder with `turboadb mv`.
+- On Linux and macOS `ShellSession.read()` returns at once when the shell has
+  printed nothing.
+
+#### Shortcuts and the Windows app
+
+- **Shortcuts on an install without PyQt5 open the app.** With the plain
+  `pip install turboadb`, the Desktop and Start-menu shortcuts and the taskbar
+  pin start TurboADB through `turboadb-gui` instead of TurboADB.exe (which
+  cannot run there) or a temporary copy of the app. They open the new version
+  after `pip install -U turboadb` and keep working when the temp folder is
+  cleaned. Coming from 3.0 or 3.1, start TurboADB once with `turboadb-gui`:
+  that repairs the Desktop and Start-menu shortcuts and the pin, also while
+  the old copy of the app is still on disk.
+- A taskbar pin made of TurboADB's window rather than of its shortcut follows
+  the taskbar's light or dark mode and starts TurboADB again.
+- Started from its shortcut or a taskbar pin, TurboADB picks up an updated
+  TurboADB or Python (TurboADB.exe is rebuilt and the new version starts), and
+  `TURBOADB_NO_LAUNCHER=1` applies there too.
+- The shortcuts can be created for a user folder or path containing a
+  typographic apostrophe (O’Brien) when Windows falls back to PowerShell.
+- TurboADB.exe copies in `~/.turboadb/launcher` that belong to deleted virtual
+  environments or removed checkouts are removed (about 6 MB each).
+
+#### Sharing, tools and updates
+
+- **Stop sharing says when sharing will come back.** It and
+  `serve --uninstall-startup` say when the SYSTEM startup task is still
+  installed because removing it needs Administrator, instead of reporting that
+  none was installed.
+- Sharing this PC's devices ends on a warning when the Windows firewall may
+  keep other machines out (no Administrator rights, a Public network), and the
+  Connect dialog keeps the share's result on a line of its own and logs it.
+- Deploy to a host that has Python and TurboADB but no adb downloads adb there
+  first, and the deploy log shows a host's warning in full.
+- Starting a shared server from the Connect dialog with "at login" ticked no
+  longer says the server could not start when only the login auto-start could
+  not be set up: the dialog shows the share, with the warning.
+- A downloaded adb that cannot run on the machine (ARM Linux, musl, NixOS) is
+  no longer installed over a working system adb, and none is downloaded where
+  Google provides none: there a first launch announces no download, and Check
+  for updates says adb and scrcpy are the system's.
+- Check for updates no longer closes the device tabs' shells or pauses Logcat
+  when adb and scrcpy are already current; after a tools update, the newly
+  installed adb and scrcpy are the ones used and reported in the same run.
+- TurboADB still stops its own adb server on exit after a second
+  `adb start-server` ran while that server was slow to answer, and a shared
+  adb server that does not start in time is stopped instead of coming up later
+  unannounced.
+
+#### App, Logcat and settings
+
+- **Logcat no longer slows TurboADB down while its page is hidden** or the
+  window is minimised during a live capture; every line is still captured and
+  saved.
+- A Filter or Highlight pattern whose repeats can share a run of one character
+  (such as `\s*\s*x` or `/+\s*/+x`) is matched as plain text, so a log line
+  with thousands of spaces, dashes or slashes no longer freezes the window.
+- A `settings.json` or `sessions.json` saved with a UTF-8 byte order mark
+  (PowerShell's `Set-Content -Encoding UTF8`) is read instead of being
+  replaced by defaults.
+- A failed scan in the Connect dialog no longer makes the dialog wider than
+  the screen, and a name typed there that another saved target already has no
+  longer replaces that target silently.
+- Closing TurboADB while "Run a command on ALL devices" is running ends those
+  commands at once.
+- The first launch on a PC without adb shows "Downloading ADB…" instead of a
+  warning and a red "ADB unavailable" before the automatic download starts.
+- The sidebar's device status dots take the new theme's colours as soon as the
+  theme is switched.
+
 ## 3.1.0
 
 ### New
