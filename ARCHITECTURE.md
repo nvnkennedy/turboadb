@@ -569,7 +569,9 @@ separator) is given a file of its own there, named after the time
 name, which is not the path that is checked and returned afterwards. The
 name is taken at once, as an empty file that holds it until the clip is
 recorded (or the program exits), so two recordings started in the same second
-each get a file.
+each get a file. On Windows the path is read as Windows reads it before the
+folder is looked up, as a pull's target is: the engine decides which folder
+`clips ` names, whatever the file system would answer for the name as typed.
 `bugreport` likewise returns the file that was saved: its path with `.zip`
 added as adb adds it, or in a folder the file adb names.
 `screen_record_continuous` records the next part while the last one is pulled,

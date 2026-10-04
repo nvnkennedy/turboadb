@@ -309,10 +309,23 @@ def test_the_editor_gets_the_content_of_a_file_whose_ending_windows_cannot_store
 @pytest.mark.parametrize("typed", ["clips ", "clips..", "clips " + os.sep])
 def test_a_recording_into_a_folder_typed_with_a_trailing_space_goes_into_it(recorder, clips,
                                                                            typed):
-    saved = _handler().screen_record(str(clips.parent / typed), time_limit=1)
+    """The engine reads the folder's name as Windows does before it looks it
+    up, so this holds on a system that takes "clips " for a name of its own."""
+    # joined as text: a Path would drop the separator the last one ends with
+    saved = _handler().screen_record(os.path.join(str(clips.parent), typed), time_limit=1)
     assert os.path.dirname(saved) == str(clips) and os.listdir(clips.parent / "clips") == [
         os.path.basename(saved)]
     assert sorted(p.name for p in clips.parent.iterdir() if p.is_dir()) == ["clips"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows reads the name without its last space")
+def test_other_systems_save_a_recording_under_the_name_as_typed(recorder, clips, monkeypatch):
+    monkeypatch.setattr(core, "_WINDOWS_NAMES", False)
+    typed = str(clips) + " "  # a file of that name there, next to the folder
+    saved = _handler().screen_record(typed, time_limit=1)
+    assert saved == typed == recorder.cmd[-1] and os.listdir(clips) == []
+    with open(saved, "rb") as fh:
+        assert fh.read() == b"video"
 
 
 def test_a_path_with_the_long_path_prefix_is_taken_as_it_is():

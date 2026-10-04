@@ -5780,14 +5780,17 @@ class ADBHandler:
         started in the same second (two displays, two head units) both took
         that second's name, and the later pull replaced the earlier clip."""
         path = os.path.expanduser(local_path) if local_path else ""
-        if not (os.path.isdir(path) or path.endswith(("/", os.sep))):
-            return local_path
+        folder = path
         if _WINDOWS_NAMES:
-            folder = path.rstrip("/" + os.sep)
-            if folder and not folder.endswith(":"):  # not a drive or the root itself
-                path = _as_windows_reads(folder)
-        os.makedirs(path, exist_ok=True)
-        stem = os.path.join(path, time.strftime("recording-%Y%m%d-%H%M%S"))
+            # read as Windows reads it before it is looked up, as a pull's
+            # target is (see _typed_target): "clips " is the folder "clips"
+            bare = path.rstrip("/" + os.sep)
+            if bare and not bare.endswith(":"):  # not a drive or the root itself
+                folder = _as_windows_reads(bare)
+        if not (os.path.isdir(folder) or path.endswith(("/", os.sep))):
+            return local_path
+        os.makedirs(folder, exist_ok=True)
+        stem = os.path.join(folder, time.strftime("recording-%Y%m%d-%H%M%S"))
         target, count = stem + ".mp4", 1
         while True:
             try:
