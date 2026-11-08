@@ -138,6 +138,15 @@ def fake_adb(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_winget(monkeypatch):
+    """This PC's winget, and what it installed, stay out of the tests."""
+    from turboadb import tools, toolsdl
+
+    monkeypatch.setattr(tools, "_winget_package_roots", lambda: [])
+    monkeypatch.setattr(toolsdl, "winget_exe", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_host_lookups():
     """Clear the scrcpy host-lookup memo between tests.
 

@@ -782,7 +782,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- setup and tools ---
     setup_cmd("doctor", "report whether adb/scrcpy were found")
 
-    p_fetch = setup_cmd("fetch-tools", "download adb (+scrcpy) into ~/.turboadb/tools")
+    p_fetch = setup_cmd("fetch-tools", "install adb and scrcpy (through winget on Windows)")
     # asking for both left nothing to download (and exited 1 without saying why)
     p_only = p_fetch.add_mutually_exclusive_group()
     p_only.add_argument("--adb-only", action="store_true")
@@ -1042,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scr.add_argument(
         "--compat", action="store_true",
-        help="IVI / automotive compatibility profile (H.264, capped size and fps, no audio, forward tunnel)",
+        help="IVI / automotive compatibility profile (H.264, capped fps, no audio, forward tunnel)",
     )
     p_scr.add_argument("--video-codec", choices=["h264", "h265", "av1"], default=None)
     p_scr.add_argument(
@@ -2073,8 +2073,7 @@ def main(argv=None) -> int:
             if ((not d["adb"] and not d.get("adb_error"))
                     or (not d["scrcpy"] and not d.get("scrcpy_error"))):
                 print(
-                    "\nTip: run  turboadb fetch-tools  to download what's missing "
-                    "into ~/.turboadb/tools"
+                    "\nTip: run  turboadb fetch-tools  to install what's missing"
                 )
             return 0 if d["adb"] else 1
 
@@ -2083,7 +2082,8 @@ def main(argv=None) -> int:
 
             want_adb = not args.scrcpy_only
             want_scrcpy = not args.adb_only
-            print(f"Downloading into {toolsdl.tools_dir()} …", file=sys.stderr)
+            print("Installing adb and scrcpy …" if want_adb and want_scrcpy
+                  else f"Installing {'adb' if want_adb else 'scrcpy'} …", file=sys.stderr)
             res = toolsdl.fetch_tools(
                 adb=want_adb,
                 scrcpy=want_scrcpy,

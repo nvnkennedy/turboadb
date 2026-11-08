@@ -6,12 +6,13 @@ Search order (first hit wins):
   1. an explicit path argument
   2. the ``TURBOADB_ADB`` / ``TURBOADB_SCRCPY`` environment variables
   3. the GUI's ``adb_path`` / ``scrcpy_path`` setting (``~/.turboadb/settings.json``)
-  4. TurboADB's managed download cache (``~/.turboadb/tools``)
-  5. binaries bundled inside this package (``turboadb/bin/...``), if present
-  6. the system ``PATH``
-  7. common Android SDK / install locations
+  4. what winget installed (``Google.PlatformTools``, ``Genymobile.scrcpy``)
+  5. TurboADB's managed download cache (``~/.turboadb/tools``)
+  6. binaries bundled inside this package (``turboadb/bin/...``), if present
+  7. the system ``PATH``
+  8. common Android SDK / install locations
 
-Auto-detection (4 to 7) never looks in the current folder, and every answer is
+Auto-detection (4 to 8) never looks in the current folder, and every answer is
 an absolute path.  A relative path given on purpose (1 to 3) names a file in
 the working folder.
 
@@ -26,6 +27,7 @@ which must use the same adb (scrcpy, a local terminal) passes it explicitly.
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import re
@@ -153,6 +155,60 @@ def _bundled_candidates(name: str) -> list:
         os.path.join(binroot, "scrcpy", exe),
         os.path.join(binroot, name, exe),
     ]
+
+
+# What winget calls the two tools.
+WINGET_PACKAGES = {"adb": "Google.PlatformTools", "scrcpy": "Genymobile.scrcpy"}
+
+
+def _winget_package_roots() -> list:
+    """The folders winget unpacks packages into: this user's, then the machine's."""
+    if os.name != "nt":
+        return []
+    local = os.environ.get("LOCALAPPDATA", "")
+    programs = os.environ.get("ProgramFiles", "")
+    return [
+        root
+        for root in (
+            os.path.join(local, "Microsoft", "WinGet", "Packages") if local else "",
+            os.path.join(programs, "WinGet", "Packages") if programs else "",
+        )
+        if root
+    ]
+
+
+def _release_of(path: str) -> tuple:
+    """The version a folder like ``scrcpy-win64-v5.0.1`` is named after."""
+    match = re.search(r"-v(\d[\d.]*)$", os.path.basename(os.path.dirname(path)))
+    return parse_version(match.group(1)) if match else ()
+
+
+def _winget_files(package: str, exe: str) -> list:
+    """*exe* in the folders winget made for *package*, newest release first."""
+    found = []
+    for root in _winget_package_roots():
+        pattern = os.path.join(glob.escape(root), glob.escape(package) + "_*", "*", exe)
+        found += glob.glob(pattern)
+    return sorted(found, key=_release_of, reverse=True)
+
+
+def _winget_candidates(name: str) -> list:
+    """Where winget put *name*.  winget's change to PATH reaches only programs
+    started after it, so a program that has just installed a tool has to look
+    for it here."""
+    package = WINGET_PACKAGES.get(name)
+    return _winget_files(package, _exe(name)) if package else []
+
+
+def _winget_scrcpy_adb(name: str) -> list:
+    """The adb inside winget's scrcpy release: better than none, but a
+    standalone adb, from winget or the cache, goes first."""
+    return _winget_files(WINGET_PACKAGES["scrcpy"], _exe("adb")) if name == "adb" else []
+
+
+def winget_copy(name: str) -> str | None:
+    """The copy of *name* winget installed, or None."""
+    return _first_file(_winget_candidates(name))
 
 
 def _managed_candidates(name: str) -> list:
@@ -327,10 +383,13 @@ def _first_file(candidates) -> str | None:
 
 
 def _discover(name: str) -> str | None:
-    """The managed, bundled, PATH and SDK copies of *name*, in that order;
-    never one in the current folder."""
+    """The winget, managed, bundled, PATH and SDK copies of *name*, in that
+    order; never one in the current folder."""
     return (
-        _first_file(_managed_candidates(name) + _bundled_candidates(name))
+        _first_file(
+            _winget_candidates(name) + _managed_candidates(name)
+            + _winget_scrcpy_adb(name) + _bundled_candidates(name)
+        )
         or _on_path(name)
         or _first_file(_sdk_candidates(name))
     )
@@ -405,8 +464,9 @@ def _resolve(name: str, explicit, env_var: str) -> str | None:
 def find_adb(explicit: str | None = None) -> str:
     """Return an absolute path to ``adb`` or raise a guided ADBNotFoundError.
 
-    Precedence: *explicit* > ``TURBOADB_ADB`` > GUI setting > managed/bundled
-    tools > ``PATH`` > SDK locations. Does not modify the process environment.
+    Precedence: *explicit* > ``TURBOADB_ADB`` > GUI setting > winget's copy >
+    managed/bundled tools > ``PATH`` > SDK locations. Does not modify the
+    process environment.
     """
     path = _resolve("adb", explicit, "TURBOADB_ADB")
     if path:

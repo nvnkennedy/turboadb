@@ -595,8 +595,11 @@ if not stand_in.hwnd or app.platformName() != "windows":
     print("no windows here", flush=True)
     stand_in.quit()
     sys.exit(0)
-container = int(panel.container.winId())
-mp._reparent(stand_in.hwnd, container, panel.container.width(), panel.container.height())
+host = panel._ensure_video_host()
+panel._place_video_host()
+host.show()
+container = int(host.winId())
+mp._reparent(stand_in.hwnd, container, host.width(), host.height())
 panel._child_hwnd, panel._embed_parent_hwnd = stand_in.hwnd, container
 panel._scrcpy, panel._embed_on = Session(stand_in), True
 panel._refresh_buttons()

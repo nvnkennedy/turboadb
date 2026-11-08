@@ -38,7 +38,13 @@ from PyQt5.QtWidgets import (
 from . import icons
 from .display_controls import DisplayControls
 from .flowlayout import ToolbarFlowLayout
-from .mirror_panel import MirrorPanel, _bitrate_to_bps, delete_when_released, display_label
+from .mirror_panel import (
+    MirrorPanel,
+    _bitrate_to_bps,
+    _parse_display_size,
+    delete_when_released,
+    display_label,
+)
 
 
 def best_columns(count, width, height, aspect, header=0.0) -> int:
@@ -172,11 +178,12 @@ class DisplayWall(QWidget):
     # which is exactly the contention this sequencing exists to avoid.
     START_TIMEOUT_MS = int(MirrorPanel._STARTUP_TIMEOUT * 1000) + 2000
     TILE_HEADER = 96  # fallback for a tile's title row + screen toolbar
-    # The tiles share one screen's worth of video bit rate (never less than
+    # The tiles share a video bit rate by their pixels, so a large display is
+    # not left with what a small cluster needs (never less than
     # TILE_MIN_BIT_RATE each): several full-rate sessions at once load the
     # device's encoder and the adb link that also carries every touch.
-    WALL_BIT_RATE = "16M"
-    TILE_MIN_BIT_RATE = "4M"
+    WALL_BIT_RATE = "40M"
+    TILE_MIN_BIT_RATE = "8M"
 
     def __init__(self, handler, session, automotive=False, dispatcher=None, parent=None,
                  sdk=None):
@@ -360,20 +367,24 @@ class DisplayWall(QWidget):
             self._retiring.remove(tile)
         tile.setParent(None)
 
-    def tile_bit_rate(self, count=None) -> str:
-        """Each tile's scrcpy bit-rate cap: the wall's budget split between
-        its tiles, at least TILE_MIN_BIT_RATE."""
-        count = max(1, len(self._tiles) if count is None else int(count))
+    @staticmethod
+    def _tile_pixels(tile) -> int:
+        size = _parse_display_size(tile.display.get("size"))
+        return size[0] * size[1] if size else 1920 * 1080
+
+    def tile_bit_rate(self, tile) -> str:
+        """*tile*'s scrcpy bit-rate cap: its share of the wall's budget by the
+        pixels it has, at least TILE_MIN_BIT_RATE."""
+        pixels = sum(self._tile_pixels(other) for other in self._tiles) or 1
         total = int(_bitrate_to_bps(self.WALL_BIT_RATE))
         floor = int(_bitrate_to_bps(self.TILE_MIN_BIT_RATE))
-        share = max(floor, total // count)
+        share = max(floor, total * self._tile_pixels(tile) // pixels)
         return f"{max(1, share // 1_000_000)}M"
 
     def _apply_video_budget(self) -> None:
-        rate = self.tile_bit_rate()
         for tile in self._tiles:
             try:
-                tile.panel.set_video_budget(bit_rate=rate)
+                tile.panel.set_video_budget(bit_rate=self.tile_bit_rate(tile))
             except RuntimeError:
                 pass
 
@@ -528,8 +539,12 @@ class DisplayWall(QWidget):
         self._esc_restore.setEnabled(self._focused is not None)
         self._columns = 0
         self._relayout()
+        self._apply_video_budget()  # (for the starts to come: the grid's shares)
         if self._focused is not None:
             self._focus_for_esc(self._focused)
+            # Alone in the tab it no longer shares the wall's bit rate: a few
+            # Mbit/s stretched over a whole large display looks grainy.
+            self._focused.panel.use_full_video_quality()
         # re-fit embedded screens to their new tile size at once, rather than
         # on their next poll
         for shown in [self._focused] if self._focused is not None else list(self._tiles):

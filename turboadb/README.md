@@ -57,26 +57,24 @@ TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 common install locations. If they're missing, **let TurboADB fetch them for you**:
 
 ```bash
-turboadb fetch-tools     # downloads adb (+scrcpy) into ~/.turboadb/tools
+turboadb fetch-tools     # installs adb and scrcpy
 turboadb doctor          # shows where adb / scrcpy were found
 ```
 
-**It's automatic, too.** The first time you run TurboADB after an install **or
-upgrade**, it downloads the **latest** platform-tools + scrcpy into a per-user
-cache (`~/.turboadb/tools/`), which is first in the detection order — so a fresh
-`pip install -U turboadb` always gives you current tools with zero setup. Each
-new version re-fetches the latest. Disable with **`TURBOADB_AUTO_FETCH=0`** (for
-offline/CI/locked-down machines), then fetch manually with `turboadb fetch-tools`.
+**It's automatic, too.** TurboADB ships neither tool. The first time you run it,
+it installs what is missing: through **winget** on Windows (`Google.PlatformTools`
+and `Genymobile.scrcpy`, no administrator prompt), and where there is no winget or
+it fails, from Google and GitHub into a per-user cache (`~/.turboadb/tools/`).
+Disable with **`TURBOADB_AUTO_FETCH=0`** (for offline/CI/locked-down machines),
+then install manually with `turboadb fetch-tools`.
 
-- **GUI:** downloads automatically on launch (progress bar), or use
+- **GUI:** installs automatically on launch (progress bar), or use
   **Tools ▾ → Download and reinstall ADB and scrcpy** in the top bar to refresh.
 - **Python:** `turboadb.fetch_tools()` (explicit) or it happens on first device use.
 
 > Why not at `pip install` time? Wheels don't run code on install, and
 > downloading during install breaks offline/CI/proxy setups and can hang pip.
-> First-run/on-upgrade fetch (the Playwright model) gives the same "just works"
-> result while keeping the wheel small and license-clean — *you* fetch Google's
-> adb (under its SDK terms); TurboADB never redistributes it. scrcpy is Apache-2.0.
+> A first-run install (the Playwright model) gives the same "just works" result.
 
 - `adb`: <https://developer.android.com/tools/releases/platform-tools>
 - `scrcpy`: <https://github.com/Genymobile/scrcpy>
@@ -436,7 +434,7 @@ with ADBHandler(ADBConfig(host="192.168.1.50")) as hu:
     hu.mirror(display_id=2)                  # mirror a specific IVI display
 
     # "scrcpy won't work" on this unit? use the automotive compatibility profile
-    # (forces H.264 and applies safe size/fps caps for IVI encoders):
+    # (forces H.264 and a safe frame rate for IVI encoders):
     hu.mirror(compat=True)
 ```
 
@@ -465,7 +463,7 @@ in **Settings → scrcpy** (audio source, codec, bitrate and latency included).
 | Symptom on a head unit                    | TurboADB's fix                                   |
 |-------------------------------------------|--------------------------------------------------|
 | Black screen / wrong screen mirrored      | `list_displays()` + `display_id=` to pick the right one |
-| "Could not open video stream" / encoder error | `compat=True` → forces `--video-codec h264`, caps size/fps |
+| "Could not open video stream" / encoder error | `compat=True` → forces `--video-codec h264`, caps the frame rate |
 | Audio capture is unavailable on Android <11 | TurboADB continues with video; disable Audio or use an Android 11+ device |
 | Bandwidth/lag over Wi-Fi                   | `max_size=`, `bit_rate=`, `max_fps=`             |
 

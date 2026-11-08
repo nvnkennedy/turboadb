@@ -6350,8 +6350,10 @@ class ADBHandler:
 
         *compat=True* applies an Android-Automotive/IVI **compatibility profile**
         for head units whose encoders choke on scrcpy's defaults: forces the
-        widely-supported H.264 codec, caps the size/fps, and disables audio. Try
-        it first when "scrcpy won't work" on a head unit.
+        widely-supported H.264 codec, caps the frame rate, and disables audio. Try
+        it first when "scrcpy won't work" on a head unit.  The video keeps the
+        display's full size: an encoder that cannot take it is no failure,
+        since scrcpy then retries by itself at a smaller one.
         """
         def _do():
             from .scrcpy import launch_scrcpy
@@ -6365,7 +6367,6 @@ class ADBHandler:
                 opts = ScrcpyOptions(**kwargs)
             if compat:
                 opts.video_codec = opts.video_codec or "h264"
-                opts.max_size = opts.max_size or 1280
                 opts.max_fps = opts.max_fps or 30
                 opts.no_audio = True
                 # IVIs/head units commonly block `adb reverse`; a forward tunnel

@@ -28,7 +28,7 @@ VERSION_INFO = VSVersionInfo(
             StringStruct('FileDescription', 'TurboADB'),
             StringStruct('FileVersion', APP_VERSION),
             StringStruct('InternalName', 'TurboADB'),
-            StringStruct('LegalCopyright', 'Copyright (c) 2026 TurboADB contributors. MIT License.'),
+            StringStruct('LegalCopyright', 'Copyright (c) 2026 Naveen Daniel Kennedy. MIT License.'),
             StringStruct('OriginalFilename', f'{EXE_NAME}.exe'),
             StringStruct('ProductName', 'TurboADB'),
             StringStruct('ProductVersion', APP_VERSION),

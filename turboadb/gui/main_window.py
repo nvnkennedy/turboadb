@@ -907,7 +907,7 @@ class MainWindow(QMainWindow):
             # half a second before the download began.
             self._cached_devices = []
             self._set_adb_indicator(self._ADB_AWAITS_DOWNLOAD)
-            self._set_live_message("⬇  Downloading ADB (one-time)…")
+            self._set_live_message("⬇  Installing ADB (one-time)…")
             QTimer.singleShot(500, self._download_adb_first)
         else:
             self._begin_adb_startup()
@@ -1139,7 +1139,7 @@ class MainWindow(QMainWindow):
             "Download and reinstall ADB and scrcpy…",
             lambda: self._run_tools(
                 "fetch",
-                "Downloading latest official ADB + Scrcpy from Google & GitHub…",
+                "Reinstalling ADB and scrcpy…",
                 force=True,
             ),
         )
@@ -1369,7 +1369,7 @@ class MainWindow(QMainWindow):
         menu.popup(chip.mapToGlobal(chip.rect().topLeft()) - QPoint(0, menu.sizeHint().height()))
 
     def _build_center(self):
-        self.tabs = AnimatedTabWidget(transition_ms=145)
+        self.tabs = AnimatedTabWidget(transition_ms=0)
         self.tabs.setObjectName("mainTabs")
         # Paint the stylesheet background (the tab-bar colour) behind the whole
         # tab row, including the strip behind the "+" new-tab corner button.
@@ -2949,8 +2949,7 @@ class MainWindow(QMainWindow):
             # Only fetch when adb or scrcpy is actually MISSING
             need = not adb_available() or not scrcpy_available()
             if need:
-                self._run_tools("ensure",
-                                "Downloading platform-tools + scrcpy (one-time)…")
+                self._run_tools("ensure", "Installing adb and scrcpy (only needed once)…")
             else:
                 try:
                     _write_stamp(_pkg_version())  # mark current; skip re-checking
@@ -2959,9 +2958,9 @@ class MainWindow(QMainWindow):
             return
         if not adb_available():
             msg = ("adb (Android platform-tools) wasn't found.\n\n"
-                   "Download platform-tools + scrcpy now into ~/.turboadb/tools?")
-            if QMessageBox.question(self, "Download tools", msg) == QMessageBox.Yes:
-                self._run_tools("fetch", "Downloading adb + scrcpy…")
+                   "Install adb and scrcpy now?")
+            if QMessageBox.question(self, "Install tools", msg) == QMessageBox.Yes:
+                self._run_tools("fetch", "Installing adb and scrcpy…")
 
     def upgrade_tools_gui(self):
         """Ribbon ‘Upgrade’: the ONE place updates happen. First check TurboADB
@@ -3044,9 +3043,7 @@ class MainWindow(QMainWindow):
         self._dl = thread
         thread.progress.connect(self._dlg.setValue)
         if show_stage:
-            thread.stage.connect(
-                lambda s: self._dlg.setLabelText(f"Downloading {s}…\n"
-                                                 "Cached in ~/.turboadb/tools."))
+            thread.stage.connect(lambda s: self._dlg.setLabelText(f"Installing {s}…"))
         thread.done.connect(on_done)
         self._run_tools_task(thread, "the tools update")
         return True
@@ -3178,10 +3175,10 @@ class MainWindow(QMainWindow):
                 self, "ADB & Scrcpy Up To Date",
                 "ADB and Scrcpy match the latest upstream versions"
                 + (f" ({versions})" if versions else "") + ".\n\n"
-                "Would you like to force a clean re-download and re-install from Google & GitHub now?",
+                "Would you like to reinstall them now?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if ans == QMessageBox.Yes:
-                self._run_tools("fetch", "Force re-downloading ADB and Scrcpy from Google & GitHub…", force=True)
+                self._run_tools("fetch", "Reinstalling ADB and scrcpy…", force=True)
             return
         elif unknown and not res.get("updated") and not res.get("errors"):
             # a FAILED check used to be reported as "already up to date"
@@ -3210,7 +3207,7 @@ class MainWindow(QMainWindow):
     def _run_tools(self, mode, label, force=False):
         if self._start_tools_task(
             mode,
-            label + "\nCached in ~/.turboadb/tools.",
+            label,
             "TurboADB — tools",
             self._tools_done,
             force=force,

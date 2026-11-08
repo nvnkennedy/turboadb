@@ -58,7 +58,7 @@
         TurboADB wraps <code>adb</code> and <code>scrcpy</code> so you don't have to
         remember their flags. The same engine powers all three front-ends, so
         anything you can click in the GUI you can script in Python or run as a
-        one-line command. It bundles its own tools (downloaded on first run), works
+        one-line command. Its tools install themselves, it works
         against devices on <em>another machine's</em> adb server over RDP, and knows
         the quirks of Android Automotive head units.
       </div>
@@ -71,6 +71,27 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
+          <h3><span class="ver">v5.0.0</span> A big, sharp device screen</h3>
+          <ul>
+            <li><b>Maximize view fills the window</b>: the menu, tabs and status
+            bar step aside, so a phone's picture really is larger.</li>
+            <li><b>Large displays stay sharp</b>: head units keep their full
+            resolution, and the default bit rate rises above 1080p.</li>
+            <li><b>The Displays tab shares its bit rate by size</b>, and a
+            maximized display runs at full quality.</li>
+          </ul>
+        </div>
+        <div class="wn">
+          <h3><span class="ver">v5.0.0</span> Pages that change cleanly</h3>
+          <ul>
+            <li><b>Immediate, with nothing of the previous page</b> when moving
+            between Terminal, Device Control, Files and Phone.</li>
+            <li><b>The picture follows a resize</b> at once.</li>
+            <li><b>Start installs scrcpy</b> when it is missing, shows the
+            progress and opens the screen.</li>
+          </ul>
+        </div>
+        <div class="wn">
           <h3><span class="ver">v4.0.0</span> Terminals, faster and steadier</h3>
           <ul>
             <li><b>About four times as fast</b> on plain output, and a flood or a
@@ -81,32 +102,6 @@
             typed properly, and tabs line up at tab stops.</li>
             <li><b>Colour that means something</b> (3.1): errors and denials in
             red, warnings in amber, successes in green, the rest plain.</li>
-          </ul>
-        </div>
-        <div class="wn">
-          <h3><span class="ver">v4.0.0</span> Files and screens you can trust</h3>
-          <ul>
-            <li><b>Delete and Rename on the device</b> can no longer land in another
-            folder, and the editor asks before saving over a file that changed.</li>
-            <li><b>Closing TurboADB waits</b> for a recording that is still being
-            saved.</li>
-            <li><b>Keys go to the right display</b> on a multi-display head unit, and
-            Clear data acts on the driver's app.</li>
-            <li><b>A scrcpy window that hangs</b> no longer freezes TurboADB when its
-            tab is closed or its window brought back.</li>
-          </ul>
-        </div>
-        <div class="wn">
-          <h3><span class="ver">v4.0.0</span> Safer and more honest</h3>
-          <ul>
-            <li><b>Nothing is run from the current folder</b>: adb, scrcpy, ffmpeg
-            and Windows' own tools are taken only from known places.</li>
-            <li><b>Failures are reported as failures</b>: <code>turboadb devices</code>
-            without adb exits 3, and a refused install is never "done".</li>
-            <li><b>Shortcuts that open the app</b> on installs without PyQt5, and
-            after an upgrade.</li>
-            <li><b>Stop sharing says when sharing will come back</b>, and a share
-            the firewall may block ends on a warning.</li>
           </ul>
         </div>
       </div>
@@ -239,8 +234,8 @@
 
         <div class="card">
           <div class="ic">⬆</div>
-          <h3>Bundled &amp; self-updating</h3>
-          <p><code>adb</code> and <code>scrcpy</code> download themselves on first
+          <h3>Sets itself up &amp; self-updating</h3>
+          <p><code>adb</code> and <code>scrcpy</code> install themselves on first
           run. <b>Tools ▾ → Check for updates…</b> updates TurboADB from PyPI,
           refreshes the tools, and restarts.</p>
         </div>
@@ -256,9 +251,9 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-4.0.0-win64.exe</code> from the latest release
-          and double-click it. It downloads <code>adb</code> and <code>scrcpy</code>
-          on first run and adds a desktop shortcut.</p>
+          <p>Download <code>TurboADB-5.0.0-win64.exe</code> from the latest release
+          and double-click it. The first run installs <code>adb</code> and <code>scrcpy</code>
+          through winget. It adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>
         </div>
         <div>

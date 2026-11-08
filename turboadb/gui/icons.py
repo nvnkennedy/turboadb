@@ -297,6 +297,8 @@ ALIASES: Dict[str, str] = {
 }
 
 _RENDERERS: Dict[Tuple[str, str, float], object] = {}
+_DRAWINGS: dict = {}  # (name, colour, width, side, scale) -> QPixmap
+_DRAWINGS_MAX = 4096
 _ENGINE = None
 
 
@@ -357,24 +359,42 @@ def _engine_class():
             return self.fixed or theme.hue(self.tone)
 
         def paint(self, painter, rect, mode, state):
-            colour = self.colour(mode)
             side = min(rect.width(), rect.height())
-            target = QRectF(
-                rect.x() + (rect.width() - side) / 2.0,
-                rect.y() + (rect.height() - side) / 2.0,
-                side,
-                side,
+            device = painter.device()
+            ratio = device.devicePixelRatioF() if device is not None else 1.0
+            painter.drawPixmap(
+                rect.x() + (rect.width() - side) // 2,
+                rect.y() + (rect.height() - side) // 2,
+                self.drawing(self.colour(mode), side, ratio),
             )
-            renderer = _renderer(self.name, colour, self.width)
-            painter.save()
+
+        def drawing(self, colour, side, ratio):
+            """The icon as a pixmap, drawn once per colour, size and scale:
+            walking the vector drawing for every icon of every repaint cost a
+            page tens of milliseconds."""
+            key = (self.name, colour, self.width, side, ratio)
+            cached = _DRAWINGS.get(key)
+            if cached is not None:
+                return cached
+            pixels = max(1, int(round(side * ratio)))
+            drawing = QPixmap(pixels, pixels)
+            drawing.fill(Qt.transparent)
+            painter = QPainter(drawing)
             painter.setRenderHint(QPainter.Antialiasing)
+            renderer = _renderer(self.name, colour, self.width)
+            target = QRectF(0, 0, pixels, pixels)
             if renderer is not None:
                 renderer.render(painter, target)
             else:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor(colour))
-                painter.drawEllipse(target.center(), side / 6.0, side / 6.0)
-            painter.restore()
+                painter.drawEllipse(target.center(), pixels / 6.0, pixels / 6.0)
+            painter.end()
+            drawing.setDevicePixelRatio(ratio)
+            if len(_DRAWINGS) >= _DRAWINGS_MAX:
+                _DRAWINGS.clear()
+            _DRAWINGS[key] = drawing
+            return drawing
 
         def pixmap(self, size, mode, state):
             pm = QPixmap(size)

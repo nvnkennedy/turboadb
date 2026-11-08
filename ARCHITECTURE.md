@@ -22,7 +22,7 @@ engine; the CLI and GUI just expose it.
                           │   turboadb.core.ADBHandler   │   the engine
                           └─────────────┬───────────────┘
                                         ▼
-                    adb / scrcpy  (bundled, auto-downloaded)
+                    adb / scrcpy  (installed on first run)
                                         ▼
                         device  (USB · TCP/IP · remote adb server)
 ```
@@ -136,8 +136,8 @@ A few rules hold across the methods:
 
 TurboADB never assumes the tools are installed. `tools.py` finds them, first hit
 wins: an explicit path, `TURBOADB_ADB` / `TURBOADB_SCRCPY`, the GUI's path
-setting, `~/.turboadb/tools`, a copy bundled in the package, `PATH`, and the
-common SDK and install folders. An explicit path or an environment variable
+setting, what winget installed, `~/.turboadb/tools`, a copy placed in the
+package, `PATH`, and the common SDK and install folders. An explicit path or an environment variable
 that names no executable is an error, never a reason to fall through (a
 different adb would restart the server the chosen one started); a stale path in
 Settings is a preference, and is skipped with a warning.
@@ -158,8 +158,15 @@ programs (netsh, schtasks, PowerShell, rundll32) are started with
 same reason: named bare, a program of that name in the current folder runs in
 their place.
 
-`toolsdl.py` downloads `adb`/`scrcpy` into `~/.turboadb/tools` on first run and
-can upgrade them, which is why a fresh `pip install turboadb` just works. Each
+TurboADB ships neither tool. On Windows `toolsdl.py` installs them through winget
+on the first run (`Google.PlatformTools`, `Genymobile.scrcpy`), and winget updates
+them. winget's change to `PATH` reaches only programs started after it, so
+`tools._winget_candidates` looks in winget's package folders instead. A copy
+winget holds comes before the cache, and is only ever updated by winget: a
+download would go to a folder looked at after it.
+Where there is no winget, where it fails, and on the other systems, `toolsdl.py`
+downloads the publishers' archives into `~/.turboadb/tools` and can upgrade them,
+which is why a fresh `pip install turboadb` just works. Each
 is downloaded only where a build exists for the machine
 (`adb_download_supported()`: Windows, macOS and Linux on x86-64, Google's one
 Linux build; `scrcpy_download_supported()`: Windows). `ensure_tools` only ever

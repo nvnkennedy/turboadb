@@ -50,6 +50,66 @@ def test_a_completion_query_waits_for_a_slot(qapp):
         widget.deleteLater()
 
 
+class _Listing(_Shell):
+    """A device whose `ls` prints *text*."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def shell(self, command, timeout=None, safe=None, **_kw):
+        self.commands.append(command)
+        return OperationResult(True, "shell", value=CommandResult(command, 0, self.text, "", 0.0))
+
+
+@pytest.mark.parametrize("line, listing, answer", [
+    # the report: "/da" offered dalvikvm and date, from the bin folders
+    ("/da", "/data/\n/data_mirror/\n", ("/data", ["/data/", "/data_mirror/"])),
+    ("/sd", "/sdcard/\n", ("/sdcard/", [])),
+    ("./ru", "./run.sh\n", ("./run.sh", [])),
+    ("sdcard/Do", "sdcard/Documents/\nsdcard/Download/\n",
+     (None, ["sdcard/Documents/", "sdcard/Download/"])),
+])
+def test_a_first_word_with_a_slash_is_completed_as_a_path(qapp, line, listing, answer):
+    from turboadb.gui.device_tab import _TerminalWidgetBase
+
+    handler = _Listing(listing)
+    widget = _TerminalWidgetBase(handler)
+    try:
+        assert widget._query_android_completion(line, "/") == answer
+        assert len(handler.commands) == 1
+        assert "/system/bin" not in handler.commands[0]
+        assert f"ls -dp '{line}'*" in handler.commands[0]
+    finally:
+        widget.deleteLater()
+
+
+def test_a_first_word_and_a_later_one_complete_the_same_path(qapp):
+    from turboadb.gui.device_tab import _TerminalWidgetBase
+
+    listing = "/data/\n/data_mirror/\n"
+    first, later = _Listing(listing), _Listing(listing)
+    widget = _TerminalWidgetBase(first)
+    try:
+        options = widget._query_android_completion("/da", "/")[1]
+        widget.handler = later
+        assert widget._query_android_completion("test /da", "/")[1] == options
+    finally:
+        widget.deleteLater()
+
+
+def test_a_first_word_without_a_slash_is_still_a_command(qapp):
+    from turboadb.gui.device_tab import _TerminalWidgetBase
+
+    handler = _Listing("/system/bin/dalvikvm\n/system/bin/date\n")
+    widget = _TerminalWidgetBase(handler)
+    try:
+        assert widget._query_android_completion("da", "/") == (None, ["dalvikvm", "date"])
+        assert handler.commands[0].startswith("ls -d /system/bin/")
+    finally:
+        widget.deleteLater()
+
+
 def test_a_closed_tab_completes_nothing(qapp):
     from turboadb.gui.device_tab import _AdbGate, _TerminalWidgetBase
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import (
-    QEvent, QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt, QThread, QTimer, pyqtSignal,
+    QEvent, QEasingCurve, QPropertyAnimation, QRect, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt5.QtWidgets import QFrame, QTabWidget
 
@@ -16,10 +16,11 @@ _parked = set()
 class AnimatedTabWidget(QTabWidget):
     """A native Qt tab widget with a small, safe animated tab indicator.
 
-    It uses native ``QPropertyAnimation`` for an active-tab underline and a
-    16-pixel slide-in of the newly selected page. No page is composited or
-    duplicated — effects on nested pages previously caused Windows to paint a
-    device twice and corrupt the second terminal's rendering.
+    Only the active-tab underline is animated. The page changes in one step:
+    nothing is composited or duplicated (effects on nested pages caused Windows
+    to paint a device twice and corrupt the second terminal's rendering), and
+    the page is not slid in either. Moving it uncovered a strip of what was
+    there before, and dragged the embedded scrcpy window along with it.
     """
 
     def __init__(self, parent=None, *, transition_ms: int = 145):
@@ -34,24 +35,16 @@ class AnimatedTabWidget(QTabWidget):
         )
         self._indicator_animation.setDuration(self._transition_ms)
         self._indicator_animation.setEasingCurve(QEasingCurve.OutCubic)
-        self._page_animation = QPropertyAnimation(self)
-        self._page_animation.setDuration(self._transition_ms)
-        self._page_animation.setEasingCurve(QEasingCurve.OutCubic)
-        self._animated_page = None
-        self._animated_page_target = None
-        self._previous_index = -1
         # Deferred work runs from timers owned by this widget, so nothing can
         # fire after it is deleted: a QTimer.singleShot lambda on a deleted
         # wrapper raised RuntimeError, which PyQt turns into a process abort.
         self._pending_indicator_index = -1
-        self._pending_page = None
+        self._last_strip_layout = None
         self._sync_timer = self._deferred(self._sync_tab_indicator)
         self._indicator_timer = self._deferred(
             lambda: self._start_indicator_animation(self._pending_indicator_index)
         )
-        self._page_timer = self._deferred(self._run_pending_page_animation)
         self.currentChanged.connect(self._animate_tab_indicator)
-        self.currentChanged.connect(self._animate_page_entry)
         self.tabBar().installEventFilter(self)
 
     def _deferred(self, slot):
@@ -61,6 +54,30 @@ class AnimatedTabWidget(QTabWidget):
         timer.setInterval(0)
         timer.timeout.connect(slot)
         return timer
+
+    def _strip_layout(self) -> tuple:
+        """What the tab strip's own layout depends on (not the pages')."""
+        corners = (self.cornerWidget(Qt.TopLeftCorner), self.cornerWidget(Qt.TopRightCorner))
+        return (
+            self.size(),
+            self.tabBar().sizeHint(),
+            self.tabBar().isHidden(),
+            tuple(None if w is None else (w.sizeHint(), w.isHidden()) for w in corners),
+        )
+
+    def event(self, event):
+        """Skip a layout pass that would change nothing.
+
+        Every page shown asks its parent to lay itself out again; QTabWidget
+        answers by repainting everything inside it and asking its own parent
+        to do the same.  With a tab widget inside a tab widget, each click
+        repainted the whole window four to six times, a piece at a time."""
+        if event.type() == QEvent.LayoutRequest:
+            layout = self._strip_layout()
+            if layout == self._last_strip_layout:
+                return True
+            self._last_strip_layout = layout
+        return super().event(event)
 
     def eventFilter(self, watched, event):
         if watched is self.tabBar() and event.type() in (
@@ -113,42 +130,6 @@ class AnimatedTabWidget(QTabWidget):
         self._indicator_animation.setEndValue(rect)
         self._tab_indicator.show()
         self._indicator_animation.start()
-
-    def _animate_page_entry(self, index):
-        """Give the new page a short native slide-in without compositing pages."""
-        previous = self._previous_index
-        self._previous_index = index
-        if previous < 0 or self._transition_ms == 0:
-            return
-        direction = 1 if index > previous else -1
-        self._pending_page = (index, direction)
-        self._page_timer.start()
-
-    def _run_pending_page_animation(self):
-        pending, self._pending_page = self._pending_page, None
-        if pending is not None:
-            self._start_page_animation(*pending)
-
-    def _start_page_animation(self, index, direction):
-        page = self.widget(index)
-        if page is None or not page.isVisible():
-            return
-        if self._animated_page is not None and self._animated_page_target is not None:
-            try:
-                self._animated_page.move(self._animated_page_target)
-            except RuntimeError:
-                pass
-        self._page_animation.stop()
-        target = page.pos()
-        start = target + QPoint(16 * direction, 0)
-        page.move(start)
-        self._animated_page = page
-        self._animated_page_target = target
-        self._page_animation.setTargetObject(page)
-        self._page_animation.setPropertyName(b"pos")
-        self._page_animation.setStartValue(start)
-        self._page_animation.setEndValue(target)
-        self._page_animation.start()
 
 
 def _unpark(t) -> None:

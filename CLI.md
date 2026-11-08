@@ -113,7 +113,7 @@ step failed), and `logcat` streams plain lines.
 |---|---|
 | `TURBOADB_ADB` | Path to the adb executable to use. A path that names no adb is an error (exit 3), never a reason to use or download another one. |
 | `TURBOADB_SCRCPY` | Path to the scrcpy executable to use (the same rule). |
-| `TURBOADB_AUTO_FETCH=0` | Never download adb / scrcpy automatically (offline, CI or locked-down machines). |
+| `TURBOADB_AUTO_FETCH=0` | Never install adb / scrcpy automatically (offline, CI or locked-down machines). |
 | `ANDROID_ADB_SERVER_PORT` | adb's own variable: moves the local adb server off port 5037. TurboADB follows it everywhere the default port applies (its server checks, the device list and `--adb-port 5037`). |
 | `VISUAL`, `EDITOR` | The editor `turboadb edit` opens. |
 
@@ -137,7 +137,7 @@ turboadb doctor --json
 ```
 
 ### `turboadb fetch-tools`
-Download adb (and scrcpy) into `~/.turboadb/tools`. `--adb-only` and
+Install adb and scrcpy: through winget on Windows, else into `~/.turboadb/tools`. `--adb-only` and
 `--scrcpy-only` are mutually exclusive — asking for both leaves nothing to
 download. adb is downloaded where Google builds it for the machine (Windows,
 macOS, Linux on x86-64) and scrcpy on Windows; a downloaded adb that does not
@@ -764,7 +764,7 @@ Mirror and control the screen with scrcpy.
 | Option | Meaning |
 |---|---|
 | `--display-id N` | Mirror this display. |
-| `--compat` | Compatibility profile for head units whose encoders fail with scrcpy's defaults: H.264, capped size and frame rate, no audio, forward tunnel. Try it first when mirroring doesn't start on an IVI. |
+| `--compat` | Compatibility profile for head units whose encoders fail with scrcpy's defaults: H.264, capped frame rate, no audio, forward tunnel. Try it first when mirroring doesn't start on an IVI. |
 | `--max-size PX` | Limit the longer side, for example `1280`. |
 | `--bit-rate RATE` | Video bitrate, for example `8M`. |
 | `--max-fps N` | Frame-rate cap. |

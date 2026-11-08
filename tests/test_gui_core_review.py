@@ -324,7 +324,7 @@ def test_split_view_reattaches_embedded_screen_when_container_changes(app, monke
     reparented = []
     panel = _panel()
     try:
-        current = int(panel.container.winId())
+        current = int(panel._ensure_video_host().winId())
         parent_of = {"hwnd": current}
         monkeypatch.setattr(mp_mod, "_IS_WIN", True)
         monkeypatch.setattr(

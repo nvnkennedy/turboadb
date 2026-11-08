@@ -16,23 +16,20 @@
 
 ---
 
-> **New in 4.0.0:** a release of fixes and hardening. The terminal draws
-> plain output about four times as fast and no longer stalls on a flood or a
-> line that never ends; Stop leaves a `python` or `node` prompt running;
-> device Delete and Rename in Files can no longer land in another folder; keys
-> on a multi-display head unit go to the display they are meant for, and
-> Clear data on Android Automotive acts on the driver's app; closing TurboADB
-> waits for a recording that is still being saved; shortcuts work on installs
-> without PyQt5; and adb, scrcpy, ffmpeg and Windows' own tools are never
-> picked up from the current folder. It is a major version because some
-> commands now report failures they used to pass over (`turboadb devices`
-> without adb exits 3). Full notes in the
+> **New in 5.0.0:** the device screen, done properly. Moving between Terminal,
+> Device Control, Files, Phone and the other pages no longer shows the previous
+> page behind the new one, and a page change is immediate; **Maximize view**
+> gives the screen the whole window; large displays stay sharp (head units keep
+> their full resolution, more bit rate above 1080p, the Displays tab shares its
+> bit rate by size); and **Start** installs scrcpy by itself when it is missing.
+> Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
 TurboADB wraps `adb` and `scrcpy` so you don't have to remember their flags. The
 same engine powers all three front-ends, so **every feature below works three
 ways** — click it in the GUI, run it as a one-line CLI command, or call it from
-Python. It bundles its own `adb`/`scrcpy` (downloaded on first run), drives
+Python. The Windows app has `adb` and `scrcpy` built in, so there is nothing else to
+install. It drives
 devices on *another* machine's adb server (handy over RDP / in a lab), and knows
 the quirks of Android Automotive head units.
 
@@ -63,11 +60,11 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-4.0.0-win64.exe`** from the
+1. Download **`TurboADB-5.0.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
-2. Double-click it. On first launch it downloads `adb` + `scrcpy` automatically
-   (about 20 seconds) and adds a desktop shortcut.
+2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
+   no administrator prompt, and it adds a desktop shortcut.
 
 ### B · With pip — CLI, Python API, and GUI
 
@@ -961,3 +958,7 @@ See [ARCHITECTURE.md](https://github.com/NVNKENNEDY/turboadb/blob/main/ARCHITECT
 ## License
 
 [MIT](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE).
+
+The Windows app includes the official, unmodified releases of
+[scrcpy](https://github.com/Genymobile/scrcpy) (Apache-2.0) and Android SDK
+Platform-Tools (Google, under its own terms), with their licence files.

@@ -831,10 +831,10 @@ def test_the_wall_shares_one_video_budget_between_its_tiles(qapp, monkeypatch):
     monkeypatch.setattr(mp.MirrorPanel, "embeds_scrcpy", staticmethod(lambda: True))
     wall = _wall([{"id": 0, "size": "1920x720"}, {"id": 2}, {"id": 3}])
     try:
-        assert wall.tile_bit_rate() == "5M" and wall.tile_bit_rate(1) == "16M"
-        assert wall.tile_bit_rate(8) == wall.TILE_MIN_BIT_RATE
+        # shared by pixels: an unknown size counts as 1080p
+        assert [wall.tile_bit_rate(tile) for tile in wall._tiles] == ["10M", "15M", "15M"]
         wall._tiles[1].panel.start()
-        assert launched[-1].bit_rate == "5M" and launched[-1].display_id == 2
+        assert launched[-1].bit_rate == "15M" and launched[-1].display_id == 2
         # a lower bit rate chosen in Settings is never raised
         monkeypatch.setattr(
             mp.settings_mod, "load", lambda: {"scrcpy_bit_rate": "2M", "scrcpy_stay_awake": True}

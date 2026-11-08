@@ -350,7 +350,7 @@ def native_panel(app, monkeypatch):
     panel.show()
     app.processEvents()
     claimed = []
-    fake = _User32(parent=int(panel.container.winId()))
+    fake = _User32(parent=int(panel._ensure_video_host().winId()))
     monkeypatch.setattr(mp, "_IS_WIN", True)
     monkeypatch.setattr(mp, "_win_api", lambda: (None, fake))
     monkeypatch.setattr(mp, "_claim_native_focus", lambda hwnd: claimed.append(hwnd) or True)
@@ -405,7 +405,7 @@ def test_click_falls_back_to_the_adb_route_when_windows_refuses(native_panel):
     panel.log.connect(logs.append)
     assert panel._focus_embedded(Qt.MouseFocusReason) is True
     assert not panel._native_keyboard
-    assert claimed == [int(panel.container.winId())]
+    assert claimed == [int(panel.window().winId())]
     assert any("sent over adb" in line for line in logs)
 
     def backspace(auto_repeat):

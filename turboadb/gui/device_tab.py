@@ -1120,7 +1120,9 @@ class _TerminalWidgetBase(QWidget):
             return None, []
         quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
         head = line[: len(line) - len(token)]
-        first_word = " " not in line.strip()
+        # A first word with a slash in it is a path, as in any shell: "/da" was
+        # looked up as a command name in the bin folders and found "date".
+        first_word = " " not in line.strip() and "/" not in token
         try:
             # Each Tab press is an `adb shell` one-shot: it waits for one of the
             # device tab's adb slots (DeviceTab sets adb_gate) like every other.
@@ -4027,7 +4029,7 @@ class ShellPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        self.subtabs = AnimatedTabWidget(transition_ms=125)
+        self.subtabs = AnimatedTabWidget(transition_ms=0)
         self.subtabs.setObjectName("terminalTabs")
         self.subtabs.setDocumentMode(True)
         self.subtabs.tabBar().setDrawBase(False)
@@ -4726,7 +4728,7 @@ class DeviceTab(QWidget):
             ):
                 action.hide()
 
-        self.inner = AnimatedTabWidget(transition_ms=145)
+        self.inner = AnimatedTabWidget(transition_ms=0)
         self.inner.setObjectName("deviceTabs")
         self.inner.setDocumentMode(True)
         self.inner.setElideMode(Qt.ElideNone)

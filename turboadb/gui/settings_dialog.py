@@ -349,7 +349,7 @@ class SettingsDialog(QDialog):
         self.bit_rate = QComboBox()
         for label, value in (
             ("8M — low bandwidth / Remote Desktop", "8M"),
-            ("16M — balanced (recommended)", "16M"),
+            ("16M — balanced, more on screens above 1080p (recommended)", "16M"),
             ("32M — high quality USB", "32M"),
             ("50M — maximum quality USB", "50M"),
         ):

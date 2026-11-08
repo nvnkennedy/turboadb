@@ -192,7 +192,7 @@ def test_a_first_launch_without_adb_shows_the_download_not_a_failure(qapp, first
     assert _Init.made == []  # no server start that could only fail
     assert window._status_adb.text() == "Downloading ADB…"
     assert window._status_adb.tone() != "error" and window._status_adb.busy()
-    assert _rows(window) == ["⬇  Downloading ADB (one-time)…"]
+    assert _rows(window) == ["⬇  Installing ADB (one-time)…"]
     assert _tools_check_ran()
     assert [task.mode for task in _Download.made] == ["ensure"]
     assert _Init.made == []
@@ -232,7 +232,7 @@ def test_a_first_launch_where_no_adb_can_be_downloaded_announces_no_download(
     window = first_launch
     assert len(_Init.made) == 1  # the startup check, which says what is missing
     assert window._status_adb.text() == "ADB starting…"
-    assert "⬇  Downloading ADB (one-time)…" not in _rows(window)
+    assert "⬇  Installing ADB (one-time)…" not in _rows(window)
     window._adb_init.ready.emit(False, "ADB initialization note: Could not find 'adb'")
     assert window._status_adb.text() == "ADB unavailable"
     assert _rows(window) == ["⚠  ADB unavailable — see the log"]

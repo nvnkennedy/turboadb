@@ -3,6 +3,52 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 5.0.0
+
+### New
+
+- **adb and scrcpy install themselves through winget.** TurboADB ships neither.
+  The first run on Windows installs both together (`Google.PlatformTools` and
+  `Genymobile.scrcpy`), with a progress bar and no administrator prompt, and
+  Upgrade goes through winget too. Where there is no winget, or it fails, the
+  tools come from Google and GitHub as before, so a version winget lists but its
+  publisher has withdrawn does not leave you without one.
+
+### Fixed
+
+- **Tab completes a path typed as the first word.** In the Android shell, `/da`
+  and Tab offered commands such as `dalvikvm` and `date`. A first word with a
+  slash in it is now a path, as in any shell, and offers `/data/` and
+  `/data_mirror/` (issue #1).
+- **Downloads survive a server's bad moment.** A brief error from GitHub or
+  Google is tried again by itself. If it keeps failing, the message says so and
+  that nothing was changed.
+
+- **Changing pages is immediate, and shows nothing of the previous page.** One
+  click between Terminal, Device Control, Files, Phone and the others used to
+  repaint the whole window four to six times, with parts of the old page showing
+  in between. A page now changes in one step, about ten times faster. The tab
+  underline moves with the page instead of sliding after it.
+- **scrcpy's picture appears and goes with its page.** The window scrcpy is shown
+  in no longer makes the widgets around it native windows of their own, and a
+  page change no longer waits for scrcpy to answer.
+- **Maximize view is really big.** It now fills the whole window (menu,
+  toolbars, tab rows and status bar go too; Restore or Esc brings them back).
+  It used to leave a phone's picture the same size, with wider black bars.
+- **Large displays stay sharp.** The compatibility profile that head units use
+  no longer reduces the video: it stays at the display's own resolution (scrcpy
+  lowers it itself only if the device's encoder refuses). The default 16M bit
+  rate rises with the pixels above 1080p, up to 50M; a rate you pick in Settings
+  is kept. Remote Desktop keeps up to 1920 pixels instead of 1280.
+- **The Displays tab shares its bit rate by size.** A large centre display no
+  longer gets the same share as a small cluster, and a maximized display restarts
+  once at full quality.
+- **The log says what the device really encodes** (`screen video: 2560x1600`).
+- **The picture follows a resize at once**, not at the next half-second check.
+- **Start installs scrcpy when it is missing.** If the check at launch failed
+  or has not finished, Start installs scrcpy, shows the progress and opens the
+  screen, instead of ending in "could not find scrcpy".
+
 ## 4.0.0
 
 ### New

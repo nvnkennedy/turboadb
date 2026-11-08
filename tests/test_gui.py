@@ -86,7 +86,7 @@ def test_animated_tabs_keep_normal_qtabwidget_api(qapp):
 
 
 def test_animated_tabs_ignore_deferred_work_after_deletion(qapp, monkeypatch):
-    """Deferred indicator/page animation must not run on a deleted tab widget.
+    """The deferred indicator animation must not run on a deleted tab widget.
 
     PyQt aborts the whole process on an unhandled slot exception, so the
     excepthook is captured here to turn a regression into a plain failure.
@@ -100,7 +100,7 @@ def test_animated_tabs_ignore_deferred_work_after_deletion(qapp, monkeypatch):
     tabs = AnimatedTabWidget(transition_ms=50)
     tabs.addTab(QWidget(), "First")
     tabs.addTab(QWidget(), "Second")
-    tabs.setCurrentIndex(1)  # schedules indicator + page-entry work
+    tabs.setCurrentIndex(1)  # schedules the indicator's work
     sip.delete(tabs)
     for _ in range(5):
         qapp.processEvents()
@@ -752,7 +752,7 @@ def test_ivi_display_and_record_toolbar_keep_native_mirror_focus(qapp):
             assert embedded_focus == [] and claimed == []
             panel._restore_mirror_focus(direct=True)
             assert embedded_focus == [Qt.OtherFocusReason]
-            assert claimed == [int(panel.container.winId())]
+            assert claimed == [int(panel.window().winId())]
         finally:
             mirror_mod._claim_native_focus = original_claim
             panel._child_hwnd = None

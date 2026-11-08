@@ -9,7 +9,7 @@ import os
 import sys
 import traceback
 
-from PyQt5.QtCore import QLockFile, QObject, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QCoreApplication, QLockFile, QObject, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
@@ -470,8 +470,22 @@ def _release_instance_lock() -> None:
         _instance_mutex = None
 
 
+def keep_widgets_in_one_window() -> None:
+    """Make only the embedded screen's own chain native Win32 child windows.
+
+    The embedded scrcpy window needs a native container, and Qt by default
+    turns every sibling of that container and of each of its parents into a
+    native window too: Terminal, Files, Phone, the tab strips and the rest,
+    about 40 in all.  A page change then hid and showed each one separately,
+    and between those steps Windows showed whatever had been there before: the
+    page before last, or the phone's picture floating over the old page.
+    """
+    QCoreApplication.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings)
+
+
 def main():
     _set_app_user_model_id()
+    keep_widgets_in_one_window()
     app = QApplication(sys.argv)
     app.setApplicationName("TurboADB")
     app.setApplicationDisplayName("TurboADB")

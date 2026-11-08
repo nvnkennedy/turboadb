@@ -18,7 +18,7 @@ import threading
 import time
 
 from PyQt5.QtCore import (
-    Qt, QEvent, QObject, QPointF, QRectF, QSize, QThread, pyqtSignal, QTimer
+    Qt, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
 )
 from PyQt5.QtGui import QColor, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
@@ -39,9 +39,11 @@ from PyQt5.QtWidgets import (
     QDialog,
     QGridLayout,
     QProgressBar,
+    QStatusBar,
 )
 
 from ..config import ScrcpyOptions
+from ..exceptions import ADBNotFoundError
 from ..results import OperationResult
 from ..scrcpy import is_remote_session
 from . import settings as settings_mod
@@ -150,6 +152,7 @@ _WS_CHILD = 0x40000000
 _WS_POPUP = 0x80000000
 _WS_CAPTION = 0x00C00000
 _WS_THICKFRAME = 0x00040000
+_WS_CLIPCHILDREN = 0x02000000
 _SWP_NOSIZE = 0x0001
 _SWP_NOZORDER = 0x0004
 _SWP_NOACTIVATE = 0x0010
@@ -737,6 +740,33 @@ def _file_stamp(path):
     return info.st_size, info.st_mtime_ns
 
 
+# The longest video side over Remote Desktop, where the CPU draws every frame.
+_REMOTE_DESKTOP_MAX_SIZE = 1920
+# Settings → Video bit rate's default suits a screen this size; more pixels at
+# the same rate is what makes a large display look grainy.
+_FULL_HD_PIXELS = 1920 * 1080
+_MAX_AUTO_BIT_RATE = 50_000_000  # the highest rate Settings offers
+
+
+def _bit_rate_for_display(bit_rate, size, max_edge=None) -> str:
+    """*bit_rate*, raised in proportion for a display with more pixels than
+    1080p.  *size* is ``(width, height)``; *max_edge* the longest side the
+    video is limited to (the video's size counts, not the panel's)."""
+    if not size:
+        return bit_rate
+    width, height = size
+    longest = max(width, height)
+    if max_edge and longest > max_edge:
+        scale = max_edge / longest
+        width, height = width * scale, height * scale
+    pixels = width * height
+    if pixels <= _FULL_HD_PIXELS:
+        return bit_rate
+    wanted = int(int(_bitrate_to_bps(bit_rate)) * pixels / _FULL_HD_PIXELS)
+    wanted = min(wanted, _MAX_AUTO_BIT_RATE)
+    return f"{max(1, round(wanted / 1_000_000))}M"
+
+
 def _record_size_for_active_view(displays, display_id, max_edge=1280):
     """Return a proportional screenrecord size capped for concurrent viewing.
 
@@ -1238,31 +1268,30 @@ class _IdleScreen(QWidget):
         p.end()
 
 
-class _EmbedContainer(QWidget):
-    """The native widget scrcpy is reparented into.
+class _VideoHost(QWidget):
+    """The one native window of an embedded screen: what scrcpy is adopted into.
 
-    After a click on the video the panel first gives Win32 keyboard focus to
-    scrcpy's own SDL child window, so scrcpy reads the keys itself (see
-    ``MirrorPanel._focus_embedded``).  When Windows refuses, the keyboard stays
-    here and keys are forwarded to the device over adb through *send_key*.
-    scrcpy always keeps video and mouse: Windows routes the mouse by cursor
-    position, whatever holds the focus.
+    It is a child of the top-level window, placed over the panel's container
+    by the panel, and not part of the page it appears on.  Anywhere in the
+    page it would make Qt give a native window to every widget above it too,
+    and a page change would then hide and show those one at a time, each
+    painted on its own, with what was there before showing in between.  Here
+    the whole page is one surface that changes in one step, and only this one
+    window comes and goes.  Moving and hiding it are calls on TurboADB's own
+    thread: scrcpy, which may be busy or stuck, is not asked anything.
 
     Clicks on the scrcpy video go straight to that foreign window and never
-    reach Qt, so the container watches for WM_PARENTNOTIFY (sent by Windows to
-    the parent on a button press over a child) and reports it through
-    *on_child_click*; the panel then takes the keyboard.  With
-    *on_key_release*, *send_key* also receives ``auto_repeat=`` and the real
-    release of each device key is reported as ``on_key_release(keycode)``."""
+    reach Qt, so this watches for WM_PARENTNOTIFY (sent by Windows to the
+    parent on a button press over a child) and reports it through
+    *on_child_click*; the panel then takes the keyboard.
+    """
 
-    def __init__(self, send_key, parent=None, on_child_click=None, on_key_release=None,
-                 on_paste=None):
+    def __init__(self, parent, on_child_click=None):
         super().__init__(parent)
-        self._send_key = send_key
         self._on_child_click = on_child_click
-        self._on_key_release = on_key_release
-        self._on_paste = on_paste
-        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.hide()
 
     def nativeEvent(self, event_type, message):
         if self._on_child_click is not None and _is_child_button_down(event_type, message):
@@ -1271,6 +1300,44 @@ class _EmbedContainer(QWidget):
             except Exception:
                 pass
         return super().nativeEvent(event_type, message)
+
+
+class _LayoutWatcher(QObject):
+    """Reports when a widget the screen sits in may have moved it."""
+
+    _KINDS = frozenset((QEvent.Move, QEvent.Resize, QEvent.ParentChange))
+
+    def __init__(self, on_change, parent=None):
+        super().__init__(parent)
+        self._on_change = on_change
+
+    def eventFilter(self, _obj, event):
+        if event.type() in self._KINDS:
+            self._on_change()
+        return False
+
+
+class _EmbedContainer(QWidget):
+    """The screen's place in the page: the idle screen, the screencap frames
+    and the keyboard when it is not with scrcpy.  scrcpy's own window lies over
+    it, in a :class:`_VideoHost`.
+
+    After a click on the video the panel first gives Win32 keyboard focus to
+    scrcpy's own SDL child window, so scrcpy reads the keys itself (see
+    ``MirrorPanel._focus_embedded``).  When Windows refuses, the keyboard stays
+    here and keys are forwarded to the device over adb through *send_key*.
+    scrcpy always keeps video and mouse: Windows routes the mouse by cursor
+    position, whatever holds the focus.
+
+    With *on_key_release*, *send_key* also receives ``auto_repeat=`` and the
+    real release of each device key is reported as ``on_key_release(keycode)``."""
+
+    def __init__(self, send_key, parent=None, on_key_release=None, on_paste=None):
+        super().__init__(parent)
+        self._send_key = send_key
+        self._on_key_release = on_key_release
+        self._on_paste = on_paste
+        self.setFocusPolicy(Qt.StrongFocus)
 
     def focusNextPrevChild(self, next_child):
         # Tab is a device key while the screen has the keyboard; focus moves
@@ -1643,6 +1710,27 @@ class _RecorderDiscardThread(_RecorderStopThread):
         self.done.emit(True)
 
 
+class _ScrcpyInstallThread(QThread):
+    """Run ``toolsdl.install_missing_scrcpy`` off the UI thread (see
+    MirrorPanel._install_scrcpy_then_start)."""
+
+    progress = pyqtSignal(int)
+    done = pyqtSignal(object)
+    fail = pyqtSignal(str)
+
+    def __init__(self, install):
+        super().__init__()
+        self._install = install
+
+    def run(self):
+        try:
+            path = self._install(on_progress=self.progress.emit)
+        except Exception as exc:
+            self.fail.emit(str(exc))
+        else:
+            self.done.emit(path)
+
+
 class _MirrorLaunchThread(QThread):
     done = pyqtSignal(object)
     fail = pyqtSignal(str)
@@ -1799,6 +1887,22 @@ class MirrorPanel(QWidget):
         self._mirror_stop_thread = None
         self._embed_timer = None
         self._fit_timer = None
+        # the native window scrcpy lies in, and what keeps it over the screen
+        self._video_host = None
+        self._layout_watcher = _LayoutWatcher(self._place_soon, self)
+        self._watched_parents = []
+        self._host_sync_timer = QTimer(self)
+        self._host_sync_timer.setSingleShot(True)
+        self._host_sync_timer.setInterval(0)
+        self._host_sync_timer.timeout.connect(self._sync_video_host)
+        self._place_timer = QTimer(self)
+        self._place_timer.setSingleShot(True)
+        self._place_timer.setInterval(0)
+        self._place_timer.timeout.connect(self._fit)
+        # a start waiting for scrcpy to be downloaded (_install_scrcpy_then_start)
+        self._install_thread = None
+        self._install_spec = None
+        self._install_tried = False
         self._embed_tries = 0
         self._win_first_seen = 0.0
         self._child_hwnd = None
@@ -1810,6 +1914,7 @@ class MirrorPanel(QWidget):
         self._embed_on = False
         self._retry_count = 0
         self._became_ready = False
+        self._video_reported = True  # (until a session starts: _on_mirror_launched)
         # screen recording (independent of how you're viewing)
         self._recording = False
         self._record_finalizing = False
@@ -2064,15 +2169,13 @@ class MirrorPanel(QWidget):
             app.focusChanged.connect(self._on_app_focus_changed)
             app.applicationStateChanged.connect(self._on_app_state_changed)
 
-        # native container that scrcpy gets reparented into — it also captures
-        # keyboard and forwards it to the device (see _EmbedContainer)
+        # the screen's place in the page; it also takes the keyboard and
+        # forwards it to the device when scrcpy can't (see _EmbedContainer)
         self.container = _EmbedContainer(
             self._send_key,
-            on_child_click=self._on_embedded_child_click,
             on_key_release=self._release_key,
             on_paste=lambda text: self.log.emit(device_paste_message(text)),
         )
-        self.container.setAttribute(Qt.WA_NativeWindow, True)
         self.container.setMinimumHeight(200)
         self.container.installEventFilter(self)  # click margins -> focus mirror
         # Idle state shown over the video area: a device-shaped frame with the
@@ -2096,6 +2199,117 @@ class MirrorPanel(QWidget):
         # Settings → Screen renderer may have changed while this was hidden
         self._sync_start_mode()
         self._refresh_buttons()
+        if not event.spontaneous():  # (not the window coming back from the taskbar)
+            self._host_sync_timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if not event.spontaneous():
+            self._release_native_keyboard()
+            self._host_sync_timer.start()
+
+    # ----- the native window scrcpy lies in -----
+    def _host_hwnd(self) -> int:
+        """The window scrcpy is, or will be, a child of."""
+        host = self._video_host
+        return int(host.winId()) if host is not None else int(self.window().winId())
+
+    def _ensure_video_host(self):
+        """This panel's :class:`_VideoHost`, on the window the panel is in."""
+        window = self.window()
+        host = self._video_host
+        if host is None:
+            host = _VideoHost(window, on_child_click=self._on_embedded_child_click)
+            self._video_host = host
+            self.destroyed.connect(host.deleteLater)  # (never before scrcpy has gone)
+            self._paint_under_host(window)
+        elif host.parentWidget() is not window:
+            host.setParent(window)
+        self._watch_parents()
+        return host
+
+    @staticmethod
+    def _paint_under_host(window) -> None:
+        """Let the window's painting reach the area under scrcpy's window.
+
+        The GPU shows that window on a surface of its own, so painting under
+        it changes nothing on screen, and the moment it goes, what lies under
+        it is already the new page.  Clipped out, that area kept whatever was
+        painted there last: the page before, for a moment, after every change.
+        """
+        if not _IS_WIN:
+            return
+        try:
+            _ctypes, u = _win_api()
+            hwnd = int(window.winId())
+            getter = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+            setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+            style = getter(hwnd, _GWL_STYLE)
+            if style & _WS_CLIPCHILDREN:
+                setter(hwnd, _GWL_STYLE, style & ~_WS_CLIPCHILDREN)
+        except Exception:
+            pass
+
+    def _watch_parents(self) -> None:
+        """Follow the widgets around the screen: one of them can move it
+        without the screen's own position in its parent changing."""
+        chain = []
+        widget = self.container
+        while widget is not None:
+            chain.append(widget)
+            if widget.isWindow():
+                break
+            widget = widget.parentWidget()
+        if chain == self._watched_parents:
+            return
+        for widget in self._watched_parents:
+            try:
+                widget.removeEventFilter(self._layout_watcher)
+            except RuntimeError:
+                pass
+        for widget in chain:
+            widget.installEventFilter(self._layout_watcher)
+        self._watched_parents = chain
+
+    def _place_soon(self) -> None:
+        if self._video_host is not None and self._child_hwnd:
+            self._place_timer.start()
+
+    def _place_video_host(self) -> None:
+        """Lay the host exactly over the container."""
+        host = self._video_host
+        if host is None:
+            return
+        self._watch_parents()
+        area = QRect(self.container.mapTo(self.window(), QPoint(0, 0)), self.container.size())
+        if host.geometry() != area:
+            host.setGeometry(area)
+
+    def _sync_video_host(self) -> None:
+        """Show or hide scrcpy's window, once the page around it has painted.
+
+        Nothing on screen has changed until the new page is flushed, and the
+        window goes (or comes) right after that: the old page stays whole
+        until the new one is ready, and no frame shows part of each.
+        """
+        host = self._video_host
+        if host is None or self._closing:
+            return
+        wanted = bool(self._child_hwnd) and self.isVisible()
+        if wanted == (not host.isHidden()):
+            if wanted:
+                self._place_video_host()
+            return
+        from PyQt5.QtCore import QCoreApplication
+
+        window = self.window()
+        QCoreApplication.sendPostedEvents(window, QEvent.UpdateRequest)
+        if wanted:
+            self._place_video_host()
+            host.show()
+        else:
+            host.hide()
+            QCoreApplication.sendPostedEvents(window, QEvent.UpdateRequest)
 
     def __getattr__(self, name):
         # The options popover's controls exist once it is built; asking for
@@ -2119,6 +2333,7 @@ class MirrorPanel(QWidget):
             self.empty_state.setGeometry(self.container.rect())
             if self._screencap is not None:
                 self._screencap.setGeometry(self.container.rect())
+            self._place_soon()  # the picture follows at once, not at the next poll
         # A click on the container's margins targets the mirror.  Importantly,
         # changing tabs or interacting with the Device Controls never does:
         # that previously put keystrokes into an unrelated TurboADB field.
@@ -2161,8 +2376,8 @@ class MirrorPanel(QWidget):
         reads the keys itself (fast, correct key repeat, no adb per key).  Qt
         focus still moves to the container, so choosing any other TurboADB
         widget is noticed (_on_app_focus_changed) and takes the keyboard back.
-        When Windows refuses, Win32 focus goes to the container's own HWND and
-        the container forwards keys over ADB (_KeyBatcher).  While the keyboard
+        When Windows refuses, Win32 focus goes to the window and the container,
+        which has Qt's focus, forwards keys over ADB (_KeyBatcher).  While the keyboard
         is with a scrcpy that does not answer, nothing moves (every focus
         change would wait for scrcpy).
         Returns whether the container took focus.
@@ -2178,13 +2393,13 @@ class MirrorPanel(QWidget):
         if self._child_hwnd:
             native = False
             try:
-                native = _focus_embedded_child(self._child_hwnd, int(self.container.winId()))
+                native = _focus_embedded_child(self._child_hwnd, self._host_hwnd())
             except Exception:
                 native = False
             self._native_keyboard = native
             if not native:
                 try:
-                    _claim_native_focus(int(self.container.winId()))
+                    _claim_native_focus(int(self.window().winId()))
                 except Exception:
                     pass
             self._report_keyboard_route(native)
@@ -2237,11 +2452,10 @@ class MirrorPanel(QWidget):
         try:
             if not self.container.hasFocus() or not self.isActiveWindow():
                 return
-            container_hwnd = int(self.container.winId())
-            native = _focus_embedded_child(self._child_hwnd, container_hwnd)
+            native = _focus_embedded_child(self._child_hwnd, self._host_hwnd())
             if not native:
                 self._native_keyboard = False
-                _claim_native_focus(container_hwnd)
+                _claim_native_focus(int(self.window().winId()))
             self._report_keyboard_route(native)
         except Exception:
             pass
@@ -2385,19 +2599,20 @@ class MirrorPanel(QWidget):
         self._toolbar.addWidget(widget)
 
     def ensure_embedded(self) -> None:
-        """Keep the embedded scrcpy window attached after Device Control moves
-        between parents (split view).
+        """Keep the embedded scrcpy window attached and placed after Device
+        Control moves between parents (split view).
 
-        Qt normally keeps a native child's HWND across a reparent, so this is
-        usually just a re-fit; re-adopting on a changed container handle is a
-        cheap safety net.
+        The host stays on the window through such a move, so this is usually
+        just a re-fit; re-adopting on a changed handle is a cheap safety net.
         """
         if self._closing or not self._child_hwnd or not _IS_WIN:
             return
         if self._scrcpy is None or not self._scrcpy.running:
             return
         try:
-            parent = int(self.container.winId())
+            host = self._ensure_video_host()
+            self._place_video_host()
+            parent = int(host.winId())
             _ctypes, u = _win_api()
             attached = int(u.GetParent(self._child_hwnd) or 0)
             if parent != self._embed_parent_hwnd or attached != parent:
@@ -2406,14 +2621,13 @@ class MirrorPanel(QWidget):
                     # again in a moment rather than hang with a stuck scrcpy.
                     QTimer.singleShot(int(_SILENT_RETRY_S * 1000), self.ensure_embedded)
                     return
-                _reparent(
-                    self._child_hwnd, parent, self.container.width(), self.container.height()
-                )
+                _reparent(self._child_hwnd, parent, host.width(), host.height())
                 self._embed_parent_hwnd = parent
         except Exception as exc:
             self.log.emit(f"[WARNING] could not re-attach the embedded screen: {exc}")
             return
         self._fit()
+        self._host_sync_timer.start()
 
     def keep_window_open(self) -> bool:
         """Let a separate scrcpy window outlive this panel: TurboADB is exiting
@@ -3113,6 +3327,44 @@ class MirrorPanel(QWidget):
             if value
         }
 
+    def _raise_bit_rate_for_big_display(self, opts, display_id) -> None:
+        """The default bit rate is sized for 1080p: spread over a larger
+        display it looks grainy.  A rate the user picked in Settings is kept."""
+        if opts.bit_rate != settings_mod.DEFAULTS["scrcpy_bit_rate"] or opts.video_source:
+            return
+        size = _parse_display_size(self._selected_display_entry(display_id).get("size"))
+        opts.bit_rate = _bit_rate_for_display(opts.bit_rate, size, opts.max_size)
+
+    def use_full_video_quality(self) -> bool:
+        """This display now fills the tab: drop its share of the wall's video
+        budget.  scrcpy's bit rate is fixed when it starts, so a screen running
+        below its full rate restarts once (True).  A recording in progress is
+        left alone."""
+        self.set_video_budget()
+        session, running = self._scrcpy, self._launch_opts
+        if session is None or running is None or not session.running or self._recording:
+            return False
+        full = self._full_bit_rate((self._launch_spec or {}).get("display_id"))
+        if int(_bitrate_to_bps(full)) <= int(_bitrate_to_bps(running.bit_rate or full)):
+            return False
+        self.log.emit(f"[INFO] restarting this display at full quality ({full})")
+        spec = dict(self._launch_spec or {})
+        spec.pop("_retry", None)
+        self.start(**spec)
+        return True
+
+    def _full_bit_rate(self, display_id) -> str:
+        """What a start with no video budget would ask for."""
+        st = settings_mod.load()
+        opts = ScrcpyOptions(
+            max_size=(st.get("scrcpy_max_size") or None),
+            bit_rate=st.get("scrcpy_bit_rate") or None,
+            no_audio=True,  # (_tune has a tip about audio, for real starts)
+        )
+        self._tune(opts)
+        self._raise_bit_rate_for_big_display(opts, display_id)
+        return opts.bit_rate
+
     def _on_audio_enabled_changed(self, enabled: bool) -> None:
         self._opt["audio"] = bool(enabled)
         for control in (self.__dict__.get("act_audio"), self.__dict__.get("btn_audio")):
@@ -3159,8 +3411,8 @@ class MirrorPanel(QWidget):
         opts.audio_dup = bool(saved.get("scrcpy_audio_dup", False)) and source == "playback"
         return opts
 
-    _MAX_TIP = "Maximize view: give the device screen the whole tab"
-    _RESTORE_TIP = "Restore view: bring back the controls and side panels (Esc)"
+    _MAX_TIP = "Maximize view: give the device screen the whole window"
+    _RESTORE_TIP = "Restore view: bring back the controls, tabs and side panels (Esc)"
 
     def _sync_max_buttons(self, on: bool) -> None:
         """Keep the toolbar button, the options-panel entry, the action and the
@@ -3249,6 +3501,7 @@ class MirrorPanel(QWidget):
             or self._launch_pending
             or self._stopping_mirror
             or self._retry_pending
+            or self._install_spec is not None
         )
         self.btn_mirror.setVisible(not active)
         self.btn_mirror.setEnabled(not active)
@@ -3363,13 +3616,14 @@ class MirrorPanel(QWidget):
         return bool(self.act_max.isChecked())
 
     def _toggle_max(self, on=None):
-        """Maximize view: the device screen gets the whole tab.
+        """Maximize view: the device screen gets the whole window.
 
         The owner does the in-tab part when told through max_view_changed
-        (Device Control hides its controls panel); the main window's docks are
-        hidden here. Hiding only the docks did nothing visible most of the time:
-        the device list already hides itself while a screen shows, and the log
-        is closed by default.
+        (Device Control hides its controls panel); the rest of the window goes
+        here (_hide_docks).  A phone is taller than it is wide, so only height
+        makes its picture larger, and the menu, toolbar, tab rows and status
+        bar were what held it back: hiding the side panels alone left the same
+        small picture with wider black bars.
         """
         if on is None:
             on = self.act_max.isChecked()
@@ -3399,21 +3653,38 @@ class MirrorPanel(QWidget):
             return
         self.btn_max.setFocus(Qt.OtherFocusReason)
 
+    def _window_chrome(self, win) -> list:
+        """What surrounds the screen in *win*: the docks, the menu, tool and
+        status bars, and the tab rows this panel sits under."""
+        from PyQt5.QtWidgets import QDockWidget, QTabWidget, QToolBar
+
+        chrome = list(win.findChildren(QDockWidget))
+        chrome += [bar for bar in win.findChildren(QToolBar) if bar.parentWidget() is win]
+        chrome += [win.menuWidget(), win.findChild(QStatusBar, "", Qt.FindDirectChildrenOnly),
+                   getattr(win, "_sidebar_handle", None)]
+        parent = self.parentWidget()
+        while parent is not None and parent is not win:
+            if isinstance(parent, QTabWidget):
+                chrome += [parent.tabBar(), parent.cornerWidget(Qt.TopRightCorner),
+                           parent.cornerWidget(Qt.TopLeftCorner)]
+            parent = parent.parentWidget()
+        return [widget for widget in chrome if widget is not None]
+
     def _hide_docks(self):
-        from PyQt5.QtWidgets import QDockWidget, QMainWindow
+        from PyQt5.QtWidgets import QMainWindow
 
         win = self.window()
         if not isinstance(win, QMainWindow):
             return
-        # only hide docks that are showing, and restore exactly those —
+        # only hide what is showing, and restore exactly that —
         # blanket-showing everything un-hid docks the user had closed.
-        # Merge with the docks already recorded: resuming max view twice
+        # Merge with what is already recorded: resuming max view twice
         # (tab switch + split view) must not forget what the first call hid.
-        for d in win.findChildren(QDockWidget):
-            if d.isVisible():
-                if d not in self._max_hidden:
-                    self._max_hidden.append(d)
-                d.setVisible(False)
+        for widget in self._window_chrome(win):
+            if widget.isVisible():
+                if widget not in self._max_hidden:
+                    self._max_hidden.append(widget)
+                widget.setVisible(False)
 
     def _show_docks(self):
         for d in getattr(self, "_max_hidden", []):
@@ -3805,6 +4076,7 @@ class MirrorPanel(QWidget):
             or self._launch_pending
             or self._stopping_mirror
             or self._retry_pending
+            or self._install_spec is not None
         )
 
     def still_closing(self) -> bool:
@@ -3839,6 +4111,8 @@ class MirrorPanel(QWidget):
         closing, or its launch still being cancelled: nothing comes after it.
         """
         if self._scrcpy is not None or self._screencap is not None or self._retry_pending:
+            return True
+        if self._install_spec is not None:
             return True
         if self._launch_pending:
             return not self._cancel_launch or self._queued_start is not None
@@ -3919,7 +4193,7 @@ class MirrorPanel(QWidget):
         Over Remote Desktop, applies software rendering and sensible caps."""
         if self._opt["soft"]:
             opts.render_driver = "software"
-            opts.max_size = opts.max_size or 1280
+            opts.max_size = opts.max_size or _REMOTE_DESKTOP_MAX_SIZE
             opts.bit_rate = opts.bit_rate or "8M"
             opts.max_fps = opts.max_fps or 30
             if not opts.no_audio:
@@ -4631,6 +4905,9 @@ class MirrorPanel(QWidget):
             self._start_screencap(display_id, requested)
             return
         self._stop_screencap()  # a scrcpy start replaces the screencap view
+        if self._scrcpy_needs_installing():
+            self._install_scrcpy_then_start(requested)
+            return
 
         st = settings_mod.load()
         opts = ScrcpyOptions(
@@ -4651,6 +4928,7 @@ class MirrorPanel(QWidget):
         # recordings use the complete user-selected audio profile.
         self._apply_audio_options(opts, allow_audio=not bool(camera) and not self._fixed_display)
         self._tune(opts)
+        self._raise_bit_rate_for_big_display(opts, display_id)
         self._apply_video_budget(opts)
         self._launch_opts = opts  # a parallel recorder copies its video settings
         if camera:
@@ -4729,6 +5007,90 @@ class MirrorPanel(QWidget):
         self._launch_thread.start()
         self._refresh_buttons()
 
+    def _scrcpy_needs_installing(self) -> bool:
+        """True when no scrcpy can be found and TurboADB can download one.
+
+        A path set on purpose that names no scrcpy (TURBOADB_SCRCPY) is not
+        replaced by a download: its error says what to correct."""
+        if self._install_tried:
+            return False  # already tried for this start: report what is wrong
+        try:
+            from .. import toolsdl
+            from ..tools import find_scrcpy
+
+            config = getattr(self.handler, "config", None)
+            try:
+                find_scrcpy(getattr(config, "scrcpy_path", None))
+            except ADBNotFoundError as exc:
+                return (
+                    not getattr(exc, "configured", None)
+                    and toolsdl.auto_fetch_enabled()
+                    and toolsdl.scrcpy_download_supported()
+                )
+        except Exception:
+            pass
+        return False
+
+    def _install_scrcpy_then_start(self, requested) -> None:
+        """Download scrcpy, then start the screen that was asked for.
+
+        The launch check normally installs scrcpy on its own, but it does so
+        once, and only the log says when that failed (GitHub unreachable or
+        rate-limiting) or the first Start came first.  Start used to end in
+        "could not find scrcpy" until the tools were downloaded by hand."""
+        from .. import toolsdl
+
+        self._install_spec = requested
+        self.status.show()
+        self.status.setText("Installing scrcpy (only needed once)…")
+        self.log.emit("[INFO] scrcpy isn't installed yet — installing it now…")
+        self._refresh_buttons()
+        if thread_running(self._install_thread):
+            return  # the download under way serves this start too
+        thread = _ScrcpyInstallThread(toolsdl.install_missing_scrcpy)
+        self._install_thread = thread
+        park_thread(thread)
+        thread.progress.connect(self._on_scrcpy_install_progress)
+        thread.done.connect(self._on_scrcpy_installed)
+        thread.fail.connect(self._on_scrcpy_install_failed)
+        thread.start()
+
+    def _on_scrcpy_install_progress(self, percent) -> None:
+        if self._install_spec is not None and not self._closing:
+            self.status.setText(f"Installing scrcpy (only needed once)… {int(percent)}%")
+
+    def _on_scrcpy_installed(self, path) -> None:
+        spec, self._install_spec = self._install_spec, None
+        if self._closing:
+            return
+        self.log.emit(f"[OK] scrcpy installed: {path}")
+        if spec is None:  # Stop was pressed meanwhile
+            self._refresh_buttons()
+            return
+        self.status.setText("")
+        self.status.hide()
+        self._install_tried = True
+        try:
+            self.start(**spec)
+        finally:
+            self._install_tried = False
+
+    def _on_scrcpy_install_failed(self, message) -> None:
+        spec, self._install_spec = self._install_spec, None
+        if self._closing:
+            return
+        self._refresh_buttons()
+        if spec is None:
+            return
+        text = (
+            "scrcpy could not be installed. Check the internet connection and press "
+            "Start again, or use Tools → Download and reinstall ADB and scrcpy."
+        )
+        self.status.show()
+        self.status.setText(text)
+        self.log.emit(f"[ERROR] {text} ({message})")
+        self.screen_failed.emit(str(message))
+
     def _retire_log(self):
         """Queue the previous session's scrcpy log for deletion."""
         if self._log_path:
@@ -4772,6 +5134,7 @@ class MirrorPanel(QWidget):
             self._rec_integrated_starting = False
         self._start_t = time.time()
         self._became_ready = False  # set once it renders / embeds
+        self._video_reported = False
         self._refresh_buttons()
         # watch for the scrcpy window being closed so the buttons reset
         self._mon = QTimer(self)
@@ -4863,6 +5226,18 @@ class MirrorPanel(QWidget):
         except Exception:
             return False
 
+    def _report_video_size(self) -> None:
+        """Say once what the device is really encoding: a screen that looks
+        soft on a large display shows here whether its video was reduced (by
+        a setting, or by scrcpy after the device's encoder refused the size)."""
+        found = re.search(r"Texture:\s*(\d+)x(\d+)", _read_log_tail(self._scrcpy, 4096))
+        if not found:
+            return
+        self._video_reported = True
+        opts = self._launch_opts
+        rate = f" at {opts.bit_rate} bit/s" if opts is not None and opts.bit_rate else ""
+        self.log.emit(f"[INFO] screen video: {found.group(1)}x{found.group(2)}{rate}")
+
     def _check_alive(self):
         """Poll the scrcpy process. Readiness = its window is up (works for embed
         AND separate window). A launch that never shows a window within
@@ -4884,6 +5259,8 @@ class MirrorPanel(QWidget):
         ):
             self._became_ready = True
             self.screen_ready.emit()
+        if not self._video_reported:
+            self._report_video_size()
 
         running = self._scrcpy.running
         ran_s = time.time() - getattr(self, "_start_t", 0)
@@ -5179,9 +5556,11 @@ class MirrorPanel(QWidget):
                 # scrcpy sized its window to the video: the real (rotated) shape
                 self._video_aspect = aspect
                 self.display_shape_changed.emit()
-            parent_hwnd = int(self.container.winId())
             try:
-                _reparent(hwnd, parent_hwnd, self.container.width(), self.container.height())
+                host = self._ensure_video_host()
+                self._place_video_host()
+                parent_hwnd = int(host.winId())
+                _reparent(hwnd, parent_hwnd, host.width(), host.height())
             except Exception as exc:
                 # Embedding failed after an off-screen launch.  Pass the handle
                 # explicitly (a half-attached child is no longer found by title)
@@ -5210,6 +5589,7 @@ class MirrorPanel(QWidget):
                 return
             self._child_hwnd = hwnd
             self._embed_parent_hwnd = parent_hwnd
+            self._host_sync_timer.start()  # (not while another page shows)
             self.status.setText("")
             self.status.hide()
             self._refresh_buttons()
@@ -5308,9 +5688,11 @@ class MirrorPanel(QWidget):
             import ctypes
             from ctypes import wintypes
 
+            self._place_video_host()
             _c, u = _win_api()
             target_rect = wintypes.RECT()
-            c_hwnd = int(self.container.winId()) if hasattr(self.container, "winId") else None
+            host = self._video_host
+            c_hwnd = int(host.winId()) if host is not None else None
             if c_hwnd and u.GetClientRect(c_hwnd, ctypes.byref(target_rect)):
                 w = max(1, target_rect.right - target_rect.left)
                 h = max(1, target_rect.bottom - target_rect.top)
@@ -5333,7 +5715,7 @@ class MirrorPanel(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._fit()
+        self._place_soon()
 
     def _stop_embed_timer(self):
         # Each launch creates fresh timers parented to the panel; delete them
@@ -5361,6 +5743,10 @@ class MirrorPanel(QWidget):
         self._release_native_keyboard(if_lost=True)
         self._take_back_keyboard()
         self._keyboard_route = None
+        self._host_sync_timer.stop()
+        self._place_timer.stop()
+        if self._video_host is not None:
+            self._video_host.hide()  # (kept: scrcpy's window is still in it)
         handle = self._child_hwnd or self._separate_hwnd
         self._child_hwnd = None
         self._embed_parent_hwnd = None
@@ -5444,6 +5830,13 @@ class MirrorPanel(QWidget):
     def stop(self):
         # the Stop button stops the scrcpy viewer; a device-side recording runs
         # independently.
+        if self._install_spec is not None:
+            # (the download itself goes on: the next Start will want it)
+            self._install_spec = None
+            self.status.setText("")
+            self.status.hide()
+            self._refresh_buttons()
+            return
         if self._retry_pending:
             self._cancel_retry()
             self._refresh_buttons()

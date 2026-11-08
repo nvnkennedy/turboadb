@@ -79,10 +79,10 @@ def test_container_reports_only_button_down_parent_notifications(app):
 
     from PyQt5 import sip
     from PyQt5.QtCore import QByteArray
-    from turboadb.gui.mirror_panel import _EmbedContainer
+    from turboadb.gui.mirror_panel import _VideoHost
 
     clicks = []
-    container = _EmbedContainer(lambda *_args: None, on_child_click=lambda: clicks.append(True))
+    container = _VideoHost(None, on_child_click=lambda: clicks.append(True))
     generic = QByteArray(b"windows_generic_MSG")
 
     def send(message, low, high=0, kind=generic):
@@ -135,7 +135,7 @@ def test_click_on_embedded_video_gives_the_container_the_keyboard(app, monkeypat
         assert focus == []  # deferred: SDL is still handling its own click
         QTest.qWait(80)
         assert focus == [Qt.MouseFocusReason]
-        assert claimed == [int(panel.container.winId())]
+        assert claimed == [int(panel.window().winId())]
         # the later re-check only re-asserts focus the container still holds
         QTest.qWait(350)
         assert focus == [Qt.MouseFocusReason]

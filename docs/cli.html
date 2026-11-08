@@ -115,7 +115,7 @@ turboadb -s @bench info                           # …and use it by name</code>
               <tbody>
                 <tr><td><code>TURBOADB_ADB</code></td><td>Path to the adb executable (one that names no adb is an error).</td></tr>
                 <tr><td><code>TURBOADB_SCRCPY</code></td><td>Path to the scrcpy executable (the same rule).</td></tr>
-                <tr><td><code>TURBOADB_AUTO_FETCH=0</code></td><td>Never download adb / scrcpy automatically.</td></tr>
+                <tr><td><code>TURBOADB_AUTO_FETCH=0</code></td><td>Never install adb / scrcpy automatically.</td></tr>
                 <tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>The editor <code>turboadb edit</code> opens.</td></tr>
               </tbody>
             </table></div>
@@ -129,7 +129,7 @@ turboadb -s @bench info                           # …and use it by name</code>
           <thead><tr><th>Command</th><th>What it does</th><th>Options</th></tr></thead>
           <tbody>
             <tr data-cmd="doctor"><td><code>doctor</code></td><td>Report whether adb and scrcpy were found, and where; the running adb server (release, protocol, executable — and a warning when another adb's server would keep being restarted); and which TurboADB runs, with a warning when this Python has a different copy installed.</td><td><code>--json</code></td></tr>
-            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Download adb (and scrcpy) into <code>~/.turboadb/tools</code>: adb where Google builds it for the machine (Windows, macOS, x86-64 Linux), scrcpy on Windows. <code>--adb-only</code> and <code>--scrcpy-only</code> are mutually exclusive.</td><td><code>--adb-only</code> | <code>--scrcpy-only</code> <code>--force</code> <code>--json</code></td></tr>
+            <tr data-cmd="fetch-tools"><td><code>fetch-tools</code></td><td>Install adb and scrcpy: through winget on Windows, else into <code>~/.turboadb/tools</code>: adb where Google builds it for the machine (Windows, macOS, x86-64 Linux), scrcpy on Windows. <code>--adb-only</code> and <code>--scrcpy-only</code> are mutually exclusive.</td><td><code>--adb-only</code> | <code>--scrcpy-only</code> <code>--force</code> <code>--json</code></td></tr>
             <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code> <code>--json</code></td></tr>
             <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from PyPI (exactly the version it offers — a lagging package mirror is reported, not called an update), then adb and scrcpy. A source checkout updates with <code>git pull</code>.</td><td><code>--check</code> <code>--json</code></td></tr>
             <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows). They start the TurboADB installed in this Python, so a different running copy (a source checkout) changes nothing and says why. Without PyQt5 they start <code>turboadb-gui</code>; where nothing could start the app, none is written and the command exits <code>1</code>.</td><td><code>--json</code></td></tr>

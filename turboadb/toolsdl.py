@@ -1,18 +1,18 @@
 """
-On-demand downloader for the external tools TurboADB drives, into a per-user
-cache (``~/.turboadb/tools/``) — so a plain ``pip install turboadb`` stays small
-and license-clean (you fetch Google's adb yourself; we never redistribute it),
-yet the tools are one command (or one click) away.
+Getting the external tools TurboADB drives.  TurboADB ships neither of them.
 
-  * ``adb``    — Google's official platform-tools zip (Apache-2.0 source; the
-                 prebuilt is under the Android SDK Terms, which you accept by
-                 downloading it here).
-  * ``scrcpy`` — Genymobile's official GitHub release (Apache-2.0). Prebuilt
-                 archives exist for Windows; on macOS/Linux use brew/apt.
+On Windows the first run installs both through winget (``Google.PlatformTools``
+and ``Genymobile.scrcpy``), and winget keeps them up to date.  Where there is no
+winget, or it fails, the tools come from their publishers into a per-user cache
+(``~/.turboadb/tools/``):
+
+  * ``adb``    — Google's official platform-tools zip.
+  * ``scrcpy`` — Genymobile's official GitHub release. Prebuilt archives exist
+                 for Windows; on macOS/Linux use brew/apt.
 
 Nothing here runs at install time (wheels don't run code on install); it runs
-when you ask: ``turboadb fetch-tools``, the GUI's download prompt, or
-``turboadb.fetch_tools()``. The automatic :func:`ensure_tools` only downloads a
+on the first launch or command, or when you ask: ``turboadb fetch-tools``, the
+GUI's download prompt, or ``turboadb.fetch_tools()``. The automatic :func:`ensure_tools` only installs a
 tool that is MISSING; upgrades happen only through :func:`upgrade_tools`
 (``turboadb upgrade-tools`` / self-update / the GUI Upgrade button).
 """
@@ -27,12 +27,15 @@ import stat
 import time
 import shutil
 import logging
+import socket
 import zipfile
 import tempfile
 import platform
 import threading
 import subprocess
+import http.client
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 
@@ -40,13 +43,17 @@ from .exceptions import ADBError, ADBNotFoundError
 from .tools import (  # noqa: F401  (_exe re-exported for existing importers)
     ADB_WINDOWS_FILES,
     NO_WINDOW,
+    WINGET_PACKAGES,
     _adb_version_output,
     _exe,
+    _is_absolute,
+    _on_path,
     clear_tools_cache,
     find_adb,
     find_scrcpy,
     managed_tools_dir,
     parse_version,
+    winget_copy,
 )
 
 PLATFORM_TOOLS_REPO_XML = "https://dl.google.com/android/repository/repository2-3.xml"
@@ -140,19 +147,68 @@ def scrcpy_dir() -> str:
 
 
 def managed_adb() -> str | None:
+    """The adb TurboADB looks after: winget's copy, else the one in the cache."""
     p = os.path.join(adb_dir(), _exe("adb"))
-    return p if os.path.isfile(p) else None
+    return winget_copy("adb") or (p if os.path.isfile(p) else None)
 
 
 def managed_scrcpy() -> str | None:
+    """The scrcpy TurboADB looks after: winget's copy, else the one in the cache."""
     p = os.path.join(scrcpy_dir(), _exe("scrcpy"))
-    return p if os.path.isfile(p) else None
+    return winget_copy("scrcpy") or (p if os.path.isfile(p) else None)
 
 
 # --------------------------------------------------------------------------- #
 # download + extract helpers
 # --------------------------------------------------------------------------- #
-def _download(url: str, dest: str, on_progress=None) -> None:
+# A server's bad moment: worth asking again (GitHub answers a release file with
+# a 504 now and then, one file at a time, and the same file a minute later).
+_RETRY_HTTP = frozenset((408, 425, 429, 500, 502, 503, 504))
+_RETRY_ERRORS = (
+    urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
+    http.client.IncompleteRead, http.client.RemoteDisconnected,
+)
+_DOWNLOAD_TRIES = 4
+_RETRY_WAITS_S = (1, 3, 6, 10, 15, 20)
+
+
+class ServerDidNotAnswer(ADBError):
+    """A download failed because of the server or the network, not the file."""
+
+
+def _worth_retrying(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRY_HTTP
+    if isinstance(getattr(exc, "reason", None), socket.gaierror):
+        return False  # no name lookup: this PC is offline, asking again won't help
+    return isinstance(exc, _RETRY_ERRORS)
+
+
+def _with_retries(action, tries: int = _DOWNLOAD_TRIES):
+    """``action()``, asked again after a pause while a server has a bad moment."""
+    for attempt in range(max(1, tries)):
+        try:
+            return action()
+        except Exception as exc:
+            if attempt + 1 >= tries or not _worth_retrying(exc):
+                raise
+            time.sleep(_RETRY_WAITS_S[min(attempt, len(_RETRY_WAITS_S) - 1)])
+
+
+def _download(url: str, dest: str, on_progress=None, tries: int = _DOWNLOAD_TRIES) -> None:
+    try:
+        _with_retries(lambda: _download_once(url, dest, on_progress), tries)
+    except Exception as exc:
+        if not _worth_retrying(exc):
+            raise
+        host = urllib.parse.urlparse(url).hostname or "the download server"
+        raise ServerDidNotAnswer(
+            f"{host} did not answer ({exc}), after {max(1, tries)} tries. Nothing was "
+            "changed, and a copy you already have still works. Try again in a while."
+        ) from exc
+
+
+def _download_once(url: str, dest: str, on_progress=None) -> None:
     req = urllib.request.Request(url, headers=_UA)
     with urllib.request.urlopen(req, timeout=60) as resp:
         total = int(resp.headers.get("Content-Length", 0))
@@ -420,11 +476,178 @@ def _require_runnable(adb: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# public download functions
+# winget
+# --------------------------------------------------------------------------- #
+# How winget ends, as an unsigned 32-bit code.  It is done when the package
+# is already at its newest.
+_WINGET_DONE = frozenset((0, 0x8A15002B, 0x8A150061))  # updated, UPDATE_NOT_APPLICABLE, ALREADY_INSTALLED
+# Asking again changes none of these: bad arguments, no installer for this PC,
+# a hash mismatch, no such package, and a 404: winget lists a file its publisher
+# has taken down (Google withdrew platform-tools 37.0.2 while winget offered it).
+_WINGET_FINAL = frozenset((0x8A150002, 0x8A150010, 0x8A150011, 0x8A150014, 0x80190194))
+_WINGET_TRIES = 2
+_WINGET_TIMEOUT_S = 240.0
+# winget prints about this many lines for one package, and no percentages when
+# a program reads its output: the progress bar follows the lines, in any language.
+_WINGET_LINES = 11
+# The line of `winget show` with the version; its label depends on the language.
+_WINGET_VERSION = re.compile(r"^[^:：\r\n]+[:：]\s*v?(\d+(?:\.\d+)+)\s*$", re.M)
+
+
+def winget_exe() -> str | None:
+    """winget by its full path, or None where this PC has none.  Never one
+    lying in the current folder (see :func:`tools._on_path`)."""
+    if os.name != "nt":
+        return None
+    found = _on_path("winget")
+    if found:
+        return found
+    # a program started from a shortcut may have no WindowsApps on its PATH
+    local = os.environ.get("LOCALAPPDATA", "")
+    alias = os.path.join(local, "Microsoft", "WindowsApps", "winget.exe")
+    return alias if _is_absolute(alias) and os.path.lexists(alias) else None
+
+
+def _tell(on_progress, percent: int) -> None:
+    if on_progress:
+        try:
+            on_progress(percent)
+        except Exception:
+            pass
+
+
+def _run_winget(cmd: list, on_progress=None, timeout: float = _WINGET_TIMEOUT_S) -> tuple:
+    """Run one winget command with no window: ``(code, output lines)``.  *code*
+    is None when it did not finish within *timeout* seconds and was ended."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=NO_WINDOW,
+    )
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, expire)
+    watchdog.daemon = True
+    watchdog.start()
+    lines = []
+    try:
+        for line in proc.stdout:
+            if line.strip():
+                lines.append(line.strip())
+                _tell(on_progress, min(95, len(lines) * 100 // _WINGET_LINES))
+        code = proc.wait()
+    finally:
+        watchdog.cancel()
+        proc.stdout.close()
+    return (None if expired.is_set() else code & 0xFFFFFFFF), lines
+
+
+def _winget_problem(winget: str, tool: str, force: bool, on_progress) -> str | None:
+    """Have winget install or update *tool*.  None when it did, else why not.
+    Asked twice: winget's downloads come from the same servers as ours.
+
+    ``--force`` takes the installed copy away first and can fail after that, so
+    only a reinstall the user asked for uses it, once winget has said there is
+    nothing newer to install."""
+    cmd = [
+        winget, "install", "--id", WINGET_PACKAGES[tool], "--exact", "--source", "winget",
+        "--scope", "user", "--silent", "--accept-package-agreements",
+        "--accept-source-agreements", "--disable-interactivity",
+    ]
+    problem = ""
+    for attempt in range(_WINGET_TRIES):
+        if attempt:
+            time.sleep(_RETRY_WAITS_S[attempt])
+        try:
+            code, lines = _run_winget(cmd, on_progress)
+            if force and code in _WINGET_DONE and code != 0 and "--force" not in cmd:
+                cmd = cmd + ["--force"]
+                code, lines = _run_winget(cmd, on_progress)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return str(exc)
+        if code in _WINGET_DONE:
+            _tell(on_progress, 100)
+            return None
+        if code is None:
+            problem = f"it did not finish within {_WINGET_TIMEOUT_S:.0f} s"
+        else:
+            said = lines[-1] if lines else "no output"
+            problem = said if f"{code:08x}" in said.lower() else f"{said} (0x{code:08X})"
+        if code in _WINGET_FINAL:
+            break
+    return problem
+
+
+def _install_with_winget(tool: str, existing: str | None, *, force: bool = False,
+                         on_progress=None) -> str | None:
+    """*tool* installed or updated by winget, and the path to it.
+
+    None leaves it to the publisher's download: this PC has no winget, or winget
+    failed and holds no copy.  When it still holds one the failure is raised,
+    because a download would go to a folder that is looked at only after
+    winget's.  An adb server locks its adb.exe, so it stops first, and scrcpy's
+    release has an adb of its own that may be the one running."""
+    winget = winget_exe()
+    if winget is None:
+        return None
+    shared = _kill_adb_server(existing if tool == "adb" else None) if existing else []
+    try:
+        problem = _winget_problem(winget, tool, force, on_progress)
+    finally:
+        clear_tools_cache()
+        _restore_shared_server(shared)
+    if problem and winget_copy(tool):  # asked now: a failed --force can leave none
+        raise ADBError(
+            f"winget could not update {tool}: {problem.rstrip('.')}. Nothing was changed, and the "
+            "copy you have still works. Try again in a while."
+        )
+    if problem:
+        _log.warning("winget could not install %s (%s); using its publisher's download", tool, problem)
+        return None
+    installed = winget_copy(tool)
+    if not installed:
+        _log.warning("winget installed %s somewhere unexpected; using its publisher's download", tool)
+    return installed
+
+
+def winget_latest(tool: str) -> str | None:
+    """The newest version of *tool* winget can install, or None if it cannot say."""
+    winget = winget_exe()
+    if winget is None:
+        return None
+    try:
+        out = subprocess.run(
+            [winget, "show", "--id", WINGET_PACKAGES[tool], "--exact", "--source", "winget",
+             "--accept-source-agreements", "--disable-interactivity"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = _WINGET_VERSION.search(out.stdout or "") if out.returncode == 0 else None
+    return found.group(1) if found else None
+
+
+# --------------------------------------------------------------------------- #
+# public install functions
 # --------------------------------------------------------------------------- #
 def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
-    """Download + extract Google's platform-tools into the cache. Returns the
-    path to the cached ``adb`` executable.
+    """Install adb and return the path to it: through winget where there is
+    one, else Google's platform-tools into the cache.
 
     The archive is extracted to a STAGING directory and swapped in atomically,
     with the adb server stopped first — extracting straight over a live adb.exe
@@ -446,6 +669,9 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
             "Google builds no adb for this machine "
             f"({platform.system()} {platform.machine()}). {_USE_SYSTEM_ADB}"
         )
+    installed = _install_with_winget("adb", existing, force=force, on_progress=on_progress)
+    if installed:
+        return installed
     archive = _archive_to_download()
     url = archive.get("url") or PLATFORM_TOOLS_URLS[_os_key()]
     if not archive.get("url"):
@@ -459,6 +685,12 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
         _download(url, zip_path, on_progress)
         _check_zip(zip_path)  # a truncated download must fail BEFORE the swap
         _verify_platform_tools(zip_path, archive)
+        return _install_platform_tools(zip_path, existing)
+
+
+def _install_platform_tools(zip_path: str, existing: str | None) -> str:
+    """Replace the managed platform-tools with those in *zip_path*."""
+    with _staging_dir() as tmp:
         # the zip contains a top-level "platform-tools/" folder
         staging = os.path.join(tmp, "new")
         _extract_zip(zip_path, staging)
@@ -583,10 +815,13 @@ def _verify_sha256(path: str, name: str, sums_url: str) -> None:
     MISMATCH always raises (corrupt or tampered download)."""
     import hashlib
 
-    try:
+    def fetch():
         req = urllib.request.Request(sums_url, headers=_UA)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            sums = resp.read().decode("utf-8", "replace")
+            return resp.read().decode("utf-8", "replace")
+
+    try:
+        sums = _with_retries(fetch)
     except Exception:
         return  # can't fetch the sums — skip check
     expected = None
@@ -669,12 +904,42 @@ def _check_zip(path: str) -> None:
         )
 
 
+# Held while scrcpy is downloaded and swapped in: the launch check, a device
+# tab's Start and Tools → Download may all ask for it at once.
+_SCRCPY_INSTALL_LOCK = threading.RLock()
+
+
+def install_missing_scrcpy(*, on_progress=None) -> str:
+    """The scrcpy to use, downloaded first if none can be found (waiting for a
+    download already under way).  Unlike :func:`ensure_tools` it can be asked
+    again in the same process: a screen started after a failed launch check,
+    or before that check has finished, gets scrcpy there and then.
+
+    Raises :class:`ADBNotFoundError` for a path set on purpose that names no
+    scrcpy (a download would not change it) and where no prebuilt exists."""
+    with _SCRCPY_INSTALL_LOCK:
+        try:
+            return find_scrcpy()
+        except ADBNotFoundError as exc:
+            if getattr(exc, "configured", None):
+                raise
+        return download_scrcpy(on_progress=on_progress)
+
+
 def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
-    """Download + extract the latest scrcpy (Windows prebuilt) into the cache.
-    Returns the path to the cached ``scrcpy`` executable."""
+    """Install scrcpy and return the path to it: through winget where there
+    is one, else the latest Windows prebuilt into the cache."""
+    with _SCRCPY_INSTALL_LOCK:
+        return _install_scrcpy_release(force=force, on_progress=on_progress)
+
+
+def _install_scrcpy_release(*, force: bool, on_progress) -> str:
     existing = managed_scrcpy()
     if existing and not force:
         return existing
+    installed = _install_with_winget("scrcpy", existing, force=force, on_progress=on_progress)
+    if installed:
+        return installed
     url, asset_name, sums_url = _scrcpy_assets()
     with _staging_dir() as tmp:
         zip_path = os.path.join(tmp, "scrcpy.zip")
@@ -682,6 +947,12 @@ def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
         _check_zip(zip_path)
         if sums_url:
             _verify_sha256(zip_path, asset_name, sums_url)
+        return _install_scrcpy(zip_path, existing)
+
+
+def _install_scrcpy(zip_path: str, existing: str | None) -> str:
+    """Replace the managed scrcpy with the one in *zip_path*."""
+    with _staging_dir() as tmp:
         staging = os.path.join(tmp, "scrcpy-new")
         _extract_zip(zip_path, tmp, strip_top_to=staging)
         if not os.path.isfile(os.path.join(staging, _exe("scrcpy"))):
@@ -813,7 +1084,7 @@ def ensure_tools(*, on_progress=None, notify=None, scrcpy: bool = True) -> dict:
                         n for n, w in (("platform-tools", want_adb), ("scrcpy", want_scrcpy)) if w
                     )
                     notify(
-                        f"Downloading latest {what} (one-time; set TURBOADB_AUTO_FETCH=0 to skip)…"
+                        f"Installing {what} (one-time; set TURBOADB_AUTO_FETCH=0 to skip)…"
                     )
                 res = fetch_tools(
                     adb=want_adb, scrcpy=want_scrcpy, force=False, on_progress=on_progress
@@ -999,7 +1270,13 @@ def check_updates() -> dict:
     ``supported`` says whether TurboADB can download that tool on this OS.
     Makes no changes.
 
-    Only the MANAGED copy (the one downloads replace, and the one TurboADB
+    ``latest`` comes from where the copy came from.  For one winget installed it
+    is the newest winget can deliver, so nothing is offered that it does not
+    have yet: a publisher's release reaches winget some days later.  For one
+    from the publisher it is the publisher's: winget can list a version the
+    publisher has withdrawn, and the update it offered would never arrive.
+
+    Only the MANAGED copy (the one an install replaces, and the one TurboADB
     prefers) is version-checked. ``installed`` is None when there is no managed
     copy — so the decision is "install", not "up to date". Passing the missing
     path straight to ``installed_*_version`` made it fall back to the PATH tool,
@@ -1009,7 +1286,8 @@ def check_updates() -> dict:
     a_path, s_path = managed_adb(), managed_scrcpy()
     ai = installed_adb_version(a_path) if a_path else None
     si = installed_scrcpy_version(s_path) if s_path else None
-    al, sl = latest_adb_version(), latest_scrcpy_version()
+    al = (winget_copy("adb") and winget_latest("adb")) or latest_adb_version()
+    sl = (winget_copy("scrcpy") and winget_latest("scrcpy")) or latest_scrcpy_version()
     return {
         "adb": {
             "installed": ai,
@@ -1101,15 +1379,16 @@ def upgrade_tools(*, on_progress=None, notify=None, checks: dict | None = None) 
 def fetch_tools(
     *, adb: bool = True, scrcpy: bool = True, force: bool = False, on_progress=None, on_stage=None
 ) -> dict:
-    """Download whatever's requested into the cache. Returns
+    """Install whatever's requested, through winget where there is one, else
+    into the cache. Returns
     ``{"adb": path|None, "scrcpy": path|None, "errors": {...}}``.
 
     *on_stage* (optional) is called with a short label ("adb (1/2)", …) as each
-    tool starts, so a progress UI can say WHAT is downloading instead of its
+    tool starts, so a progress UI can say WHAT is installing instead of its
     bar appearing to jump backwards between the two 0-100 runs.
 
-    scrcpy bundles its own adb on Windows; downloading scrcpy alone is enough to
-    get both, but fetching platform-tools gives you the latest standalone adb.
+    scrcpy's Windows release has its own adb; installing scrcpy alone is enough
+    to get both, but platform-tools gives you the latest standalone adb.
     """
 
     def stage(label):
