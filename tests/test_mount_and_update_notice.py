@@ -6,6 +6,7 @@ update adb or scrcpy finished quietly: the user is told, with what to run.
 
 No device is used: FakeAdb answers.
 """
+import time
 import types
 
 import pytest
@@ -16,9 +17,21 @@ from turboadb.core import ADBHandler
 from turboadb.exceptions import ADBCommandError
 
 
+class _Clock:
+    """``time`` for core alone.  Patched on the real module, every thread still
+    running from an earlier test would spin through it as well."""
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    @staticmethod
+    def sleep(_seconds):
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
-    monkeypatch.setattr(core.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(core, "time", _Clock())
 
 
 def _handler():

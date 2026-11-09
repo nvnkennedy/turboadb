@@ -321,12 +321,16 @@ def test_zoom_moves_a_screencap_view_as_well(panel, monkeypatch):
 
 # ---- the webcam ---------------------------------------------------------------
 @pytest.fixture
-def camera(qapp):
+def camera(qapp, monkeypatch):
     from turboadb.gui import camera_widget
 
+    # It scans for cameras 150 ms after it is made, in a thread: a panel
+    # destroyed while that runs takes the whole process down.
+    monkeypatch.setattr(camera_widget.CameraPanel, "_auto_scan", lambda self: None)
     made = camera_widget.CameraPanel()
     made.resize(800, 600)
     yield made
+    made.close_panel()
     made.deleteLater()
     _pump(qapp, 10)
 

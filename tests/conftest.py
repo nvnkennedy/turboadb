@@ -139,13 +139,17 @@ def fake_adb(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _no_open_message_box(monkeypatch):
-    """Qt's offscreen platform crashes in QMessageBox.open (a real desktop does
-    not), and a question left open would wait for nobody."""
+    """Qt's offscreen platform crashes in QMessageBox (a real desktop does not),
+    and a question left open would wait for nobody.  A window left open by one
+    test can ask it during another (the launch check of a PC with no adb)."""
     try:
         from PyQt5.QtWidgets import QMessageBox
     except ImportError:
         return
     monkeypatch.setattr(QMessageBox, "open", lambda self: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_a, **_k: QMessageBox.No)
+    for name in ("information", "warning", "critical"):
+        monkeypatch.setattr(QMessageBox, name, lambda *_a, **_k: QMessageBox.Ok)
 
 
 @pytest.fixture(autouse=True)
