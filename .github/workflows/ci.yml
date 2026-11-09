@@ -21,6 +21,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.8", "3.11", "3.13"]
+        # No Python 3.8 is built for Ubuntu 26.04, which ubuntu-latest now is.
+        exclude:
+          - os: ubuntu-latest
+            python-version: "3.8"
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.8"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
