@@ -16,6 +16,8 @@
 
 ---
 
+> **6.0.1:** head units over Remote Desktop keep their full resolution.
+>
 > **New in 6.0.0:** large screens and head units now start **the way scrcpy
 > itself does**, with hardware decoding; **zoom** on the device screen and the
 > webcam; ADB screencap only if you choose it; **Tab** in the Android shell reads
@@ -59,7 +61,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-6.0.0-win64.exe`** from the
+1. Download **`TurboADB-6.0.1-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
@@ -71,7 +73,7 @@ TurboADB is published on GitHub Releases, not on PyPI, so pip installs the wheel
 attached to the release:
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl
 ```
 
 On Windows this already includes the app: the package carries the same
@@ -81,7 +83,7 @@ replace the packaged file). To run the GUI from the Python code instead — on
 Linux or macOS, for example — add the GUI extra:
 
 ```bash
-pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl"
+pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl"
 ```
 
 Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or

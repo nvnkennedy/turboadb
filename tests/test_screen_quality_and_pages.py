@@ -426,9 +426,10 @@ def test_compat_keeps_a_large_display_whole(monkeypatch):
     assert seen["opts"].max_size == 1600  # a limit set on purpose stays
 
 
-def test_remote_desktop_no_longer_halves_a_large_display(panel):
+def test_software_rendering_keeps_the_whole_video(panel):
+    """A 7200-wide head unit arrived as 1920x314 over Remote Desktop."""
     panel._opt["soft"] = True
-    assert panel._tune(mp.ScrcpyOptions(no_audio=True)).max_size == 1920
+    assert panel._tune(mp.ScrcpyOptions(no_audio=True)).max_size is None
     assert panel._tune(mp.ScrcpyOptions(no_audio=True, max_size=1000)).max_size == 1000
 
 

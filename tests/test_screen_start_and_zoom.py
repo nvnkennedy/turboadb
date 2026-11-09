@@ -319,6 +319,91 @@ def test_zoom_moves_a_screencap_view_as_well(panel, monkeypatch):
     assert placed[-1] == (100, -300, 600, 1200)
 
 
+# ---- Remote Desktop and very large displays -----------------------------------
+def test_remote_desktop_starts_as_scrcpy_starts_itself(qapp, monkeypatch):
+    """Forced software rendering and a 1920 cap turned 7200x1178 into 1920x314."""
+    monkeypatch.setattr(mp, "is_remote_session", lambda: True)
+    made = mp.MirrorPanel(types.SimpleNamespace(serial="s", config=None), {"name": "s"})
+    try:
+        assert made._rdp is True and made._opt["soft"] is False
+        opts = made._tune(mp.ScrcpyOptions(no_audio=True), native=True)
+        assert opts.render_driver is None and opts.max_size is None and opts.max_fps is None
+    finally:
+        made._closing = True
+        made._host_sync_timer.stop()
+        made._place_timer.stop()
+        made.deleteLater()
+        _pump(qapp, 10)
+
+
+def test_a_default_renderer_that_cannot_run_falls_back_to_software(panel):
+    panel._launch_opts = mp.ScrcpyOptions()
+    panel._launch_spec = {"display_id": 0}
+    panel._schedule_retry = lambda delay, callback: None
+    panel._retry_or_show_scrcpy_failure("ERROR: Could not create renderer: no driver")
+    assert panel._opt["soft"] is True and panel._retry_count == 1
+
+
+def test_other_failures_leave_the_renderer_alone(panel):
+    panel._launch_opts = mp.ScrcpyOptions()
+    panel._launch_spec = {"display_id": 0}
+    panel._schedule_retry = lambda delay, callback: None
+    panel._retry_or_show_scrcpy_failure("ERROR: Could not open video stream")
+    assert panel._opt["soft"] is False
+
+
+def test_software_failing_does_not_loop(panel):
+    panel._opt["soft"] = True
+    panel._launch_opts = mp.ScrcpyOptions(render_driver="software")
+    panel._launch_spec = {"display_id": 0}
+    logged = []
+    panel.log.connect(logged.append)
+    panel._schedule_retry = lambda delay, callback: None
+    panel._retry_or_show_scrcpy_failure("ERROR: Could not create renderer")
+    assert not any("using software rendering instead" in line for line in logged)
+
+
+@pytest.mark.parametrize("text, size", [
+    ("INFO: Texture: 1920x314\n", (1920, 314)),
+    ("INFO: Texture (D3D11VA): 4096x672\n", (4096, 672)),  # hardware decoding
+    ("INFO: Texture: 1080x2400\nINFO: Texture: 2400x1080\n", (2400, 1080)),  # rotated since
+    ("INFO: Video decoding: d3d11va\n", None),
+    ("", None),
+])
+def test_the_video_size_is_read_from_every_kind_of_log(text, size):
+    assert mp._video_size_in_log(text) == size
+
+
+def test_actual_pixels_uses_what_the_encoder_really_makes(panel, monkeypatch):
+    """A 7200-wide display the encoder could only make 4096 wide."""
+    panel._scrcpy = _Session("INFO: Texture (D3D11VA): 4096x672\n")
+    panel._displays = [{"id": 0, "size": "7200x1178"}]
+    panel._launch_spec = {"display_id": 0}
+    panel.container.resize(2048, 800)
+    monkeypatch.setattr(panel, "devicePixelRatioF", lambda: 1.0)
+    assert panel._actual_pixels_zoom() == 2.0
+
+
+def test_hardware_decoding_counts_as_a_picture(panel):
+    _waiting(panel, "INFO: Renderer: direct3d11\nINFO: Texture (D3D11VA): 4096x672\n", ran=1.0)
+    panel._check_alive()
+    assert panel._became_ready
+
+
+def test_fill_covers_the_window_with_a_very_wide_display(panel):
+    panel.container.resize(1500, 900)
+    panel._video_aspect = 7200 / 1178
+    zoom = panel._fill_zoom()
+    assert zoom == pytest.approx(3.67, abs=0.01)  # the picture is now 900 high
+    x, y, w, h = mp._zoomed_rect(1500, 900, panel._video_aspect, zoom)
+    assert h == 900 and w > 5000 and y == 0
+
+
+def test_fill_with_no_picture_shape_stays_at_fit(panel):
+    panel._video_aspect = None
+    assert panel._fill_zoom() == 1.0
+
+
 # ---- the webcam ---------------------------------------------------------------
 @pytest.fixture
 def camera(qapp, monkeypatch):

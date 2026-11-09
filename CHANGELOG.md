@@ -3,6 +3,24 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.0.1
+
+### Fixed
+
+- **Remote Desktop keeps the display's full resolution.** Over Remote Desktop,
+  TurboADB forced software rendering, 30 fps and a video 1920 wide, which turned a
+  7200-wide head unit into a 1920x314 strip. It now starts the way scrcpy does by
+  itself, whatever the session, and scrcpy reduces the size only if the device's
+  encoder cannot take it. If the session's graphics really cannot draw, TurboADB
+  switches to software rendering, still at full size.
+- **Actual pixels (1:1) is right with hardware decoding.** It used the display's
+  size where the video was smaller than the display.
+
+### New
+
+- **Fill the window** in the zoom menu: a very wide display uses the full height
+  and scrolls sideways.
+
 ## 6.0.0
 
 ### New

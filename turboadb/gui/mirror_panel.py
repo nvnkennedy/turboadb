@@ -646,6 +646,13 @@ def _scrcpy_output(log_text) -> str:
     return text
 
 
+def _video_size_in_log(text):
+    """``(width, height)`` from scrcpy's newest "Texture" line, or None.  With
+    hardware decoding that line reads ``Texture (D3D11VA): 4096x672``."""
+    found = re.findall(r"Texture[^:\n]*:\s*(\d+)x(\d+)", text or "")
+    return (int(found[-1][0]), int(found[-1][1])) if found else None
+
+
 def _renderer_failed(log_text) -> bool:
     """True when scrcpy reported that it could not set up its renderer.
 
@@ -741,8 +748,6 @@ def _file_stamp(path):
     return info.st_size, info.st_mtime_ns
 
 
-# The longest video side over Remote Desktop, where the CPU draws every frame.
-_REMOTE_DESKTOP_MAX_SIZE = 1920
 # The most a head unit is asked for, whatever Settings says.  scrcpy's own
 # default is 8M; a head unit's encoder and its adb link are where a high rate
 # hurts, and Options → compat can be turned off for one that copes.
@@ -1991,7 +1996,10 @@ class MirrorPanel(QWidget):
             "audio": bool(settings_mod.get("scrcpy_audio", True)),
             "audio_source": str(settings_mod.get("scrcpy_audio_source", "output") or "output"),
             "compat": bool(automotive),
-            "soft": bool(self._rdp),
+            # Remote Desktop is no reason by itself: native scrcpy runs there.
+            # Forced, this shrank a 7200-wide display to 1920x314. A renderer
+            # that really cannot run turns it on (_retry_or_show_scrcpy_failure).
+            "soft": False,
             "embed": bool(prefer_embed),
             "kb_uhid": False,
             "cam_front": False,
@@ -2148,6 +2156,7 @@ class MirrorPanel(QWidget):
         self.btn_zoom.setPopupMode(QToolButton.InstantPopup)
         zoom_menu = QMenu(self.btn_zoom)
         zoom_menu.addAction("Fit to the window", lambda: self._zoom_to(1.0))
+        zoom_menu.addAction("Fill the window", lambda: self._zoom_to(self._fill_zoom()))
         zoom_menu.addAction("Actual pixels (1:1)", lambda: self._zoom_to(self._actual_pixels_zoom()))
         zoom_menu.addSeparator()
         for factor in (2.0, 3.0, 4.0):
@@ -2918,12 +2927,12 @@ class MirrorPanel(QWidget):
         self._track_option("compat", self.act_compat)
         self.act_compat.toggled.connect(self._on_compat_toggled)
         v.addWidget(self.act_compat)
-        hint("H.264 + safe caps — for head-unit encoders that choke on defaults")
+        hint("scrcpy's own defaults, with H.264 and no audio — what head units run best with")
         self.act_soft = QCheckBox("Software rendering")
         self.act_soft.setChecked(opt["soft"])
         self._track_option("soft", self.act_soft)
         v.addWidget(self.act_soft)
-        hint("needed over Remote Desktop / GPU-less sessions")
+        hint("only if the picture fails or stays black (a PC with no usable graphics)")
         self.act_embed = QCheckBox("Show screen inside this tab")
         self.act_embed.setChecked(opt["embed"])
         self._track_option("embed", self.act_embed)
@@ -3437,11 +3446,11 @@ class MirrorPanel(QWidget):
 
     def _video_pixels(self):
         """``(width, height)`` of the video, or None: scrcpy's own report when
-        it gives one (software decoding), else the display's size."""
-        found = re.search(r"Texture:\s*(\d+)x(\d+)", _read_log_tail(self._scrcpy, 4096)) if (
+        it gives one, else the display's size."""
+        found = _video_size_in_log(_read_log_tail(self._scrcpy, 4096)) if (
             self._scrcpy is not None) else None
         if found:
-            return int(found.group(1)), int(found.group(2))
+            return found
         spec = self._launch_spec or {}
         return _parse_display_size(self._selected_display_entry(spec.get("display_id")).get("size"))
 
@@ -3453,6 +3462,15 @@ class MirrorPanel(QWidget):
         if not size or area_w < 1 or area_h < 1:
             return 1.0
         return max(1.0, size[0] / area_w, size[1] / area_h)
+
+    def _fill_zoom(self) -> float:
+        """The zoom at which the picture covers its whole place: a very wide
+        display then uses the full height, and scrolls sideways."""
+        aspect, width, height = self._video_aspect, self.container.width(), self.container.height()
+        if not aspect or width < 1 or height < 1:
+            return 1.0
+        fit_w = min(float(width), height * aspect)
+        return max(1.0, width / fit_w, height / (fit_w / aspect))
 
     def _place_screencap(self) -> None:
         view = self._screencap
@@ -4353,7 +4371,6 @@ class MirrorPanel(QWidget):
         Over Remote Desktop, applies software rendering and sensible caps."""
         if self._opt["soft"]:
             opts.render_driver = "software"
-            opts.max_size = opts.max_size or _REMOTE_DESKTOP_MAX_SIZE
             opts.bit_rate = opts.bit_rate or "8M"
             opts.max_fps = opts.max_fps or 30
             if not opts.no_audio:
@@ -5009,11 +5026,16 @@ class MirrorPanel(QWidget):
         # Over Remote Desktop keep the compat profile, but HONOUR the embed
         # choice — it used to be silently disabled here, which is why "embed"
         # appeared to do nothing at all on RDP setups.
+        if self._rdp and not self._opt["soft"] and embed and not use_screencap:
+            self.log.emit(
+                "[INFO] over Remote Desktop: if the picture stays black, "
+                "tick Options → Software rendering"
+            )
         if self._opt["soft"]:
             compat = True
             if embed and not use_screencap:
                 self.log.emit(
-                    "[INFO] embedding over Remote Desktop — if the "
+                    "[INFO] software rendering, inside this tab — if the "
                     "picture stays black, untick “Embed window in "
                     "this tab” and mirror in a separate window"
                 )
@@ -5352,7 +5374,7 @@ class MirrorPanel(QWidget):
     # alone (the "fake started" bug). Nor "Renderer:": scrcpy makes its renderer
     # before the first frame.  Only these lines mean a frame actually flowed.
     _HEALTHY = (
-        "Texture:",
+        "Texture",
         "Recording started",
         "Frame: ",
         "v4l2",
@@ -5395,13 +5417,13 @@ class MirrorPanel(QWidget):
         """Say once what the device is really encoding: a screen that looks
         soft on a large display shows here whether its video was reduced (by
         a setting, or by scrcpy after the device's encoder refused the size)."""
-        found = re.search(r"Texture:\s*(\d+)x(\d+)", _read_log_tail(self._scrcpy, 4096))
+        found = _video_size_in_log(_read_log_tail(self._scrcpy, 4096))
         if not found:
             return
         self._video_reported = True
         opts = self._launch_opts
         rate = f" at {opts.bit_rate} bit/s" if opts is not None and opts.bit_rate else ""
-        self.log.emit(f"[INFO] screen video: {found.group(1)}x{found.group(2)}{rate}")
+        self.log.emit(f"[INFO] screen video: {found[0]}x{found[1]}{rate}")
 
     def _check_alive(self):
         """Poll the scrcpy process. Readiness = its window is up (works for embed
@@ -5531,6 +5553,22 @@ class MirrorPanel(QWidget):
             self.log.emit(
                 "[INFO] scrcpy could not use OpenGL on this PC; "
                 "using its default renderer instead"
+            )
+        elif (
+            not self._opt["soft"]
+            and opts is not None
+            and not opts.render_driver
+            and _renderer_failed(error)
+        ):
+            # Not even scrcpy's default renderer runs here (a remote session
+            # with no usable graphics): the retries draw in software.
+            renderer_failed = True
+            self._opt["soft"] = True
+            box = self.__dict__.get("act_soft")
+            if box is not None:
+                box.setChecked(True)
+            self.log.emit(
+                "[INFO] scrcpy could not use this PC's graphics; using software rendering instead"
             )
         tries = getattr(self, "_retry_count", 0)
         self._retry_error = error  # what a retry that is put on hold reports

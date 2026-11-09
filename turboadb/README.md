@@ -44,13 +44,13 @@ can run on background threads, so it never blocks or crashes the caller.
 ## Install
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl
 ```
 
 That gives you the Python API, the `turboadb` CLI and `turboadb-gui`. On Windows
 the wheel bundles the GUI executable, so `turboadb-gui` works without PyQt5. To
 run the GUI from the Python package instead, install the optional GUI dependency:
-`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
+`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
 
 TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 **`scrcpy`**. It auto-detects them on your `PATH`, in the Android SDK, or in
@@ -671,10 +671,10 @@ locally; it supports `--rebuild-exe` to rebuild the executable first, and
     the common adb-version-mismatch that hides devices.
   - Or enable **USB redirection** in your RDP client (mstsc → Local Resources →
     More → your device).
-- **scrcpy over RDP** often can't open its video stream (no local GPU/decoder in
-  the RDP session). The **Device Control** screen detects scrcpy exiting early and
-  tells you so; try **compatibility mode** (forces H.264), and if it still fails,
-  mirroring isn't available in that RDP session — use it from a local session.
+- **scrcpy over RDP** runs as scrcpy does by itself, at the display's full size. If
+  it cannot use the session's graphics, TurboADB switches to software rendering. If
+  the picture stays black, tick **Options → Software rendering**, or open it in a
+  separate window.
 
 **"scrcpy won't work" on a head unit** → turn on **Device Control → Options →
 Compatibility mode (IVI / automotive)** (or **Screen ▾ → Open screen in
