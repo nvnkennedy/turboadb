@@ -39,6 +39,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QGridLayout,
     QProgressBar,
+    QScrollBar,
     QStatusBar,
 )
 
@@ -742,29 +743,33 @@ def _file_stamp(path):
 
 # The longest video side over Remote Desktop, where the CPU draws every frame.
 _REMOTE_DESKTOP_MAX_SIZE = 1920
-# Settings → Video bit rate's default suits a screen this size; more pixels at
-# the same rate is what makes a large display look grainy.
-_FULL_HD_PIXELS = 1920 * 1080
-_MAX_AUTO_BIT_RATE = 50_000_000  # the highest rate Settings offers
+# The most a head unit is asked for, whatever Settings says.  scrcpy's own
+# default is 8M; a head unit's encoder and its adb link are where a high rate
+# hurts, and Options → compat can be turned off for one that copes.
+_HEAD_UNIT_BIT_RATE = "16M"
+# Zoom factors over the fitted picture that the + and - buttons step through.
+ZOOM_STEPS = (1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+# A GPU surface larger than this is refused, or crawls.
+_MAX_ZOOMED_EDGE = 8192
 
 
-def _bit_rate_for_display(bit_rate, size, max_edge=None) -> str:
-    """*bit_rate*, raised in proportion for a display with more pixels than
-    1080p.  *size* is ``(width, height)``; *max_edge* the longest side the
-    video is limited to (the video's size counts, not the panel's)."""
-    if not size:
-        return bit_rate
-    width, height = size
-    longest = max(width, height)
-    if max_edge and longest > max_edge:
-        scale = max_edge / longest
-        width, height = width * scale, height * scale
-    pixels = width * height
-    if pixels <= _FULL_HD_PIXELS:
-        return bit_rate
-    wanted = int(int(_bitrate_to_bps(bit_rate)) * pixels / _FULL_HD_PIXELS)
-    wanted = min(wanted, _MAX_AUTO_BIT_RATE)
-    return f"{max(1, round(wanted / 1_000_000))}M"
+def _zoomed_rect(area_w, area_h, aspect, zoom, pan_x=0.5, pan_y=0.5):
+    """``(x, y, w, h)`` of the picture, inside an area of *area_w* x *area_h*.
+
+    Zoomed, the picture has the video's own shape (*aspect*, width / height)
+    and is larger than the area, which clips it: *pan_x* and *pan_y* (0 to 1)
+    say which part shows, and a side that still fits is centred.  At 1.0 it is
+    the whole area, as the renderer letter-boxes the video itself."""
+    if zoom <= 1.0 or not aspect or area_w < 1 or area_h < 1:
+        return 0, 0, area_w, area_h
+    fit_w = min(float(area_w), area_h * aspect)
+    fit_h = fit_w / aspect
+    width, height = fit_w * zoom, fit_h * zoom
+    shrink = min(1.0, _MAX_ZOOMED_EDGE / max(width, height))
+    w, h = int(round(width * shrink)), int(round(height * shrink))
+    x = (area_w - w) // 2 if w <= area_w else -int(round(pan_x * (w - area_w)))
+    y = (area_h - h) // 2 if h <= area_h else -int(round(pan_y * (h - area_h)))
+    return x, y, w, h
 
 
 def _record_size_for_active_view(displays, display_id, max_edge=1280):
@@ -1291,6 +1296,11 @@ class _VideoHost(QWidget):
         self._on_child_click = on_child_click
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setFocusPolicy(Qt.NoFocus)
+        # what shows around a zoomed picture that does not fill one side
+        self.setAutoFillBackground(True)
+        black = self.palette()
+        black.setColor(self.backgroundRole(), Qt.black)
+        self.setPalette(black)
         self.hide()
 
     def nativeEvent(self, event_type, message):
@@ -1993,6 +2003,12 @@ class MirrorPanel(QWidget):
         self._screencap_threads = []  # capture workers of stopped views, still finishing
         self._screencap_fps = self.SCREENCAP_FPS
         self._video_budget = {}  # per-panel scrcpy caps (DisplayWall tiles)
+        self._zoom = 1.0  # over the fitted picture
+        self._pan = [0.5, 0.5]  # which part of a zoomed picture shows (0 to 1)
+        self._syncing_zoom = False
+        self._no_picture_asked = False  # the "no picture yet" question, once a start
+        self._next_step_box = None  # the "scrcpy is not starting" question, while open
+        self._next_step_running = False  # whether that question is about a live scrcpy
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -2115,10 +2131,36 @@ class MirrorPanel(QWidget):
         self._esc_restore.setEnabled(False)
         self._esc_restore.activated.connect(lambda: self.act_max.setChecked(False))
 
+        # Zoom: the picture is made larger than its place and clipped by it,
+        # so the renderer really draws more pixels and touches still land right.
+        self.btn_zoom_out = self._icon_button("zoom-out", "Zoom out", "Zoom out")
+        self.btn_zoom_out.clicked.connect(lambda _checked=False: self._zoom_step(-1))
+        self.btn_zoom_in = self._icon_button(
+            "zoom-in", "Zoom in",
+            "Zoom in, then use the scroll bars to move around. "
+            "Clicks and touches still reach the right place on the device.",
+        )
+        self.btn_zoom_in.clicked.connect(lambda _checked=False: self._zoom_step(1))
+        self.btn_zoom = QToolButton()
+        self.btn_zoom.setText("Fit")
+        self.btn_zoom.setToolTip("Zoom level")
+        self.btn_zoom.setMinimumWidth(52)
+        self.btn_zoom.setPopupMode(QToolButton.InstantPopup)
+        zoom_menu = QMenu(self.btn_zoom)
+        zoom_menu.addAction("Fit to the window", lambda: self._zoom_to(1.0))
+        zoom_menu.addAction("Actual pixels (1:1)", lambda: self._zoom_to(self._actual_pixels_zoom()))
+        zoom_menu.addSeparator()
+        for factor in (2.0, 3.0, 4.0):
+            zoom_menu.addAction(f"{int(factor * 100)}%", lambda f=factor: self._zoom_to(f))
+        self.btn_zoom.setMenu(zoom_menu)
+
         for w in (self.cmb_display, self.btn_mirror, self.btn_stop, self.lbl_renderer):
             bar.addWidget(w)
         bar.addStretch()  # the rest (and add_toolbar_widget) sits on the right
         for w in (
+            self.btn_zoom_out,
+            self.btn_zoom,
+            self.btn_zoom_in,
             self.btn_popout,
             self.btn_shot,
             self.btn_record,
@@ -2189,7 +2231,24 @@ class MirrorPanel(QWidget):
             lambda _checked=False: self._popout_mirror()
         )
         self._video_active = None
-        lay.addWidget(self.container, 1)
+        # The scroll bars move a zoomed picture; they are outside the picture,
+        # whose clicks and wheel belong to the device.
+        self._pan_v = QScrollBar(Qt.Vertical)
+        self._pan_h = QScrollBar(Qt.Horizontal)
+        for bar_widget, axis in ((self._pan_h, 0), (self._pan_v, 1)):
+            bar_widget.setRange(0, 1000)
+            bar_widget.hide()
+            bar_widget.valueChanged.connect(lambda value, a=axis: self._on_pan(a, value))
+        area = QGridLayout()
+        area.setContentsMargins(0, 0, 0, 0)
+        area.setSpacing(0)
+        area.addWidget(self.container, 0, 0)
+        area.addWidget(self._pan_v, 0, 1)
+        area.addWidget(self._pan_h, 1, 0)
+        area.setRowStretch(0, 1)
+        area.setColumnStretch(0, 1)
+        lay.addLayout(area, 1)
+        self._sync_zoom_controls()
         self._sync_start_mode(self._opt["embed"])
         self._sync_renderer_controls()
         self._sync_video_surface(False)
@@ -2331,8 +2390,8 @@ class MirrorPanel(QWidget):
             return super().eventFilter(obj, event)
         if obj is self.__dict__.get("container") and event.type() == QEvent.Resize:
             self.empty_state.setGeometry(self.container.rect())
-            if self._screencap is not None:
-                self._screencap.setGeometry(self.container.rect())
+            self._place_screencap()
+            self._sync_zoom_controls()
             self._place_soon()  # the picture follows at once, not at the next poll
         # A click on the container's margins targets the mirror.  Importantly,
         # changing tabs or interacting with the Device Controls never does:
@@ -3225,6 +3284,7 @@ class MirrorPanel(QWidget):
         if aspect and abs(aspect - (self._video_aspect or 0.0)) > 0.01:
             self._video_aspect = aspect
             self.display_shape_changed.emit()
+            self._apply_zoom()
 
     def _on_screencap_ended(self, message, failed) -> None:
         if self._closing:
@@ -3282,6 +3342,8 @@ class MirrorPanel(QWidget):
     def _stop_screencap(self) -> bool:
         """Stop and remove the screencap view; True when one was running."""
         view, self._screencap = self._screencap, None
+        if view is not None:
+            self._reset_zoom()
         if view is None:
             return False
         self._sync_renderer_chip()
@@ -3327,13 +3389,107 @@ class MirrorPanel(QWidget):
             if value
         }
 
-    def _raise_bit_rate_for_big_display(self, opts, display_id) -> None:
-        """The default bit rate is sized for 1080p: spread over a larger
-        display it looks grainy.  A rate the user picked in Settings is kept."""
-        if opts.bit_rate != settings_mod.DEFAULTS["scrcpy_bit_rate"] or opts.video_source:
-            return
+    def _runs_like_native(self, compat, display_id) -> bool:
+        """Whether this start leaves video to scrcpy's own choices.
+
+        Forcing OpenGL makes scrcpy decode in software (native scrcpy decodes
+        in hardware): three times the CPU on a 2560x1600 display that is not
+        even moving, which is what made a large screen crawl here and run
+        smoothly in scrcpy itself.  OpenGL is kept for a tall phone screen
+        alone: small enough to decode, and drawn so much smaller that its
+        trilinear filtering is what keeps text readable."""
+        if compat:
+            return True
         size = _parse_display_size(self._selected_display_entry(display_id).get("size"))
-        opts.bit_rate = _bit_rate_for_display(opts.bit_rate, size, opts.max_size)
+        return not (size and size[1] > size[0] and size[0] <= 1440)
+
+    @staticmethod
+    def _limit_bit_rate(opts, cap) -> None:
+        if opts.bit_rate and int(_bitrate_to_bps(opts.bit_rate)) > int(_bitrate_to_bps(cap)):
+            opts.bit_rate = cap
+
+    # ----- zoom -----
+    def _zoom_step(self, direction) -> None:
+        if direction > 0:
+            self._zoom_to(next((z for z in ZOOM_STEPS if z > self._zoom + 0.001), ZOOM_STEPS[-1]))
+        else:
+            self._zoom_to(next((z for z in reversed(ZOOM_STEPS) if z < self._zoom - 0.001), 1.0))
+
+    def _zoom_to(self, zoom) -> None:
+        zoom = max(1.0, min(float(zoom or 1.0), ZOOM_STEPS[-1]))
+        if abs(zoom - self._zoom) < 0.001:
+            return
+        self._zoom = zoom
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        self._fit()
+        self._place_screencap()
+        self._sync_zoom_controls()
+
+    def _on_pan(self, axis, value) -> None:
+        if self._syncing_zoom:
+            return
+        bar = self._pan_v if axis else self._pan_h
+        self._pan[axis] = value / max(1, bar.maximum())
+        self._fit()
+        self._place_screencap()
+
+    def _video_pixels(self):
+        """``(width, height)`` of the video, or None: scrcpy's own report when
+        it gives one (software decoding), else the display's size."""
+        found = re.search(r"Texture:\s*(\d+)x(\d+)", _read_log_tail(self._scrcpy, 4096)) if (
+            self._scrcpy is not None) else None
+        if found:
+            return int(found.group(1)), int(found.group(2))
+        spec = self._launch_spec or {}
+        return _parse_display_size(self._selected_display_entry(spec.get("display_id")).get("size"))
+
+    def _actual_pixels_zoom(self) -> float:
+        """The zoom at which one device pixel is one pixel on this PC's screen."""
+        size = self._video_pixels()
+        area_w = self.container.width() * self.devicePixelRatioF()
+        area_h = self.container.height() * self.devicePixelRatioF()
+        if not size or area_w < 1 or area_h < 1:
+            return 1.0
+        return max(1.0, size[0] / area_w, size[1] / area_h)
+
+    def _place_screencap(self) -> None:
+        view = self._screencap
+        if view is None:
+            return
+        area = self.container.rect()
+        view.setGeometry(*_zoomed_rect(area.width(), area.height(), self._video_aspect,
+                                       self._zoom, *self._pan))
+
+    def _sync_zoom_controls(self) -> None:
+        """The zoom buttons and scroll bars, for the picture as it is now."""
+        if "_pan_h" not in self.__dict__:
+            return  # (still being built)
+        showing = bool(self._child_hwnd or self._screencap is not None)
+        zoomed = showing and self._zoom > 1.0
+        self.btn_zoom.setText(f"{int(round(self._zoom * 100))}%" if self._zoom > 1.0 else "Fit")
+        self.btn_zoom.setEnabled(showing)
+        self.btn_zoom_out.setEnabled(zoomed)
+        self.btn_zoom_in.setEnabled(showing and self._zoom < ZOOM_STEPS[-1])
+        area = self.container.rect()
+        _x, _y, w, h = _zoomed_rect(area.width(), area.height(), self._video_aspect,
+                                    self._zoom, *self._pan)
+        self._syncing_zoom = True
+        try:
+            for bar, axis, shown, whole in (
+                (self._pan_h, 0, area.width(), w),
+                (self._pan_v, 1, area.height(), h),
+            ):
+                needed = zoomed and whole > shown
+                if needed:
+                    page = max(1, 1000 * shown // whole)
+                    bar.setPageStep(page)
+                    bar.setMaximum(1000 - page)
+                    bar.setValue(int(round(self._pan[axis] * bar.maximum())))
+                bar.setVisible(needed)
+        finally:
+            self._syncing_zoom = False
 
     def use_full_video_quality(self) -> bool:
         """This display now fills the tab: drop its share of the wall's video
@@ -3361,8 +3517,10 @@ class MirrorPanel(QWidget):
             bit_rate=st.get("scrcpy_bit_rate") or None,
             no_audio=True,  # (_tune has a tip about audio, for real starts)
         )
-        self._tune(opts)
-        self._raise_bit_rate_for_big_display(opts, display_id)
+        compat = bool(getattr(self, "_compat", False))
+        self._tune(opts, native=self._runs_like_native(compat, display_id))
+        if compat:
+            self._limit_bit_rate(opts, _HEAD_UNIT_BIT_RATE)
         return opts.bit_rate
 
     def _on_audio_enabled_changed(self, enabled: bool) -> None:
@@ -3537,6 +3695,7 @@ class MirrorPanel(QWidget):
         )
         self._sync_renderer_controls()
         self._sync_video_surface(active)
+        self._sync_zoom_controls()
         self._note_toolbar_width()
 
     def _popout_mirror(self):
@@ -4187,9 +4346,10 @@ class MirrorPanel(QWidget):
         self._begin_record(display_id=disp_id)
 
 
-    def _tune(self, opts):
+    def _tune(self, opts, *, native=False):
         """Apply performance and quality tuning. Over GPU-accelerated local sessions,
-        preserves native resolution and high 16M bitrate identical to native scrcpy.
+        preserves native resolution and high 16M bitrate. With *native* the renderer
+        stays scrcpy's own, which decodes in hardware (see _runs_like_native).
         Over Remote Desktop, applies software rendering and sensible caps."""
         if self._opt["soft"]:
             opts.render_driver = "software"
@@ -4208,7 +4368,7 @@ class MirrorPanel(QWidget):
             # The embedded screen is usually drawn 3-4x smaller than the phone's
             # resolution. SDL's default Direct3D renderer scales without mipmaps,
             # which made small text grainy; OpenGL enables trilinear filtering.
-            if not opts.render_driver and not getattr(self, "_avoid_opengl", False):
+            if not native and not opts.render_driver and not getattr(self, "_avoid_opengl", False):
                 opts.render_driver = "opengl"
         return opts
 
@@ -4927,10 +5087,13 @@ class MirrorPanel(QWidget):
         # Camera mirroring is a video-source operation; screen mirroring and
         # recordings use the complete user-selected audio profile.
         self._apply_audio_options(opts, allow_audio=not bool(camera) and not self._fixed_display)
-        self._tune(opts)
-        self._raise_bit_rate_for_big_display(opts, display_id)
+        self._tune(opts, native=self._runs_like_native(compat, display_id))
+        if compat:
+            self._limit_bit_rate(opts, _HEAD_UNIT_BIT_RATE)
         self._apply_video_budget(opts)
         self._launch_opts = opts  # a parallel recorder copies its video settings
+        self._no_picture_asked = False
+        self._dismiss_next_step()
         if camera:
             self.status.setText(f"Camera ({camera}) — live view")
         if opts.render_driver == "software":
@@ -5186,17 +5349,19 @@ class MirrorPanel(QWidget):
     # normal close, NOT a failed start). Deliberately NOT "Device:" / "New
     # display" — scrcpy prints those the instant it CONNECTS, before it opens a
     # decoder, so a connect-then-die failure used to look "started" and was left
-    # alone (the "fake started" bug). Only a renderer/texture/recording line
-    # means a frame actually flowed.
+    # alone (the "fake started" bug). Nor "Renderer:": scrcpy makes its renderer
+    # before the first frame.  Only these lines mean a frame actually flowed.
     _HEALTHY = (
-        "Renderer:",
         "Texture:",
         "Recording started",
-        "INFO: Renderer",
         "Frame: ",
         "v4l2",
         "audio player",
     )
+    # scrcpy has reached the device and is waiting for it to send a picture.
+    # Such a start is not hung: a display that shows nothing new can take a
+    # long time, and native scrcpy would simply wait.
+    _CONNECTED = ("[server] INFO: Device:", "Renderer:")
     # Scrcpy itself is spawned immediately.  A first device-side server push
     # (especially after Android reboot) can legitimately take more than six
     # seconds, so do not kill a healthy launch before it can create its window.
@@ -5258,6 +5423,7 @@ class MirrorPanel(QWidget):
             or any(m in _read_log_tail(self._scrcpy) for m in self._HEALTHY)
         ):
             self._became_ready = True
+            self._dismiss_next_step()
             self.screen_ready.emit()
         if not self._video_reported:
             self._report_video_size()
@@ -5266,7 +5432,25 @@ class MirrorPanel(QWidget):
         ran_s = time.time() - getattr(self, "_start_t", 0)
         # startup watchdog: alive but no window yet = it hung (the first-launch
         # server-push race can leave scrcpy waiting forever) — kill it so the
-        # retry path runs instead of the user staring at nothing
+        # retry path runs instead of the user staring at nothing.  Connected to
+        # the device it is not hung, only waiting for a picture: it is left
+        # running, and the user decides what happens next.
+        waiting_for_picture = (
+            running and not self._became_ready and ran_s > self._STARTUP_TIMEOUT
+            and self._rec_mode != "integrated"
+            and any(m in _read_log_tail(self._scrcpy, 4096) for m in self._CONNECTED)
+        )
+        if waiting_for_picture:
+            if not self._no_picture_asked:
+                self._no_picture_asked = True
+                self.log.emit(
+                    f"[WARNING] scrcpy is connected but no picture has arrived after "
+                    f"{int(self._STARTUP_TIMEOUT)}s; it keeps waiting."
+                )
+                self.status.show()
+                self.status.setText("scrcpy is connected and waiting for the first picture…")
+                self._offer_next_step(self._scrcpy.read_log() or "", still_running=True)
+            return
         if running and not self._became_ready and ran_s > self._STARTUP_TIMEOUT:
             if self._rec_mode == "integrated":
                 action = "failing the recording start"
@@ -5365,12 +5549,10 @@ class MirrorPanel(QWidget):
             return
         if tries == 1:
             self._retry_count = 2
-            # The last rung also drops embedding — but never for a locked tile:
-            # the displays tab would put one free-floating scrcpy window per
-            # failing display outside TurboADB.  Keep the caller's choice there.
+            # The last rung changes the video only.  Where the screen goes
+            # after that (a separate window, screencap) is the user's choice:
+            # _offer_next_step asks.
             overrides = {"compat": True}
-            if not self._fixed_display:
-                overrides["embed"] = False
             self.log.emit(
                 "[WARNING] scrcpy still didn't start; retrying with IVI-compatible video…"
             )
@@ -5403,12 +5585,101 @@ class MirrorPanel(QWidget):
         )
         self._refresh_buttons()
         self.screen_failed.emit(tail)
-        self._show_scrcpy_log(
+        self._offer_next_step(
             str(error or "")
             or "(scrcpy exited immediately with no output. "
             "It likely couldn't reach the device, or couldn't "
             "open a video encoder for this display.)"
         )
+
+    def _offer_next_step(self, err, *, still_running=False) -> None:
+        """scrcpy is not showing the screen: ask what to do.  Nothing switches
+        to ADB screencap or a separate window unless the user picks it here.
+
+        A locked tile says so on its status line with links, since several
+        failing displays would otherwise stack dialogs in front of a running
+        start chain.  Elsewhere the dialog opens from the event loop, and
+        without blocking: it goes by itself once the picture arrives."""
+        if self._closing:
+            return
+        self._scrcpy_error = str(err or "")
+        if self._fixed_display:
+            self._tile_notice(
+                ("This display is connected, but no picture has arrived yet. "
+                 if still_running else "This display's screen couldn't start. ")
+                + "<a href='#scrcpy-retry'>Try again</a> · "
+                "<a href='#use-screencap'>Switch to ADB screencap</a> · "
+                "<a href='#scrcpy-log'>Show log</a>"
+            )
+            return
+        self._next_step_running = still_running
+        # (a bound method: Qt drops the call if this panel is destroyed first)
+        QTimer.singleShot(0, self._open_next_step)
+
+    def _open_next_step(self) -> None:
+        still_running = self._next_step_running
+        if self._closing or (still_running and (self._became_ready or self._scrcpy is None)):
+            return
+        self._dismiss_next_step()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("scrcpy is not starting")
+        if still_running:
+            box.setText("scrcpy has connected, but the device has not sent a picture yet.")
+            box.setInformativeText(
+                "A display that shows nothing new can take a while. You can keep "
+                "waiting, or show this display another way."
+            )
+            leave = "Keep waiting"
+        else:
+            tail = " ".join(self._scrcpy_error.splitlines()[-2:])[:300]
+            box.setText("scrcpy could not start the screen on this display.")
+            box.setInformativeText(tail)
+            leave = "Close"
+        again = box.addButton("Restart scrcpy" if still_running else "Try again",
+                              QMessageBox.AcceptRole)
+        screencap = box.addButton("Switch to ADB screencap", QMessageBox.ActionRole)
+        separate = box.addButton("Open in a separate window", QMessageBox.ActionRole)
+        log = box.addButton("Show log", QMessageBox.ActionRole)
+        box.addButton(leave, QMessageBox.RejectRole)
+
+        def chosen(button):
+            if self._closing:
+                return
+            if button is again:
+                self._start_again()
+            elif button is screencap:
+                self._switch_to_screencap()
+            elif button is separate:
+                self._popout_mirror()
+            elif button is log:
+                self._show_scrcpy_log(self._scrcpy_error)
+
+        box.buttonClicked.connect(chosen)
+        self._next_step_box = box
+        box.open()
+
+    def _dismiss_next_step(self) -> None:
+        box, self._next_step_box = self._next_step_box, None
+        if box is not None:
+            try:
+                box.done(0)
+                box.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _start_again(self) -> None:
+        spec = dict(self._launch_spec or {})
+        spec.pop("_retry", None)
+        self.start(**spec)
+
+    def _switch_to_screencap(self) -> None:
+        """The user chose it: this panel shows its display with ADB screencap
+        frames (Options → Renderer takes it back)."""
+        spec = dict(self._launch_spec or {})
+        self.log.emit("[INFO] switching this screen to ADB screencap, as you chose")
+        self.set_screen_backend("screencap")
+        self.start(display_id=spec.get("display_id", "__use_combo__"))
 
     def _show_scrcpy_log(self, err):
         """Offer scrcpy's full output so a failure (esp. over RDP / on an IVI)
@@ -5443,6 +5714,10 @@ class MirrorPanel(QWidget):
             return
         if href == "#scrcpy-log" and not self._closing:
             QTimer.singleShot(0, lambda: self._open_scrcpy_log(self._scrcpy_error))
+        if href == "#scrcpy-retry" and not self._closing:
+            QTimer.singleShot(0, self._start_again)
+        if href == "#use-screencap" and not self._closing:
+            QTimer.singleShot(0, self._switch_to_screencap)
 
     def _open_scrcpy_log(self, err):
         """The modal log window itself. Never call this from a timer slot that
@@ -5605,21 +5880,11 @@ class MirrorPanel(QWidget):
             self._fit_timer.start(self._poll_interval)  # keeps it filling the whole session
             self._fit()
             return
-        # Keep looking for at least as long as the process startup watchdog.
-        # The old 10-second cutoff preceded the 25-second launch timeout and
-        # could leave a legitimate slow start permanently at (-32000,-32000).
-        if self._embed_tries > int((self._STARTUP_TIMEOUT + 2.0) / 0.2):
-            # we launched scrcpy off-screen for a seamless embed but never managed
-            # to adopt its window — move it on-screen so it isn't stuck invisible.
-            # Stop polling either way: FindWindow + EnumWindows every 200 ms for
-            # the rest of the session cannot succeed any more.
-            self._stop_embed_timer()
-            if self._rescue_offscreen():
-                self.status.setText(
-                    "Couldn't embed the scrcpy window; it's running in its own window instead."
-                )
-            else:
-                self.status.setText("Couldn't find the scrcpy window to embed.")
+        # A display can take long to send its first picture, and scrcpy shows
+        # no window before that: keep looking for as long as it runs, more
+        # slowly once the start is overdue.  The watchdog asks the user.
+        if self._embed_tries > int((self._STARTUP_TIMEOUT + 2.0) / 0.2) and self._embed_timer:
+            self._embed_timer.setInterval(1000)
 
     def _rescue_offscreen(self, hwnd=None):
         """We launch scrcpy off-screen so it can render its first frame before we
@@ -5701,15 +5966,20 @@ class MirrorPanel(QWidget):
                 w = max(1, int(round(self.container.width() * dpr)))
                 h = max(1, int(round(self.container.height() * dpr)))
 
-            rect = wintypes.RECT()
+            x, y, w, h = _zoomed_rect(w, h, self._video_aspect, self._zoom, *self._pan)
+            rect, origin = wintypes.RECT(), wintypes.RECT()
             if u.GetWindowRect(self._child_hwnd, ctypes.byref(rect)):
                 curr_w = rect.right - rect.left
                 curr_h = rect.bottom - rect.top
-                if abs(curr_w - w) <= 1 and abs(curr_h - h) <= 1:
-                    return  # already the right size
+                placed = True
+                if c_hwnd and u.GetWindowRect(c_hwnd, ctypes.byref(origin)):
+                    placed = (abs(rect.left - origin.left - x) <= 1
+                              and abs(rect.top - origin.top - y) <= 1)
+                if placed and abs(curr_w - w) <= 1 and abs(curr_h - h) <= 1:
+                    return  # already the right size, in the right place
             if not _answering(self._child_hwnd):
                 return
-            u.MoveWindow(self._child_hwnd, 0, 0, w, h, True)
+            u.MoveWindow(self._child_hwnd, x, y, w, h, True)
         except Exception:
             pass
 
@@ -5751,7 +6021,13 @@ class MirrorPanel(QWidget):
         self._child_hwnd = None
         self._embed_parent_hwnd = None
         self._separate_hwnd = None
+        self._dismiss_next_step()
+        self._reset_zoom()
         return handle
+
+    def _reset_zoom(self) -> None:
+        self._zoom, self._pan = 1.0, [0.5, 0.5]
+        self._sync_zoom_controls()
 
     def _retry_start(self, **overrides):
         """Retry the same requested screen mode, with optional safe overrides."""

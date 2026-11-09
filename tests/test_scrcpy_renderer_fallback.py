@@ -111,6 +111,7 @@ def panel(qapp, monkeypatch):
     monkeypatch.setattr(mp, "park_thread", lambda thread: None)
     panel = mp.MirrorPanel(_Handler(), {"name": "car"}, dispatcher=_NullDispatcher())
     panel._opt["soft"] = False  # a PC with a GPU (not a Remote Desktop session)
+    panel._displays = [{"id": 0, "size": "1080x2400"}]  # a phone: the screen OpenGL is for
     retries = []
     monkeypatch.setattr(panel, "_schedule_retry", lambda _ms, callback: retries.append(callback))
     monkeypatch.setattr(panel, "_scrcpy_window_up", lambda: False)

@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
 from . import theme
 from . import settings as settings_mod
 
-DOCS_URL = "https://pypi.org/project/turboadb/"
+DOCS_URL = "https://nvnkennedy.github.io/turboadb/"
 
 #   name -> (rank, 4-char badge, badge colour, message colour)
 _LEVELS = {

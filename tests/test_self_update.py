@@ -3,7 +3,7 @@
 pip upgrades the copy this Python has installed. A source checkout (``python
 main.py``, even one installed in editable mode) is not that copy, so pip must
 not be pointed at it; and pip exiting 0 is no proof that anything newer was
-installed — a package index that lags behind PyPI answers "already satisfied".
+installed.  Releases are read from GitHub, and pip installs the release's wheel.
 """
 import json
 import os
@@ -114,34 +114,34 @@ def test_children_start_in_the_interpreters_folder(monkeypatch):
 # a newer release is reported whether or not pip can install it here
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def pypi(monkeypatch, tmp_path):
-    """PyPI has 4.0.0, this is 3.1.0; the daily cache is the test's own."""
+def released(monkeypatch, tmp_path):
+    """GitHub has 4.0.0, this is 3.1.0; the daily cache is the test's own."""
     asked = []
     monkeypatch.setattr(update, "current_version", lambda: "3.1.0")
-    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: asked.append(1) or "4.0.0")
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: asked.append(1) or "4.0.0")
     monkeypatch.setattr(update, "_CHECK_CACHE", str(tmp_path / "update-check.json"))
     return asked
 
 
-def test_the_standalone_exe_is_told_about_a_newer_release(monkeypatch, pypi):
-    """It was never told: the checks answered None before they asked PyPI,
+def test_the_standalone_exe_is_told_about_a_newer_release(monkeypatch, released):
+    """It was never told: the checks answered None before they asked,
     because pip cannot upgrade it."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert not update.can_self_update()
     assert update.check() == "4.0.0"
     assert update.check_cached() == "4.0.0"
-    assert update.check_cached() == "4.0.0" and len(pypi) == 2  # asked once a day
+    assert update.check_cached() == "4.0.0" and len(released) == 2  # asked once a day
     blocker = update.self_update_blocker()
-    assert "releases/latest" in blocker and "pip install -U turboadb" in blocker
-    # the newest one, or a PyPI that can't be reached, reports nothing
+    assert "releases/latest" in blocker and "pip" not in blocker
+    # the newest one, or a GitHub that can't be reached, reports nothing
     monkeypatch.setattr(update, "current_version", lambda: "4.0.0")
     assert update.check() is None and update.check_cached() is None
     monkeypatch.setattr(update, "current_version", lambda: "3.1.0")
-    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: None)
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: None)
     assert update.check() is None
 
 
-def test_a_source_checkout_is_told_about_a_newer_release(monkeypatch, pypi, tmp_path):
+def test_a_source_checkout_is_told_about_a_newer_release(monkeypatch, released, tmp_path):
     other = str(tmp_path / "site-packages" / "turboadb" / "__init__.py")
     _probe(monkeypatch, {"file": other, "version": "2.0.0", "dist_file": other, "editable": False})
     assert not update.can_self_update() and "git pull" in update.self_update_blocker()
@@ -150,14 +150,14 @@ def test_a_source_checkout_is_told_about_a_newer_release(monkeypatch, pypi, tmp_
 
 @pytest.fixture(scope="module")
 def between_tests():
-    """``update.pypi_latest`` as a thread finds it while no test runs.  A main
-    window asks PyPI 2.5 s after it opens, on a worker of its own: for one
+    """``update.latest_release`` as a thread finds it while no test runs.  A main
+    window asks GitHub 2.5 s after it opens, on a worker of its own: for one
     that a test left open, that is between two later tests."""
-    return update.pypi_latest
+    return update.latest_release
 
 
-def test_a_launch_check_that_runs_between_two_tests_asks_pypi_nothing(between_tests, monkeypatch):
-    """Now that a source checkout asks too, the suite reached pypi.org: the
+def test_a_launch_check_that_runs_between_two_tests_asks_github_nothing(between_tests, monkeypatch):
+    """Now that a source checkout asks too, the suite reached the network: the
     stand-in for it was only there while a test ran."""
     asked = []
 
@@ -195,19 +195,19 @@ def pip(monkeypatch):
 
 def test_an_upgrade_that_installs_nothing_newer_fails_before_the_tools(pip):
     """The GUI said 'Updated to TurboADB 2.5.0', restarted, and offered the same
-    update again, forever, while pip's mirror lagged behind PyPI."""
-    res = update.run_upgrade()
+    update again, forever."""
+    res = update.run_upgrade(expected="2.6.0")
     assert res["ok"] is False and res["unchanged"] is True and res["new"] == "2.5.0"
-    assert "does not have the new release yet" in res["error"]
+    assert "still what is installed" in res["error"] and "(not 2.6.0)" in res["error"]
     assert pip["tools_refreshed"] is False  # nothing else was touched
-    assert pip["cmds"][0][-1] == "turboadb"
+    assert pip["cmds"][0][-1] == update.wheel_url("2.6.0")
 
 
-def test_the_version_pypi_offered_is_pinned(pip):
+def test_the_offered_release_s_wheel_is_installed(pip):
     pip["installed"] = "2.6.0"
     res = update.run_upgrade(expected="2.6.0")
     assert res["ok"] is True and res["new"] == "2.6.0" and res["unchanged"] is False
-    assert pip["cmds"][0][-1] == "turboadb==2.6.0" and pip["tools_refreshed"] is True
+    assert pip["cmds"][0][-1] == update.wheel_url("2.6.0") and pip["tools_refreshed"] is True
 
     pip["installed"] = "2.5.5"  # newer than before, but not what was offered
     res = update.run_upgrade(expected="2.6.0")
@@ -215,15 +215,55 @@ def test_the_version_pypi_offered_is_pinned(pip):
 
 
 def test_a_refresh_only_run_may_leave_the_version_alone(pip):
-    """`turboadb self-update` with nothing newer on PyPI refreshes adb/scrcpy."""
+    """`turboadb self-update` with no newer release refreshes adb/scrcpy only."""
     res = update.run_upgrade(allow_unchanged=True)
     assert res["ok"] is True and res["unchanged"] is True and pip["tools_refreshed"] is True
+    assert pip["cmds"] == []  # pip has nothing to install
 
 
-def test_only_a_plain_version_is_pinned():
-    assert update._pip_upgrade_cmd("2.6.0")[-1] == "turboadb==2.6.0"
-    assert update._pip_upgrade_cmd(None)[-1] == "turboadb"
-    assert update._pip_upgrade_cmd("2.6.0; rm -rf /")[-1] == "turboadb"
+def test_only_a_plain_version_reaches_the_download_address(pip, monkeypatch):
+    assert update._pip_upgrade_cmd("2.6.0")[-1] == (
+        "https://github.com/NVNKENNEDY/turboadb/releases/download/"
+        "v2.6.0/turboadb-2.6.0-py3-none-any.whl")
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: None)
+    res = update.run_upgrade(expected="2.6.0; rm -rf /")
+    assert res["ok"] is False and pip["cmds"] == []
+
+
+def test_with_no_version_given_the_newest_release_is_asked_for(pip, monkeypatch):
+    pip["installed"] = "2.7.0"
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: "2.7.0")
+    res = update.run_upgrade()
+    assert res["ok"] is True and pip["cmds"][0][-1] == update.wheel_url("2.7.0")
+
+
+def test_with_no_newer_release_only_the_tools_are_refreshed(pip, monkeypatch):
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: "2.5.0")
+    res = update.run_upgrade()
+    assert res["ok"] is True and pip["cmds"] == [] and pip["tools_refreshed"] is True
+
+
+def test_an_unreachable_github_changes_nothing(pip, monkeypatch):
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: None)
+    res = update.run_upgrade()
+    assert res["ok"] is False and "releases/latest" in res["error"]
+    assert pip["cmds"] == [] and pip["tools_refreshed"] is False
+
+
+@pytest.mark.parametrize("url, version", [
+    ("https://github.com/NVNKENNEDY/turboadb/releases/tag/v6.0.0", "6.0.0"),
+    ("https://github.com/NVNKENNEDY/turboadb/releases/tag/6.1.2/", "6.1.2"),
+    ("https://github.com/NVNKENNEDY/turboadb/releases", None),  # no release yet
+    ("https://github.com/login", None),
+    (None, None),
+])
+def test_the_newest_release_is_read_from_where_github_redirects(url, version):
+    assert update._version_of_release(url) == version
+
+
+def test_nothing_in_the_updater_names_pypi():
+    with open(update.__file__, encoding="utf-8") as fh:
+        assert "pypi" not in fh.read().lower()
 
 
 def test_run_upgrade_says_why_it_cannot_update_a_checkout(monkeypatch, tmp_path):
@@ -244,7 +284,7 @@ def cli_upgrade(monkeypatch, capsys):
     monkeypatch.setattr(update, "current_version", lambda: "2.5.0")
 
     def go(argv, latest, result):
-        monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: latest)
+        monkeypatch.setattr(update, "latest_release", lambda *a, **k: latest)
         monkeypatch.setattr(update, "run_upgrade",
                             lambda notify=None, **kw: calls.append(kw) or dict(result))
         rc = cli.main(argv)
@@ -276,7 +316,7 @@ def test_cli_upgrade_pins_the_offered_version_and_prints_one_json_document(cli_u
 
 def test_cli_refuses_a_checkout_with_the_reason(monkeypatch, capsys):
     monkeypatch.setattr(update, "self_update_blocker", lambda: "TurboADB runs from a checkout")
-    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: pytest.fail("asked PyPI"))
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: pytest.fail("asked GitHub"))
     assert cli.main(["self-update"]) == 1
     err = capsys.readouterr().err
     assert "TurboADB runs from a checkout" in err and "turboadb upgrade-tools" in err

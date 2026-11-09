@@ -166,7 +166,7 @@ winget holds comes before the cache, and is only ever updated by winget: a
 download would go to a folder looked at after it.
 Where there is no winget, where it fails, and on the other systems, `toolsdl.py`
 downloads the publishers' archives into `~/.turboadb/tools` and can upgrade them,
-which is why a fresh `pip install turboadb` just works. Each
+which is why a fresh install just works. Each
 is downloaded only where a build exists for the machine
 (`adb_download_supported()`: Windows, macOS and Linux on x86-64, Google's one
 Linux build; `scrcpy_download_supported()`: Windows). `ensure_tools` only ever
@@ -177,7 +177,7 @@ is stopped or anything is replaced, so a build that cannot run here (musl,
 NixOS) never takes the place of a working system adb. After a swap the tools
 cache is cleared, so the copy just installed is the one found and reported.
 
-`update.py` handles upgrading TurboADB *itself* from PyPI and relaunching. It
+`update.py` handles upgrading TurboADB *itself* from GitHub Releases and relaunching. It
 keeps two questions apart: whether a newer release exists (`check`,
 `check_cached`, asked from any copy) and whether pip can install it here
 (`can_self_update`; `self_update_blocker` says why not: the standalone exe, a
@@ -989,7 +989,8 @@ whose app ID no Start-menu shortcut has.
   `scripts/gui_entry.py` is the frozen entry point (with a startup self-test hook).
 - `scripts/release.py` — copy that exe into `turboadb/bin/turboadb-gui.exe`
   (package data, git-ignored), build wheel+sdist, check the wheel contains the
-  exe, and upload to PyPI. `turboadb-gui` starts the bundled exe when PyQt5 is
+  exe. Pushing a `v*` tag publishes the same files on the GitHub Release, the
+  one place TurboADB is released. `turboadb-gui` starts the bundled exe when PyQt5 is
   not installed, from a copy in `~/.turboadb/gui` (see above).
 
 ## Where things live at runtime

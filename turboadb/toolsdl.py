@@ -41,8 +41,10 @@ from contextlib import contextmanager
 
 from .exceptions import ADBError, ADBNotFoundError
 from .tools import (  # noqa: F401  (_exe re-exported for existing importers)
+    ADB_DOWNLOAD,
     ADB_WINDOWS_FILES,
     NO_WINDOW,
+    SCRCPY_DOWNLOAD,
     WINGET_PACKAGES,
     _adb_version_output,
     _exe,
@@ -617,6 +619,13 @@ def _install_with_winget(tool: str, existing: str | None, *, force: bool = False
     if not installed:
         _log.warning("winget installed %s somewhere unexpected; using its publisher's download", tool)
     return installed
+
+
+def manual_update_steps(tool: str) -> str:
+    """What someone runs to update *tool* themselves, or where to get it."""
+    if winget_exe():
+        return f"winget upgrade --id {WINGET_PACKAGES[tool]} --exact"
+    return {"adb": ADB_DOWNLOAD, "scrcpy": SCRCPY_DOWNLOAD}[tool]
 
 
 def winget_latest(tool: str) -> str | None:

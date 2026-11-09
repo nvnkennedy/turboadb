@@ -59,7 +59,7 @@ from .tools import (
     windows_program,
 )
 
-DOCS_URL = "https://pypi.org/project/turboadb/"
+DOCS_URL = "https://nvnkennedy.github.io/turboadb/"
 
 
 # --------------------------------------------------------------------------- #
@@ -541,7 +541,7 @@ def launch_gui(argv=None) -> int:
     """`turboadb-gui`: launch the PyQt5 app.
 
     Runs the GUI from the installed Python package when PyQt5 is available, so
-    ``pip install --upgrade turboadb`` always takes effect on the next launch.
+    a pip upgrade always takes effect on the next launch.
     On Windows it runs as TurboADB.exe, a copy of this Python's pythonw.exe
     that Task Manager and the taskbar know as TurboADB (:mod:`launcher`).
     Without PyQt5 (e.g. a Python with no PyQt5 wheel) it starts the Windows
@@ -1042,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scr.add_argument(
         "--compat", action="store_true",
-        help="IVI / automotive compatibility profile (H.264, capped fps, no audio, forward tunnel)",
+        help="IVI / automotive compatibility profile (scrcpy's own defaults, H.264, no audio)",
     )
     p_scr.add_argument("--video-codec", choices=["h264", "h265", "av1"], default=None)
     p_scr.add_argument(
@@ -2186,12 +2186,12 @@ def main(argv=None) -> int:
             from . import update as _upd
 
             if args.check:
-                current, latest = _upd.current_version(), _upd.pypi_latest()
+                current, latest = _upd.current_version(), _upd.latest_release()
                 newer = bool(latest) and _upd.is_newer(latest)
                 if _JSON["on"]:
                     print(json.dumps({"current": current, "latest": latest, "update_available": newer}))
                 elif not latest:
-                    print(f"TurboADB {current} — couldn't reach PyPI to check for a newer version.")
+                    print(f"TurboADB {current} — couldn't reach GitHub to check for a newer version.")
                 elif newer:
                     print(f"TurboADB {latest} is available (installed: {current}). Run: turboadb self-update")
                 else:
@@ -2207,7 +2207,7 @@ def main(argv=None) -> int:
                     print(message, file=sys.stderr)
                     print("adb and scrcpy update with: turboadb upgrade-tools", file=sys.stderr)
                 return 1
-            latest = _upd.pypi_latest()
+            latest = _upd.latest_release()
             newer = bool(latest) and _upd.is_newer(latest)
             if latest and not newer:
                 print(
@@ -2215,9 +2215,9 @@ def main(argv=None) -> int:
                     f"refreshing adb/scrcpy…",
                     file=sys.stderr,
                 )
-            # Pinned to the release PyPI offers, and a run that installs nothing
-            # newer is a failure — unless PyPI had nothing newer (or couldn't be
-            # asked), when refreshing adb and scrcpy is the point.
+            # Pinned to the newest release, and a run that installs nothing
+            # newer is a failure — unless no release is newer (or GitHub couldn't
+            # be asked), when refreshing adb and scrcpy is the point.
             res = _upd.run_upgrade(
                 notify=lambda m: print(m, file=sys.stderr),
                 expected=latest if newer else None,

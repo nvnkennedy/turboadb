@@ -447,7 +447,7 @@ class SettingsDialog(QDialog):
         )
         self.shortcut.setChecked(self.cfg.get("make_shortcut_first_run", True))
         self.autoupd = QCheckBox(
-            "Check PyPI for a newer TurboADB at launch "
+            "Check GitHub for a newer TurboADB at launch "
             "(notify in the log only — never auto-installs)"
         )
         self.autoupd.setChecked(self.cfg.get("auto_update", True))

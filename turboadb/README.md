@@ -4,7 +4,7 @@
 (Android Automotive OS / IVI head units) and general Android work.**
 
 TurboADB wraps Google's `adb` and `scrcpy` behind one robust, structured layer
-you can drive three ways from a single `pip install turboadb`:
+you can drive three ways from a single install:
 
 1. **Python API** — `import turboadb` for scripts and test frameworks.
 2. **CLI** — `turboadb …`, fully argument-driven (argparse).
@@ -44,13 +44,13 @@ can run on background threads, so it never blocks or crashes the caller.
 ## Install
 
 ```bash
-pip install turboadb
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl
 ```
 
 That gives you the Python API, the `turboadb` CLI and `turboadb-gui`. On Windows
 the wheel bundles the GUI executable, so `turboadb-gui` works without PyQt5. To
 run the GUI from the Python package instead, install the optional GUI dependency:
-`pip install "turboadb[gui]"`. The standalone executable is also on GitHub Releases.
+`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
 
 TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 **`scrcpy`**. It auto-detects them on your `PATH`, in the Android SDK, or in
@@ -159,7 +159,7 @@ A tabbed, multi-device workspace:
   - **Screen** — scrcpy with a named display picker and compatibility mode, shown
     inside Device Control (Windows) or in a separate window from the **Screen ▾**
     menu.
-- **Tools ▾ → Check for updates…** updates TurboADB from PyPI when a newer
+- **Tools ▾ → Check for updates…** updates TurboADB from GitHub Releases when a newer
   version exists (then refreshes adb/scrcpy and restarts); otherwise it checks
   adb/scrcpy and downloads **only if a newer version exists**.
 - A dark, color-coded **log dock** at the bottom. With it closed, every action
@@ -647,11 +647,11 @@ python scripts/release.py patch    # bump -> test -> exe -> build -> twine check
 (`turboadb[gui]`) and otherwise starts the executable bundled in the wheel
 (`turboadb/bin/turboadb-gui.exe`). The same executable is attached to the GitHub
 Release, whose page shows that version's section of `CHANGELOG.md`
-(`python scripts/release_notes.py` prints it). The release helper reads the PyPI
-token from `TWINE_PASSWORD` (never hard-coded) and uploads the wheel and the
-source archive (about 59 MB each, because both carry the exe). It also supports
-`--wheel-only` if a flaky network makes the upload hang, `--rebuild-exe` to
-rebuild the executable first, and `--no-exe` for a lean package.
+(`python scripts/release_notes.py` prints it). Pushing a `v*` tag builds the exe,
+the wheel and the source archive (about 60 MB each, because both carry the exe)
+and attaches them to that release. `scripts/release.py` builds the same files
+locally; it supports `--rebuild-exe` to rebuild the executable first, and
+`--no-exe` for a lean package.
 
 ---
 

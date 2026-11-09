@@ -118,7 +118,7 @@ def test_a_host_with_adb_downloads_nothing(host):
     (folder / "adb").write_text("")
     ok, lines = deploy(update=True)
     assert ok, lines
-    assert _calls(folder) == ["-m pip install -U --quiet --disable-pip-version-check turboadb",
+    assert _calls(folder) == ["-m pip install -U --quiet --disable-pip-version-check <code>",
                               "-c <code>", "-m turboadb serve --port 5037 --startup-task"]
     assert not any("downloaded" in line for line in lines)
 
@@ -158,7 +158,7 @@ def test_what_serve_warns_about_reaches_the_deploy_log(host):
 
 
 def test_the_script_asks_before_it_downloads_and_only_for_adb():
-    script = rd._DEPLOY_PS.format(upd="0", port=5037)
+    script = rd._DEPLOY_PS.format(upd="0", port=5037, wheel="x")
     check, fetch, serve = (script.index(text) for text in (
         "tools.diagnose()", "fetch-tools --adb-only", "serve --port 5037 --startup-task"))
     assert check < fetch < serve

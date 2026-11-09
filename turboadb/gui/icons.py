@@ -147,6 +147,8 @@ ICONS: Dict[str, str] = {
         '<path d="M12 9v4M12 17h.01"/>'
     ),
     "search": '<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/>',
+    "zoom-in": '<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5M11 8v6M8 11h6"/>',
+    "zoom-out": '<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5M8 11h6"/>',
     "filter": '<path d="M22 3H2l8 9.5V19l4 2v-8.5z"/>',
     "link": (
         '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7L11.8 5.2"/>'

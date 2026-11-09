@@ -77,7 +77,7 @@ DEFAULTS = {
     # (periodic `adb screencap` frames for builds where scrcpy doesn't work).
     "screen_backend": "scrcpy",
     "make_shortcut_first_run": True,
-    "auto_update": True,  # check PyPI for a newer TurboADB at launch
+    "auto_update": True,  # check GitHub for a newer TurboADB at launch
     # Ask whether a second open of the same device should create a terminal-only
     # tab.  The terminal session owns independent Android Shell/CMD/PowerShell
     # processes but does not duplicate the full device workspace.

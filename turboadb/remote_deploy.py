@@ -6,8 +6,8 @@ plain WinRM **without** needing Kerberos, SPNs, or TrustedHosts configured on th
 client. That's why this works where PowerShell's ``Invoke-Command`` / ``Test-WSMan``
 (which insist on Negotiate/Kerberos) were failing.
 
-On each host it runs (as the admin credential): optionally ``pip install -U
-turboadb``, ``turboadb fetch-tools --adb-only`` when the host has no adb yet,
+On each host it runs (as the admin credential): optionally a pip upgrade to this
+release's wheel, ``turboadb fetch-tools --adb-only`` when the host has no adb yet,
 then ``turboadb serve --startup-task`` — starting the shared adb
 server now and registering a SYSTEM startup task so the host keeps sharing its
 devices headlessly. Prereqs per host: WinRM on (``Enable-PSRemoting -Force``),
@@ -22,6 +22,7 @@ import threading
 import time
 
 from .config import format_host_port, validate_port
+from .update import current_version, wheel_url
 
 # Per-host WinRM budget, and the budget for a whole run. 20 unreachable hosts at
 # 120 s each used to mean ~40 minutes behind a modal dialog.
@@ -148,11 +149,11 @@ try {{
     $py = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $py) {{ $py = (Get-Command py -ErrorAction SilentlyContinue).Source }}
     if (-not $py) {{
-        'ERROR:Python not found on the host (install Python + ''pip install turboadb'' there)'
+        'ERROR:Python not found on the host (install Python and TurboADB there)'
     }} else {{
         $ErrorActionPreference='Continue'
         if ('{upd}' -eq '1') {{
-            $pipOut = & $py -m pip install -U --quiet --disable-pip-version-check turboadb 2>&1
+            $pipOut = & $py -m pip install -U --quiet --disable-pip-version-check '{wheel}' 2>&1
             if ($LASTEXITCODE -ne 0) {{
                 'WARNING:pip upgrade of turboadb failed (exit ' + $LASTEXITCODE + '): ' + (Join-Output $pipOut)
             }}
@@ -269,7 +270,9 @@ def _deploy_one(
             lines.append(f"[ERROR] {host}: connected but check failed: {(err or out)[:200]}")
             return False, lines
 
-        script = _DEPLOY_PS.format(upd="1" if update else "0", port=port)
+        script = _DEPLOY_PS.format(
+            upd="1" if update else "0", port=port, wheel=wheel_url(current_version())
+        )
         code, out, err = _run_ps(
             host,
             username,

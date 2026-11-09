@@ -1,8 +1,8 @@
 name: Release
 
 # Build the Windows GUI exe and attach it (plus the wheel/sdist) to the GitHub
-# Release when a v* tag is pushed. The wheel bundles the same exe, exactly like
-# the one scripts/release.py uploads to PyPI (the PyPI upload stays manual).
+# Release when a v* tag is pushed, the one place TurboADB is published. The wheel
+# bundles the same exe.
 
 on:
   push:
@@ -85,7 +85,7 @@ jobs:
         run: python -m build
       - name: Check the artifacts
         # Same gates as scripts/release.py: every wheel really carries the exe,
-        # and the metadata is valid for PyPI.
+        # and the metadata is valid.
         shell: pwsh
         run: |
           python -c "import importlib.util, pathlib, sys; spec = importlib.util.spec_from_file_location('rel', 'scripts/release.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); bad = [w.name for w in pathlib.Path('dist').glob('*.whl') if not m.wheel_has_exe(w)]; sys.exit('wheels without the bundled exe: ' + ', '.join(bad) if bad else 0)"

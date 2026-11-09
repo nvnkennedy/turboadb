@@ -372,36 +372,38 @@ def test_maximize_view_brings_back_only_what_it_hid(panel, qapp):
 
 # ---- the video -------------------------------------------------------------
 @pytest.mark.parametrize(
-    "rate, size, max_edge, expected",
+    "size, compat, native",
     [
-        ("16M", (1920, 1080), None, "16M"),  # the size the default is meant for
-        ("16M", (1280, 720), None, "16M"),  # never lowered
-        ("16M", None, None, "16M"),  # unknown
-        ("16M", (2560, 1440), None, "28M"),
-        ("16M", (3840, 2160), None, "50M"),  # the most Settings offers
-        ("16M", (2560, 1440), 1920, "16M"),  # the video is what counts
+        ("1080x2400", False, False),  # a phone: small enough for OpenGL's filtering
+        ("1440x3200", False, False),
+        ("2560x1600", False, True),  # OpenGL would decode this in software
+        ("3840x2160", False, True),
+        ("1600x2560", False, True),  # a large tablet held upright
+        (None, False, True),  # unknown: what native does
+        ("1080x2400", True, True),  # the head-unit profile, whatever the shape
     ],
 )
-def test_bit_rate_follows_the_pixels(rate, size, max_edge, expected):
-    assert mp._bit_rate_for_display(rate, size, max_edge) == expected
+def test_what_starts_like_native_scrcpy(panel, monkeypatch, size, compat, native):
+    monkeypatch.setattr(panel, "_selected_display_entry", lambda _d: {"size": size} if size else {})
+    assert panel._runs_like_native(compat, 0) is native
 
 
-def test_a_rate_chosen_in_settings_is_kept(panel, monkeypatch):
-    monkeypatch.setattr(panel, "_selected_display_entry", lambda _d: {"size": "2560x1440"})
-    opts = mp.ScrcpyOptions(bit_rate="8M")
-    panel._raise_bit_rate_for_big_display(opts, 0)
-    assert opts.bit_rate == "8M"
+def test_a_native_start_leaves_the_renderer_to_scrcpy(panel):
+    """Forcing OpenGL turned scrcpy's hardware decoding off."""
+    assert panel._tune(mp.ScrcpyOptions(no_audio=True), native=True).render_driver is None
+    assert panel._tune(mp.ScrcpyOptions(no_audio=True)).render_driver == "opengl"
 
 
-def test_the_default_rate_rises_for_a_big_display(panel, monkeypatch):
-    monkeypatch.setattr(panel, "_selected_display_entry", lambda _d: {"size": "2560x1440"})
-    opts = mp.ScrcpyOptions(bit_rate="16M")
-    panel._raise_bit_rate_for_big_display(opts, 0)
-    assert opts.bit_rate == "28M"
+@pytest.mark.parametrize("rate, kept", [("32M", "16M"), ("50M", "16M"), ("16M", "16M"), ("8M", "8M")])
+def test_a_head_unit_is_not_asked_for_a_high_rate(panel, rate, kept):
+    opts = mp.ScrcpyOptions(bit_rate=rate)
+    panel._limit_bit_rate(opts, mp._HEAD_UNIT_BIT_RATE)
+    assert opts.bit_rate == kept
 
 
 def test_compat_keeps_a_large_display_whole(monkeypatch):
-    """scrcpy lowers the size itself, only if the device's encoder refuses."""
+    """scrcpy lowers the size itself, only if the device's encoder refuses, and
+    the profile forces nothing else that native scrcpy does not do."""
     from turboadb import scrcpy as scrcpy_mod
     from turboadb.config import ADBConfig
     from turboadb.core import ADBHandler
@@ -418,7 +420,8 @@ def test_compat_keeps_a_large_display_whole(monkeypatch):
     handler.mirror(compat=True)
     assert seen["opts"].max_size is None
     assert seen["opts"].video_codec == "h264"
-    assert seen["opts"].max_fps == 30
+    assert seen["opts"].max_fps is None and seen["opts"].force_adb_forward is False
+    assert seen["opts"].stay_awake is False and seen["opts"].no_audio is True
     handler.mirror(mp.ScrcpyOptions(max_size=1600), compat=True)
     assert seen["opts"].max_size == 1600  # a limit set on purpose stays
 

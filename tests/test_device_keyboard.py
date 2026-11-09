@@ -486,8 +486,8 @@ def test_embedded_sdk_keyboard_launch_sends_every_key_as_a_key_event(app, monkey
         panel.act_kb_sdk.setChecked(True)
         real_tune = panel._tune
 
-        def view_only(opts):
-            opts = real_tune(opts)
+        def view_only(opts, **kw):
+            opts = real_tune(opts, **kw)
             opts.no_control = True
             return opts
 

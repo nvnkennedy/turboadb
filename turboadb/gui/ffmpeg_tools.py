@@ -1,8 +1,7 @@
 """Get hold of ffmpeg for the host-webcam feature, and enumerate / capture local
 DirectShow cameras on Windows.
 
-ffmpeg is too big to bundle in the PyPI wheel (it would push us over the 100 MB
-limit), so we fetch a Windows build once from a public GitHub release and cache it
+ffmpeg is too big to bundle in the wheel, so we fetch a Windows build once from a public GitHub release and cache it
 under ``~/.turboadb/ffmpeg/``. A user-supplied ffmpeg (Settings → ffmpeg path, or
 one already on PATH) overrides the download for fully offline setups.
 """

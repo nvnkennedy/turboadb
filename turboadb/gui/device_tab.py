@@ -10,7 +10,7 @@ import shlex
 import threading
 import time
 import weakref
-from collections import deque
+from collections import deque, namedtuple
 
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QEvent, QSize, QTimer
 from PyQt5.QtWidgets import (
@@ -28,7 +28,7 @@ from . import fileutil
 from . import settings as settings_mod
 from . import theme
 from .terminal import ReaderThread
-from .console import AnsiConsole
+from .console import AnsiConsole, Completion
 from .logcat_view import LogcatPanel
 from .file_browser import FileBrowser
 from .apps_panel import AppsPanel
@@ -1110,58 +1110,71 @@ class _TerminalWidgetBase(QWidget):
             park_thread(completion)
 
     def _query_android_completion(self, line: str, cwd: str):
-        """Complete Android commands (first word) or paths relative to *cwd*."""
+        """Complete the word being typed on an Android shell line, read as the
+        device's shell reads it: a command, or a path relative to *cwd*."""
         handler = self.handler
         if not line or not line.strip() or handler is None:
             return None, []
-        match = re.search(r"(\S*)$", line)
-        token = match.group(1) if match else ""
-        if not token:
-            return None, []
-        quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
-        head = line[: len(line) - len(token)]
-        # A first word with a slash in it is a path, as in any shell: "/da" was
-        # looked up as a command name in the bin folders and found "date".
-        first_word = " " not in line.strip() and "/" not in token
+        word = _last_shell_word(line)
         try:
             # Each Tab press is an `adb shell` one-shot: it waits for one of the
             # device tab's adb slots (DeviceTab sets adb_gate) like every other.
             gate = getattr(self, "adb_gate", None)
             shell = gate.wrap(handler.shell) if gate is not None else handler.shell
-            if first_word:
-                globs = " ".join(f"{path}/{quote(token)}*" for path in self._BIN_DIRS)
-                result = shell(f"ls -d {globs} 2>/dev/null", timeout=1.5, safe=True)
-                if not isinstance(result, OperationResult) or not result.success:
-                    return None, []
-                names = sorted({
-                    os.path.basename(path.rstrip("\r"))
-                    for path in result.value.text.split()
-                    if path.strip()
-                })
-                if not names:
-                    return None, []
-                if len(names) == 1:
-                    return head + names[0] + " ", []
-                prefix = os.path.commonprefix(names)
-                return (head + prefix if len(prefix) > len(token) else None), names
-
-            result = shell(
-                f"cd {quote(cwd)} 2>/dev/null; "
-                f"ls -dp {quote(token)}* 2>/dev/null",
-                timeout=1.5,
-                safe=True,
-            )
-            if not isinstance(result, OperationResult) or not result.success:
-                return None, []
-            entries = [entry.rstrip("\r") for entry in result.value.text.split("\n") if entry.strip()]
-            if not entries:
-                return None, []
-            if len(entries) == 1:
-                return head + entries[0], []
-            prefix = os.path.commonprefix(entries)
-            return (head + prefix if len(prefix) > len(token) else None), entries
+            if word.command:
+                return self._complete_android_command(shell, line, word)
+            return self._complete_android_path(shell, line, word, cwd)
         except Exception:
             return None, []
+
+    def _complete_android_command(self, shell, line: str, word):
+        """Commands in the bin folders and the shell's own built-ins."""
+        globs = " ".join(f"{path}/{_shell_literal(word.text)}*" for path in self._BIN_DIRS)
+        result = shell(f"ls -d {globs} 2>/dev/null", timeout=1.5, safe=True)
+        if not isinstance(result, OperationResult) or not result.success:
+            return None, []
+        names = sorted({
+            os.path.basename(path.rstrip("\r"))
+            for path in result.value.text.split()
+            if path.strip()
+        } | {name for name in _SHELL_BUILTINS if name.startswith(word.text)})
+        if not names:
+            return None, []
+        head = line[:word.start]
+        if len(names) == 1:
+            return head + names[0] + " ", []
+        prefix = os.path.commonprefix(names)
+        return (
+            head + prefix if len(prefix) > len(word.text) else None,
+            [Completion(name, start=word.start) for name in names],
+        )
+
+    def _complete_android_path(self, shell, line: str, word, cwd: str):
+        """Files and folders; on the line they are written so the shell reads
+        them back as one word, and the list shows only their last part."""
+        result = shell(
+            f"cd {_shell_literal(cwd)} 2>/dev/null; "
+            f"ls -dp {_shell_literal(word.text)}* 2>/dev/null",
+            timeout=1.5,
+            safe=True,
+        )
+        if not isinstance(result, OperationResult) or not result.success:
+            return None, []
+        entries = [entry.rstrip("\r") for entry in result.value.text.split("\n") if entry.strip()]
+        if not entries:
+            return None, []
+        head = line[:word.start]
+
+        def written(entry, whole=True):
+            return _word_for_line(entry, word.quote, closed=whole and not entry.endswith("/"))
+
+        if len(entries) == 1:
+            return head + written(entries[0]), []
+        prefix = os.path.commonprefix(entries)
+        return (
+            head + written(prefix, whole=False) if len(prefix) > len(word.text) else None,
+            [Completion(written(entry), _last_path_part(entry), word.start) for entry in entries],
+        )
 
     def restart_adb(self):
         """Ask the top-level window to restart its one shared ADB daemon."""
@@ -1187,6 +1200,104 @@ _DEVICE_SHELLS = ("su", "sh", "mksh", "bash")
 _FULL_SCREEN_PROGRAMS = ("top", "htop", "vi", "vim", "less", "more", "nano", "watch")
 # A findstr/find search word that means the same as a literal string.
 _PLAIN_WORD = re.compile(r"[\w@#%+=:,\-]+\Z")
+
+
+# ---- reading an Android shell line for Tab ---------------------------------
+# What the device's shell (mksh) runs with no file in a bin folder.
+_SHELL_BUILTINS = frozenset((
+    "alias", "bg", "bind", "break", "builtin", "cd", "chdir", "command", "continue", "eval",
+    "exec", "exit", "export", "false", "fc", "fg", "getopts", "hash", "jobs", "let", "print",
+    "printf", "pwd", "read", "readonly", "return", "set", "shift", "source", "suspend", "test",
+    "time", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset",
+    "wait", "whence",
+))
+# After one of these the next word is a command again.
+_SHELL_COMMAND_ENDS = ";|&("
+# After one of these the next word is a file.
+_SHELL_REDIRECTS = "<>"
+# What a backslash has to protect when a name goes on the line.
+_SHELL_SPECIAL = frozenset(" \t\\'\"$`&;|()<>*?[]#!{}")
+# start: where the word begins on the line; text: the word with its quoting
+# taken off; command: it names a command; quote: the quote still open, if any.
+_ShellWord = namedtuple("_ShellWord", "start text command quote")
+
+
+def _last_shell_word(line: str) -> _ShellWord:
+    """The word being typed at the end of *line*, read as the shell reads it:
+    an escaped or quoted space is part of a word, and ``;``, ``|`` or ``&&``
+    end a command although no space need surround them.  A line that ends in
+    a separator ends in an empty word."""
+    start, text, quote = None, [], None
+    at_command, after_redirect = True, False
+
+    def end_word():
+        nonlocal start, text, at_command, after_redirect
+        if start is None:
+            return
+        if after_redirect:
+            after_redirect = False
+        elif not re.match(r"[A-Za-z_]\w*=", "".join(text)):  # FOO=1 cmd: cmd is the command
+            at_command = False
+        start, text = None, []
+
+    index = 0
+    while index < len(line):
+        ch = line[index]
+        if quote:
+            following = line[index + 1:index + 2]
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"' and following and following in '"\\$`':
+                index += 1
+                text.append(following)
+            else:
+                text.append(ch)
+        elif ch.isspace() or ch in _SHELL_COMMAND_ENDS or ch in _SHELL_REDIRECTS:
+            end_word()
+            if ch in _SHELL_COMMAND_ENDS:
+                at_command, after_redirect = True, False
+            elif ch in _SHELL_REDIRECTS:
+                after_redirect = True
+        else:
+            start = index if start is None else start
+            if ch == "\\":
+                index += 1
+                text.append(line[index:index + 1])
+            elif ch in "'\"":
+                quote = ch
+            else:
+                text.append(ch)
+        index += 1
+    word = "".join(text)
+    return _ShellWord(
+        len(line) if start is None else start,
+        word,
+        at_command and not after_redirect and "/" not in word,
+        quote,
+    )
+
+
+def _shell_literal(value: str) -> str:
+    """*value* in single quotes: the shell takes every character as it is."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _word_for_line(text: str, quote: str = None, *, closed: bool = False) -> str:
+    """*text* as it goes on the line: inside the quote the user opened (*closed*
+    ends it too), else with backslashes before what the shell would act on."""
+    if quote == "'":
+        body = text.replace("'", "'\\''")
+    elif quote == '"':
+        body = re.sub(r'(["\\$`])', r"\\\1", text)
+    else:
+        return "".join("\\" + ch if ch in _SHELL_SPECIAL else ch for ch in text)
+    return quote + body + (quote if closed else "")
+
+
+def _last_path_part(entry: str) -> str:
+    """``/data/`` as ``data/``: what a shell lists for a completed path."""
+    folder = entry.endswith("/")
+    return entry.rstrip("/").rsplit("/", 1)[-1] + ("/" if folder else "")
 
 
 def _split_command_line(line: str, quotes: str = '"'):

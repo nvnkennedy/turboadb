@@ -97,7 +97,7 @@ def test_the_current_version_has_release_notes():
     notes = rn.release_notes(turboadb.__version__)
     assert "\n### " not in notes and notes.startswith("## ")
     assert f"TurboADB-{turboadb.__version__}-win64.exe" in notes
-    assert "pip install --upgrade turboadb" in notes
+    assert f"releases/download/v{turboadb.__version__}/turboadb-{turboadb.__version__}-py3" in notes
     assert f"...v{turboadb.__version__}" in notes  # the compare link
 
 

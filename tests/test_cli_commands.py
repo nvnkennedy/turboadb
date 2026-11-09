@@ -666,7 +666,7 @@ def test_self_update_check(run, monkeypatch):
     import turboadb.update as update
 
     monkeypatch.setattr(update, "current_version", lambda: "2.0.0")
-    monkeypatch.setattr(update, "pypi_latest", lambda *a, **k: "2.1.0")
+    monkeypatch.setattr(update, "latest_release", lambda *a, **k: "2.1.0")
     rc, out, _ = run(["self-update", "--check"])
     assert rc == 0 and "2.1.0 is available" in out
     rc, out, _ = run(["--json", "self-update", "--check"])

@@ -77,15 +77,21 @@ def test_an_unchanged_version_file_is_not_rewritten(project):
 
 
 def test_a_release_without_notes_stops_before_anything_runs(project, capsys):
-    """The tests ran against the old version's notes, so the upload went out and
+    """The tests ran against the old version's notes, so the build went ahead and
     the Release workflow failed afterwards."""
     release, root, ran = project
     (root / "CHANGELOG.md").write_text("## 1.2.3\n\n- Older.\n", encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
         release.main(["patch"])
     assert "no notes for 1.2.4" in str(exc.value) and "## 1.2.4" in str(exc.value)
-    assert ran == []  # no tests, no build, no upload
+    assert ran == []  # no tests, no build
     assert '"1.2.3"' in (root / "turboadb" / "__init__.py").read_text(encoding="utf-8")
+
+
+def test_the_script_uploads_nothing(project):
+    release, _root, ran = project
+    assert release.main(["patch", "--skip-tests"]) == 0
+    assert not any("upload" in cmd for cmd in ran)
 
 
 def test_a_dry_run_without_notes_warns_and_still_builds(project, capsys):

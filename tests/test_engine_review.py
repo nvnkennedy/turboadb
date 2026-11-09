@@ -421,6 +421,7 @@ def test_root_on_production_build_fails(fake_adb):
 
 def test_mount_rw_failure_and_tcpip_failure_raise(fake_adb):
     fake_adb.add("remount,rw", stdout="mount: '/' not in /proc/mounts")
+    fake_adb.add("remount", returncode=1, stderr="remount failed")
     fake_adb.add("tcpip", returncode=1, stderr="error: no devices/emulators found")
     h = ADBHandler(ADBConfig(serial="x"))
     with pytest.raises(ADBCommandError):
@@ -497,7 +498,7 @@ def test_no_control_skips_control_only_flags():
 def test_deploy_script_checks_native_exit_codes():
     from turboadb.remote_deploy import _DEPLOY_PS
 
-    script = _DEPLOY_PS.format(upd="1", port=5037)
+    script = _DEPLOY_PS.format(upd="1", port=5037, wheel="x")
     assert "$ErrorActionPreference='Continue'" in script
     assert "$LASTEXITCODE" in script and "--port 5037" in script
 
@@ -1491,7 +1492,7 @@ def test_run_upgrade_never_drives_the_new_downloader_from_the_old_package(monkey
             "errors": {"scrcpy": "boom"},
         },
     )
-    res = update.run_upgrade(notify=lambda m: None)
+    res = update.run_upgrade(notify=lambda m: None, expected="9.9.9")
     assert res["ok"] and res["new"] == "9.9.9"
     assert res["adb"] == "35.0.2" and res["scrcpy"] == "3.1"
     assert res["tools_errors"] == {"scrcpy": "boom"}
@@ -1798,7 +1799,7 @@ def test_an_exe_older_than_its_sources_is_rebuilt(tmp_path, monkeypatch):
     assert release.exe_is_stale(exe) is False
 
 
-def test_a_failed_upload_rolls_the_version_back(monkeypatch, tmp_path):
+def test_a_failed_check_rolls_the_version_back(monkeypatch, tmp_path):
     release = _release_under_test()
     pyproject = tmp_path / "pyproject.toml"
     init = tmp_path / "__init__.py"
@@ -1811,10 +1812,9 @@ def test_a_failed_upload_rolls_the_version_back(monkeypatch, tmp_path):
     monkeypatch.setattr(release, "INIT", init)
     monkeypatch.setattr(release, "bundle_exe", lambda version, rebuild=False, **kw: None)
     monkeypatch.setattr(release, "wheel_has_exe", lambda wheel: True)
-    monkeypatch.setenv("TWINE_PASSWORD", "pypi-token")
 
     def fake_run(cmd, **kw):
-        if "upload" in cmd:
+        if "twine" in cmd:
             raise subprocess.CalledProcessError(1, cmd)
         if "build" in cmd:
             (tmp_path / "dist" / "turboadb-1.2.4-py3-none-any.whl").write_bytes(b"")

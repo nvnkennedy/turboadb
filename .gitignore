@@ -12,7 +12,7 @@ venv/
 *.log
 
 # The bundled GUI executable is a build artifact (~56 MB). It's rebuilt by
-# scripts/build_exe.py for the PyPI wheel and attached to GitHub Releases, so it
+# scripts/build_exe.py for the wheel and attached to GitHub Releases, so it
 # does not belong in git history.
 turboadb/bin/*.exe
 

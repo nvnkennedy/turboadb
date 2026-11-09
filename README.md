@@ -7,21 +7,20 @@
   CLI, and a desktop GUI. Built for Android Automotive / IVI head units and
   regular phones alike.**
 
-  [![PyPI](https://img.shields.io/pypi/v/turboadb.svg)](https://pypi.org/project/turboadb/)
-  [![Python](https://img.shields.io/pypi/pyversions/turboadb.svg)](https://pypi.org/project/turboadb/)
+  [![Release](https://img.shields.io/github/v/release/NVNKENNEDY/turboadb.svg)](https://github.com/NVNKENNEDY/turboadb/releases/latest)
+  [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
   [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE)
 
-  **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest) · [📦 PyPI](https://pypi.org/project/turboadb/)**
+  **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
 </div>
 
 ---
 
-> **New in 5.0.0:** the device screen, done properly. Moving between Terminal,
-> Device Control, Files, Phone and the other pages no longer shows the previous
-> page behind the new one, and a page change is immediate; **Maximize view**
-> gives the screen the whole window; large displays stay sharp (head units keep
-> their full resolution, more bit rate above 1080p, the Displays tab shares its
-> bit rate by size); and **Start** installs scrcpy by itself when it is missing.
+> **New in 6.0.0:** large screens and head units now start **the way scrcpy
+> itself does**, with hardware decoding; **zoom** on the device screen and the
+> webcam; ADB screencap only if you choose it; **Tab** in the Android shell reads
+> the line as the shell does. TurboADB is now published on **GitHub Releases**
+> only, and updates itself from there.
 > Full notes in the
 > [changelog](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
@@ -60,7 +59,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-5.0.0-win64.exe`** from the
+1. Download **`TurboADB-6.0.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
@@ -68,29 +67,28 @@ Pick whichever fits — both give you the full GUI.
 
 ### B · With pip — CLI, Python API, and GUI
 
+TurboADB is published on GitHub Releases, not on PyPI, so pip installs the wheel
+attached to the release:
+
 ```bash
-pip install turboadb
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl
 ```
 
 On Windows this already includes the app: the package carries the same
-executable (which is why the download is about 59 MB), so `turboadb-gui` starts
+executable (which is why the download is about 60 MB), so `turboadb-gui` starts
 it even without PyQt5 (from a copy in `~/.turboadb/gui`, so an upgrade can
 replace the packaged file). To run the GUI from the Python code instead — on
 Linux or macOS, for example — add the GUI extra:
 
 ```bash
-pip install "turboadb[gui]"
+pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl"
 ```
 
 Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or
-`import turboadb` (the API). Other optional extras are:
+`import turboadb` (the API). The other optional extras go in the same place:
+`winrm` for the remote 'serve' deploy over WinRM, and `all` for GUI + WinRM support.
 
-```bash
-pip install "turboadb[winrm]"  # remote 'serve' deploy over WinRM
-pip install "turboadb[all]"    # GUI + WinRM support
-```
-
-Upgrade any time with `pip install --upgrade turboadb`.
+Upgrade any time with `turboadb self-update`.
 
 `adb` and `scrcpy` download themselves into `~/.turboadb/tools` on first use, so
 they never need to be on your PATH: adb on Windows, macOS and x86-64 Linux,
@@ -861,7 +859,7 @@ deploy_serve(["lab-pc-01", "lab-pc-02"], "DOMAIN\\user", "password",
 
 ## Keep things up to date
 
-**GUI** — **Tools ▾ → Check for updates…** checks PyPI for a newer TurboADB,
+**GUI** — **Tools ▾ → Check for updates…** checks GitHub Releases for a newer TurboADB,
 updates it, refreshes `adb`/`scrcpy`, and restarts (with no newer TurboADB it
 still checks the tools). The standalone Windows app and a source checkout,
 which pip cannot update, are told when a newer version is out (at launch, on
@@ -932,7 +930,7 @@ dev.screenshot("after_install.png")
   stopped until you start it (or **Start all**).
 - `list_displays()` names each display (`Instrument cluster`, `Passenger`) and
   asks Android over adb; pass `method="scrcpy"` for scrcpy's own list.
-- If the default mirror fails, use **compatibility mode** (software decode).
+- If the default mirror fails, use **compatibility mode** (scrcpy's own defaults, H.264).
 - `bootloader` / `sideload` reboots warn hard — many head units have no on-screen
   recovery UI and can get stuck.
 - Calculator / Camera / Play Store are often absent; launchers fall back and the

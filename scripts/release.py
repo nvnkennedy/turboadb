@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """
-Release helper for turboadb:  bump version -> test -> build -> check -> upload.
+Release helper for turboadb:  bump version -> test -> build -> check.
+
+Publishing is pushing the tag: .github/workflows/release.yml builds the same
+files and attaches them to the GitHub Release.  Nothing here uploads anything.
 
 Usage
 -----
@@ -8,9 +11,7 @@ Usage
     python scripts/release.py patch              # 0.1.0 -> 0.1.1
     python scripts/release.py minor              # 0.1.0 -> 0.2.0
     python scripts/release.py major              # 0.1.0 -> 1.0.0
-    python scripts/release.py 0.1.1 --dry-run    # build + check, do NOT upload
-    python scripts/release.py 0.1.1 --test-pypi  # upload to TestPyPI
-    python scripts/release.py 0.1.1 --wheel-only # upload only the wheel (skip sdist)
+    python scripts/release.py 0.1.1 --dry-run    # also builds with no release notes yet
     python scripts/release.py 0.1.1 --rebuild-exe  # rebuild the exe even if dist/ has it
     python scripts/release.py 0.1.1 --no-exe     # lean package without the Windows exe
 
@@ -22,19 +23,11 @@ changed after it was built.
 CHANGELOG.md must have a ``## <version>`` section for the new version (the
 GitHub Release is written from it): without one the release stops before
 anything runs, and a --dry-run warns.
-
-The PyPI token is read from the environment, never hard-coded:
-    TWINE_USERNAME=__token__   (default if unset)
-    TWINE_PASSWORD=pypi-...    (your token)
-
-PyPI permanently forbids re-uploading an existing version, so every release
-must use a new version number.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shutil
 import subprocess
@@ -185,7 +178,7 @@ def missing_release_notes(version: str) -> str | None:
     """Why CHANGELOG.md has no ``## <version>`` section, or None when it has one.
 
     The test suite runs before the bump, so it checks the OLD version's notes;
-    without this, a release with no notes reached PyPI and only then failed in
+    without this, a release with no notes was built and only then failed in
     the Release workflow (whose GitHub Release is built from these notes)."""
     try:
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -196,18 +189,12 @@ def missing_release_notes(version: str) -> str | None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Build and publish turboadb.")
+    ap = argparse.ArgumentParser(description="Build and check turboadb.")
     ap.add_argument("version", help="X.Y.Z, or patch/minor/major")
     ap.add_argument(
-        "--dry-run", action="store_true", help="build and twine check only; do not upload"
+        "--dry-run", action="store_true", help="build even with no release notes yet"
     )
-    ap.add_argument("--test-pypi", action="store_true", help="upload to TestPyPI instead of PyPI")
     ap.add_argument("--skip-tests", action="store_true")
-    ap.add_argument(
-        "--wheel-only",
-        action="store_true",
-        help="upload only the wheel (handy if sdist upload hangs)",
-    )
     ap.add_argument(
         "--rebuild-exe",
         action="store_true",
@@ -221,7 +208,7 @@ def main(argv=None) -> int:
     cur = current_version()
     new = resolve_target(args.version, cur)
     print(f"Current version: {cur}\nNew version:     {new}")
-    # Checked before anything runs: a release without notes must not reach PyPI.
+    # Checked before anything runs: a release without notes must not be built.
     # A dry run only warns (at the start and again at the end), so it can still
     # bump and build a version whose notes are yet to be written.
     no_notes = missing_release_notes(new)
@@ -248,9 +235,8 @@ def main(argv=None) -> int:
 
     print("\nUpdating version strings:")
     # The version must be bumped before building (the wheel embeds it), but a
-    # failed build, check OR UPLOAD must not leave the files bumped for a
-    # release that never happened — the next `patch` run would then skip a
-    # version number. The guard covers everything up to a successful upload.
+    # failed build or check must not leave the files bumped for a release that
+    # never happened — the next `patch` run would then skip a version number.
     originals = {path: path.read_text(encoding="utf-8") for path in (PYPROJECT, INIT)}
     set_version(PYPROJECT, r'(?m)^version\s*=\s*"([^"]+)"', new, "pyproject.toml")
     set_version(INIT, r'__version__\s*=\s*"([^"]+)"', new, "turboadb/__init__.py")
@@ -280,35 +266,18 @@ def main(argv=None) -> int:
                 if not wheel_has_exe(wheel):
                     sys.exit(f"{wheel.name} is missing {BUNDLED_EXE}")
         run([sys.executable, "-m", "twine", "check", *(str(p) for p in artifacts)])
-
-        if args.dry_run:
-            print("\n--dry-run: built and validated, skipping upload.")
-            if no_notes:
-                print(f"WARNING: {no_notes}; the real release stops until it has one.")
-            return 0
-
-        if "TWINE_PASSWORD" not in os.environ:
-            sys.exit("Set TWINE_PASSWORD (your PyPI token) before uploading.")
-        os.environ.setdefault("TWINE_USERNAME", "__token__")
-        cmd = [sys.executable, "-m", "twine", "upload"]
-        if args.test_pypi:
-            cmd += ["--repository", "testpypi"]
-        if args.wheel_only:
-            cmd += [str(p) for p in sorted((ROOT / "dist").glob("*.whl"))]
-        else:
-            cmd += [str(p) for p in artifacts]
-        run(cmd)
+        if no_notes:
+            print(f"WARNING: {no_notes}; the real release stops until it has one.")
     except BaseException:
-        # SystemExit included: every sys.exit() above means nothing reached
-        # PyPI, so the bump must be undone as well.
+        # SystemExit included: every sys.exit() above means nothing was built
+        # to release, so the bump must be undone as well.
         for path, text in originals.items():
             if path.read_text(encoding="utf-8") != text:
                 path.write_text(text, encoding="utf-8")
         print(f"\nRelease failed — version strings restored to {cur}.", file=sys.stderr)
         raise
 
-    target = "TestPyPI" if args.test_pypi else "PyPI"
-    print(f"\nDone. Published turboadb {new} to {target}.")
+    print(f"\nDone. Built turboadb {new} in dist/. Commit it and push the tag v{new} to publish.")
     return 0
 
 

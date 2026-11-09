@@ -1,6 +1,6 @@
-"""Self-update: check PyPI for a newer TurboADB and ``pip install --upgrade`` it
-in place, then refresh adb/scrcpy and relaunch — so the user always runs the
-latest version without touching a terminal."""
+"""Self-update: check GitHub Releases for a newer TurboADB and install its wheel
+with pip in place, then refresh adb/scrcpy and relaunch — so the user always runs
+the latest version without touching a terminal."""
 
 from __future__ import annotations
 
@@ -15,9 +15,12 @@ import urllib.request
 from .config import user_path
 from .tools import NO_WINDOW, parse_version, windowless_python
 
-PYPI_JSON = "https://pypi.org/pypi/turboadb/json"
-# Where each release's standalone executable is published.
-RELEASES_PAGE = "https://github.com/NVNKENNEDY/turboadb/releases/latest"
+REPO_URL = "https://github.com/NVNKENNEDY/turboadb"
+# Where each release is published: the standalone executable, the wheel and the
+# source package.  This address redirects to the newest release's own page.
+RELEASES_PAGE = f"{REPO_URL}/releases/latest"
+# A version that can go in a download address.
+_PLAIN_VERSION = re.compile(r"[0-9][0-9A-Za-z.!+_-]*")
 
 # The folder of the turboadb package this process imported.
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,15 +36,30 @@ def current_version() -> str:
         return "0"
 
 
-def pypi_latest(timeout: float = 6.0) -> str | None:
-    """The newest version on PyPI, or None if the network/PyPI is unavailable."""
+def _version_of_release(url: str | None) -> str | None:
+    """The version in a release page's address (``…/releases/tag/v6.0.0``)."""
+    found = re.search(r"/releases/tag/v?([0-9][0-9A-Za-z.!+_-]*)/?$", url or "")
+    return found.group(1) if found else None
+
+
+def latest_release(timeout: float = 6.0) -> str | None:
+    """The newest version on GitHub Releases, or None if it cannot be reached.
+
+    Read from where :data:`RELEASES_PAGE` redirects to: GitHub's API allows 60
+    requests an hour from one address, which a shared office address spends."""
     try:
-        req = urllib.request.Request(PYPI_JSON, headers={"User-Agent": "TurboADB"})
+        req = urllib.request.Request(
+            RELEASES_PAGE, headers={"User-Agent": "TurboADB"}, method="HEAD"
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.load(resp)
-        return (data.get("info") or {}).get("version")
+            return _version_of_release(resp.geturl())
     except Exception:
         return None
+
+
+def wheel_url(version: str) -> str:
+    """Where the wheel of *version* is published."""
+    return f"{REPO_URL}/releases/download/v{version}/turboadb-{version}-py3-none-any.whl"
 
 
 def is_newer(latest: str | None, current: str | None = None) -> bool:
@@ -191,10 +209,7 @@ def self_update_blocker() -> str | None:
     process imports), and for a checkout installed in editable mode it would
     replace that install with a release."""
     if getattr(sys, "frozen", False):
-        return (
-            "running the standalone executable — download the new one from "
-            f"{RELEASES_PAGE} (or, where pip installed it: pip install -U turboadb)"
-        )
+        return f"running the standalone executable — download the new one from {RELEASES_PAGE}"
     copy = running_copy()
     if copy["pip_managed"] is not False:
         return None
@@ -226,7 +241,7 @@ def check() -> str | None:
     (:func:`can_self_update`): the standalone executable and a source checkout
     are told about a newer release too, and :func:`self_update_blocker` says
     how they get it."""
-    latest = pypi_latest()
+    latest = latest_release()
     return latest if is_newer(latest) else None
 
 
@@ -235,7 +250,7 @@ _DEFAULT_CHECK_CACHE = _CHECK_CACHE
 
 
 def check_cache_path() -> str:
-    """Where the daily PyPI check is cached, resolved on call through
+    """Where the daily release check is cached, resolved on call through
     :func:`turboadb.config.user_dir` (the module-level ``_CHECK_CACHE`` was
     frozen at import, so a process whose HOME changed afterwards wrote it beside
     a different settings.json). An explicit override of ``_CHECK_CACHE`` still
@@ -246,7 +261,7 @@ def check_cache_path() -> str:
 
 
 def check_cached(max_age: float = 86400) -> str | None:
-    """Like :func:`check`, but hits PyPI at most once per *max_age* seconds
+    """Like :func:`check`, but asks GitHub at most once per *max_age* seconds
     (default: daily) — for the quiet launch check, so starting the app several
     times a day doesn't mean several network round-trips."""
     import time
@@ -260,7 +275,7 @@ def check_cached(max_age: float = 86400) -> str | None:
             return latest if is_newer(latest) else None
     except Exception:
         pass
-    latest = pypi_latest()
+    latest = latest_release()
     if latest:  # cache successes only — a network blip
         try:  # shouldn't silence the check for a day
             os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -271,14 +286,8 @@ def check_cached(max_age: float = 86400) -> str | None:
     return latest if is_newer(latest) else None
 
 
-def _pip_upgrade_cmd(expected: str | None = None):
-    """``pip install --upgrade turboadb``, pinned to *expected* (the version
-    PyPI reported) when it is known: a package index that does not have that
-    release yet (a mirror, a proxy's cache) then fails with pip's own clear
-    message instead of calling the installed version "already satisfied"."""
-    spec = "turboadb"
-    if expected and re.fullmatch(r"[0-9][0-9A-Za-z.!+_-]*", expected):
-        spec = f"turboadb=={expected}"
+def _pip_upgrade_cmd(version: str):
+    """``pip install --upgrade`` of the wheel published for *version*."""
     return [
         sys.executable,
         "-m",
@@ -287,7 +296,7 @@ def _pip_upgrade_cmd(expected: str | None = None):
         "--upgrade",
         "--no-input",
         "--disable-pip-version-check",
-        spec,
+        wheel_url(version),
     ]
 
 
@@ -310,6 +319,9 @@ _REPORT_CODE = (
     "    if UPGRADE:\n"
     "        up = toolsdl.upgrade_tools() or {}\n"
     "        out['errors'].update({k: str(v) for k, v in (up.get('errors') or {}).items()})\n"
+    "        for tool in up.get('unknown') or []:\n"
+    "            out['errors'].setdefault(tool, 'could not find out whether a newer version exists')\n"
+    "        out['manual'] = {t: toolsdl.manual_update_steps(t) for t in ('adb', 'scrcpy') if t in out['errors']}\n"
     "        out['updated'] = sorted(up.get('updated') or {})\n"
     "    out['adb'] = toolsdl.installed_adb_version()\n"
     "    out['scrcpy'] = toolsdl.installed_scrcpy_version()\n"
@@ -361,16 +373,16 @@ def _installed_version_fresh() -> str | None:
 
 
 def run_upgrade(notify=None, *, expected: str | None = None, allow_unchanged: bool = False) -> dict:
-    """pip-upgrade TurboADB, then refresh adb + scrcpy. Returns a result dict:
-    {ok, old, new, unchanged, adb, scrcpy, error}.
+    """Install the newer release's wheel with pip, then refresh adb + scrcpy.
+    Returns a result dict: {ok, old, new, unchanged, adb, scrcpy, error}.
 
-    *expected* is the version PyPI offered, and pip installs exactly that one.
-    pip also exits 0 when its package index (a mirror that lags behind PyPI)
-    has nothing newer, so the installed version is read back first: an
-    upgrade that leaves it where it was fails, before adb and scrcpy are
-    touched — otherwise the GUI reported the old version as new, restarted,
-    and offered the same update again.  *allow_unchanged* is for a run that
-    only means to refresh adb and scrcpy (PyPI had nothing newer)."""
+    *expected* is the version that was offered, and pip installs exactly that
+    one (without it the newest release is asked for here).  The installed
+    version is read back first: an upgrade that leaves it where it was fails,
+    before adb and scrcpy are touched — otherwise the GUI reported the old
+    version as new, restarted, and offered the same update again.
+    *allow_unchanged* is for a run that only means to refresh adb and scrcpy
+    (no release is newer): pip is not run at all."""
 
     def say(msg):
         if notify:
@@ -391,37 +403,45 @@ def run_upgrade(notify=None, *, expected: str | None = None, allow_unchanged: bo
     if not can_self_update():
         res["error"] = self_update_blocker() or "pip cannot upgrade this copy of TurboADB"
         return res
-    try:
-        say("Upgrading TurboADB from PyPI (pip install --upgrade)…")
-        p = subprocess.run(
-            _pip_upgrade_cmd(expected),
-            capture_output=True,
-            text=True,
-            timeout=600,
-            creationflags=NO_WINDOW,
-        )
-        if p.returncode != 0:
-            tail = (p.stderr or p.stdout or "pip failed").strip()
-            res["error"] = tail[-600:]
+    version = expected if expected and _PLAIN_VERSION.fullmatch(expected) else None
+    if version is None and not allow_unchanged:
+        latest = latest_release()
+        if not latest:
+            res["error"] = f"could not read the newest release from {RELEASES_PAGE}"
             return res
-    except Exception as exc:
-        res["error"] = str(exc)
-        return res
+        if is_newer(latest):
+            version = latest
+        else:
+            allow_unchanged = True  # nothing newer: only adb and scrcpy are left
+    if version and not allow_unchanged:
+        try:
+            say(f"Installing TurboADB {version} from GitHub…")
+            p = subprocess.run(
+                _pip_upgrade_cmd(version),
+                capture_output=True,
+                text=True,
+                timeout=600,
+                creationflags=NO_WINDOW,
+            )
+            if p.returncode != 0:
+                tail = (p.stderr or p.stdout or "pip failed").strip()
+                res["error"] = tail[-600:]
+                return res
+        except Exception as exc:
+            res["error"] = str(exc)
+            return res
     installed = None
-    if not allow_unchanged:
+    if version and not allow_unchanged:
         installed = _installed_version_fresh()
-        target = parse_version(expected) if expected else None
         if installed and (
             parse_version(installed) <= parse_version(res["old"])
-            or (target is not None and parse_version(installed) < target)
+            or parse_version(installed) < parse_version(version)
         ):
             res["new"] = installed
             res["unchanged"] = installed == res["old"]
             res["error"] = (
-                f"pip finished, but TurboADB {installed} is still what is installed"
-                + (f" (not {expected})" if expected else "")
-                + ": the package index pip uses (a mirror, or a proxy's cache) does not "
-                "have the new release yet. Nothing else was changed; try again later."
+                f"pip finished, but TurboADB {installed} is still what is installed "
+                f"(not {version}). Nothing else was changed; try again later."
             )
             return res
     res["ok"] = True
@@ -439,10 +459,15 @@ def run_upgrade(notify=None, *, expected: str | None = None, allow_unchanged: bo
         say(f"TurboADB upgraded to {res['new']}.")
     terr = report.get("errors") or {}
     if terr:
-        # surface failures instead of silently reporting the OLD versions
+        # TurboADB itself is updated either way: surface what was not, and how
+        # to do it by hand, instead of silently reporting the OLD versions
         res["tools_errors"] = terr
+        manual = report.get("manual") or {}
+        res["tools_manual"] = manual
         for tool, err in terr.items():
             say(f"[WARNING] {tool} update failed: {err}")
+            if manual.get(tool):
+                say(f"  Update {tool} yourself: {manual[tool]}")
     return res
 
 

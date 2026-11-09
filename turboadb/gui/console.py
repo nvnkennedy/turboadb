@@ -232,6 +232,17 @@ _SCREEN_KEYS = {
 }
 
 
+class Completion(str):
+    """One Tab option: the text that goes on the line (the string itself), what
+    the list shows (*display*), and where on the line its word begins (*start*)."""
+
+    def __new__(cls, text, display=None, start=None):
+        option = super().__new__(cls, text)
+        option.display = text if display is None else display
+        option.start = start
+        return option
+
+
 class AnsiConsole(QPlainTextEdit):
     # Emitted with the new point size whenever this console's zoom changes.
     font_size_changed = pyqtSignal(int)
@@ -850,7 +861,7 @@ class AnsiConsole(QPlainTextEdit):
             return ""
         display_items = []
         for s in items:
-            s_str = str(s)
+            s_str = getattr(s, "display", str(s))
             clean = s_str.strip('"\'')
             if clean.endswith("\\") or clean.endswith("/"):
                 display_items.append("📁 " + s_str)
@@ -1080,7 +1091,10 @@ class AnsiConsole(QPlainTextEdit):
             self._tab_cycle_idx = -1
             self._tab_base_line = self._line
             tokens = self._line.split()
-            if tokens and not self._line.endswith(" "):
+            start = getattr(opts[0], "start", None)
+            if start is not None:
+                self._tab_replace_idx = start  # the provider knows where its word begins
+            elif tokens and not self._line.endswith(" "):
                 last_tok = tokens[-1]
                 self._tab_replace_idx = self._line.rfind(last_tok)
             else:

@@ -138,6 +138,17 @@ def fake_adb(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_open_message_box(monkeypatch):
+    """Qt's offscreen platform crashes in QMessageBox.open (a real desktop does
+    not), and a question left open would wait for nobody."""
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+    except ImportError:
+        return
+    monkeypatch.setattr(QMessageBox, "open", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_winget(monkeypatch):
     """This PC's winget, and what it installed, stay out of the tests."""
     from turboadb import tools, toolsdl
@@ -266,19 +277,19 @@ def _no_ffmpeg_download(monkeypatch):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _no_pypi_lookup():
-    """The update check asks PyPI whichever TurboADB runs: a main window does
+def _no_release_lookup():
+    """The update check asks GitHub whichever TurboADB runs: a main window does
     2.5 s after it opens, "Check for updates" at once.  No test reaches the
-    network for it; those of the check give ``pypi_latest`` an answer of
+    network for it; those of the check give ``latest_release`` an answer of
     their own.
 
     For the whole run, not per test: a window that a test leaves open asks
     later, between two tests, on a worker of its own.  A stand-in that went
-    with each test was gone by then, and the suite reached pypi.org."""
+    with each test was gone by then, and the suite reached the network."""
     from turboadb import update
 
     stand_in = pytest.MonkeyPatch()
-    stand_in.setattr(update, "pypi_latest", lambda *args, **kwargs: None)
+    stand_in.setattr(update, "latest_release", lambda *args, **kwargs: None)
     yield
     stand_in.undo()
 

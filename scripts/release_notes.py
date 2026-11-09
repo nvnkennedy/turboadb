@@ -68,7 +68,7 @@ def release_notes(version: str, text: str | None = None) -> str:
         "## Install",
         "",
         f"- **Windows app:** download `TurboADB-{version}-win64.exe` below and run it.",
-        "- **pip:** `pip install --upgrade turboadb`",
+        f"- **pip:** `pip install {REPO}/releases/download/v{version}/turboadb-{version}-py3-none-any.whl`",
     ]
     if previous:
         lines += ["", f"**Full changes:** {REPO}/compare/v{previous}...v{version}"]

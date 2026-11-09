@@ -136,6 +136,7 @@ def _instrument(panel, monkeypatch):
     monkeypatch.setattr(panel, "_schedule_retry", lambda _ms, callback: schedule(0, callback))
     monkeypatch.setattr(panel, "_scrcpy_window_up", lambda: False)
     monkeypatch.setattr(panel, "_open_scrcpy_log", opened.append)
+    monkeypatch.setattr(panel, "_open_next_step", lambda: opened.append(panel._scrcpy_error))
     panel.screen_failed.connect(failed.append)
     panel.log.connect(logs.append)
     return opened, failed, logs

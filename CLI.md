@@ -32,7 +32,7 @@ options, straight from the installed version.
 ## Getting started
 
 ```bash
-pip install turboadb
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.0/turboadb-6.0.0-py3-none-any.whl
 turboadb doctor                                   # are adb and scrcpy available?
 turboadb devices                                  # what's attached
 turboadb -s 10BE330KG9000AF info                  # talk to one device by serial
@@ -169,10 +169,10 @@ turboadb upgrade-tools --check --json
 ```
 
 ### `turboadb self-update`
-Upgrade TurboADB itself from PyPI, then adb and scrcpy. pip installs exactly
-the version PyPI offers; when pip's package index (a mirror or a proxy) doesn't
-have it yet, the update fails with that reason and nothing else changes. With
-nothing newer on PyPI it only refreshes adb and scrcpy ("already up to date").
+Upgrade TurboADB itself from the newest GitHub Release, then adb and scrcpy. pip
+installs that release's wheel; an update that leaves the old version in place
+fails with that reason and nothing else changes. With no newer release it only
+refreshes adb and scrcpy ("already up to date").
 A source checkout, even one installed with `pip install -e`, is updated with
 `git pull` instead, and the standalone executable by installing the new one.
 
@@ -764,7 +764,7 @@ Mirror and control the screen with scrcpy.
 | Option | Meaning |
 |---|---|
 | `--display-id N` | Mirror this display. |
-| `--compat` | Compatibility profile for head units whose encoders fail with scrcpy's defaults: H.264, capped frame rate, no audio, forward tunnel. Try it first when mirroring doesn't start on an IVI. |
+| `--compat` | Compatibility profile for head units: scrcpy's own defaults, with H.264 named and no audio. |
 | `--max-size PX` | Limit the longer side, for example `1280`. |
 | `--bit-rate RATE` | Video bitrate, for example `8M`. |
 | `--max-fps N` | Frame-rate cap. |

@@ -16,9 +16,10 @@ import socket
 import threading
 import subprocess
 
-from PyQt5.QtCore import QRect, Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import QEvent, QRect, Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter, QPixmap, QTransform
 from PyQt5.QtWidgets import (
+    QSlider,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -824,6 +825,25 @@ class CameraPanel(QWidget):
         self.flip.setToolTip("Flip the image horizontally (mirror, selfie-style).")
         self.flip.stateChanged.connect(lambda *_: self._repaint_now())
         row.addWidget(self.flip)
+        row.addSpacing(4)
+        row.addWidget(QLabel("Zoom"))
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(self.ZOOM_MIN, self.ZOOM_MAX)
+        self.zoom_slider.setSingleStep(25)
+        self.zoom_slider.setPageStep(100)
+        self.zoom_slider.setFixedWidth(120)
+        self.zoom_slider.setToolTip(
+            "Zoom into the picture. Drag it to move around, use the mouse wheel to zoom, "
+            "double-click to go back. Snapshots and recordings keep the whole picture."
+        )
+        self.zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        row.addWidget(self.zoom_slider)
+        self.zoom_lbl = QLabel("100%")
+        self.zoom_lbl.setObjectName("mutedHint")
+        row.addWidget(self.zoom_lbl)
+        self.view.installEventFilter(self)
+        self._zoom_pan = [0.5, 0.5]  # which part of the zoomed picture shows (0 to 1)
+        self._zoom_drag = None  # where the mouse was, while it drags the picture
         self.fps_lbl = QLabel("")
         self.fps_lbl.setObjectName("mutedHint")
         row.addWidget(self.fps_lbl)
@@ -948,6 +968,65 @@ class CameraPanel(QWidget):
 
     def _repaint_now(self):
         self._last_paint = -1
+
+    # ---- zoom (of the view only: snapshots and recordings keep the whole picture) ----
+    ZOOM_MIN = 100
+    ZOOM_MAX = 800
+
+    def _zoom_factor(self) -> float:
+        return self.zoom_slider.value() / 100.0
+
+    def _on_zoom_changed(self, value) -> None:
+        self.zoom_lbl.setText(f"{value}%")
+        self.view.setCursor(Qt.OpenHandCursor if value > self.ZOOM_MIN else Qt.ArrowCursor)
+        self._repaint_now()
+
+    def _zoomed(self, img):
+        """The part of *img* the zoom shows."""
+        zoom = self._zoom_factor()
+        if zoom <= 1.0:
+            return img
+        w, h = max(1, int(round(img.width() / zoom))), max(1, int(round(img.height() / zoom)))
+        x = int(round(self._zoom_pan[0] * (img.width() - w)))
+        y = int(round(self._zoom_pan[1] * (img.height() - h)))
+        return img.copy(x, y, w, h)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view:
+            kind = event.type()
+            if kind == QEvent.Wheel:
+                step = 25 if event.angleDelta().y() > 0 else -25
+                self.zoom_slider.setValue(self.zoom_slider.value() + step)
+                return True
+            if kind == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
+                self.zoom_slider.setValue(self.ZOOM_MIN)
+                self._zoom_pan = [0.5, 0.5]
+                self._repaint_now()
+                return True
+            if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._zoom_drag = event.pos()
+                return False
+            if kind == QEvent.MouseButtonRelease:
+                self._zoom_drag = None
+                return False
+            if kind == QEvent.MouseMove and self._zoom_drag is not None:
+                self._drag_zoom(event.pos())
+                return True
+        return super().eventFilter(obj, event)
+
+    def _drag_zoom(self, pos) -> None:
+        """Move the zoomed part with the drag: the picture follows the mouse."""
+        zoom = self._zoom_factor()
+        if zoom <= 1.0:
+            return
+        delta, self._zoom_drag = pos - self._zoom_drag, pos
+        span_w = max(1.0, self.view.width() * (zoom - 1.0))
+        span_h = max(1.0, self.view.height() * (zoom - 1.0))
+        self._zoom_pan = [
+            max(0.0, min(1.0, self._zoom_pan[0] - delta.x() / span_w)),
+            max(0.0, min(1.0, self._zoom_pan[1] - delta.y() / span_h)),
+        ]
+        self._repaint_now()
 
     def _res(self):
         return _RES.get(self.res.currentText(), (1280, 720))
@@ -1525,7 +1604,9 @@ class CameraPanel(QWidget):
 
     # ---- display (cheap: just scale an already-decoded QImage) ----
     def _tick(self):
-        if self._paused or self.reader is None:
+        if self.reader is None:
+            return
+        if self._paused and self._last_paint != -1:  # (a zoom or turn still shows)
             return
         n = self.reader.frames
         if n == self._last_paint:  # no new frame -> don't rescale again
@@ -1534,6 +1615,7 @@ class CameraPanel(QWidget):
         img = self._orient(self.reader.latest_image())
         if img is None:
             return
+        img = self._zoomed(img)
         target = self.view.size()
         mode = self.view_mode.currentData()
         # Smooth scaling is expensive at 720p/1080p and was the other common

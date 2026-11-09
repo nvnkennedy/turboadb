@@ -3,6 +3,56 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.0.0
+
+### New
+
+- **Zoom on the device screen.** The − and + buttons beside the screen (or Actual
+  pixels, 1:1) make the picture larger, and scroll bars move around it, so a small
+  bar on a big display can be read. The renderer really draws the extra pixels,
+  and clicks and touches still land in the right place. It works for scrcpy and
+  for ADB screencap.
+- **Zoom in the webcam view.** A slider, the mouse wheel, and dragging to move
+  around; double-click goes back. Snapshots and recordings keep the whole picture.
+
+### Changed
+
+- **TurboADB is published on GitHub Releases only, no longer on PyPI.** Check for
+  updates and `turboadb self-update` read the newest release from GitHub, and a
+  pip install updates itself from the wheel attached to that release. To install
+  with pip, use the wheel's address on the release page.
+- **Only you move a screen to ADB screencap or a separate window.** When scrcpy
+  cannot start, a question offers Try again, Switch to ADB screencap, Open in a
+  separate window and Show log. The automatic retries change the video only.
+
+### Fixed
+
+- **Large screens and head units start the way scrcpy itself does.** TurboADB
+  forced a renderer that switched scrcpy to software decoding, three times the
+  CPU on an idle 2560x1600 display and far more once it moves, where scrcpy on
+  its own decodes in hardware. Only a tall phone screen still uses that renderer.
+  5.0.0's higher bit rate for big displays is gone, and the head-unit profile no
+  longer caps the frame rate, forces a forward tunnel or keeps the device awake;
+  it asks for at most 16M.
+- **A late first picture no longer ends the screen.** scrcpy that has reached the
+  device keeps running however long the first picture takes, and you are asked
+  what to do once it is overdue. It used to be killed after 25 seconds, or shown
+  as a blank window of its own.
+- **`adb remount` and `mount` work more often, and say why when they cannot.**
+  `adb root` is now waited for until adbd has really restarted, which caused the
+  occasional "error: closed". Both get root first where the build allows it, and
+  `mount` falls back to `adb remount` for partitions it cannot change.
+- **Updating TurboADB says what it could not update.** If adb or scrcpy cannot be
+  updated along with it, TurboADB is still updated, and you are told what to run.
+- **Tab in the Android shell reads the line as the shell does.**
+  - Names with spaces complete, whether typed with backslashes or inside quotes,
+    and go on the line escaped so the command still works.
+  - After `;`, `|`, `&&` or `(` the next word completes as a command, and after
+    `>` or `<` as a file.
+  - Tab after a space lists the folder.
+  - Shell built-ins such as `cd` and `export` are offered as commands.
+  - The list shows only the last part of a path, `data/` rather than `/data/`.
+
 ## 5.0.0
 
 ### New

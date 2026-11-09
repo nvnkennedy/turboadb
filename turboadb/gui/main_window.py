@@ -648,7 +648,7 @@ def _update_blocker() -> str:
 
 
 def _update_check_worker(cached=False):
-    """Ask PyPI whether a newer TurboADB exists; ``done`` carries ``(latest,
+    """Ask GitHub whether a newer TurboADB exists; ``done`` carries ``(latest,
     blocker)``: the newer version or "", and why pip cannot install it here
     (see :func:`_update_blocker`), "" when it can.  *cached=True* uses the
     once-a-day cache (quiet launch check)."""
@@ -667,7 +667,7 @@ def _update_check_worker(cached=False):
 def _upgrade_check_worker():
     """The Upgrade button's check: ``done`` carries ``(can_update, latest,
     blocker)``: whether pip can upgrade this copy of TurboADB, the newer
-    version PyPI has or "", and, when pip cannot, why not (see
+    newest version on GitHub or "", and, when pip cannot, why not (see
     :func:`_update_blocker`).  A newer version is reported either way: the
     standalone exe and a source checkout were never told of one."""
 
@@ -705,7 +705,7 @@ class _AppUpgradeThread(QThread):
 
     *expected* is the version the user was offered: pip installs exactly that
     one, and an upgrade that leaves the installed version unchanged (a package
-    mirror that lags behind PyPI) fails instead of reporting the old version
+    mirror that lags behind) fails instead of reporting the old version
     as new (see ``update.run_upgrade``)."""
     progress = pyqtSignal(str)
     done = pyqtSignal(dict)
@@ -915,7 +915,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, self._check_tools)
         # make sure the Desktop + Start-menu shortcuts exist (self-healing)
         QTimer.singleShot(1000, self._ensure_shortcuts)
-        # quiet launch check (Settings → Startup, on by default): if PyPI has a
+        # quiet launch check (Settings → Startup, on by default): if GitHub has a
         # newer TurboADB it only logs a line — installing still happens ONLY via
         # the ribbon 🔄 Upgrade button, never automatically.
         if settings_mod.get("auto_update"):
@@ -1062,8 +1062,8 @@ class MainWindow(QMainWindow):
             f"<b>TurboADB {self._version}</b><br><br>"
             "Android ADB + scrcpy device toolkit for automotive/embedded "
             "(Android Automotive / IVI) &amp; general Android.<br><br>"
-            "<a href='https://pypi.org/project/turboadb/'>"
-            "pypi.org/project/turboadb</a>")
+            "<a href='https://github.com/NVNKENNEDY/turboadb'>"
+            "github.com/NVNKENNEDY/turboadb</a>")
 
     # ---- app bar: global actions only (device actions live in each device tab) ----
     def _build_ribbon(self):
@@ -2964,7 +2964,7 @@ class MainWindow(QMainWindow):
 
     def upgrade_tools_gui(self):
         """Ribbon ‘Upgrade’: the ONE place updates happen. First check TurboADB
-        itself on PyPI; if newer, self-update (which also refreshes adb + scrcpy)
+        itself on GitHub; if newer, self-update (which also refreshes adb + scrcpy)
         and restart. Otherwise just check/refresh adb + scrcpy."""
         if thread_running(getattr(self, "_upd_run", None)):
             self._log("[WARNING] An update is already running.")
@@ -3320,7 +3320,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Update failed",
                 "Could not update automatically:\n\n"
-                f"{err}\n\nUpdate manually with:\n    pip install --upgrade turboadb")
+                f"{err}\n\nThe new version is at:\n    {_upd.RELEASES_PAGE}")
             return
         for tool, err in (res.get("tools_errors") or {}).items():
             self._log(f"[WARNING] {tool} refresh failed: {err}")
@@ -3333,10 +3333,16 @@ class MainWindow(QMainWindow):
         self._log(
             f"[OK] Updated to TurboADB {res.get('new')}{tools}. Restarting…")
         relaunched = _upd.relaunch_on_exit()
+        manual = res.get("tools_manual") or {}
+        by_hand = "".join(
+            f"\n{tool} could not be updated. Update it yourself:\n    {steps}\n"
+            for tool, steps in manual.items()
+        )
         QMessageBox.information(
             self, "Updated",
             f"Updated to TurboADB {res.get('new')}.\n"
             + (f"Latest tools: {', '.join(bits)}.\n" if bits else "")
+            + by_hand
             + ("\nTurboADB will now restart." if relaunched
                else "\nReopen TurboADB to use the new version."))
         if relaunched:

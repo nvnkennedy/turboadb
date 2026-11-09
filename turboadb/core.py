@@ -1563,12 +1563,28 @@ class ADBHandler:
     def _adbd_restart(self, verb: str, already: str):
         text = self._checked_adb([verb], ("cannot run as root", "error"))
         if already not in text.lower():
-            # adbd restarts; wait for it to come back instead of a fixed sleep
-            try:
-                self._wait_for_device(10.0)
-            except ADBError:
-                pass
+            self._wait_for_adbd(root=verb == "root")
         return text
+
+    def _wait_for_adbd(self, *, root: bool, timeout: float = 20.0) -> None:
+        """Wait until adbd has really restarted as root (or not).
+
+        ``adb root`` returns while the old adbd is still up, and ``wait-for-device``
+        is satisfied by that one: the next command then met it going away and
+        failed ("error: closed"), now and then.  So adbd is asked who it is."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                res = self._run(self._shell_args("id", "-u"), timeout=5, check=False)
+            except ADBError:
+                res = None
+            if res is not None and res.ok:
+                uid = res.text.strip()
+                if not uid.isdigit() or (uid == "0") == root:
+                    return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.3)
 
     def root(self, *, safe: Optional[bool] = None):
         """Restart adbd as root (``adb root``). Raises ADBCommandError on
@@ -1595,10 +1611,18 @@ class ADBHandler:
         On Android 10+ the first remount may only set up overlayfs (or turn
         verity off) and ask for a reboot: the partitions stay read-only until
         then. That is logged as a warning and said at the end of the returned
-        text. :meth:`make_writable` reboots and remounts by itself."""
+        text. :meth:`make_writable` reboots and remounts by itself.
+
+        adbd not running as root is put right first, where the build allows it."""
 
         def _do():
-            text, reboot_needed = self._remount_once()
+            try:
+                text, reboot_needed = self._remount_once()
+            except ADBCommandError as exc:
+                if "not running as root" not in str(exc).lower():
+                    raise
+                self._adbd_restart("root", "already running as root")
+                text, reboot_needed = self._remount_once()
             if reboot_needed:
                 self._emit(logging.WARNING, f"adb remount: {self._REMOUNT_REBOOT_NOTE}")
                 text = f"{text}\n{self._REMOUNT_REBOOT_NOTE}"
@@ -1652,11 +1676,22 @@ class ADBHandler:
 
         return self._guard("access_status", _do, safe=safe)
 
-    def _remount_once(self):
+    # The link dropped under the command: adbd was restarting, not refusing.
+    _ADBD_RESTARTING = (
+        "error: closed", "device offline", "no devices/emulators", "protocol fault",
+        "connection reset", "device not found",
+    )
+
+    def _remount_once(self, tries: int = 3):
         """``adb remount`` -> ``(output, reboot_needed)``; raises when refused."""
-        res = self._run(["remount"], timeout=60, check=False)
-        text = self._combined_output(res)
-        low = text.lower()
+        for attempt in range(tries):
+            res = self._run(["remount"], timeout=60, check=False)
+            text = self._combined_output(res)
+            low = text.lower()
+            if res.ok or not any(marker in low for marker in self._ADBD_RESTARTING):
+                break
+            if attempt + 1 < tries:
+                time.sleep(1.5)
         succeeded = "remount succeeded" in low
         reboot_needed = not succeeded and bool(self._REBOOT_REQUEST_RE.search(text))
         refused = not res.ok or any(marker in low for marker in self._REMOUNT_REFUSALS)
@@ -1768,16 +1803,32 @@ class ADBHandler:
 
     def mount_rw(self, path: str = "/", *, safe: Optional[bool] = None):
         """Remount a partition read-write via the shell (needs root).
-        Default ``/`` (system-as-root); pass ``/system`` on older devices."""
-        return self._guard(
-            "mount_rw",
-            lambda: self._checked_adb(
-                ["mount", "-o", "remount,rw", path],
-                ("mount:", "denied", "not permitted", "read-only", "no such"),
-                shell=True,
-            ),
-            safe=safe,
-        )
+        Default ``/`` (system-as-root); pass ``/system`` on older devices.
+
+        adbd is switched to root first where the build allows it.  A partition
+        ``mount`` cannot change (Android 10+ makes them read-only images) gets
+        what can: ``adb remount``, with its overlayfs.  Where both are refused,
+        the error says why ``mount`` failed."""
+
+        markers = ("mount:", "denied", "not permitted", "read-only", "no such", "invalid")
+
+        def _do():
+            try:
+                self._adbd_restart("root", "already running as root")
+            except ADBError as exc:
+                self._emit(logging.INFO, f"mount {path}: no root through adb ({exc})")
+            try:
+                return self._checked_adb(["mount", "-o", "remount,rw", path], markers, shell=True)
+            except ADBCommandError as first:
+                if path.rstrip("/") not in ("", "/system", "/vendor", "/product", "/system_ext", "/odm"):
+                    raise
+                try:
+                    text, reboot_needed = self._remount_once()
+                except ADBError:
+                    raise first from None
+                return f"{text}\n{self._REMOUNT_REBOOT_NOTE}" if reboot_needed else text
+
+        return self._guard("mount_rw", _do, safe=safe)
 
     # ------------------------------------------------------------------ #
     # Device input & controls (keys, text, connectivity) — handy for IVI /
@@ -6348,12 +6399,12 @@ class ADBHandler:
         forwarded to :class:`ScrcpyOptions` (e.g. ``max_size=1024, bit_rate="8M",
         display_id=2, record="drive.mp4"``). Returns a ScrcpySession handle.
 
-        *compat=True* applies an Android-Automotive/IVI **compatibility profile**
-        for head units whose encoders choke on scrcpy's defaults: forces the
-        widely-supported H.264 codec, caps the frame rate, and disables audio. Try
-        it first when "scrcpy won't work" on a head unit.  The video keeps the
-        display's full size: an encoder that cannot take it is no failure,
-        since scrcpy then retries by itself at a smaller one.
+        *compat=True* applies an Android-Automotive/IVI **compatibility profile**:
+        scrcpy's own defaults, which is what runs smoothly on head units, with
+        the widely-supported H.264 codec named and audio off.  Nothing else is
+        forced.  scrcpy already falls back to a forward tunnel where
+        ``adb reverse`` is blocked, and retries by itself at a smaller size when
+        an encoder cannot take the display's full one.
         """
         def _do():
             from .scrcpy import launch_scrcpy
@@ -6367,11 +6418,8 @@ class ADBHandler:
                 opts = ScrcpyOptions(**kwargs)
             if compat:
                 opts.video_codec = opts.video_codec or "h264"
-                opts.max_fps = opts.max_fps or 30
                 opts.no_audio = True
-                # IVIs/head units commonly block `adb reverse`; a forward tunnel
-                # is what lets scrcpy connect to its server on them
-                opts.force_adb_forward = True
+                opts.stay_awake = False  # a head unit stays on by itself
             adb = self.adb_path  # pin scrcpy to OUR adb (avoids server clashes)
             # Do not synchronously probe or restart adb here.  TurboADB already
             # maintains its bundled adb server while discovering the device; an
