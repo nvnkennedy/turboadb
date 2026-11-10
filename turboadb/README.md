@@ -687,6 +687,7 @@ Device Control (see the automotive table above).
 
 ## License
 
-TurboADB's own code is MIT — see [LICENSE](LICENSE). The Windows app also contains PyQt5
-(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is under the GPL v3; see the
+Copyright © 2026 Naveen Daniel Kennedy. TurboADB is free software under the
+[GNU General Public License version 3](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE), with no warranty. The Windows app
+contains PyQt5 (GNU GPL v3) and Qt (GNU LGPL v3); see the
 [third-party notices](https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md).

@@ -1,5 +1,5 @@
 """Guard the packaging metadata so it stays installable on every supported
-setuptools — the `license = "MIT"` SPDX string form silently worked on new
+setuptools — the SPDX string form of `license` silently worked on new
 setuptools but broke the editable/source install on the Python 3.8 CI (whose
 setuptools predates PEP 639).
 
@@ -21,9 +21,9 @@ def _read_pyproject():
 
 
 def test_license_uses_portable_table_form():
-    """`license` must be the classic table form ``{ text = "MIT" }``.
+    """`license` must be the classic table form ``{ text = "GPL-3.0-only" }``.
 
-    The bare SPDX string ``license = "MIT"`` only validates on setuptools>=77,
+    The bare SPDX string ``license = "GPL-3.0-only"`` only validates on setuptools>=77,
     which isn't available on Python 3.8 — so it broke source/editable installs
     (and the 3.8 CI) there. This asserts the portable form so it can't regress."""
     text = _read_pyproject()
@@ -31,10 +31,10 @@ def test_license_uses_portable_table_form():
     assert m, "no `license =` line in pyproject.toml"
     value = m.group(1).strip()
     assert value.startswith("{"), (
-        f'license must be the table form `{{ text = "MIT" }}`, not the SPDX '
+        f'license must be the table form `{{ text = "GPL-3.0-only" }}`, not the SPDX '
         f"string (that needs setuptools>=77, absent on Python 3.8). Got: {value}"
     )
-    assert "text" in value and "MIT" in value, value
+    assert "text" in value and "GPL-3.0-only" in value, value
 
 
 def test_version_strings_match():

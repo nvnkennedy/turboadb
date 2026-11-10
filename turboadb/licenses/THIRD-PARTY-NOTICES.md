@@ -1,12 +1,15 @@
 # Licences of what TurboADB ships
 
-TurboADB's own source code is under the [MIT License](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE).
+TurboADB is Copyright © 2026 Naveen Daniel Kennedy and is licensed under the GNU
+General Public License version 3 (`GPL-3.0.txt`, beside this file). It comes with
+no warranty.
 
 The Windows app (`TurboADB-*-win64.exe`), and the wheel and source package that
-carry it, also contain the software listed below. Because the app includes PyQt5,
-which is licensed under the GNU General Public License version 3, **the app as a
-whole is distributed under the GPL v3** (`GPL-3.0.txt`, beside this file). The MIT
-License continues to apply to TurboADB's own code taken on its own.
+carry it, also contain the software listed below, each under its own licence.
+**The app as a whole is distributed under the GPL v3.**
+
+Releases up to 6.0.1 published TurboADB's own code under the MIT License, and those
+releases stay under it.
 
 ## Getting the source
 

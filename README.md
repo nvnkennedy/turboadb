@@ -9,7 +9,7 @@
 
   [![Release](https://img.shields.io/github/v/release/NVNKENNEDY/turboadb.svg)](https://github.com/NVNKENNEDY/turboadb/releases/latest)
   [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-  [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE)
+  [![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE)
 
   **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest) · [💬 Discussions](https://github.com/NVNKENNEDY/turboadb/discussions)**
 </div>
@@ -965,12 +965,19 @@ See [ARCHITECTURE.md](https://github.com/NVNKENNEDY/turboadb/blob/main/ARCHITECT
 
 ## License
 
-TurboADB's own code is under the [MIT License](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE).
+Copyright © 2026 Naveen Daniel Kennedy.
+
+TurboADB is free software: you can use, change and share it under the
+[GNU General Public License version 3](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE). It comes with no warranty. Anyone
+who passes TurboADB on, changed or not, passes on its source under the same licence.
 
 The Windows app, and the wheel and source package that carry it, also contain PyQt5
-(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is distributed under the
-GPL v3. The source is in this repository and every release is tagged. The
-[third-party notices](https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md) list everything the app contains, with each licence.
+(GNU GPL v3) and Qt (GNU LGPL v3). The source is in this repository and every release
+is tagged. The [third-party notices](https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md) list everything the app contains, with
+each licence.
 
 TurboADB does not ship adb or scrcpy. They are installed on the first run, under
 their own licences.
+
+Releases up to 6.0.1 published TurboADB's own code under the MIT License, and those
+releases stay under it.

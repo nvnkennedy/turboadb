@@ -3,6 +3,14 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **TurboADB is now under the GNU General Public License version 3.** Releases up to
+  6.0.1 published its own code under the MIT License, and those releases stay under
+  it. The About window gives the copyright, the licence and that there is no warranty.
+
 ## 6.0.1
 
 ### Fixed

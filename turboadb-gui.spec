@@ -28,7 +28,7 @@ VERSION_INFO = VSVersionInfo(
             StringStruct('FileDescription', 'TurboADB'),
             StringStruct('FileVersion', APP_VERSION),
             StringStruct('InternalName', 'TurboADB'),
-            StringStruct('LegalCopyright', 'Copyright (c) 2026 Naveen Daniel Kennedy. MIT License.'),
+            StringStruct('LegalCopyright', 'Copyright (c) 2026 Naveen Daniel Kennedy. GNU GPL v3.'),
             StringStruct('OriginalFilename', f'{EXE_NAME}.exe'),
             StringStruct('ProductName', 'TurboADB'),
             StringStruct('ProductVersion', APP_VERSION),
@@ -47,8 +47,7 @@ datas = [('turboadb/assets/icon.ico', 'turboadb/assets'),
          ('turboadb/assets/icon-light.ico', 'turboadb/assets'),   # the light taskbar's
          ('turboadb/assets/icon-light.png', 'turboadb/assets'),
          # what the app contains, and the licence texts it has to carry
-         ('turboadb/licenses/*', 'turboadb/licenses'),
-         ('LICENSE', 'turboadb/licenses')]
+         ('turboadb/licenses/*', 'turboadb/licenses')]
 binaries = []
 # Bundle the ENTIRE pywinrm/NTLM stack (submodules + binaries + data). NTLM is a
 # lazy import inside pywinrm, so collect_all is needed or the frozen exe fails at

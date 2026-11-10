@@ -1064,8 +1064,11 @@ class MainWindow(QMainWindow):
             "(Android Automotive / IVI) &amp; general Android.<br><br>"
             "<a href='https://github.com/NVNKENNEDY/turboadb'>"
             "github.com/NVNKENNEDY/turboadb</a><br><br>"
-            "TurboADB's own code is under the MIT License. This app also contains PyQt5 "
-            "(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is under the GPL v3. "
+            "Copyright &copy; 2026 Naveen Daniel Kennedy.<br><br>"
+            "TurboADB is free software: you can use, change and share it under the "
+            "<a href='https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE'>"
+            "GNU General Public License version 3</a>. It comes with no warranty.<br><br>"
+            "This app contains PyQt5 (GNU GPL v3) and Qt (GNU LGPL v3). "
             "<a href='https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md'>Third-party notices</a>")
 
     # ---- app bar: global actions only (device actions live in each device tab) ----

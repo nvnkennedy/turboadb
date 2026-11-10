@@ -9,9 +9,9 @@ description = "TurboADB — Android ADB + scrcpy device toolkit for automotive/e
 readme = "README.md"
 requires-python = ">=3.8"
 # Classic PEP 621 table form — works on every setuptools>=61 (the SPDX string
-# form `license = "MIT"` needs setuptools>=77, which isn't available on the
+# form `license = "GPL-3.0-only"` needs setuptools>=77, which isn't available on the
 # Python 3.8 our CI matrix builds on, so it broke the editable install there).
-license = { text = "MIT" }
+license = { text = "GPL-3.0-only" }
 authors = [{ name = "Naveen Daniel Kennedy" }]
 keywords = ["adb", "scrcpy", "android", "automotive", "android-automotive",
             "ivi", "logcat", "automation", "pyqt5", "testing", "embedded"]
@@ -32,8 +32,6 @@ classifiers = [
     "Topic :: System :: Hardware",
     "Topic :: Utilities",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    # the Windows app the wheel carries contains PyQt5
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Typing :: Typed",
 ]
