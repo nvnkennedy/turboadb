@@ -153,9 +153,18 @@ try {{
     }} else {{
         $ErrorActionPreference='Continue'
         if ('{upd}' -eq '1') {{
-            $pipOut = & $py -m pip install -U --quiet --disable-pip-version-check '{wheel}' 2>&1
-            if ($LASTEXITCODE -ne 0) {{
-                'WARNING:pip upgrade of turboadb failed (exit ' + $LASTEXITCODE + '): ' + (Join-Output $pipOut)
+            $want = $null
+            if ('{wheel}' -match 'turboadb-([0-9][0-9A-Za-z.]*)-py3') {{ $want = $Matches[1] }}
+            $have = & $py -c "import importlib.metadata as m; print(m.version('turboadb'))" 2>$null | Select-Object -First 1
+            $current = $false
+            try {{ $current = [bool]($want -and $have -and ([version]"$have".Trim() -ge [version]$want)) }} catch {{ $current = $false }}
+            if ($current) {{
+                'INFO:TurboADB ' + "$have".Trim() + ' is there already (this PC has ' + $want + '): left as it is'
+            }} else {{
+                $pipOut = & $py -m pip install -U --quiet --disable-pip-version-check '{wheel}' 2>&1
+                if ($LASTEXITCODE -ne 0) {{
+                    'WARNING:pip upgrade of turboadb failed (exit ' + $LASTEXITCODE + '): ' + (Join-Output $pipOut)
+                }}
             }}
         }}
         & $py -c "import sys; from turboadb import tools, toolsdl; d = tools.diagnose(); sys.exit(3 if toolsdl.auto_fetch_enabled() and not d.get('adb_path') and not d.get('adb_error') else 0)" 2>&1 | Out-Null
@@ -282,11 +291,16 @@ def _deploy_one(
             use_ssl=use_ssl,
             host_timeout=host_timeout,
         )
-        for line in out.splitlines():
+        said = out.splitlines()
+        for line in said:
             for level in ("WARNING", "INFO"):
                 if line.startswith(level + ":"):
                     lines.append(f"[{level}] {host}: {line[len(level) + 1:].strip()[:_NOTE_MAX]}")
-        ok = code == 0 and "STATUS:" in out and "ERROR:" not in out
+        # Judged by the script's own lines: a WARNING may quote a tool's
+        # "ERROR: …" (pip says that when the host cannot fetch the wheel),
+        # and serve still started.
+        ok = (code == 0 and any(line.startswith("STATUS:") for line in said)
+              and not any(line.startswith("ERROR:") for line in said))
         if ok:
             detail = next(
                 (

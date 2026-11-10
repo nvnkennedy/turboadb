@@ -200,14 +200,14 @@ def test_an_upgrade_that_installs_nothing_newer_fails_before_the_tools(pip):
     assert res["ok"] is False and res["unchanged"] is True and res["new"] == "2.5.0"
     assert "still what is installed" in res["error"] and "(not 2.6.0)" in res["error"]
     assert pip["tools_refreshed"] is False  # nothing else was touched
-    assert pip["cmds"][0][-1] == update.wheel_url("2.6.0")
+    assert pip["cmds"][0][-1].endswith(update.wheel_url("2.6.0"))
 
 
 def test_the_offered_release_s_wheel_is_installed(pip):
     pip["installed"] = "2.6.0"
     res = update.run_upgrade(expected="2.6.0")
     assert res["ok"] is True and res["new"] == "2.6.0" and res["unchanged"] is False
-    assert pip["cmds"][0][-1] == update.wheel_url("2.6.0") and pip["tools_refreshed"] is True
+    assert pip["cmds"][0][-1].endswith(update.wheel_url("2.6.0")) and pip["tools_refreshed"] is True
 
     pip["installed"] = "2.5.5"  # newer than before, but not what was offered
     res = update.run_upgrade(expected="2.6.0")
@@ -222,7 +222,7 @@ def test_a_refresh_only_run_may_leave_the_version_alone(pip):
 
 
 def test_only_a_plain_version_reaches_the_download_address(pip, monkeypatch):
-    assert update._pip_upgrade_cmd("2.6.0")[-1] == (
+    assert update._pip_upgrade_cmd("2.6.0")[-1].endswith(
         "https://github.com/NVNKENNEDY/turboadb/releases/download/"
         "v2.6.0/turboadb-2.6.0-py3-none-any.whl")
     monkeypatch.setattr(update, "latest_release", lambda *a, **k: None)
@@ -234,7 +234,7 @@ def test_with_no_version_given_the_newest_release_is_asked_for(pip, monkeypatch)
     pip["installed"] = "2.7.0"
     monkeypatch.setattr(update, "latest_release", lambda *a, **k: "2.7.0")
     res = update.run_upgrade()
-    assert res["ok"] is True and pip["cmds"][0][-1] == update.wheel_url("2.7.0")
+    assert res["ok"] is True and pip["cmds"][0][-1].endswith(update.wheel_url("2.7.0"))
 
 
 def test_with_no_newer_release_only_the_tools_are_refreshed(pip, monkeypatch):

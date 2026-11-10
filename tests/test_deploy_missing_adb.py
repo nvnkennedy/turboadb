@@ -32,6 +32,11 @@ _PYTHON = textwrap.dedent(r'''
     has_adb = os.path.exists(os.path.join(here, "adb"))
     with open(os.path.join(here, "calls.log"), "a") as log:
         log.write(" ".join(a if len(a) < 40 else "<code>" for a in args) + "\n")
+    if args[:1] == ["-c"] and "importlib.metadata" in args[1]:  # which turboadb is here?
+        version = os.path.join(here, "version")
+        if os.path.exists(version):
+            print(open(version).read().strip())
+        sys.exit(0)
     if args[:1] == ["-c"]:  # "does this host lack adb?" is exit code 3
         no_fetch = os.path.exists(os.path.join(here, "no-auto-fetch"))
         sys.exit(0 if has_adb or no_fetch else 3)
@@ -118,9 +123,26 @@ def test_a_host_with_adb_downloads_nothing(host):
     (folder / "adb").write_text("")
     ok, lines = deploy(update=True)
     assert ok, lines
-    assert _calls(folder) == ["-m pip install -U --quiet --disable-pip-version-check <code>",
+    assert _calls(folder) == ["-c <code>",  # which turboadb the host has: none it can say
+                              "-m pip install -U --quiet --disable-pip-version-check <code>",
                               "-c <code>", "-m turboadb serve --port 5037 --startup-task"]
     assert not any("downloaded" in line for line in lines)
+
+
+@windows_only
+@pytest.mark.parametrize("there, upgraded", [("1.0.0", True), ("99.0.0", False)])
+def test_a_host_with_a_newer_turboadb_keeps_it(host, monkeypatch, there, upgraded):
+    """The deploying PC's own wheel is what pip is given: from an older PC
+    that replaced the host's newer TurboADB."""
+    folder, deploy = host
+    monkeypatch.setattr(rd, "current_version", lambda: "6.1.0")
+    (folder / "adb").write_text("")
+    (folder / "version").write_text(there)
+    ok, lines = deploy(update=True)
+    assert ok, lines
+    assert any(call.startswith("-m pip install") for call in _calls(folder)) is upgraded
+    if not upgraded:
+        assert "[INFO] lab-pc: TurboADB 99.0.0 is there already (this PC has 6.1.0): left as it is" in lines
 
 
 @windows_only

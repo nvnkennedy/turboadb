@@ -13,6 +13,7 @@ import time
 import webbrowser
 from collections import deque
 
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
 from PyQt5.QtWidgets import (
     QGroupBox,
@@ -127,6 +128,9 @@ class _Record:
 
 
 class LogPanel(QGroupBox):
+    # Every message, as it is added (the control API passes them on).
+    line_added = pyqtSignal(str)
+
     def __init__(self, parent=None):
         # The dock already titles this panel "Log"; a second group-box title
         # repeated it.
@@ -197,6 +201,7 @@ class LogPanel(QGroupBox):
     def append(self, text: str):
         if text is None:
             return
+        self.line_added.emit(str(text))
         sb = self.view.verticalScrollBar()
         # Follow new entries only when already at the bottom; someone reading
         # older lines must not be yanked away by every new message.

@@ -32,7 +32,7 @@ options, straight from the installed version.
 ## Getting started
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl
 turboadb doctor                                   # are adb and scrcpy available?
 turboadb devices                                  # what's attached
 turboadb -s 10BE330KG9000AF info                  # talk to one device by serial
@@ -116,6 +116,7 @@ step failed), and `logcat` streams plain lines.
 | `TURBOADB_AUTO_FETCH=0` | Never install adb / scrcpy automatically (offline, CI or locked-down machines). |
 | `ANDROID_ADB_SERVER_PORT` | adb's own variable: moves the local adb server off port 5037. TurboADB follows it everywhere the default port applies (its server checks, the device list and `--adb-port 5037`). |
 | `VISUAL`, `EDITOR` | The editor `turboadb edit` opens. |
+| `TURBOADB_API_TOKEN` | The token of the control API that `turboadb gui --api-port` starts (otherwise it makes one and writes it to the handshake file). TurboADB removes it from its environment, so nothing it starts inherits it. |
 
 ---
 
@@ -206,9 +207,22 @@ turboadb shortcut
 ```
 
 ### `turboadb gui`
-Launch the desktop app (the same as `turboadb-gui`).
+Launch the desktop app (the same as `turboadb-gui`). The options below put it
+inside another program's window and let that program drive it; see
+[EMBEDDING.md](EMBEDDING.md). The standalone `TurboADB-x.y.z-win64.exe` takes the
+same options.
+
+| Option | Meaning |
+|---|---|
+| `--embed-into HWND` | Live inside this window of another program (its handle, decimal or `0x` hex): fill its client area, follow its size, close when it goes. |
+| `--api-port PORT` | Start the control API on 127.0.0.1 at this port (`0`: any free one). |
+| `--handshake-file FILE` | Write the control API's address and token to FILE once the window is up (as JSON). |
+| `--hide PARTS` | Leave out parts of the window, comma separated: `menubar`, `ribbon`, `sidebar`, `statusbar`, `log`. |
+| `--json` | Accepted for symmetry; the GUI prints nothing. |
+
 ```bash
 turboadb gui
+turboadb gui --embed-into 0x40A1C --api-port 0 --handshake-file handshake.json --hide menubar
 ```
 
 ---

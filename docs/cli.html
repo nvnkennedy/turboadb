@@ -60,7 +60,7 @@
         the ones on PATH are used), and neither is ever taken from the current folder.
         <code>turboadb -h</code> lists the commands and
         <code>turboadb &lt;command&gt; -h</code> shows one command's options.</p>
-        <div class="code"><pre><code>pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
+        <div class="code"><pre><code>pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl
 turboadb doctor                                   # are adb and scrcpy available?
 turboadb devices                                  # what's attached
 turboadb -s 10BE330KG9000AF info                  # one device by serial
@@ -134,7 +134,7 @@ turboadb -s @bench info                           # …and use it by name</code>
             <tr data-cmd="upgrade-tools"><td><code>upgrade-tools</code></td><td>Update adb and scrcpy only when a newer version exists.</td><td><code>--check</code> <code>--json</code></td></tr>
             <tr data-cmd="self-update"><td><code>self-update</code></td><td>Upgrade TurboADB from the newest GitHub Release, then adb and scrcpy. A source checkout updates with <code>git pull</code>.</td><td><code>--check</code> <code>--json</code></td></tr>
             <tr data-cmd="shortcut"><td><code>shortcut</code></td><td>Create Desktop and Start-menu shortcuts (Windows). They start the TurboADB installed in this Python, so a different running copy (a source checkout) changes nothing and says why. Without PyQt5 they start <code>turboadb-gui</code>; where nothing could start the app, none is written and the command exits <code>1</code>.</td><td><code>--json</code></td></tr>
-            <tr data-cmd="gui"><td><code>gui</code></td><td>Launch the desktop app.</td><td></td></tr>
+            <tr data-cmd="gui"><td><code>gui</code></td><td>Launch the desktop app; <code>--embed-into HWND</code> puts it inside another program's window and <code>--api-port</code> starts its control API (see <a href="https://github.com/NVNKENNEDY/turboadb/blob/main/EMBEDDING.md">EMBEDDING.md</a>).</td><td><code>--embed-into</code> <code>--api-port</code> <code>--handshake-file</code> <code>--hide</code></td></tr>
           </tbody>
         </table></div>
         <div class="code"><pre><code>turboadb fetch-tools --scrcpy-only --force

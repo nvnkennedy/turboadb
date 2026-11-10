@@ -995,8 +995,19 @@ class CameraPanel(QWidget):
         if obj is self.view:
             kind = event.type()
             if kind == QEvent.Wheel:
-                step = 25 if event.angleDelta().y() > 0 else -25
-                self.zoom_slider.setValue(self.zoom_slider.value() + step)
+                turned = event.angleDelta().y()
+                if not turned:
+                    return False  # a sideways scroll is no zoom
+                # 25% for each notch of a wheel (120); a touchpad sends many
+                # small turns, which add up to the same
+                rest = getattr(self, "_wheel_rest", 0)
+                if (rest > 0) != (turned > 0):
+                    rest = 0  # turned the other way: start counting again
+                self._wheel_rest = rest + turned
+                notches = int(self._wheel_rest / 120)
+                if notches:
+                    self._wheel_rest -= notches * 120
+                    self.zoom_slider.setValue(self.zoom_slider.value() + 25 * notches)
                 return True
             if kind == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
                 self.zoom_slider.setValue(self.ZOOM_MIN)

@@ -511,7 +511,7 @@ def run_branded(argv: List[str], home: str) -> int:
         return launch_gui(argv)
     from .gui.app import main
 
-    return main()
+    return main(argv)
 
 
 def _stale(home: str) -> bool:

@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from ..config import format_host_port, parse_host_port, user_path
 from ..results import OperationResult
 from ..scrcpy import TUNNEL_PORT_FIREWALL_RANGE
-from . import icons, theme
+from . import embedding, icons, theme
 from .connect_dialog import firewall_warning
 from .log_panel import LogPanel, classify as classify_log_line
 from .sessions import SessionStore, session_identity
@@ -913,8 +913,10 @@ class MainWindow(QMainWindow):
             self._begin_adb_startup()
             # if adb is missing, offer to download it once the window is up
             QTimer.singleShot(500, self._check_tools)
-        # make sure the Desktop + Start-menu shortcuts exist (self-healing)
-        QTimer.singleShot(1000, self._ensure_shortcuts)
+        # make sure the Desktop + Start-menu shortcuts exist (self-healing);
+        # not from inside another program's window, which is that program's
+        if not embedding.is_embedded():
+            QTimer.singleShot(1000, self._ensure_shortcuts)
         # quiet launch check (Settings → Startup, on by default): if GitHub has a
         # newer TurboADB it only logs a line — installing still happens ONLY via
         # the ribbon 🔄 Upgrade button, never automatically.
@@ -961,6 +963,12 @@ class MainWindow(QMainWindow):
 
         m_view = mb.addMenu("&View")
         m_view.addAction(ico("📹"), "Open webcam (host camera)", self.open_webcam_tab)
+        self.act_webcam_pages = m_view.addAction("Webcam page in device tabs")
+        self.act_webcam_pages.setCheckable(True)
+        self.act_webcam_pages.setChecked(bool(settings_mod.get("show_webcam_page", False)))
+        self.act_webcam_pages.setToolTip(
+            "Show a Webcam page in every device tab (off: the page is not built at all)")
+        self.act_webcam_pages.toggled.connect(self.set_webcam_pages)
         m_view.addAction(ico("🌗"), "Toggle dark / light theme", self.toggle_theme)
         m_view.addAction(ico("📋"), "Toggle log panel", self.toggle_log)
 
@@ -2315,6 +2323,59 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"[OK] Saved target '{saved['name']}'")
 
+    # ---- parts of the window a host program may leave out ----
+    def ui_parts(self) -> dict:
+        """Which parts of the window show (see :meth:`set_ui_parts`)."""
+        dock = getattr(self, "_sidebar_dock", None)
+        log = getattr(self, "_log_dock", None)
+        return {
+            "menubar": not self.menuBar().isHidden(),
+            "ribbon": not self._ribbon.isHidden(),
+            "sidebar": dock is not None and not dock.isHidden(),
+            "statusbar": not self.statusBar().isHidden(),
+            "log": log is not None and not log.isHidden(),
+        }
+
+    def set_ui_parts(self, **shown) -> dict:
+        """Show or hide parts of the window: ``menubar``, ``ribbon``,
+        ``sidebar``, ``statusbar`` and ``log``.  A program that holds
+        TurboADB in its own window may want the device pages alone
+        (``--hide``, or the control API).  Returns :meth:`ui_parts`."""
+        unknown = [part for part in shown if part not in embedding.HIDE_PARTS]
+        if unknown:
+            raise ValueError(f"no part called {', '.join(unknown)}: the parts are "
+                             + ", ".join(embedding.HIDE_PARTS))
+        for part, visible in shown.items():
+            visible = bool(visible)
+            if part == "menubar":
+                self.menuBar().setVisible(visible)
+            elif part == "ribbon":
+                self._ribbon.setVisible(visible)
+            elif part == "sidebar":
+                self._toggle_devices(visible)
+            elif part == "statusbar":
+                self.statusBar().setVisible(visible)
+            elif part == "log" and getattr(self, "_log_dock", None) is not None:
+                self._log_dock.setVisible(visible)
+        return self.ui_parts()
+
+    def set_webcam_pages(self, shown: bool) -> None:
+        """Show or hide the Webcam page in every device tab, now and from now
+        on (View → Webcam page in device tabs, or the control API)."""
+        shown = bool(shown)
+        try:
+            settings_mod.update({"show_webcam_page": shown})
+        except (OSError, ValueError) as exc:
+            self._log(f"[WARNING] could not save the Webcam page choice: {exc}")
+        action = getattr(self, "act_webcam_pages", None)
+        if action is not None and action.isChecked() != shown:
+            action.blockSignals(True)
+            action.setChecked(shown)
+            action.blockSignals(False)
+        for tab in self._device_tabs():
+            tab.set_webcam_page(shown)
+        self._log("[INFO] Webcam page in device tabs: " + ("shown" if shown else "hidden"))
+
     def open_webcam_tab(self):
         """Open the host Webcam as a standalone tab — available right away, with no
         device connected. Focuses the existing one if it's already open."""
@@ -3338,7 +3399,9 @@ class MainWindow(QMainWindow):
         tools = ("  ·  " + ", ".join(bits)) if bits else ""
         self._log(
             f"[OK] Updated to TurboADB {res.get('new')}{tools}. Restarting…")
-        relaunched = _upd.relaunch_on_exit()
+        # Inside another program's window a restart would come back as a
+        # window of its own: that program starts the new version instead.
+        relaunched = False if embedding.is_embedded() else _upd.relaunch_on_exit()
         manual = res.get("tools_manual") or {}
         by_hand = "".join(
             f"\n{tool} could not be updated. Update it yourself:\n    {steps}\n"

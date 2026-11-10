@@ -311,6 +311,10 @@ def mdns_devices(
             cmd + ["mdns", "services"],
             capture_output=True,
             text=True,
+            # adb prints the names devices announce as UTF-8: read strictly in
+            # the system's code page, one of them cost every device found
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=NO_WINDOW,
         )

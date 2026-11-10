@@ -62,7 +62,8 @@
             <li>Under <b>How is it connected?</b> pick <b>USB</b>, <b>Network</b>
             (IP and port) or <b>Remote</b> (a device on another PC's adb server).</li>
             <li>Hit <b>Connect</b> — a device tab opens with Terminal, Logcat, Files,
-            Device Control, Apps, Phone and Webcam.</li>
+            Device Control, Apps and Phone (<b>View → Webcam page in device tabs</b>
+            adds Webcam).</li>
           </ol>
           <p class="muted">Attached devices also appear under <b>Connected</b> in the
           left sidebar — double-click any to open it. For Wi-Fi use <b>Connect ▾ →
@@ -307,7 +308,8 @@ dev.screen_record("clip.mp4", time_limit=20, size="1280x720")</code></pre></div>
           <ol class="steps">
             <li>Choose <b>Tools ▾ → Open host webcam</b> (or <b>View → Open webcam
             (host camera)</b>) — it opens as a standalone tab, <b>no device
-            needed</b>. Every device also has its own <b>Webcam</b> tab.
+            needed</b>. Tick <b>View → Webcam page in device tabs</b> to give every
+            device a <b>Webcam</b> page as well.
             <b>Source</b> = <b>Local — this PC</b>.</li>
             <li>Click <b>Scan cameras</b> (the first time, ffmpeg is fetched once,
             ~160 MB → <code>~/.turboadb/ffmpeg</code>), pick a camera, resolution and

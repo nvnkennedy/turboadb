@@ -32,6 +32,7 @@ can run on background threads, so it never blocks or crashes the caller.
 - [Media — screenshot & screen record](#media--screenshot--screen-record)
 - [Port forwarding (forward / reverse)](#port-forwarding-forward--reverse)
 - [scrcpy mirroring (the visual session)](#scrcpy-mirroring-the-visual-session)
+- [Embedding the GUI in your own program](#embedding-the-gui-in-your-own-program)
 - [Automotive (Android Automotive OS / IVI)](#automotive-android-automotive-os--ivi)
 - [Result objects & error handling](#result-objects--error-handling)
 - [CLI reference](#cli-reference)
@@ -44,13 +45,13 @@ can run on background threads, so it never blocks or crashes the caller.
 ## Install
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl
 ```
 
 That gives you the Python API, the `turboadb` CLI and `turboadb-gui`. On Windows
 the wheel bundles the GUI executable, so `turboadb-gui` works without PyQt5. To
 run the GUI from the Python package instead, install the optional GUI dependency:
-`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
+`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
 
 TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 **`scrcpy`**. It auto-detects them on your `PATH`, in the Android SDK, or in
@@ -418,6 +419,25 @@ dev.mirror(opts)
 ```
 
 ---
+
+## Embedding the GUI in your own program
+
+TurboADB can live inside a window of your own program, written in PyQt5, PySide6,
+Delphi, C# or anything else with a window handle, and be driven from it through a
+small control API (JSON over HTTP on 127.0.0.1, with a token). It runs as a process of
+its own, fills the window you give it and follows its size.
+
+```python
+from turboadb.embed_qt import TurboADBWidget      # PyQt5, PySide6, PyQt6 or PySide2
+
+view = TurboADBWidget(hide=("menubar",))
+view.started.connect(lambda: view.client.open("R58M12345", page="files"))
+layout.addWidget(view)
+```
+
+From another language, start `TurboADB-x.y.z-win64.exe --embed-into <window handle>
+--api-port 0 --handshake-file <file>` and call the API. [EMBEDDING.md](https://github.com/NVNKENNEDY/turboadb/blob/main/EMBEDDING.md) has the
+whole API, and examples for Python, Delphi and C#.
 
 ## Automotive (Android Automotive OS / IVI)
 

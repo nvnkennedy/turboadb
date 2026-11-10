@@ -3,6 +3,45 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.1.0
+
+### New
+
+- **TurboADB inside your own program.** `--embed-into <window handle>` puts the
+  whole app into a window of another program: PyQt5, PySide6, Delphi, C# or
+  anything else with a window handle. It fills that window, follows its size and
+  its DPI awareness, and closes when the window goes. Its **control API** (JSON
+  over HTTP on 127.0.0.1, with a token) lets that program list devices, open one
+  on a page, start its screen, run device commands, show or hide parts of the
+  window, and follow what happens. `turboadb.embed` does this for any Python
+  program, and `turboadb.embed_qt.TurboADBWidget` is a ready widget for PyQt5,
+  PySide6, PyQt6 and PySide2. EMBEDDING.md has the API, and examples for Python,
+  Delphi and C#.
+- **The Webcam page is there when you want it.** Device tabs have no Webcam page
+  until **View → Webcam page in device tabs** is ticked, and the choice applies
+  to open tabs at once. **View → Open webcam** works as before.
+
+### Fixed
+
+- **Automatic adb and scrcpy updates never use winget's `--force`.** It removes
+  the installed copy first, so an update winget had nothing newer for could
+  leave no adb or scrcpy at all. Only a reinstall you ask for uses it.
+- **A winget that leaves a helper running** no longer holds first-run setup or
+  an update past its time limit.
+- **A self-update says when the adb and scrcpy refresh did not report back**,
+  and how to update them yourself, instead of saying nothing. It also waits long
+  enough for both, and brings any new package the window needs.
+- **Deploying serve** no longer reports a failure when the host's pip could not
+  fetch the wheel but serve started, and no longer replaces a newer TurboADB on
+  the host with the deploying PC's older one.
+- **Zoom**: Fill the window with an upright phone no longer makes the scroll bars
+  flicker for ever, and zoom follows a device turned while it shows.
+- **Try again** after a failed screen start uses your Options, not the compat
+  mode the automatic retries chose.
+- **Wireless discovery** no longer loses every device over one name it cannot read.
+- **The webcam zooms by wheel notches**: a sideways scroll no longer zooms out,
+  and a touchpad no longer jumps from one end to the other.
+
 ## 6.0.2
 
 ### Changed

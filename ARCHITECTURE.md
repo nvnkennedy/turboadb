@@ -48,6 +48,8 @@ turboadb/
 ├── remote_deploy.py   deploy 'serve' to remote Windows hosts over WinRM (pywinrm/NTLM)
 ├── remotefs.py        device-file shell helpers (ls parsing, mv/cp/rm/probe) shared by the engine and the Files tab
 ├── cli.py             argparse front-end; console-script entry points
+├── embed.py           start TurboADB inside another program's window and drive its control API (stdlib only)
+├── embed_qt.py        TurboADBWidget: that, as a widget for PyQt5, PySide6, PyQt6 or PySide2
 ├── launcher.py        Windows: the GUI as TurboADB.exe, a branded copy of this Python (see below)
 ├── winshell.py        Windows: taskbar mode, window app ID + pin command, .lnk shortcuts (ctypes COM)
 ├── assets/            icon.ico / icon.png (dark), icon-light.ico / icon-light.png
@@ -262,6 +264,8 @@ never freezes.
 
 ```
 app.py            QApplication bootstrap, theme, excepthook, app-user-model-id
+  embedding.py      --embed-into / --api-port / --hide: living inside a host window, its size and DPI
+  control_api.py    the control API: HTTP + JSON on 127.0.0.1 with a token, events, device commands
   taskbar.py        the taskbar icon for Windows' light/dark mode, live; what a pin starts
 main_window.py    ribbon + menu bar, device tabs, sidebar, log dock, split view,
                   upgrade/self-update, shortcuts, share/deploy actions

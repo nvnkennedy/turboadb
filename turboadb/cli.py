@@ -537,6 +537,20 @@ def _remove_stale_staged_exes(keep: str) -> None:
                 pass
 
 
+def _gui_arguments(args) -> list:
+    """The embedding options of `turboadb gui`, as the GUI reads them."""
+    out = []
+    if getattr(args, "parent", None):
+        out += ["--embed-into", str(args.parent)]
+    if getattr(args, "api_port", None) is not None:
+        out += ["--api-port", str(args.api_port)]
+    if getattr(args, "handshake", None):
+        out += ["--handshake-file", args.handshake]
+    if getattr(args, "hide", None):
+        out += ["--hide", ",".join(args.hide)]
+    return out
+
+
 def launch_gui(argv=None) -> int:
     """`turboadb-gui`: launch the PyQt5 app.
 
@@ -573,7 +587,7 @@ def launch_gui(argv=None) -> int:
     # its traceback instead of being mislabelled as "PyQt5 missing".
     from .gui.app import main as gui_main
 
-    return gui_main()
+    return gui_main(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -799,7 +813,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--check", action="store_true", help="only report whether a newer TurboADB exists"
     )
     setup_cmd("shortcut", "create Desktop + Start-menu shortcuts to the GUI")
-    setup_cmd("gui", "launch the desktop GUI")
+    p_gui = setup_cmd("gui", "launch the desktop GUI")
+    from .gui.embedding import add_arguments as _embed_arguments
+
+    _embed_arguments(p_gui)  # inside another program's window, with the control API
 
     # --- devices and connection ---
     device_cmd("devices", "list devices on the local (or a remote) adb server")
@@ -2000,7 +2017,7 @@ def main(argv=None) -> int:
         # each one. And it fetches adb AND scrcpy itself, with a progress
         # dialog, once its window is up: a fetch here held the window back
         # and, having fetched only adb, kept the GUI's own from getting scrcpy.
-        return launch_gui([])
+        return launch_gui(_gui_arguments(args))
     _configure_logging()
 
     problem = _usage_error(args, argv)
@@ -2151,7 +2168,7 @@ def main(argv=None) -> int:
             return 1 if res.get("errors") else 0
 
         if cmd == "gui":
-            return launch_gui([])
+            return launch_gui(_gui_arguments(args))
 
         if cmd == "shortcut":
             return create_shortcut([])

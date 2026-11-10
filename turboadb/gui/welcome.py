@@ -164,7 +164,8 @@ class WelcomeScreen(QScrollArea):
              "use + in the sidebar to add one."),
             ("displays", "purple",
              "Each device opens as a tab with Terminal, Logcat, Files, Device Control, "
-             "Apps and Webcam pages — toolbar actions apply to the current tab."),
+             "Apps and Phone pages (View adds Webcam) — toolbar actions apply to the "
+             "current tab."),
         ):
             row = QHBoxLayout()
             row.setSpacing(10)

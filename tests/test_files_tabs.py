@@ -49,7 +49,7 @@ def test_a_second_files_tab_opens_next_to_the_first(tab):
     page = tab.open_files_tab("/sdcard/DCIM")
     assert isinstance(page, FileBrowser)
     assert _labels(tab) == ["Terminal", "Logcat", "Files", "Files 2", "Device Control",
-                            "Apps", "Phone", "Webcam"]
+                            "Apps", "Phone"]
     assert tab.inner.currentWidget() is page
     assert page.remote_cwd == "/sdcard/DCIM"
     assert page.handler is tab.handler  # the same device session

@@ -9,6 +9,7 @@ include README.md
 include CHANGELOG.md
 include ARCHITECTURE.md
 include CLI.md
+include EMBEDDING.md
 include requirements.txt
 include ruff.toml
 include turboadb-gui.spec

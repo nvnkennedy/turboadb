@@ -151,13 +151,15 @@ def test_switching_to_screencap_is_the_users_choice(panel, qapp):
 
 
 def test_try_again_repeats_the_same_start(panel, qapp):
+    """The same display and window, with the compat mode the user's Options
+    say: the last automatic retry turns compat on for itself."""
     panel._launch_spec = {"display_id": 2, "compat": True, "embed": None, "_retry": True}
     panel._give_up_scrcpy_start("boom", 3)
     _pump(qapp)
     calls = []
     panel.start = lambda **spec: calls.append(spec)
     _press(panel, qapp, "Try again")
-    assert calls == [{"display_id": 2, "compat": True, "embed": None}]
+    assert calls == [{"display_id": 2, "embed": None}]
 
 
 def test_retries_never_open_a_separate_window(panel):
@@ -479,3 +481,39 @@ def test_double_click_goes_back(camera):
     dbl = QMouseEvent(QEvent.MouseButtonDblClick, QPointF(5, 5), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
     assert camera.eventFilter(camera.view, dbl)
     assert camera.zoom_slider.value() == 100 and camera._zoom_pan == [0.5, 0.5]
+
+
+def _wheel(dx, dy):
+    return QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(0, 0), QPoint(dx, dy),
+                       Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+
+
+def test_a_sideways_scroll_does_not_zoom_the_webcam(camera):
+    assert not camera.eventFilter(camera.view, _wheel(120, 0))
+    assert camera.zoom_slider.value() == 100
+
+
+def test_a_touchpad_s_small_turns_add_up_to_one_step(camera):
+    for _ in range(3):
+        camera.eventFilter(camera.view, _wheel(0, 30))
+    assert camera.zoom_slider.value() == 100
+    camera.eventFilter(camera.view, _wheel(0, 30))
+    assert camera.zoom_slider.value() == 125
+    camera.eventFilter(camera.view, _wheel(0, 60))
+    camera.eventFilter(camera.view, _wheel(0, -120))  # the other way: a step back at once
+    assert camera.zoom_slider.value() == 100
+
+
+# ---- a device turned while it shows ---------------------------------------------
+def test_the_zoom_follows_a_turned_device(panel, monkeypatch):
+    shapes = []
+    panel.display_shape_changed.connect(lambda: shapes.append(panel._video_aspect))
+    monkeypatch.setattr(panel, "_fit", lambda: None)
+    _waiting(panel, "INFO: Texture: 1080x2400\n", ran=40.0)
+    panel._became_ready, panel._child_hwnd = True, 1234
+    panel._video_aspect = 1080 / 2400
+    panel._check_alive()
+    assert shapes == []  # the same shape: nothing to do
+    panel._scrcpy.log += "INFO: Texture: 2400x1080\n"
+    panel._check_alive()
+    assert shapes == [pytest.approx(2400 / 1080)]

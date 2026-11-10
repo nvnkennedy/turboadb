@@ -12,6 +12,7 @@ import os
 import subprocess
 import threading
 import time
+import types
 
 import pytest
 
@@ -615,10 +616,10 @@ def test_lazy_pages_are_built_on_first_show_and_attributes_resolve(qapp, monkeyp
     try:
         _connect(tab, device)
         pages = tab._lazy_pages
-        assert set(pages) == {"logcat", "files", "apps", "phone", "webcam"}
+        assert set(pages) == {"logcat", "files", "apps", "phone"}  # Webcam: View menu
         assert all(holder.page is None for holder in pages.values())
         labels = [tab.inner.tabText(i) for i in range(tab.inner.count())]
-        assert labels == ["Terminal", "Logcat", "Files", "Device Control", "Apps", "Phone", "Webcam"]
+        assert labels == ["Terminal", "Logcat", "Files", "Device Control", "Apps", "Phone"]
 
         tab.show()
         tab.show_subtab("files")
@@ -1167,3 +1168,71 @@ def test_the_files_page_asks_the_tab_for_write_access(qapp, monkeypatch):
     finally:
         tab.hide()
         _close(qapp, tab)
+
+
+# --------------------------------------------------------------------------- #
+# the Webcam page is there when it is wanted (View → Webcam page in device tabs)
+# --------------------------------------------------------------------------- #
+def _labels(tab):
+    return [tab.inner.tabText(i) for i in range(tab.inner.count())]
+
+
+def test_the_webcam_page_comes_and_goes_with_the_view_menu(qapp, monkeypatch):
+    from turboadb.gui import camera_widget
+
+    monkeypatch.setattr(camera_widget.CameraPanel, "_auto_scan", lambda self: None)
+    tab = _tab(qapp)
+    try:
+        _connect(tab, _Device())
+        assert not tab.has_webcam_page() and tab._subtabs["webcam"] is None
+        tab.set_webcam_page(True)
+        assert _labels(tab)[-1] == "Webcam"
+        assert tab._subtabs["webcam"] is tab._lazy_pages["webcam"]
+        tab.show()
+        tab.show_subtab("webcam")
+        assert _pump(qapp, lambda: tab._lazy_pages["webcam"].page is not None)
+        page = tab._lazy_pages["webcam"].page
+        stopped = []
+        real_close = page.close_panel
+        monkeypatch.setattr(page, "close_panel", lambda: (stopped.append(True), real_close()))
+        tab.set_webcam_page(False)
+        assert stopped == [True] and not tab.has_webcam_page()
+        assert "Webcam" not in _labels(tab) and tab._subtabs["webcam"] is None
+        tab.set_webcam_page(False)  # already gone: nothing to do
+    finally:
+        _close(qapp, tab)
+
+
+def test_a_new_tab_follows_the_setting(qapp, monkeypatch):
+    from turboadb.gui import settings as settings_mod
+
+    real_get = settings_mod.get
+    monkeypatch.setattr(settings_mod, "get", lambda key, *default: (
+        True if key == "show_webcam_page" else real_get(key, *default)))
+    tab = _tab(qapp)
+    try:
+        _connect(tab, _Device())
+        assert tab.has_webcam_page() and _labels(tab)[-1] == "Webcam"
+    finally:
+        _close(qapp, tab)
+
+
+def test_a_tab_still_connecting_reads_the_setting_later(qapp):
+    tab = _tab(qapp)
+    try:
+        tab.set_webcam_page(True)  # nothing is built yet: no error, no page
+        assert not tab.has_webcam_page()
+    finally:
+        _close(qapp, tab)
+
+
+def test_the_view_menu_choice_reaches_every_device_tab(monkeypatch):
+    from turboadb.gui import main_window, settings as settings_mod
+
+    saved, shown = [], []
+    monkeypatch.setattr(settings_mod, "update", saved.append)
+    tabs = [types.SimpleNamespace(set_webcam_page=shown.append) for _ in range(2)]
+    window = types.SimpleNamespace(_device_tabs=lambda: tabs, _log=lambda _text: None,
+                                   act_webcam_pages=None)
+    main_window.MainWindow.set_webcam_pages(window, True)
+    assert saved == [{"show_webcam_page": True}] and shown == [True, True]

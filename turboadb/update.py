@@ -286,8 +286,23 @@ def check_cached(max_age: float = 86400) -> str | None:
     return latest if is_newer(latest) else None
 
 
+def _has_gui() -> bool:
+    """Whether this Python has the window's toolkit (the ``gui`` extra)."""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("PyQt5") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _pip_upgrade_cmd(version: str):
-    """``pip install --upgrade`` of the wheel published for *version*."""
+    """``pip install --upgrade`` of the wheel published for *version*.
+
+    Where the window is installed, the wheel is asked for with its ``gui``
+    extra: a release that adds a package the window needs then brings it,
+    where the bare wheel left the new window unable to start."""
+    url = wheel_url(version)
     return [
         sys.executable,
         "-m",
@@ -296,7 +311,7 @@ def _pip_upgrade_cmd(version: str):
         "--upgrade",
         "--no-input",
         "--disable-pip-version-check",
-        wheel_url(version),
+        f"turboadb[gui] @ {url}" if _has_gui() else url,
     ]
 
 
@@ -337,7 +352,12 @@ def _report_source(upgrade_tools: bool) -> str:
     return "MARK = %r\nUPGRADE = %r\n%s" % (_REPORT_MARK, bool(upgrade_tools), _REPORT_CODE)
 
 
-def _fresh_report(upgrade_tools: bool = True, timeout: float = 900.0) -> dict:
+# What the adb/scrcpy refresh may take: winget asked twice for each tool, up to
+# 240 s a time, then the publisher's download.
+_TOOLS_REPORT_TIMEOUT_S = 1800.0
+
+
+def _fresh_report(upgrade_tools: bool = True, timeout: float = _TOOLS_REPORT_TIMEOUT_S) -> dict:
     """Ask a fresh interpreter for the installed version AND (optionally) run the
     adb/scrcpy refresh there, returning its report dict.
 
@@ -345,26 +365,46 @@ def _fresh_report(upgrade_tools: bool = True, timeout: float = 900.0) -> dict:
     would lie about the version and would run the previous release's downloader.
     It starts in a neutral folder (see :func:`_neutral_cwd`), so a source
     checkout in the current folder can't stand in for the upgraded package.
-    Returns ``{}`` when the subprocess could not be run or parsed."""
+    When there is no report, the dict holds only ``_failure``: why not."""
     code = _report_source(upgrade_tools)
     try:
         r = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=_neutral_cwd(),
             creationflags=NO_WINDOW,
         )
-    except Exception:
-        return {}
+    except subprocess.TimeoutExpired:
+        return {"_failure": f"it did not finish within {timeout:g} s"}
+    except Exception as exc:
+        return {"_failure": f"it could not be started: {exc}"}
     for line in (r.stdout or "").splitlines():
         if line.startswith(_REPORT_MARK):
             try:
-                return json.loads(line[len(_REPORT_MARK) :])
+                found = json.loads(line[len(_REPORT_MARK) :])
             except ValueError:
-                return {}
-    return {}
+                break
+            if isinstance(found, dict):
+                return found
+            break
+    said = (r.stderr or "").strip().splitlines()
+    return {"_failure": f"it ended with exit code {r.returncode} and no report"
+                        + (f": {said[-1][:300]}" if said else "")}
+
+
+def _manual_steps() -> dict:
+    """How the user updates adb and scrcpy by hand (text only: nothing of the
+    old package's downloader runs)."""
+    try:
+        from . import toolsdl
+
+        return {tool: toolsdl.manual_update_steps(tool) for tool in ("adb", "scrcpy")}
+    except Exception:
+        return {}
 
 
 def _installed_version_fresh() -> str | None:
@@ -450,24 +490,35 @@ def run_upgrade(notify=None, *, expected: str | None = None, allow_unchanged: bo
     # still running the old package and must not drive the new one's downloader.
     say("Updating adb + scrcpy…")
     report = _fresh_report()
-    res["new"] = report.get("version") or installed or res["old"]
+    # pip installed exactly *version* (it said so, and its exit code was 0):
+    # with no report to read that back from, that is still the new version
+    pip_ran = bool(version and not allow_unchanged)
+    res["new"] = report.get("version") or installed or (version if pip_ran else None) or res["old"]
     res["unchanged"] = res["new"] == res["old"]
     res["adb"], res["scrcpy"] = report.get("adb"), report.get("scrcpy")
     if res["unchanged"]:
         say(f"TurboADB {res['new']} is up to date.")
     else:
         say(f"TurboADB upgraded to {res['new']}.")
-    terr = report.get("errors") or {}
+    terr = dict(report.get("errors") or {})
+    manual = dict(report.get("manual") or {})
+    if report.get("_failure"):
+        # The refresh gave no report at all: whether adb and scrcpy were
+        # updated is unknown, and the user is told so, with how to do it.
+        terr["tools"] = f"the adb and scrcpy update did not report back ({report['_failure']})"
+        manual = {**_manual_steps(), **manual}
     if terr:
         # TurboADB itself is updated either way: surface what was not, and how
         # to do it by hand, instead of silently reporting the OLD versions
         res["tools_errors"] = terr
-        manual = report.get("manual") or {}
         res["tools_manual"] = manual
         for tool, err in terr.items():
             say(f"[WARNING] {tool} update failed: {err}")
             if manual.get(tool):
                 say(f"  Update {tool} yourself: {manual[tool]}")
+        for tool, steps in manual.items():
+            if tool not in terr:  # (the refresh as a whole went unreported)
+                say(f"  Update {tool} yourself: {steps}")
     return res
 
 

@@ -777,6 +777,27 @@ def _zoomed_rect(area_w, area_h, aspect, zoom, pan_x=0.5, pan_y=0.5):
     return x, y, w, h
 
 
+def _pan_bars(full_w, full_h, thickness, aspect, zoom):
+    """``(horizontal, vertical)``: the scroll bars a zoomed picture needs in a
+    place of *full_w* x *full_h*, which the bars take room from (*thickness*:
+    the horizontal bar's height and the vertical bar's width).
+
+    Decided from the whole place, never from what is left beside a bar shown
+    already: that answer changed as the bar came and went, and with a tall
+    picture filling a wide place the bars flickered for ever."""
+    if zoom <= 1.0 or not aspect:
+        return False, False
+    h_thick, v_thick = thickness
+    h_bar = v_bar = False
+    for _ in range(2):  # a bar's room can call for the other one, once
+        width = full_w - (v_thick if v_bar else 0)
+        height = full_h - (h_thick if h_bar else 0)
+        _x, _y, w, h = _zoomed_rect(width, height, aspect, zoom)
+        h_bar = h_bar or w > width
+        v_bar = v_bar or h > height
+    return h_bar, v_bar
+
+
 def _record_size_for_active_view(displays, display_id, max_edge=1280):
     """Return a proportional screenrecord size capped for concurrent viewing.
 
@@ -3493,15 +3514,22 @@ class MirrorPanel(QWidget):
         area = self.container.rect()
         _x, _y, w, h = _zoomed_rect(area.width(), area.height(), self._video_aspect,
                                     self._zoom, *self._pan)
+        # the whole place: the container and the room of the bars shown now
+        h_thick = self._pan_h.sizeHint().height()
+        v_thick = self._pan_v.sizeHint().width()
+        full_w = area.width() + (0 if self._pan_v.isHidden() else v_thick)
+        full_h = area.height() + (0 if self._pan_h.isHidden() else h_thick)
+        wanted = _pan_bars(full_w, full_h, (h_thick, v_thick), self._video_aspect,
+                           self._zoom) if zoomed else (False, False)
         self._syncing_zoom = True
         try:
             for bar, axis, shown, whole in (
                 (self._pan_h, 0, area.width(), w),
                 (self._pan_v, 1, area.height(), h),
             ):
-                needed = zoomed and whole > shown
+                needed = wanted[axis]
                 if needed:
-                    page = max(1, 1000 * shown // whole)
+                    page = max(1, min(1000, 1000 * shown // max(1, whole)))
                     bar.setPageStep(page)
                     bar.setMaximum(1000 - page)
                     bar.setValue(int(round(self._pan[axis] * bar.maximum())))
@@ -4365,10 +4393,11 @@ class MirrorPanel(QWidget):
 
 
     def _tune(self, opts, *, native=False):
-        """Apply performance and quality tuning. Over GPU-accelerated local sessions,
-        preserves native resolution and high 16M bitrate. With *native* the renderer
-        stays scrcpy's own, which decodes in hardware (see _runs_like_native).
-        Over Remote Desktop, applies software rendering and sensible caps."""
+        """Apply performance and quality tuning: native resolution and a 16M
+        bit rate.  With *native* the renderer stays scrcpy's own, which decodes
+        in hardware (see _runs_like_native).  Software rendering (Options, or
+        after scrcpy could not create any renderer) adds a 30 fps and 8M cap.
+        Remote Desktop by itself changes nothing: scrcpy runs there as it is."""
         if self._opt["soft"]:
             opts.render_driver = "software"
             opts.bit_rate = opts.bit_rate or "8M"
@@ -5392,10 +5421,10 @@ class MirrorPanel(QWidget):
     _EMBED_SETTLE = 0.6  # let the window render its 1st frame before we adopt it
 
     def _scrcpy_window_up(self) -> bool:
-        """True once scrcpy has actually put its window up — the reliable
-        readiness signal for BOTH embed and separate-window modes. (The log is
-        block-buffered to a file, so its 'Renderer:' markers don't appear until
-        scrcpy exits; the WINDOW existing is what proves a live start.)"""
+        """True once scrcpy has actually put its window up — the readiness
+        signal for BOTH embed and separate-window modes.  scrcpy's log says it
+        too (see _HEALTHY, read while it runs); the window is the first sign,
+        and the log is what covers a build whose window title can't be matched."""
         if self._child_hwnd is not None:
             return True
         if not _IS_WIN:
@@ -5425,6 +5454,22 @@ class MirrorPanel(QWidget):
         rate = f" at {opts.bit_rate} bit/s" if opts is not None and opts.bit_rate else ""
         self.log.emit(f"[INFO] screen video: {found[0]}x{found[1]}{rate}")
 
+    def _follow_video_shape(self) -> None:
+        """Take the video's shape from scrcpy's newest "Texture" line.  The
+        shape was learnt once, when the window was embedded: a device turned
+        since then sends its picture the other way round, and zoom, Fill and
+        the scroll bars went on with the old shape."""
+        found = _video_size_in_log(_read_log_tail(self._scrcpy, 4096)) if (
+            self._scrcpy is not None) else None
+        if not found or not found[1]:
+            return
+        aspect = found[0] / found[1]
+        if abs(aspect - (self._video_aspect or 0.0)) <= 0.01:
+            return
+        self._video_aspect = aspect
+        self.display_shape_changed.emit()
+        self._apply_zoom()
+
     def _check_alive(self):
         """Poll the scrcpy process. Readiness = its window is up (works for embed
         AND separate window). A launch that never shows a window within
@@ -5449,6 +5494,8 @@ class MirrorPanel(QWidget):
             self.screen_ready.emit()
         if not self._video_reported:
             self._report_video_size()
+        if self._became_ready and self._child_hwnd:
+            self._follow_video_shape()
 
         running = self._scrcpy.running
         ran_s = time.time() - getattr(self, "_start_t", 0)
@@ -5707,8 +5754,12 @@ class MirrorPanel(QWidget):
                 pass
 
     def _start_again(self) -> None:
+        """Start the same screen again, as the user's Options now say: the
+        compat mode a retry chose for itself is not kept (it stays where the
+        user turned it on)."""
         spec = dict(self._launch_spec or {})
         spec.pop("_retry", None)
+        spec.pop("compat", None)
         self.start(**spec)
 
     def _switch_to_screencap(self) -> None:

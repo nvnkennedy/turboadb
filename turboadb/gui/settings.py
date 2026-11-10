@@ -99,6 +99,9 @@ DEFAULTS = {
     "deploy_user": "",
     "deploy_remember": True,
     "mute_popups_with_log": True,
+    # The Webcam page in device tabs: View → Webcam page in device tabs.  Off
+    # until it is wanted; View → Open webcam shows the PC's camera any time.
+    "show_webcam_page": False,
 }
 
 # Serialises every read-modify-write so concurrent set()/save() calls (UI

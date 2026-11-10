@@ -5540,7 +5540,8 @@ class DeviceTab(QWidget):
         self._add_subtab(self.combo_view, "🎛", "Device Control")
         self._add_lazy_page("apps", "📦", "Apps", self._build_apps)
         self._add_lazy_page("phone", "📞", "Phone", self._build_phone)
-        self._add_lazy_page("webcam", "📹", "Webcam", self._build_webcam)
+        if settings_mod.get("show_webcam_page", False):
+            self._add_lazy_page("webcam", "📹", "Webcam", self._build_webcam)
 
         pages = self._lazy_pages
         self._subtabs = {
@@ -5552,7 +5553,7 @@ class DeviceTab(QWidget):
             "controls": self.combo_view,
             "apps": pages["apps"],
             "phone": pages["phone"],
-            "webcam": pages["webcam"],
+            "webcam": pages.get("webcam"),
         }
         self.mirror_tab.displays_changed.connect(self._on_displays_found)
         self.mirror_tab.all_displays_requested.connect(self._show_all_displays)
@@ -5585,6 +5586,40 @@ class DeviceTab(QWidget):
         self._lazy_pages[key] = holder
         self._add_subtab(holder, emoji, label)
         return holder
+
+    def has_webcam_page(self) -> bool:
+        return "webcam" in self.__dict__.get("_lazy_pages", {})
+
+    def set_webcam_page(self, shown: bool) -> None:
+        """Show or hide this tab's Webcam page (View → Webcam page in device
+        tabs).  A page that goes stops its camera first.  A tab still
+        connecting, or a terminal-only one, is left alone: it reads the
+        setting when it builds its pages."""
+        subtabs = self.__dict__.get("_subtabs")
+        if self._terminal_only or subtabs is None or "logcat" not in self._lazy_pages:
+            return
+        holder = self._lazy_pages.get("webcam")
+        if shown and holder is None:
+            holder = self._add_lazy_page("webcam", "📹", "Webcam", self._build_webcam)
+            subtabs["webcam"] = holder
+            ivi = subtabs.get("ivi")  # the displays page stays last
+            at = self.inner.indexOf(ivi) if ivi is not None else -1
+            if at >= 0:
+                self.inner.tabBar().moveTab(self.inner.indexOf(holder), at)
+        elif not shown and holder is not None:
+            if holder.page is not None:
+                try:
+                    holder.page.close_panel()
+                except Exception as exc:
+                    self.log.emit(f"[WARNING] could not stop the webcam: {exc}")
+            index = self.inner.indexOf(holder)
+            if index >= 0:
+                self.inner.removeTab(index)
+            del self._lazy_pages["webcam"]
+            subtabs["webcam"] = None
+            self._subtab_meta.pop(holder, None)
+            holder.setParent(None)
+            holder.deleteLater()
 
     def _built_page(self, key):
         """The page behind *key* if it has been built; never builds it."""

@@ -518,9 +518,19 @@ def _tell(on_progress, percent: int) -> None:
             pass
 
 
+# How long the output of a winget that has ended is still read: a program it
+# started may hold the pipe open long after (see _run_winget).
+_WINGET_DRAIN_S = 5.0
+
+
 def _run_winget(cmd: list, on_progress=None, timeout: float = _WINGET_TIMEOUT_S) -> tuple:
     """Run one winget command with no window: ``(code, output lines)``.  *code*
-    is None when it did not finish within *timeout* seconds and was ended."""
+    is None when it did not finish within *timeout* seconds and was ended.
+
+    The output is read on a thread of its own and the wait is for winget
+    itself: on Windows a pipe stays open until every process that inherited it
+    lets go, so a helper winget started kept the read, and with it this call,
+    going after winget had been ended."""
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -531,26 +541,35 @@ def _run_winget(cmd: list, on_progress=None, timeout: float = _WINGET_TIMEOUT_S)
         errors="replace",
         creationflags=NO_WINDOW,
     )
-    expired = threading.Event()
-
-    def expire():
-        expired.set()
-        proc.kill()
-
-    watchdog = threading.Timer(timeout, expire)
-    watchdog.daemon = True
-    watchdog.start()
     lines = []
+
+    def read():
+        try:
+            for line in proc.stdout:
+                if line.strip():
+                    lines.append(line.strip())
+                    _tell(on_progress, min(95, len(lines) * 100 // _WINGET_LINES))
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=read, name="turboadb-winget-output", daemon=True)
+    reader.start()
+    expired = False
     try:
-        for line in proc.stdout:
-            if line.strip():
-                lines.append(line.strip())
-                _tell(on_progress, min(95, len(lines) * 100 // _WINGET_LINES))
-        code = proc.wait()
-    finally:
-        watchdog.cancel()
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        expired, code = True, None
+        proc.kill()
+        try:
+            proc.wait(timeout=_WINGET_DRAIN_S)
+        except subprocess.TimeoutExpired:
+            pass
+    reader.join(_WINGET_DRAIN_S)
+    if not reader.is_alive():
         proc.stdout.close()
-    return (None if expired.is_set() else code & 0xFFFFFFFF), lines
+    # (a reader still blocked is left to end with the pipe; closing it under
+    # the read would block here instead)
+    return (None if expired else code & 0xFFFFFFFF), list(lines)
 
 
 def _winget_problem(winget: str, tool: str, force: bool, on_progress) -> str | None:
@@ -654,9 +673,15 @@ def winget_latest(tool: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # public install functions
 # --------------------------------------------------------------------------- #
-def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
+def download_platform_tools(*, force: bool = False, reinstall: bool | None = None,
+                            on_progress=None) -> str:
     """Install adb and return the path to it: through winget where there is
     one, else Google's platform-tools into the cache.
+
+    *force* installs although adb is there.  *reinstall* (default: *force*)
+    lets winget install the version it already has again, which takes the
+    installed copy away first: only a reinstall the user asked for does that,
+    never an automatic update (see :func:`upgrade_tools`).
 
     The archive is extracted to a STAGING directory and swapped in atomically,
     with the adb server stopped first — extracting straight over a live adb.exe
@@ -678,7 +703,8 @@ def download_platform_tools(*, force: bool = False, on_progress=None) -> str:
             "Google builds no adb for this machine "
             f"({platform.system()} {platform.machine()}). {_USE_SYSTEM_ADB}"
         )
-    installed = _install_with_winget("adb", existing, force=force, on_progress=on_progress)
+    again = force if reinstall is None else reinstall
+    installed = _install_with_winget("adb", existing, force=again, on_progress=on_progress)
     if installed:
         return installed
     archive = _archive_to_download()
@@ -935,18 +961,21 @@ def install_missing_scrcpy(*, on_progress=None) -> str:
         return download_scrcpy(on_progress=on_progress)
 
 
-def download_scrcpy(*, force: bool = False, on_progress=None) -> str:
+def download_scrcpy(*, force: bool = False, reinstall: bool | None = None,
+                    on_progress=None) -> str:
     """Install scrcpy and return the path to it: through winget where there
-    is one, else the latest Windows prebuilt into the cache."""
+    is one, else the latest Windows prebuilt into the cache.  *force* and
+    *reinstall* work as for :func:`download_platform_tools`."""
     with _SCRCPY_INSTALL_LOCK:
-        return _install_scrcpy_release(force=force, on_progress=on_progress)
+        return _install_scrcpy_release(force=force, reinstall=reinstall, on_progress=on_progress)
 
 
-def _install_scrcpy_release(*, force: bool, on_progress) -> str:
+def _install_scrcpy_release(*, force: bool, on_progress, reinstall: bool | None = None) -> str:
     existing = managed_scrcpy()
     if existing and not force:
         return existing
-    installed = _install_with_winget("scrcpy", existing, force=force, on_progress=on_progress)
+    again = force if reinstall is None else reinstall
+    installed = _install_with_winget("scrcpy", existing, force=again, on_progress=on_progress)
     if installed:
         return installed
     url, asset_name, sums_url = _scrcpy_assets()
@@ -1364,15 +1393,20 @@ def upgrade_tools(*, on_progress=None, notify=None, checks: dict | None = None) 
         if want_scrcpy:
             bits.append(f"scrcpy {checks['scrcpy']['installed']}→{checks['scrcpy']['latest']}")
         notify("Updating " + ", ".join(bits) + " …")
+    # An update, not a reinstall: where winget says it has nothing newer (its
+    # version check said otherwise, or the installed version could not be
+    # read), the copy that works is kept rather than taken away and put back.
     with _one_restart():
         if want_adb:
             try:
-                updated["adb"] = download_platform_tools(force=True, on_progress=on_progress)
+                updated["adb"] = download_platform_tools(
+                    force=True, reinstall=False, on_progress=on_progress)
             except Exception as exc:
                 errors["adb"] = str(exc)
         if want_scrcpy:
             try:
-                updated["scrcpy"] = download_scrcpy(force=True, on_progress=on_progress)
+                updated["scrcpy"] = download_scrcpy(
+                    force=True, reinstall=False, on_progress=on_progress)
             except Exception as exc:
                 errors["scrcpy"] = str(exc)
     _take_share_problem(errors)

@@ -16,7 +16,7 @@
 
 ---
 
-> **6.0.2:** TurboADB is now under the GNU General Public License version 3.
+> **6.1.0:** TurboADB fits inside your own program (PyQt5, PySide6, Delphi, C#) and is driven by its control API; the Webcam page in device tabs is there when you want it.
 >
 > **New in 6.0.0:** large screens and head units now start **the way scrcpy
 > itself does**, with hardware decoding; **zoom** on the device screen and the
@@ -51,6 +51,7 @@ steps, the **CLI** command, and the **Python** call.
   - [Keep things up to date](#keep-things-up-to-date)
 - [CLI cheatsheet](#cli-cheatsheet) — full [CLI reference](https://github.com/NVNKENNEDY/turboadb/blob/main/CLI.md)
 - [Python API notes](#python-api-notes)
+- [Embedding in your own program](#embedding-in-your-own-program) — TurboADB inside a PyQt5, PySide6, Delphi or C# window, driven by its API
 - [Android Automotive / IVI tips](#android-automotive--ivi-tips)
 - [Build from source](#build-from-source)
 - [Community](#community)
@@ -62,7 +63,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-6.0.2-win64.exe`** from the
+1. Download **`TurboADB-6.1.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
@@ -74,7 +75,7 @@ TurboADB is published on GitHub Releases, not on PyPI, so pip installs the wheel
 attached to the release:
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl
 ```
 
 On Windows this already includes the app: the package carries the same
@@ -84,7 +85,7 @@ replace the packaged file). To run the GUI from the Python code instead — on
 Linux or macOS, for example — add the GUI extra:
 
 ```bash
-pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl"
+pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.1.0/turboadb-6.1.0-py3-none-any.whl"
 ```
 
 Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or
@@ -162,8 +163,9 @@ abort a run.
   twice; turn this off in **Settings → Startup**). Type in the search box to
   filter or quick-connect to a host; hide the sidebar with **‹** or Ctrl+B.
 - **Device tabs** — every device gets **Terminal**, **Logcat**, **Files**,
-  **Device Control**, **Apps**, **Phone** and **Webcam** (plus **IVI Displays**
-  on cars and multi-display devices). **Screen ▾**, **Screenshot**, **Reboot ▾** and **More ▾** sit at the
+  **Device Control**, **Apps** and **Phone** (plus **IVI Displays** on cars and
+  multi-display devices, and **Webcam** when **View → Webcam page in device tabs**
+  is ticked). **Screen ▾**, **Screenshot**, **Reboot ▾** and **More ▾** sit at the
   right end of that row. **More ▾** holds **Split view** (Terminal, Device
   Control, Files and Logcat side by side, stacked or in a grid), **Device
   health…**, **Build details…**, **Root and mount**, **Go wireless (USB → Wi-Fi)**
@@ -596,8 +598,9 @@ Point one at the physical head unit / bench and watch it **beside** the scrcpy m
 
 **GUI** — choose **Tools ▾ → Open host webcam** (or **View → Open webcam (host
 camera)**, or the **Host webcam** tile on the start page) to open it as a
-standalone tab — no device needed. Every device also has its own **Webcam** tab,
-handy beside the screen. Pick a **Source**:
+standalone tab — no device needed. Tick **View → Webcam page in device tabs** and
+every device gets a **Webcam** page too, handy beside the screen (off until you
+want it). Pick a **Source**:
 
 - **Local — this PC** — **Scan cameras** → pick a camera, resolution and frame
   rate → **Start camera**.
@@ -923,6 +926,25 @@ assert dev.shell("getprop ro.build.version.release").ok
 dev.install("app.apk", grant_perms=True)
 dev.screenshot("after_install.png")
 ```
+
+## Embedding in your own program
+
+TurboADB can live inside a window of your own program, written in PyQt5, PySide6,
+Delphi, C# or anything else with a window handle, and be driven from it through a
+small control API (JSON over HTTP on 127.0.0.1, with a token). It runs as a process of
+its own, fills the window you give it and follows its size.
+
+```python
+from turboadb.embed_qt import TurboADBWidget      # PyQt5, PySide6, PyQt6 or PySide2
+
+view = TurboADBWidget(hide=("menubar",))
+view.started.connect(lambda: view.client.open("R58M12345", page="files"))
+layout.addWidget(view)
+```
+
+From another language, start `TurboADB-x.y.z-win64.exe --embed-into <window handle>
+--api-port 0 --handshake-file <file>` and call the API. [EMBEDDING.md](https://github.com/NVNKENNEDY/turboadb/blob/main/EMBEDDING.md) has the
+whole API, and examples for Python, Delphi and C#.
 
 ## Android Automotive / IVI tips
 

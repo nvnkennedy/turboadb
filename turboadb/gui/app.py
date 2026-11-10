@@ -483,8 +483,53 @@ def keep_widgets_in_one_window() -> None:
     QCoreApplication.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings)
 
 
-def main():
-    _set_app_user_model_id()
+def _handshake_failure(options, message: str) -> None:
+    """Tell the host why TurboADB is not coming (it waits for the handshake)."""
+    logging.getLogger("turboadb.gui").error("%s", message)
+    if options.handshake:
+        from .embedding import write_handshake
+
+        try:
+            write_handshake(options.handshake, {"error": message, "pid": os.getpid()})
+        except OSError:
+            pass
+
+
+def _start_control_api(window, options):
+    """The control API for *window*, listening; None (the host is told) when
+    its port could not be had."""
+    from .control_api import ControlApi
+
+    try:
+        api = ControlApi(window, port=options.api_port or 0, token=options.token)
+    except OSError as exc:
+        _handshake_failure(options, f"the control API could not listen on port "
+                                    f"{options.api_port or 0}: {exc}")
+        return None
+    api.start()
+    return api
+
+
+def _close_for_host(window) -> None:
+    """The window TurboADB lived in has gone: close as File > Exit does."""
+    window.close()
+    QApplication.instance().quit()
+
+
+def main(argv=None):
+    from . import embedding
+
+    try:
+        options = embedding.parse(sys.argv[1:] if argv is None else argv)
+    except SystemExit as exc:  # a bad --embed-into, --api-port or --hide
+        return exc.code if isinstance(exc.code, int) else 2
+    options.token = embedding.take_token()
+    embedding.activate(options)
+    if options.embedded:
+        # as DPI aware as the window it goes into (before Qt starts)
+        embedding.match_host_dpi(options.parent)
+    else:
+        _set_app_user_model_id()
     keep_widgets_in_one_window()
     app = QApplication(sys.argv)
     app.setApplicationName("TurboADB")
@@ -492,7 +537,10 @@ def main():
     if os.path.exists(ICON_PATH):
         icon = QIcon(ICON_PATH)
         app.setWindowIcon(icon)
-    if not _acquire_instance_lock():
+    # One TurboADB window per account, but a program may hold its own one
+    # beside it (inside its window, or driven by the control API): that one
+    # is part of the program, not a second launch.
+    if not options.embedded and not options.api and not _acquire_instance_lock():
         return 0
     from . import theme, settings as settings_mod
 
@@ -509,17 +557,42 @@ def main():
 
     global _window
     _window = MainWindow()
-    # The taskbar's icon for the Windows mode, and what a pin shows and starts:
-    # set before the window shows, as Windows reads them then
-    from . import taskbar
+    if options.hide:
+        _window.set_ui_parts(**{part: False for part in options.hide})
+    api = _start_control_api(_window, options) if options.api else None
+    if options.api and api is None:
+        return 3
+    if options.embedded:
+        embedder = embedding.Embedder(_window, options.parent)
+        embedder.host_closed.connect(lambda: _close_for_host(_window))
+        if not embedder.attach():
+            _handshake_failure(options, f"there is no window {options.parent} to go into")
+            if api is not None:
+                api.stop()
+            return 4
+        _window._embedder = embedder
+    else:
+        # The taskbar's icon for the Windows mode, and what a pin shows and
+        # starts: set before the window shows, as Windows reads them then
+        from . import taskbar
 
-    _window._taskbar = taskbar.install(app, _window)
-    # Always open maximized; the workspace (sidebar, screen and controls side by
-    # side) is designed for the full screen.
-    _window.showMaximized()
+        _window._taskbar = taskbar.install(app, _window)
+        # Always open maximized; the workspace (sidebar, screen and controls
+        # side by side) is designed for the full screen.
+        _window.showMaximized()
+    if api is not None:
+        _window._control_api = api
+        if options.handshake:
+            try:
+                embedding.write_handshake(options.handshake, api.handshake())
+            except OSError as exc:
+                logging.getLogger("turboadb.gui").error(
+                    "could not write the handshake file %s: %s", options.handshake, exc)
     try:
         return app.exec_()
     finally:
+        if api is not None:
+            api.stop()
         _stop_started_tools()
         _release_instance_lock()
 
