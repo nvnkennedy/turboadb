@@ -30,7 +30,9 @@ def no_downloads(monkeypatch):
         return f"C:/winget/{tool}.exe"
 
     monkeypatch.setattr(toolsdl, "_install_with_winget", install_with_winget)
+    # as on Windows: elsewhere no scrcpy is downloaded, so an update never asks for it
     monkeypatch.setattr(toolsdl, "adb_download_supported", lambda: True)
+    monkeypatch.setattr(toolsdl, "scrcpy_download_supported", lambda: True)
     monkeypatch.setattr(toolsdl, "managed_adb", lambda: "C:/winget/adb.exe")
     monkeypatch.setattr(toolsdl, "managed_scrcpy", lambda: "C:/winget/scrcpy.exe")
     return asked
