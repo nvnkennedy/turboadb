@@ -44,13 +44,13 @@ can run on background threads, so it never blocks or crashes the caller.
 ## Install
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
 ```
 
 That gives you the Python API, the `turboadb` CLI and `turboadb-gui`. On Windows
 the wheel bundles the GUI executable, so `turboadb-gui` works without PyQt5. To
 run the GUI from the Python package instead, install the optional GUI dependency:
-`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
+`pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl"`. TurboADB is published on GitHub Releases, not on PyPI; the standalone executable is on the same release.
 
 TurboADB needs Google's **platform-tools (`adb`)** and, for mirroring,
 **`scrcpy`**. It auto-detects them on your `PATH`, in the Android SDK, or in

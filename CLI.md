@@ -32,7 +32,7 @@ options, straight from the installed version.
 ## Getting started
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.1/turboadb-6.0.1-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.0.2/turboadb-6.0.2-py3-none-any.whl
 turboadb doctor                                   # are adb and scrcpy available?
 turboadb devices                                  # what's attached
 turboadb -s 10BE330KG9000AF info                  # talk to one device by serial
