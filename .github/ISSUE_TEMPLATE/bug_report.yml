@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in TurboADB doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. The log is usually what lets a bug get fixed, so please include it.
+  - type: input
+    id: version
+    attributes:
+      label: TurboADB version
+      description: Shown in the About window, or run `turboadb --version`.
+      placeholder: "6.0.1"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: "Android Automotive head unit, Android 16, 7200x1178"
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How do you reach the device?
+      multiple: true
+      options:
+        - USB
+        - Wi-Fi or network
+        - A remote adb server
+        - TurboADB is running over Remote Desktop
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What did you do?
+      description: The steps that lead to the problem.
+      placeholder: |
+        1. Open the device's Terminal
+        2. Type /da and press Tab
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The log panel's **Save log…** button writes this. For a screen that won't start, **Show log** in its message has scrcpy's own output.
+      render: text
+    validations:
+      required: true

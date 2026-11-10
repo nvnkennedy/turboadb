@@ -33,6 +33,8 @@ classifiers = [
     "Topic :: Utilities",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    # the Windows app the wheel carries contains PyQt5
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Typing :: Typed",
 ]
 # Batteries-included: the engine + CLI wrap adb/scrcpy and need no third-party
@@ -72,7 +74,7 @@ packages = ["turboadb", "turboadb.gui"]
 include-package-data = false
 
 [tool.setuptools.package-data]
-turboadb = ["*.md", "py.typed", "assets/*.ico", "assets/*.png", "bin/*.exe"]
+turboadb = ["*.md", "py.typed", "assets/*.ico", "assets/*.png", "bin/*.exe", "licenses/*"]
 
 [tool.pytest.ini_options]
 addopts = "--ignore=tests/test_offline.py"

@@ -45,7 +45,10 @@ hiddenimports += ['PyQt5.QtSvg']   # gui/icons.py renders its vector icons lazil
 datas = [('turboadb/assets/icon.ico', 'turboadb/assets'),
          ('turboadb/assets/icon.png', 'turboadb/assets'),
          ('turboadb/assets/icon-light.ico', 'turboadb/assets'),   # the light taskbar's
-         ('turboadb/assets/icon-light.png', 'turboadb/assets')]
+         ('turboadb/assets/icon-light.png', 'turboadb/assets'),
+         # what the app contains, and the licence texts it has to carry
+         ('turboadb/licenses/*', 'turboadb/licenses'),
+         ('LICENSE', 'turboadb/licenses')]
 binaries = []
 # Bundle the ENTIRE pywinrm/NTLM stack (submodules + binaries + data). NTLM is a
 # lazy import inside pywinrm, so collect_all is needed or the frozen exe fails at

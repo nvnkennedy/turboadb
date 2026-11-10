@@ -1,0 +1,17 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Built a script, a test rig or a workflow with TurboADB? We'd love to see it.
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you make?
+      description: What it does, and which device it runs on. Screenshots are welcome.
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Link (optional)
+      description: A repository, video or article, if you have one.

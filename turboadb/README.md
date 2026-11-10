@@ -687,4 +687,6 @@ Device Control (see the automotive table above).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+TurboADB's own code is MIT — see [LICENSE](LICENSE). The Windows app also contains PyQt5
+(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is under the GPL v3; see the
+[third-party notices](https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md).

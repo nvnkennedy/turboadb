@@ -16,6 +16,7 @@ include turboadb/py.typed
 
 recursive-include turboadb *.md
 recursive-include turboadb/assets *.ico *.png
+recursive-include turboadb/licenses *
 # The bundled Windows GUI executable ships in the sdist as well as the wheel.
 recursive-include turboadb/bin *.exe *.txt
 recursive-include scripts *.py

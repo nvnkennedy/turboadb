@@ -11,7 +11,7 @@
   [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
   [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE)
 
-  **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
+  **[🌐 Website](https://nvnkennedy.github.io/turboadb/) · [⤓ Download for Windows](https://github.com/NVNKENNEDY/turboadb/releases/latest) · [💬 Discussions](https://github.com/NVNKENNEDY/turboadb/discussions)**
 </div>
 
 ---
@@ -53,6 +53,7 @@ steps, the **CLI** command, and the **Python** call.
 - [Python API notes](#python-api-notes)
 - [Android Automotive / IVI tips](#android-automotive--ivi-tips)
 - [Build from source](#build-from-source)
+- [Community](#community)
 - [License](#license)
 
 ## Install
@@ -955,10 +956,21 @@ python tests/test_offline.py      # offline checks
 
 See [ARCHITECTURE.md](https://github.com/NVNKENNEDY/turboadb/blob/main/ARCHITECTURE.md) and [CHANGELOG.md](https://github.com/NVNKENNEDY/turboadb/blob/main/CHANGELOG.md).
 
+## Community
+
+- **Questions and help:** [Discussions → Q&A](https://github.com/NVNKENNEDY/turboadb/discussions/categories/q-a)
+- **Ideas and feature requests:** [Discussions → Ideas](https://github.com/NVNKENNEDY/turboadb/discussions/categories/ideas)
+- **Show what you built:** [Discussions → Show and tell](https://github.com/NVNKENNEDY/turboadb/discussions/categories/show-and-tell)
+- **Bugs:** [open an issue](https://github.com/NVNKENNEDY/turboadb/issues/new/choose), with the log from **Save log…**
+
 ## License
 
-[MIT](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE).
+TurboADB's own code is under the [MIT License](https://github.com/NVNKENNEDY/turboadb/blob/main/LICENSE).
 
-The Windows app includes the official, unmodified releases of
-[scrcpy](https://github.com/Genymobile/scrcpy) (Apache-2.0) and Android SDK
-Platform-Tools (Google, under its own terms), with their licence files.
+The Windows app, and the wheel and source package that carry it, also contain PyQt5
+(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is distributed under the
+GPL v3. The source is in this repository and every release is tagged. The
+[third-party notices](https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md) list everything the app contains, with each licence.
+
+TurboADB does not ship adb or scrcpy. They are installed on the first run, under
+their own licences.

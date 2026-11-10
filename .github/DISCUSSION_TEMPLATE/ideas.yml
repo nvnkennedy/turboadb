@@ -1,0 +1,36 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome, big or small. Tell us about the problem first: there may be more than one good way to solve it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task, and what makes it hard today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: How you'd like it to work.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of TurboADB?
+      multiple: true
+      options:
+        - Device screen (scrcpy)
+        - Terminal
+        - Files
+        - Logcat
+        - Displays and head units
+        - Webcam
+        - Command line
+        - Python API
+        - Something else
+    validations:
+      required: true

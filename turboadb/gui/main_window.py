@@ -1063,7 +1063,10 @@ class MainWindow(QMainWindow):
             "Android ADB + scrcpy device toolkit for automotive/embedded "
             "(Android Automotive / IVI) &amp; general Android.<br><br>"
             "<a href='https://github.com/NVNKENNEDY/turboadb'>"
-            "github.com/NVNKENNEDY/turboadb</a>")
+            "github.com/NVNKENNEDY/turboadb</a><br><br>"
+            "TurboADB's own code is under the MIT License. This app also contains PyQt5 "
+            "(GNU GPL v3) and Qt (GNU LGPL v3), so the app as a whole is under the GPL v3. "
+            "<a href='https://github.com/NVNKENNEDY/turboadb/blob/main/turboadb/licenses/THIRD-PARTY-NOTICES.md'>Third-party notices</a>")
 
     # ---- app bar: global actions only (device actions live in each device tab) ----
     def _build_ribbon(self):

@@ -1,0 +1,45 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. Knowing your setup is usually what gets a question answered quickly.
+  - type: input
+    id: version
+    attributes:
+      label: TurboADB version
+      description: Shown in the About window, or run `turboadb --version`.
+      placeholder: "6.0.1"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: "Android Automotive head unit, Android 16, 7200x1178"
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How do you reach the device?
+      multiple: true
+      options:
+        - USB
+        - Wi-Fi or network
+        - A remote adb server
+        - TurboADB is running over Remote Desktop
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do, and what happens?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log (optional)
+      description: The log panel's **Save log…** button writes this. For a screen that won't start, **Show log** in its message has scrcpy's own output.
+      render: text
