@@ -8,15 +8,18 @@ All notable changes are recorded here. Versions follow
 ### New
 
 - **TurboADB inside your own program.** `--embed-into <window handle>` puts the
-  whole app into a window of another program: PyQt5, PySide6, Delphi, C# or
-  anything else with a window handle. It fills that window, follows its size and
-  its DPI awareness, and closes when the window goes. Its **control API** (JSON
-  over HTTP on 127.0.0.1, with a token) lets that program list devices, open one
-  on a page, start its screen, run device commands, show or hide parts of the
-  window, and follow what happens. `turboadb.embed` does this for any Python
-  program, and `turboadb.embed_qt.TurboADBWidget` is a ready widget for PyQt5,
-  PySide6, PyQt6 and PySide2. EMBEDDING.md has the API, and examples for Python,
-  Delphi and C#.
+  whole app into a window of another program: PyQt5, PySide6, PyQt6, Qt C++, Tk,
+  wxPython, C# WinForms and WPF, Win32, Delphi, Electron or anything else with a
+  window handle. It fills that area, follows its size and its DPI awareness, keeps
+  its dialogs in front of the program's window, and closes when the area goes.
+  Its **control API** (JSON over HTTP on 127.0.0.1, with a token) lets that program
+  list devices, open one on a page, start its screen, run device commands, show
+  or hide parts of the window, open TurboADB's dialogs and follow what happens.
+  `turboadb.embed` does this for any Python program, and
+  `turboadb.embed_qt.TurboADBWidget` is a ready widget for PyQt5, PySide6, PyQt6
+  and PySide2. EMBEDDING.md has the API, code for each framework, and what was
+  tested: PyQt5, PySide6, PyQt6, Tk, wxPython, WinForms, WPF, Win32 and Electron
+  hosts.
 - **The Webcam page is there when you want it.** Device tabs have no Webcam page
   until **View → Webcam page in device tabs** is ticked, and the choice applies
   to open tabs at once. **View → Open webcam** works as before.

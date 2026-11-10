@@ -514,3 +514,79 @@ def test_turboadb_gui_passes_the_options_on(monkeypatch):
                      "--hide", "menubar,log"]]
     seen.clear()
     assert cli.main(["gui"]) == 0 and seen == [[]]
+
+
+# ---- a busy window never holds a read up ---------------------------------------------
+def _ask_without_the_window(api, path, method="GET"):
+    """A request while the window's thread does not answer (busy, or waiting
+    on the host): nothing pumps Qt's events meanwhile."""
+    out = {}
+
+    def go():
+        req = urllib.request.Request(f"http://127.0.0.1:{api.port}{path}", method=method,
+                                     data=b"{}" if method == "POST" else None,
+                                     headers={"Authorization": "Bearer secret"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=15) as resp:
+                out["status"], out["body"] = resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            out["status"], out["body"] = exc.code, json.loads(exc.read())
+
+    worker = threading.Thread(target=go)
+    started = time.monotonic()
+    worker.start()
+    worker.join(15)
+    return out["status"], out["body"], time.monotonic() - started
+
+
+def test_a_read_answers_from_the_last_look_when_the_window_is_busy(qapp, api):
+    api.window._live_devices = [_device("R58M1")]
+    api._notice()  # the last look
+    status, body, took = _ask_without_the_window(api, "/v1/devices")
+    assert status == 200 and [d["serial"] for d in body["result"]] == ["R58M1"]
+    assert took < control_api.ControlApi.READ_WAIT_S + 2
+    qapp.processEvents()  # (the call that was queued meanwhile runs, and is dropped)
+
+
+def test_a_change_still_waits_for_the_window(qapp, api, monkeypatch):
+    monkeypatch.setattr(control_api.ControlApi, "UI_TIMEOUT_S", 0.3)
+    status, body, _took = _ask_without_the_window(api, "/v1/focus", "POST")
+    assert status == 504 and "did not answer" in body["error"]
+    qapp.processEvents()
+
+
+def test_dialogs_open_after_the_answer(qapp, api):
+    opened = []
+    api.window.show_settings = lambda: opened.append("settings")
+    status, body = _ask(qapp, api, "POST", "/v1/dialog", {"name": "settings"})
+    assert status == 200 and body["result"] == {"opening": "settings"}
+    end = time.monotonic() + 2
+    while not opened and time.monotonic() < end:
+        qapp.processEvents()
+    assert opened == ["settings"]
+    assert _ask(qapp, api, "POST", "/v1/dialog", {"name": "format_disk"})[0] == 400
+
+
+def test_every_dialog_is_a_window_method():
+    from turboadb.gui.main_window import MainWindow
+
+    assert all(callable(getattr(MainWindow, method, None))
+               for method in control_api.DIALOGS.values())
+
+
+def test_a_client_on_a_window_thread_keeps_answering(monkeypatch):
+    """Its wait takes what other threads send its windows (embed._answering_windows)."""
+    seen = []
+    monkeypatch.setattr(embed, "_thread_has_windows", lambda: True)
+    monkeypatch.setattr(embed, "_answering_windows", lambda work: seen.append(1) or work())
+    client = embed.Client(1, "t")
+    monkeypatch.setattr(client, "_request", lambda *a: {"ok": 1})
+    assert client.request("GET", "/info") == {"ok": 1} and seen == [1]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows' messages")
+def test_the_answering_wait_returns_the_answer_and_the_error():
+    assert embed._answering_windows(lambda: 42) == 42
+    with pytest.raises(embed.TurboADBError):
+        embed._answering_windows(lambda: (_ for _ in ()).throw(embed.TurboADBError("no")))

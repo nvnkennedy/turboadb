@@ -17,11 +17,16 @@ or ``{"ok": false, "error": "…"}`` with a matching HTTP status.
     POST /v1/device                {"serial", "method", "args", "kwargs"}: a device command
     POST /v1/ui                    {"menubar", "ribbon", "sidebar", "statusbar", "log",
                                     "webcam_page": true/false, "theme": name}
+    POST /v1/dialog                {"name": "settings"|"new_target"|"connect"|"about"}
     POST /v1/focus                 give TurboADB the keyboard
     POST /v1/quit                  close TurboADB
 
-Requests that touch the window run on its thread; device commands run on the
-request's own thread, so a long ``shell`` never holds the window up.  A
+Requests that change the window run on its thread; device commands run on
+the request's own thread, so a long ``shell`` never holds the window up.  A
+request that only reads (devices, tabs, parts, info) waits half a second for
+the window at most, then answers with what it showed at its last look (a
+host's window and TurboADB's share their input on Windows: each may be
+waiting on the other for a moment, and a read must never make that worse).  A
 browser can't use the API: a request with an ``Origin`` header is refused, and
 it never knows the token.  EMBEDDING.md has the details and examples.
 """
@@ -33,6 +38,7 @@ import dataclasses
 import hmac
 import inspect
 import json
+import logging
 import os
 import secrets
 import threading
@@ -56,6 +62,11 @@ PAGES = {
     "screen": "controls", "apps": "apps", "phone": "phone", "webcam": "webcam",
     "displays": "ivi",
 }
+
+# TurboADB's own dialogs a host may open (its menu bar may be hidden), by the
+# MainWindow method that opens each.
+DIALOGS = {"settings": "show_settings", "new_target": "new_session",
+           "connect": "open_connect", "about": "_about"}
 
 # Device commands the API runs (ADBHandler methods), each a request that ends.
 # Streaming ones (logcat, an interactive shell, a mirror) are left out: they
@@ -155,6 +166,18 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = False
     api = None
 
+    def handle_error(self, request, client_address):
+        """A client that went away (a host that quit with a connection still
+        open) is no error; anything else goes to TurboADB's log, never to a
+        console the host may have."""
+        import sys
+
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        logging.getLogger("turboadb.gui").warning(
+            "control API: a request from %s failed: %s", client_address, error)
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "TurboADB"
@@ -238,7 +261,8 @@ class ControlApi(QObject):
     """The control API of one TurboADB window (see the module's notes)."""
 
     _call = pyqtSignal(object)
-    UI_TIMEOUT_S = 30.0
+    UI_TIMEOUT_S = 10.0  # a request that changes the window
+    READ_WAIT_S = 0.5  # a request that reads: then the last look answers
 
     def __init__(self, window, *, port: int = 0, token: str | None = None, parent=None):
         super().__init__(parent)
@@ -252,6 +276,8 @@ class ControlApi(QObject):
         self._tab_ids = {}  # tab widget -> its number in the API
         self._next_tab = 1
         self._seen = {"devices": {}, "tabs": {}, "current": None, "pages": {}}
+        self._snapshot = {}  # what the window showed at the last look (_notice)
+        self._snapshot_lock = threading.Lock()
         self._watch = QTimer(self)
         self._watch.setInterval(400)
         self._watch.timeout.connect(self._notice)
@@ -322,10 +348,10 @@ class ControlApi(QObject):
     # ---- routes ----
     def dispatch(self, method: str, path: str, body: dict, query: dict):
         routes = {
-            ("GET", "/v1/info"): lambda: self.on_ui(self._info),
-            ("GET", "/v1/devices"): lambda: self.on_ui(self._devices),
-            ("GET", "/v1/tabs"): lambda: self.on_ui(self._tabs),
-            ("GET", "/v1/ui"): lambda: self.on_ui(self._ui),
+            ("GET", "/v1/info"): lambda: self._read("info", self._info),
+            ("GET", "/v1/devices"): lambda: self._read("devices", self._devices),
+            ("GET", "/v1/tabs"): lambda: self._read("tabs", self._tabs),
+            ("GET", "/v1/ui"): lambda: self._read("ui", self._ui),
             ("GET", "/v1/events"): lambda: self._events(query),
             ("POST", "/v1/open"): lambda: self.on_ui(lambda: self._open(body)),
             ("POST", "/v1/show"): lambda: self.on_ui(lambda: self._show(body)),
@@ -333,6 +359,7 @@ class ControlApi(QObject):
             ("POST", "/v1/screen"): lambda: self.on_ui(lambda: self._screen(body)),
             ("POST", "/v1/ui"): lambda: self.on_ui(lambda: self._set_ui(body)),
             ("POST", "/v1/device"): lambda: self._device(body),
+            ("POST", "/v1/dialog"): lambda: self.on_ui(lambda: self._dialog(body)),
             ("POST", "/v1/focus"): lambda: self.on_ui(self._focus),
             ("POST", "/v1/quit"): lambda: self.on_ui(self._quit),
         }
@@ -342,6 +369,33 @@ class ControlApi(QObject):
                 raise ApiError(405, f"{path} does not take {method}")
             raise ApiError(404, f"no such request: {method} {path}")
         return route()
+
+    def _read(self, name: str, fn):
+        """*fn*'s answer from the window, or the last look's when the window
+        is busy for longer than :attr:`READ_WAIT_S`."""
+        try:
+            return self.on_ui(fn, timeout=self.READ_WAIT_S)
+        except ApiError as exc:
+            if exc.status != 504:
+                raise
+        with self._snapshot_lock:
+            found = self._snapshot.get(name)
+        if found is None:
+            raise ApiError(504, "TurboADB's window is busy; ask again in a moment")
+        if name == "info":
+            found = dict(found, events=self.events.last)
+        return found
+
+    def _remember(self) -> None:
+        """Keep what the window shows now, for reads that cannot wait (the
+        window's thread)."""
+        try:
+            snapshot = {"info": self._info(), "devices": self._devices(),
+                        "tabs": self._tabs(), "ui": self._ui()}
+        except Exception:
+            return
+        with self._snapshot_lock:
+            self._snapshot = snapshot
 
     def _window_handle(self) -> int:
         try:
@@ -355,7 +409,8 @@ class ControlApi(QObject):
             "version": __version__, "api_version": API_VERSION, "pid": os.getpid(),
             "window": self._window_handle(), "embedded": options.embedded,
             "parent": options.parent, "pages": sorted(PAGES), "ui_parts": list(embedding.HIDE_PARTS),
-            "device_calls": sorted(DEVICE_CALLS), "events": self.events.last,
+            "device_calls": sorted(DEVICE_CALLS), "dialogs": sorted(DIALOGS),
+            "events": self.events.last,
         }
 
     # devices and tabs
@@ -573,6 +628,16 @@ class ControlApi(QObject):
             self.window.set_webcam_pages(body["webcam_page"])
         return self._ui()
 
+    def _dialog(self, body: dict) -> dict:
+        """Open one of TurboADB's dialogs.  It opens after this answer has
+        gone: a dialog waits for the user, and the request must not."""
+        name = _text(body, "name")
+        method = getattr(self.window, DIALOGS.get(name, ""), None)
+        if method is None:
+            raise ApiError(400, f"no dialog called {name!r}: {', '.join(sorted(DIALOGS))}")
+        QTimer.singleShot(0, method)
+        return {"opening": name}
+
     def _focus(self) -> dict:
         window = self.window
         window.activateWindow()
@@ -646,6 +711,7 @@ class ControlApi(QObject):
             if page and seen["pages"].get(number) not in (None, page):
                 self.events.publish("page", tab=number, serial=self.tab_serial(tab), page=page)
         seen["pages"] = pages
+        self._remember()
 
     # devices
     def _handler_for(self, serial: str):

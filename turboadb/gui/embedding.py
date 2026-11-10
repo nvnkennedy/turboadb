@@ -199,6 +199,95 @@ def match_host_dpi(hwnd: int, environ=None) -> Optional[int]:
     return awareness
 
 
+_WS_EX_NOPARENTNOTIFY = 0x00000004
+_GWL_EXSTYLE = -20
+_GWLP_HWNDPARENT = -8
+
+
+def host_root(hwnd: int) -> int:
+    """The top-level window of the host window *hwnd* (0 when unknown)."""
+    if os.name != "nt" or not hwnd:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        u.GetAncestor.restype = wintypes.HWND
+        u.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+        return int(u.GetAncestor(hwnd, 2) or 0)  # GA_ROOT
+    except Exception:
+        return 0
+
+
+def own_by(hwnd: int, owner: int) -> bool:
+    """Make the host's top-level window *owner* the owner of TurboADB's
+    top-level window *hwnd* (a dialog, a menu, a message box) when it has
+    none.  An owned window stays in front of its owner: without one, a
+    dialog of TurboADB inside a host went behind the host's window, where
+    nobody could see it.  Returns True when the owner was set."""
+    if os.name != "nt" or not hwnd or not owner:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        u.GetWindow.restype = wintypes.HWND
+        u.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+        put = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+        put.restype = ctypes.c_ssize_t
+        put.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+        if u.GetWindow(hwnd, 4):  # GW_OWNER: it has one already
+            return False
+        put(hwnd, _GWLP_HWNDPARENT, owner)
+        # In front of its owner now, not only from the next change of order:
+        # in the always-on-top band too when the host's window is in it
+        get = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+        get.restype = ctypes.c_ssize_t
+        get.argtypes = (wintypes.HWND, ctypes.c_int)
+        u.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT)
+        on_top = bool(get(owner, _GWL_EXSTYLE) & 0x00000008)  # WS_EX_TOPMOST
+        u.SetWindowPos(hwnd, wintypes.HWND(-1 if on_top else 0), 0, 0, 0, 0,
+                       0x0001 | 0x0002 | 0x0010)  # NOSIZE | NOMOVE | NOACTIVATE
+        return True
+    except Exception:
+        return False
+
+
+def keep_to_itself(hwnd: int) -> bool:
+    """Stop Windows telling the host about TurboADB's own windows.
+
+    A window that is created, destroyed or clicked inside another one sends
+    WM_PARENTNOTIFY up the chain of its parents, and waits for each to take
+    it.  Inside a host that meant every window TurboADB made (a device tab,
+    the phone's screen) waited for the host's own thread: a host waiting on
+    the control API at that moment, as a button's handler does, and
+    TurboADB waiting on the host, both stood still until the request gave
+    up.  With WS_EX_NOPARENTNOTIFY on TurboADB's window the notices end
+    there.  Returns True when the style had to be set."""
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u = ctypes.windll.user32
+        get = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+        put = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+        get.restype = put.restype = ctypes.c_ssize_t
+        get.argtypes = (wintypes.HWND, ctypes.c_int)
+        put.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+        style = get(hwnd, _GWL_EXSTYLE)
+        if style & _WS_EX_NOPARENTNOTIFY:
+            return False
+        put(hwnd, _GWL_EXSTYLE, style | _WS_EX_NOPARENTNOTIFY)
+        return True
+    except Exception:
+        return False
+
+
 # ---- the handshake -----------------------------------------------------------------
 def write_handshake(path: str, info: dict) -> None:
     """Write *info* to *path* as JSON, whole or not at all: a host polling for
@@ -213,13 +302,38 @@ def write_handshake(path: str, info: dict) -> None:
 
 # ---- the window inside the host ----------------------------------------------------
 try:
-    from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
+    from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QTimer, pyqtSignal
 except ImportError:  # the host side imports this module's helpers without Qt
     QObject = object
     pyqtSignal = None
 
 
 if pyqtSignal is not None:
+
+    class _Owners(QObject):
+        """Gives every window TurboADB shows besides its own (dialogs,
+        menus, message boxes) the host's top-level window as owner.
+
+        Qt makes a dialog's parent window its owner, but refuses one that
+        lives inside another window ("transient parent must be a top level
+        window") and, as the dialog shows, sets no owner at all: the owner is
+        set here, and once more just after Qt has shown the window."""
+
+        def __init__(self, main_window, owner: int):
+            super().__init__(main_window)
+            self._main = main_window
+            self._owner = owner
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Show:
+                try:
+                    if obj.isWidgetType() and obj.isWindow() and obj is not self._main:
+                        hwnd = int(obj.winId())
+                        own_by(hwnd, self._owner)
+                        QTimer.singleShot(0, lambda h=hwnd: own_by(h, self._owner))
+                except RuntimeError:
+                    pass
+            return False
 
     class Embedder(QObject):
         """Keeps *window* inside the host window *parent*: as its child, the
@@ -257,6 +371,13 @@ if pyqtSignal is not None:
             window.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
             window.winId()  # the native window, to be given its parent
             window.windowHandle().setParent(host)
+            keep_to_itself(int(window.winId()))
+            root = host_root(self._parent)
+            if root:
+                from PyQt5.QtWidgets import QApplication
+
+                self._owners = _Owners(window, root)
+                QApplication.instance().installEventFilter(self._owners)
             self._follow()
             window.show()
             self._timer.start()
@@ -270,6 +391,7 @@ if pyqtSignal is not None:
                 self._timer.stop()
                 self.host_closed.emit()
                 return
+            keep_to_itself(int(self._window.winId()))  # (Qt may set the styles again)
             size = host_client_size(self._parent)
             if size is None:
                 return

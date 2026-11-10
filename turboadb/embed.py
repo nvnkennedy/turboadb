@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -56,7 +57,18 @@ class Client:
 
     def request(self, method: str, path: str, body: Optional[dict] = None,
                 timeout: Optional[float] = None):
-        """Send one request; returns its ``result``, raises TurboADBError."""
+        """Send one request; returns its ``result``, raises TurboADBError.
+
+        Asked from a thread with windows (a button's handler), the wait keeps
+        answering what Windows sends that thread meanwhile: TurboADB inside
+        one of its windows shares its input, and a focus change in TurboADB
+        waits for the host's thread.  A host thread that only waited for the
+        answer made each wait for the other."""
+        if _thread_has_windows():
+            return _answering_windows(lambda: self._request(method, path, body, timeout))
+        return self._request(method, path, body, timeout)
+
+    def _request(self, method, path, body, timeout):
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.base + path, data=data, method=method)
         req.add_header("Authorization", f"Bearer {self.token}")
@@ -123,6 +135,11 @@ class Client:
         statusbar, log), the Webcam page (``webcam_page``), or set ``theme``."""
         return self.request("POST", "/ui", parts)
 
+    def dialog(self, name: str) -> dict:
+        """Open one of TurboADB's dialogs: settings, new_target, connect or
+        about (for a host that hides TurboADB's menu bar)."""
+        return self.request("POST", "/dialog", {"name": name})
+
     def focus(self) -> dict:
         return self.request("POST", "/focus", {})
 
@@ -167,6 +184,56 @@ class Client:
                 yield event
                 if event.get("type") == "closing":
                     return
+
+
+def _thread_has_windows() -> bool:
+    """Whether the calling thread owns a window (Windows only)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        found = []
+        callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(
+            lambda _hwnd, _param: found.append(1) and False)
+        ctypes.windll.user32.EnumThreadWindows(ctypes.windll.kernel32.GetCurrentThreadId(),
+                                              callback, None)
+        return bool(found)
+    except Exception:
+        return False
+
+
+def _answering_windows(work):
+    """Run *work* on a helper thread; meanwhile this thread takes the
+    messages other threads send its windows (and only those: nothing the
+    program posted or the user typed runs here), as Windows' own COM does."""
+    import ctypes
+    from ctypes import wintypes
+
+    box = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box["value"] = work()
+        except BaseException as exc:
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="turboadb-api-request", daemon=True).start()
+    u = ctypes.windll.user32
+    u.MsgWaitForMultipleObjects.argtypes = (wintypes.DWORD, ctypes.c_void_p, wintypes.BOOL,
+                                            wintypes.DWORD, wintypes.DWORD)
+    msg = wintypes.MSG()
+    qs_sendmessage = 0x0040
+    pm_noremove_sent = 0x0000 | (qs_sendmessage << 16)  # PM_NOREMOVE | PM_QS_SENDMESSAGE
+    while not done.is_set():
+        u.MsgWaitForMultipleObjects(0, None, False, 15, qs_sendmessage)
+        u.PeekMessageW(ctypes.byref(msg), None, 0, 0, pm_noremove_sent)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 class Embedded(Client):

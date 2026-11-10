@@ -166,3 +166,37 @@ def test_the_widget_uses_the_qt_the_program_has():
 
     assert embed_qt.BINDING == "PyQt5"  # imported by these tests already
     assert embed_qt.QtWidgets.__name__ == "PyQt5.QtWidgets"
+
+
+# ---- inside a host: TurboADB's own windows ------------------------------------------------
+@pytest.mark.skipif(os.name != "nt", reason="window owners are Windows'")
+def test_a_dialog_gets_the_host_as_owner_and_turboadb_keeps_its_notices():
+    """A dialog with no owner went behind the host's window; a window made inside
+    TurboADB told the host, and waited for it.  (Real windows: Qt's offscreen
+    platform has no handles.)"""
+    import ctypes
+    from ctypes import wintypes
+
+    from turboadb.gui import embedding
+
+    u = ctypes.windll.user32
+    u.CreateWindowExW.restype = wintypes.HWND
+    u.CreateWindowExW.argtypes = (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                  wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID)
+    u.GetWindow.restype = wintypes.HWND
+    u.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+    u.DestroyWindow.argtypes = (wintypes.HWND,)
+    popup = 0x80000000  # WS_POPUP, never shown
+    host = u.CreateWindowExW(0, "STATIC", "host", popup, 0, 0, 10, 10, None, None, None, None)
+    box = u.CreateWindowExW(0, "STATIC", "box", popup, 0, 0, 10, 10, None, None, None, None)
+    try:
+        assert embedding.own_by(box, host) is True
+        assert int(u.GetWindow(box, 4) or 0) == host  # GW_OWNER
+        assert embedding.own_by(box, host) is False  # it has one now
+        assert embedding.host_root(host) == host
+        assert embedding.keep_to_itself(host) is True
+        assert embedding.keep_to_itself(host) is False  # set already
+    finally:
+        u.DestroyWindow(box)
+        u.DestroyWindow(host)

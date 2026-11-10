@@ -422,10 +422,13 @@ dev.mirror(opts)
 
 ## Embedding the GUI in your own program
 
-TurboADB can live inside a window of your own program, written in PyQt5, PySide6,
-Delphi, C# or anything else with a window handle, and be driven from it through a
-small control API (JSON over HTTP on 127.0.0.1, with a token). It runs as a process of
-its own, fills the window you give it and follows its size.
+The whole TurboADB app can live inside a window of your own program and be driven
+from it through a small control API (JSON over HTTP on 127.0.0.1, with a token):
+PyQt5, PySide6, PyQt6, Qt C++, Python Tk, wxPython, C# WinForms and WPF, Win32,
+Delphi or Electron. It runs as a process of its own, fills the area you give it,
+follows its size, keeps its dialogs in front of your window and closes with it.
+It has been tested inside PyQt5, PySide6, PyQt6, Tk, wxPython, WinForms, WPF,
+plain Win32 and Electron programs.
 
 ```python
 from turboadb.embed_qt import TurboADBWidget      # PyQt5, PySide6, PyQt6 or PySide2
