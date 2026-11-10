@@ -243,7 +243,7 @@ def test_launch_gui_runs_here_when_turboadb_exe_can_not(monkeypatch):
     ran = []
     monkeypatch.setattr(cli, "_prewarm_gui_adb_server", lambda: ran.append("prewarm"))
     monkeypatch.setattr(launcher, "relaunch", lambda argv: None)
-    monkeypatch.setattr(app_mod, "main", lambda: ran.append("gui") or 0)
+    monkeypatch.setattr(app_mod, "main", lambda argv=None: ran.append("gui") or 0)
     assert cli.launch_gui([]) == 0
     assert ran == ["prewarm", "gui"]
 
@@ -275,7 +275,8 @@ def direct(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "executable", "C:\\Python\\pythonw.exe")
     done = []
     app = types.ModuleType("turboadb.gui.app")
-    app.main = lambda: done.append("gui") or 0
+    app.main = lambda argv=None: done.append("gui") or app.argv.append(argv) or 0
+    app.argv = []
     monkeypatch.setitem(sys.modules, "turboadb.gui.app", app)
 
     def popen(cmd, creationflags=0, **kwargs):
@@ -283,8 +284,26 @@ def direct(monkeypatch, tmp_path):
         return _Proc()
 
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
-    return types.SimpleNamespace(home=str(home), done=done,
+    return types.SimpleNamespace(home=str(home), done=done, app=app,
                                  run=lambda argv=(): launcher.run_branded(list(argv), str(home)))
+
+
+def test_the_options_for_another_program_s_window_reach_the_gui(direct):
+    """TurboADB.exe --embed-into HWND: the options go to the GUI it runs."""
+    argv = ["--embed-into", "0x40A1C", "--api-port", "0", "--handshake-file", "h.json"]
+    assert direct.run(argv) == 0 and direct.done == ["gui"]
+    assert direct.app.argv == [argv]
+
+
+def test_launch_gui_passes_its_options_to_the_gui(monkeypatch):
+    pytest.importorskip("PyQt5")
+    import turboadb.gui.app as app_mod
+
+    seen = []
+    monkeypatch.setattr(cli, "_prewarm_gui_adb_server", lambda: None)
+    monkeypatch.setattr(launcher, "relaunch", lambda argv: None)
+    monkeypatch.setattr(app_mod, "main", lambda argv=None: seen.append(argv) or 0)
+    assert cli.launch_gui(["--api-port", "0"]) == 0 and seen == [["--api-port", "0"]]
 
 
 def test_a_copy_built_of_another_turboadb_or_python_hands_the_start_over(direct, monkeypatch):
