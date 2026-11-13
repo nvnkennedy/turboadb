@@ -521,7 +521,7 @@ tadb = launch(parent=area_window_handle)   # frame.winfo_id(), panel.GetHandle()
 tadb.open("SERIAL", page="logcat")
 print(tadb.shell("SERIAL", "getprop ro.product.model"))</code></pre></div></div>
         <div class="mode"><span class="tag cli">Any language</span>
-          <div class="code"><pre><code>TurboADB-6.2.0-win64.exe --embed-into &lt;window handle&gt; --api-port 0 --handshake-file &lt;file&gt;
+          <div class="code"><pre><code>TurboADB-6.3.0-win64.exe --embed-into &lt;window handle&gt; --api-port 0 --handshake-file &lt;file&gt;
 GET  /v1/devices     POST /v1/open {"serial": "…", "page": "files"}
 POST /v1/device {"serial": "…", "method": "shell", "args": ["…"]}</code></pre></div></div>
       </article>

@@ -336,7 +336,15 @@ These patterns recur and are worth preserving:
   its name cell is drawn (`_NameDelegate`, `_ICON_LATER_ROLE`), so a folder
   of thousands asks for a screenful. Moving a widget to another parent
   applies the stylesheet again to all of its children, so a layout that
-  changes (Device Control's columns) moves layout items, never widgets.
+  changes (Device Control's columns) moves layout items, never widgets, and
+  pages are built inside their final parent: `_build_control_view(place=…)`
+  puts the empty Device Control among the pages before the screen and the
+  controls are built in its cards, and `_LazyPage` hands itself to the
+  page's factory. No program starts on the window's thread either: the
+  Android terminal's `adb shell` opens on a thread (`_OpeningShell` stands
+  in for the ShellSession meanwhile: running, nothing to read, input waits
+  for it), and `LocalShellSession` starts PowerShell or CMD on one
+  (`wait_started`, `start_error`; its writer and closers wait for it).
 - **The edit region.** In `AnsiConsole` the synthetic prompt (Android shell over a
   pipe) and the line being typed are always the last characters of the document,
   and output is inserted above them. Typing while a command streams therefore never

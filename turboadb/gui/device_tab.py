@@ -2315,7 +2315,12 @@ class _LocalShellWidget(_TerminalWidgetBase):
         if not self._closing:
             # one notice, after the shell's last output
             self.term.set_alive(False, show_disconnect_notice=False)
-            self.term.notice("[Process terminated]", theme.ECHO_ERROR)
+            error = getattr(self.session, "start_error", None)
+            self.term.notice(
+                f"[Could not start local {self.shell_type}: {error}]" if error is not None
+                else "[Process terminated]",
+                theme.ECHO_ERROR,
+            )
 
     def _send(self, data: bytes):
         """A submitted line.  At the shell's own prompt it is a command and
@@ -3075,6 +3080,79 @@ def _fold_crs(data: bytes, carry: bytes = b""):
     return _CR_RUN_LF.sub(b"\r\n", body), data[len(body):]
 
 
+class _OpeningShell:
+    """An interactive ``adb shell`` (:meth:`ADBHandler.open_shell`) opened on
+    a thread of its own, standing in for its :class:`ShellSession`.
+
+    Opening it starts adb.exe, and while other programs started too (a device
+    connecting, more terminals opening) that took the window's thread for up
+    to a fifth of a second.  The terminal uses this at once: it is
+    :attr:`running` while the shell opens, has nothing to :meth:`read`, and
+    :meth:`send` (called on :class:`_ShellInput`'s thread) waits for the
+    shell.  An open that failed leaves it ended, with :attr:`error`; one
+    closed meanwhile closes the shell as soon as it is open."""
+
+    def __init__(self, handler, *, tty: bool):
+        self.error = None            # why no shell opened, once it is known
+        self._session = None
+        self._closed = False
+        self._lock = threading.Lock()
+        self._opened = threading.Event()
+        threading.Thread(
+            target=self._open, args=(handler, tty), name="turboadb-shell-open", daemon=True
+        ).start()
+
+    def _open(self, handler, tty) -> None:
+        session = error = None
+        try:
+            res = handler.open_shell(tty=tty)
+            session = res.value if isinstance(res, OperationResult) else res
+            if session is None:
+                error = (res.error if isinstance(res, OperationResult) else None) or "no shell"
+        except Exception as exc:
+            error = exc
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._session, self.error = session, error
+            self._opened.set()
+        if closed and session is not None:
+            try:
+                session.close()  # nobody wants it any more
+            except Exception:
+                pass
+
+    @property
+    def opened(self) -> bool:
+        """The open is over (a shell, or :attr:`error`)."""
+        return self._opened.is_set()
+
+    @property
+    def running(self) -> bool:
+        if self._closed:
+            return False
+        if not self._opened.is_set():
+            return True
+        session = self._session
+        return session is not None and session.running
+
+    def read(self, size: int = 65536) -> bytes:
+        session = self._session
+        return session.read(size) if session is not None else b""
+
+    def send(self, data) -> bool:
+        self._opened.wait()
+        session = self._session
+        return session is not None and not self._closed and session.send(data) is not False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            session = self._session
+        if session is not None:
+            session.close()
+
+
 class _ShellInput:
     """Writes one adb shell's input on a thread of its own, in order.
 
@@ -3119,8 +3197,8 @@ class _ShellInput:
                 )
                 self._thread.start()
             self._cond.notify_all()
-            if not idle:
-                return True
+            if not idle or not getattr(self._session, "opened", True):
+                return True  # (a shell still opening takes it once it is open)
             self._cond.wait_for(
                 lambda: self._done >= ticket or self._closed or self._failed, self.WAIT_S
             )
@@ -3320,13 +3398,16 @@ class _AndroidShellWidget(_TerminalWidgetBase):
         return self._device_prompt if self._pty and self._at_device_prompt else ""
 
     def _open(self, *, focus=True, cwd=None, fallback=False) -> bool:
-        """Open the interactive adb shell (in folder *cwd*); False when none runs.
+        """Open the interactive adb shell (in folder *cwd*); False when none
+        will run.
 
-        A failed open leaves no prompt behind, where typing would go nowhere:
-        the terminal says so and tells the device tab (:attr:`disconnected`),
-        which brings the shell back as after a lost connection.  *fallback*:
-        the pipes that replace a terminal the device did not give (see
-        :meth:`_shell_ended`)."""
+        adb starts on a thread of its own (:class:`_OpeningShell`): the
+        terminal is ready at once, and what is typed meanwhile goes to the
+        shell once it is open.  A failed open leaves no prompt behind, where
+        typing would go nowhere: the terminal says so and tells the device tab
+        (:attr:`disconnected`), which brings the shell back as after a lost
+        connection (see :meth:`_open_failed`).  *fallback*: the pipes that
+        replace a terminal the device did not give (see :meth:`_shell_ended`)."""
         if not self.handler:
             return False
         self._started = True
@@ -3337,20 +3418,7 @@ class _AndroidShellWidget(_TerminalWidgetBase):
             self._pause_notice()
             return False
         pty = not self._pty_fallback and bool(settings_mod.get("android_shell_pty"))
-        res = self.handler.open_shell(tty=pty)
-        self.session = res.value if isinstance(res, OperationResult) else res
-        if self.session is None:
-            error = res.error if isinstance(res, OperationResult) else None
-            self.term.notice(
-                "[could not open adb shell" + (f": {error}" if error else "") + "]",
-                theme.ECHO_ERROR,
-            )
-            self.term.set_alive(False, show_disconnect_notice=False)
-            if not self._closing:
-                self.disconnected.emit()
-            return False
-
-        sess = self.session
+        self.session = sess = _OpeningShell(self.handler, tty=pty)
         self._input = _ShellInput(sess)
         self._set_mode(pty)
         self._tty_requested = pty
@@ -3708,7 +3776,20 @@ class _AndroidShellWidget(_TerminalWidgetBase):
     def _on_reader_closed(self):
         if self._closing or self._adb_restart_paused:
             return
+        error = getattr(self.session, "error", None)
+        if error is not None:
+            self._open_failed(error)
+            return
         self._shell_ended(self._take_hold())
+
+    def _open_failed(self, error) -> None:
+        """No adb shell opened (adb could not be started): no prompt is left
+        behind, where typing would go nowhere."""
+        self._close_stream()
+        self.term.notice(f"[could not open adb shell: {error}]", theme.ECHO_ERROR)
+        self.term.set_alive(False, show_disconnect_notice=False)
+        if not self._closing:
+            self.disconnected.emit()
 
     def _on_early_error(self):
         """adb reported an error before the terminal shell's first prompt."""
@@ -4359,12 +4440,14 @@ class _ControlView(QWidget):
     CARD_FRAME = 4
 
     def __init__(self, mirror, screen_card, controls, controls_card, parent=None, toggle=None):
+        """*mirror* and *controls* may come later (:meth:`attach`): the cards
+        can be put in their place first, and the pages built inside them."""
         super().__init__(parent)
-        self.mirror = mirror
+        self.mirror = None
         self.screen_card = screen_card
-        self.controls = controls
+        self.controls = None
         self.controls_card = controls_card
-        self.toggle = toggle  # the screen toolbar's show/hide-controls button
+        self.toggle = None  # the screen toolbar's show/hide-controls button
         self.mode = "side"
         self._user_sized = False
         self._applying = False
@@ -4390,6 +4473,15 @@ class _ControlView(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._apply)
+        if mirror is not None:
+            self.attach(mirror, controls, toggle)
+
+    def attach(self, mirror, controls, toggle=None) -> None:
+        """The screen (a MirrorPanel in the screen card) and the controls (a
+        ControlsPanel in the controls card)."""
+        self.mirror = mirror
+        self.controls = controls
+        self.toggle = toggle
         mirror.display_shape_changed.connect(self.schedule_layout)
         mirror.toolbar_changed.connect(self.schedule_layout)
         mirror.max_view_changed.connect(self.set_maximized)
@@ -4473,7 +4565,8 @@ class _ControlView(QWidget):
 
     def _apply(self):
         width, height = self.split.width(), self.split.height()
-        if width < 200 or height < 150 or not self.controls_card.isVisibleTo(self):
+        if (self.mirror is None or width < 200 or height < 150
+                or not self.controls_card.isVisibleTo(self)):
             return
         aspect = self.mirror.display_aspect()
         frame = self._card_frame()
@@ -4554,7 +4647,9 @@ class _LazyPage(QWidget):
     Logcat, Files, Apps, Phone and Webcam hold widgets, caches and (for Files
     and Webcam) start-up workers that an unvisited page never needs.  This
     holder is the persistent page object for the tab order and split view;
-    :attr:`page` is the real panel once built.
+    :attr:`page` is the real panel once built.  *factory(parent)* builds it
+    inside the holder: a page built elsewhere and then moved in had the
+    stylesheet applied to all of it again.
     """
 
     def __init__(self, factory, parent=None):
@@ -4569,7 +4664,7 @@ class _LazyPage(QWidget):
         """Build the page now if it wasn't yet; returns it (None once released)."""
         if self.page is None and self._factory is not None:
             factory, self._factory = self._factory, None
-            self.page = factory()
+            self.page = factory(self)
             self.layout().addWidget(self.page)
             if self.isVisible():
                 self.page.show()
@@ -5530,14 +5625,16 @@ class DeviceTab(QWidget):
             if friendly:
                 self.title_changed.emit(friendly)
             return
-        self.combo_view = self._build_control_view(handler)
-
         # Logcat, Files, Apps, Phone and Webcam are built when first shown.
-        # Phone loads call history and messages only then, too.
+        # Phone loads call history and messages only then, too.  Device
+        # Control is built in its place among the pages (see
+        # _build_control_view).
         self._add_subtab(self.shell, "⌨", "Terminal")
         self._add_lazy_page("logcat", "📜", "Logcat", self._build_logcat)
         self._add_lazy_page("files", "📁", "Files", self._build_files)
-        self._add_subtab(self.combo_view, "🎛", "Device Control")
+        self.combo_view = self._build_control_view(
+            handler, place=lambda view: self._add_subtab(view, "🎛", "Device Control")
+        )
         self._add_lazy_page("apps", "📦", "Apps", self._build_apps)
         self._add_lazy_page("phone", "📞", "Phone", self._build_phone)
         if settings_mod.get("show_webcam_page", False):
@@ -5626,13 +5723,13 @@ class DeviceTab(QWidget):
         holder = self._lazy_pages.get(key)
         return holder.page if holder is not None else None
 
-    def _build_logcat(self):
-        page = LogcatPanel(self.handler)
+    def _build_logcat(self, parent=None):
+        page = LogcatPanel(self.handler, parent=parent)
         page.log.connect(self.log)
         return page
 
-    def _build_files(self):
-        page = FileBrowser(self.handler, start="/sdcard", adb_gate=self._adb_gate)
+    def _build_files(self, parent=None):
+        page = FileBrowser(self.handler, start="/sdcard", parent=parent, adb_gate=self._adb_gate)
         self._wire_files_page(page)
         return page
 
@@ -5816,22 +5913,23 @@ class DeviceTab(QWidget):
         menu.exec_(bar.mapToGlobal(pos))
         menu.deleteLater()
 
-    def _build_apps(self):
-        page = AppsPanel(self.handler, automotive=self._automotive, adb_gate=self._adb_gate)
+    def _build_apps(self, parent=None):
+        page = AppsPanel(self.handler, automotive=self._automotive, parent=parent,
+                         adb_gate=self._adb_gate)
         page.log.connect(self.log)
         page.trace.connect(self.trace)  # listing counts: log panel only
         return page
 
-    def _build_phone(self):
-        page = PhonePanel(self.handler, adb_gate=self._adb_gate)
+    def _build_phone(self, parent=None):
+        page = PhonePanel(self.handler, parent=parent, adb_gate=self._adb_gate)
         page.log.connect(self.log)
         if self._adb_restart_in_progress:
             # first shown while the adb server restarts: it loads after that
             page.suspend_for_device_loss()
         return page
 
-    def _build_webcam(self):
-        page = CameraPanel()
+    def _build_webcam(self, parent=None):
+        page = CameraPanel(parent)
         page.log.connect(self.log)
         return page
 
@@ -6341,13 +6439,18 @@ class DeviceTab(QWidget):
             if mirror is not None and hasattr(mirror, "_resume_max"):
                 mirror._resume_max()
 
-    def _build_control_view(self, handler):
+    def _build_control_view(self, handler, place=None):
+        """Device Control (a :class:`_ControlView`).  *place(view)* puts the
+        empty view where it goes (the device tab's pages) before the screen
+        and the controls are built inside it: moving a built page to another
+        parent applies the stylesheet again to every widget in it, and the
+        four moves of building it bottom-up took longer than building it."""
         from .device_commands import DeviceCommandDispatcher
 
         if self._device_dispatcher is None:
             self._device_dispatcher = DeviceCommandDispatcher()
 
-        def card(title, inner, object_name):
+        def card(title, object_name):
             # One surface per region: the page's own widgets sit directly on
             # it instead of inside a second nested frame.
             frame = QFrame()
@@ -6359,8 +6462,15 @@ class DeviceTab(QWidget):
                 cap = QLabel(title)
                 cap.setObjectName("cardTitle")
                 fv.addWidget(cap)
-            fv.addWidget(inner, 1)
             return frame
+
+        m_card = card("", "mirrorView")
+        m_card.setMinimumWidth(340)
+        c_card = card("Device controls", "sidePanel")
+        c_card.setMinimumWidth(280)
+        view = _ControlView(None, m_card, None, c_card)
+        if place is not None:
+            place(view)
 
         self.mirror_tab = MirrorPanel(
             handler,
@@ -6370,8 +6480,10 @@ class DeviceTab(QWidget):
             # choose the dedicated native scrcpy window from Screen when a
             # device or remote desktop session does not embed cleanly.
             prefer_embed=True,
+            parent=m_card,
             dispatcher=self._device_dispatcher,
         )
+        m_card.layout().addWidget(self.mirror_tab, 1)
         self.mirror_tab.log.connect(self.log)
         self.mirror_tab.video_active_changed.connect(self.screen_active)
         self.mirror_tab.set_device(sdk=getattr(self, "_sdk", None))
@@ -6384,12 +6496,10 @@ class DeviceTab(QWidget):
             # keys.  Display 0 of several is named too: Android sends a key
             # without one to the display in focus.
             display_provider=self.mirror_tab.key_display_id,
+            parent=c_card,
         )
+        c_card.layout().addWidget(self.controls, 1)
         self.controls.log.connect(self.log)
-        m_card = card("", self.mirror_tab, "mirrorView")
-        m_card.setMinimumWidth(340)
-        c_card = card("Device controls", self.controls, "sidePanel")
-        c_card.setMinimumWidth(280)
 
         # An icon toggle at the end of the screen toolbar (checked while the
         # controls show), so the toolbar keeps to one row; its label is the
@@ -6405,7 +6515,7 @@ class DeviceTab(QWidget):
         self._device_controls_toggle = btn_tog
         self.mirror_tab.add_toolbar_widget(btn_tog)
 
-        view = _ControlView(self.mirror_tab, m_card, self.controls, c_card, toggle=btn_tog)
+        view.attach(self.mirror_tab, self.controls, toggle=btn_tog)
         self._control_view = view
         return view
 

@@ -910,25 +910,58 @@ class LocalShellSession:
         self._inbox_bytes = 0
         self._inbox_cv = threading.Condition()
         self._writer = None
-        self._proc = _popen_clean_dll_path(
-            shell_argv(self.shell_type, system_root, columns=columns),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=self.cwd,
-            env=self.env,
-            creationflags=NO_WINDOW,
-            bufsize=0,
-        )
+        # The shell starts on a thread of its own: starting a program took
+        # the window's thread for up to a fifth of a second while others
+        # started too (a device connecting).  Until it runs, input waits for
+        # it and there is nothing to read.
+        self._proc = None
+        self.start_error = None  # why it did not start, once that is known
+        self._started = threading.Event()
+        threading.Thread(
+            target=self._start,
+            args=(shell_argv(self.shell_type, system_root, columns=columns),),
+            name="turboadb-local-shell-start",
+            daemon=True,
+        ).start()
+
+    def _start(self, argv) -> None:
+        try:
+            self._proc = _popen_clean_dll_path(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=self.cwd,
+                env=self.env,
+                creationflags=NO_WINDOW,
+                bufsize=0,
+            )
+        except Exception as exc:
+            self.start_error = exc
+        finally:
+            self._started.set()
+
+    def wait_started(self, timeout: Optional[float] = None) -> bool:
+        """Wait until the shell has started (or failed to); False on timeout."""
+        return self._started.wait(timeout)
 
     @property
-    def proc(self) -> subprocess.Popen:
+    def proc(self) -> Optional[subprocess.Popen]:
+        """The shell's process, once started (this waits for that); None when
+        it could not be started."""
+        self._started.wait(10.0)
         return self._proc
 
     @property
     def running(self) -> bool:
-        """True until :meth:`close` is called or the shell process exits."""
-        return not self._closed and self._proc.poll() is None
+        """True until :meth:`close` is called or the shell process exits (or
+        could not be started); also while it starts."""
+        if self._closed:
+            return False
+        if not self._started.is_set():
+            return True
+        proc = self._proc  # (set before _started is)
+        return proc is not None and proc.poll() is None
 
     def send(self, data: Union[str, bytes]) -> bool:
         """Queue input for the shell; bytes are UTF-8 (as the console produces
@@ -951,9 +984,12 @@ class LocalShellSession:
         elif encoding != "utf-8" and not data.isascii():
             data = data.decode("utf-8", "replace").encode(encoding, "replace")
         data = data.replace(b"\r\n", b"\n")
-        proc = self._proc
-        if not data or self._closed or proc is None or proc.stdin is None:
+        if not data or self._closed:
             return False
+        if self._started.is_set():
+            proc = self._proc
+            if proc is None or proc.stdin is None:
+                return False  # it could not be started
         with self._inbox_cv:
             if self._inbox_bytes + len(data) > self.INPUT_QUEUE_MAX:
                 return False
@@ -962,7 +998,6 @@ class LocalShellSession:
             if self._writer is None:
                 self._writer = threading.Thread(
                     target=self._write_input,
-                    args=(proc.stdin,),
                     name="turboadb-local-shell-input",
                     daemon=True,
                 )
@@ -980,9 +1015,16 @@ class LocalShellSession:
             self._inbox_cv.notify()
         return dropped
 
-    def _write_input(self, pipe) -> None:
-        """Writer thread: hand queued input to the shell, in order.  Ends with
-        the session, or once the shell is gone (its kill breaks a blocked write)."""
+    def _write_input(self) -> None:
+        """Writer thread: hand queued input to the shell, in order, once it
+        has started.  Ends with the session, or once the shell is gone (its
+        kill breaks a blocked write)."""
+        self._started.wait()
+        proc = self._proc
+        pipe = proc.stdin if proc is not None else None
+        if pipe is None:
+            self.discard_pending_input()
+            return
         while True:
             with self._inbox_cv:
                 while not self._inbox and not self._closed:
@@ -1013,8 +1055,11 @@ class LocalShellSession:
         # only once its rest has clearly not come, or the shell has exited:
         # forcing the final flush on EVERY empty poll defeated the guard, so a
         # character cut at a read boundary was printed as mojibake at once.
+        started = self._started.is_set()  # (before _proc, which is set first)
         proc = self._proc
-        if self._transcoder.held_expired() or proc is None or proc.poll() is not None:
+        if self._transcoder.held_expired() or (
+            started and (proc is None or proc.poll() is not None)
+        ):
             return self._transcoder.feed(b"", final=True)
         return b""
 
@@ -1044,15 +1089,18 @@ class LocalShellSession:
         thread, a moment after the event (:attr:`CtrlC.at` says when that
         was).  False when there is no running shell (or no console: not on
         Windows)."""
-        proc = self._proc
-        if os.name != "nt" or self._closed or proc is None or proc.poll() is not None:
+        if os.name != "nt" or not self.running:
             return False
         self.discard_pending_input()
 
         def run():
-            programs = _runs_programs(proc.pid)
-            raised = _console_ctrl_c(proc.pid)
-            result = CtrlC(raised is not None, programs, raised)
+            proc = self._started_proc()
+            if proc is None:
+                result = CtrlC(False, None)  # it could not be started
+            else:
+                programs = _runs_programs(proc.pid)
+                raised = _console_ctrl_c(proc.pid)
+                result = CtrlC(raised is not None, programs, raised)
             if on_done is not None:
                 try:
                     on_done(result)
@@ -1073,13 +1121,13 @@ class LocalShellSession:
         in a batch file, asks ``Terminate batch job (Y/N)?`` as for Ctrl+C.
         Unsent input goes too.  *on_done* gets a :class:`CommandStop` on the
         worker thread.  False when there is no running shell."""
-        proc = self._proc
-        if self._closed or proc is None or proc.poll() is not None:
+        if not self.running:
             return False
         self.discard_pending_input()
 
         def stop():
-            result = _kill_commands(proc.pid)
+            proc = self._started_proc()
+            result = _kill_commands(proc.pid) if proc is not None else CommandStop(None, False)
             if on_done is not None:
                 try:
                     on_done(result)
@@ -1103,7 +1151,7 @@ class LocalShellSession:
             return
         self._closed = True
         self.discard_pending_input()
-        _start_closer(_kill_process_tree, (self._proc,), "turboadb-local-shell-close")
+        _start_closer(self._kill_tree, (), "turboadb-local-shell-close")
 
     def interrupt(self) -> None:
         """End the local shell and every command it started, without blocking:
@@ -1116,12 +1164,24 @@ class LocalShellSession:
         seconds.  A shell that has ended by itself is cleaned up after all
         the same (its pipes, commands it left running).
         """
-        proc = self._proc
-        if not proc or self._closed:
+        if self._closed or (self._started.is_set() and self._proc is None):
             return
         self._closed = True
         self.discard_pending_input()
-        _start_closer(_kill_process_tree, (proc, 1.0), "turboadb-local-shell-interrupt")
+        _start_closer(self._kill_tree, (1.0,), "turboadb-local-shell-interrupt")
+
+    def _started_proc(self) -> Optional[subprocess.Popen]:
+        """The shell's process once it has started (a worker thread waits for
+        it here); None when it could not be started."""
+        self._started.wait()
+        return self._proc
+
+    def _kill_tree(self, *wait_s) -> None:
+        """Closer thread: the tree kill, once the shell has started (closed
+        while it started, it is ended as soon as it runs)."""
+        proc = self._started_proc()
+        if proc is not None:
+            _kill_process_tree(proc, *wait_s)
 
 
 # Tree kills of closed shells still running (see join_closers).

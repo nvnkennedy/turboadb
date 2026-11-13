@@ -261,6 +261,7 @@ def test_session_env_and_argv(lt, monkeypatch, tmp_path):
     monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
 
     ps = lt.LocalShellSession("powershell", serial="S1", cwd=str(tmp_path / "gone"), adb_path="x")
+    assert ps.wait_started(5)  # the shell starts on a thread of its own
     assert captured["argv"][-2] == "-Command" and "UTF8Encoding" in captured["argv"][-1]
     assert "-NoExit" in captured["argv"]
     assert captured["cwd"] == os.path.expanduser("~")  # a missing folder falls back
@@ -270,6 +271,7 @@ def test_session_env_and_argv(lt, monkeypatch, tmp_path):
     ps.close()
 
     cmd = lt.LocalShellSession("cmd", cwd=str(tmp_path), adb_path="x")
+    assert cmd.wait_started(5)
     assert os.path.basename(captured["argv"][0]).lower() == "cmd.exe"
     assert captured["cwd"] == str(tmp_path)
     cmd.close()

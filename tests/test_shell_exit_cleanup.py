@@ -35,6 +35,9 @@ def test_join_closers_waits_for_a_closing_shell(monkeypatch):
     session = lt.LocalShellSession.__new__(lt.LocalShellSession)
     session._closed = False
     session._proc = Proc()
+    session._started = threading.Event()
+    session._started.set()
+    session.start_error = None
     session._inbox = __import__("collections").deque()
     session._inbox_bytes = 0
     session._inbox_cv = threading.Condition()

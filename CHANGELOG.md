@@ -3,6 +3,29 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.3.0
+
+### Faster
+
+- **Opening a device terminal no longer holds the window.** The Android
+  terminal started `adb shell` on the window's thread, and while other
+  programs started too (a device connecting, more terminals opening) Windows
+  took up to a fifth of a second for it: each time a device connected, a
+  terminal session opened, Stop or Restart shell reopened the shell, or the
+  device came back. adb now starts on a thread of its own: the terminal is
+  ready at once, a line typed meanwhile goes to the shell as soon as it is
+  open, and a shell closed meanwhile is ended as soon as it is.
+- **PowerShell and CMD start the same way.** Their shell starts on a thread
+  of its own; what is typed while it starts goes to it once it runs, Stop
+  and closing wait for it there, and a shell that cannot start says why.
+- **A device connects with half the wait.** Device Control was built away
+  from the window and then moved into a card, a splitter, its page and the
+  device tab; each move applied the stylesheet again to every one of its
+  widgets, which took longer than building them. It is now built where it
+  goes, and connecting holds the window for about 100 ms instead of 170.
+  The Logcat, Files, Apps, Phone and Webcam pages are built in their place
+  too when first shown (Files: 110 ms instead of 135).
+
 ## 6.2.0
 
 ### Faster

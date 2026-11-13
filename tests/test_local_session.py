@@ -133,6 +133,7 @@ def _session(lt, monkeypatch, stdin=None, shell="cmd"):
     monkeypatch.setattr(lt, "_get_registry_env", lambda: {})
     monkeypatch.setattr(lt, "_kill_process_tree", lambda proc, wait_s=2.0: None)
     session = lt.LocalShellSession(shell, adb_path="__missing__")
+    assert session.wait_started(5)  # the shell starts on a thread of its own
     session.captured = captured
     return session
 

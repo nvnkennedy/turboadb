@@ -50,23 +50,26 @@ def test_a_failed_open_leaves_a_dead_terminal_not_a_live_prompt(qapp):
     widget, lost = _android(qapp, handler)
     try:
         term = widget.term
-        widget.ensure_started()
-        assert not term._alive and lost == [True]  # the device tab takes over
+        widget.ensure_started()  # adb starts on a thread of its own
+        # the device tab takes over
+        assert _pump(qapp, lambda: not term._alive and lost == [True])
         assert _pump(qapp, lambda: "[could not open adb shell: adb not found]" in term.toPlainText())
         assert "$ " not in term.toPlainText()  # no prompt that would swallow commands
         _enter(term, "ls")  # typing goes nowhere, visibly
         assert "ls" not in term.toPlainText()
 
         widget.interrupt()  # Stop tries again
-        assert handler.opened == [True, True] and not term._alive
+        assert _pump(qapp, lambda: handler.opened == [True, True] and lost == [True, True])
+        assert not term._alive
         widget.reconnect(focus=False)  # and so does a reconnect
-        assert handler.opened == [True, True, True] and not term._alive
-        assert lost == [True, True, True]
+        assert _pump(qapp, lambda: handler.opened == [True, True, True] and len(lost) == 3)
+        assert not term._alive
 
         handler.fail = None
         widget.restart_shell()
-        assert term._alive and len(handler.sessions) == 1
+        assert term._alive
         _settle(qapp, widget, "PD2318:/ $ ")
+        assert len(handler.sessions) == 1
     finally:
         _close(widget)
 

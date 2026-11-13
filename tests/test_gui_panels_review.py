@@ -1041,6 +1041,7 @@ def test_local_shell_env_dedupes_and_close_kills_tree_async(monkeypatch):
     monkeypatch.setattr(lt, "_kill_process_tree", lambda proc, wait_s=2.0: killed.set())
 
     sess = lt.LocalShellSession("cmd", adb_path="__missing__")
+    assert sess.wait_started(5)  # the shell starts on a thread of its own
     env = captured["env"]
     upper = [key.upper() for key in env]
     assert len(upper) == len(set(upper))
@@ -1733,7 +1734,9 @@ def _fake_local_shell(monkeypatch):
     monkeypatch.setattr(lt, "find_adb", lambda *_a, **_k: None)
     monkeypatch.setattr(tools, "find_scrcpy", lambda *_a, **_k: None)
     monkeypatch.setattr(lt, "_get_registry_env", lambda: {})
-    return lt, lt.LocalShellSession("cmd", adb_path="__missing__")
+    session = lt.LocalShellSession("cmd", adb_path="__missing__")
+    assert session.wait_started(5)  # the shell starts on a thread of its own
+    return lt, session
 
 
 def test_local_shell_interrupt_kills_the_tree_off_the_ui_thread(monkeypatch):

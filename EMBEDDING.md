@@ -32,7 +32,7 @@ HTTP on `127.0.0.1`, protected by a token.
    variable `TURBOADB_API_TOKEN` (so the token never appears on a command line):
 
    ```text
-   TurboADB-6.2.0-win64.exe --embed-into <HWND> --api-port 0 --handshake-file <file>
+   TurboADB-6.3.0-win64.exe --embed-into <HWND> --api-port 0 --handshake-file <file>
    ```
 
    With TurboADB installed in a Python (`pip install "turboadb[gui]"`), start
@@ -50,7 +50,7 @@ HTTP on `127.0.0.1`, protected by a token.
 
    ```json
    {"api": "http://127.0.0.1:52817/v1", "port": 52817, "token": "…", "pid": 18320,
-    "version": "6.2.0", "api_version": 1, "window": 3540230, "embedded": true}
+    "version": "6.3.0", "api_version": 1, "window": 3540230, "embedded": true}
    ```
 
    If it cannot start, the file says why instead: `{"error": "there is no window 5 to go into", "pid": 18320}`.
@@ -98,7 +98,7 @@ signals are `started`, `failed(str)`, `event_received(dict)` and `finished`.
 
 TurboADB itself runs on PyQt5. In a PySide6 or PyQt6 program whose Python has no
 PyQt5, point the widget at the standalone app:
-`TurboADBWidget(exe=r"C:\Tools\TurboADB-6.2.0-win64.exe")`.
+`TurboADBWidget(exe=r"C:\Tools\TurboADB-6.3.0-win64.exe")`.
 
 [`examples/embed_in_qt.py`](examples/embed_in_qt.py) is a complete program with its
 own toolbar above an embedded TurboADB: `python examples/embed_in_qt.py`, or add
@@ -160,7 +160,7 @@ Shown += async (_, _) =>
 {
     var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     var handshake = Path.Combine(Path.GetTempPath(), $"tadb-{Guid.NewGuid()}.json");
-    var start = new ProcessStartInfo(@"C:\Tools\TurboADB-6.2.0-win64.exe",
+    var start = new ProcessStartInfo(@"C:\Tools\TurboADB-6.3.0-win64.exe",
         $"--embed-into {area.Handle} --api-port 0 --handshake-file \"{handshake}\" --hide menubar")
         { UseShellExecute = false };
     start.Environment["TURBOADB_API_TOKEN"] = token;
@@ -212,7 +212,7 @@ Create a child window as the area, and start TurboADB with its handle:
 HWND area = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE,
                             0, 40, width, height - 40, hMainWnd, nullptr, hInst, nullptr);
 SetEnvironmentVariableW(L"TURBOADB_API_TOKEN", token.c_str());
-std::wstring cmd = L"\"C:\\Tools\\TurboADB-6.2.0-win64.exe\" --embed-into "
+std::wstring cmd = L"\"C:\\Tools\\TurboADB-6.3.0-win64.exe\" --embed-into "
     + std::to_wstring((UINT_PTR)area) + L" --api-port 0 --handshake-file \"" + handshake + L"\"";
 CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
 SetEnvironmentVariableW(L"TURBOADB_API_TOKEN", nullptr);
