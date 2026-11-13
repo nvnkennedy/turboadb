@@ -1,4 +1,4 @@
-"""The window keeps answering however much is going on (6.2.0).
+"""The window keeps answering however much is going on (6.3.0).
 
 Every test here is about work that used to hold the window's thread: a logcat
 flood painted line by line, terminals flooding together, Windows' file icons
@@ -348,8 +348,11 @@ def test_a_long_pc_folder_looks_up_only_the_rows_on_screen(qapp, monkeypatch, tm
         assert _wait(qapp, first_rows_in)
         assert _colour(table.item(1, 0).icon()) == "#aa00aa"
         assert table.item(299, 0).data(later) == (str(tmp_path),)  # never drawn, never asked
-        assert 0 < len(lookups.calls) < 100
-        assert all(os.path.dirname(p) == str(tmp_path) for p in lookups.calls)
+        # (the browser's own first folder may have been drawn, and asked for,
+        # before these rows replaced it)
+        ours = [p for p in lookups.calls if os.path.dirname(p) == str(tmp_path)]
+        assert 0 < len(ours) < 100
+        assert os.path.join(str(tmp_path), "tool299.exe") not in lookups.calls
     finally:
         browser.close_panel()
         shell.stop()

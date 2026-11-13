@@ -16,9 +16,7 @@
 
 ---
 
-> **6.3.0:** terminals open without a pause (adb, PowerShell and CMD start on the side) and a device connects with half the wait.
->
-> **6.2.0:** the window keeps answering while logcat floods, terminals stream and several devices run at once; opening a PC folder in Files no longer freezes it.
+> **6.3.0:** the window keeps answering while logcat floods, terminals stream and several devices run at once; terminals open without a pause, a device connects with half the wait, and opening a PC folder in Files no longer freezes it.
 >
 > **6.1.0:** TurboADB fits inside your own program (PyQt5, PySide6, Delphi, C#) and is driven by its control API.
 >

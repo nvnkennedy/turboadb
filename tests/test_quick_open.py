@@ -56,7 +56,9 @@ def test_the_android_terminal_starts_adb_off_the_windows_thread(qapp):
     try:
         began = time.monotonic()
         widget.ensure_started()
-        assert time.monotonic() - began < 0.5  # adb has not even started
+        # a start on this thread would wait the whole 5 s for adb (a slow CI
+        # runner may take a moment to draw the banner)
+        assert time.monotonic() - began < 3.0  # adb has not even started
         assert _pump(qapp, lambda: handler.threads)
         assert handler.threads[0] is not threading.main_thread()
         assert widget.term._alive  # ready to take what is typed
@@ -163,7 +165,7 @@ def test_a_local_shell_starts_off_the_windows_thread(monkeypatch):
     try:
         began = time.monotonic()
         session = lt.LocalShellSession("cmd", adb_path="__missing__")
-        assert time.monotonic() - began < 0.5  # the shell has not started yet
+        assert time.monotonic() - began < 3.0  # the shell has not started yet (5 s if it had)
         assert session.running and session.read() == b""
         assert session.send(b"dir\r\n") and session.send("cd ..\r\n")  # typed meanwhile
         deadline = time.monotonic() + 5

@@ -7,6 +7,17 @@ All notable changes are recorded here. Versions follow
 
 ### Faster
 
+- **The window keeps answering while logcat floods.** A busy device's logcat
+  was put on screen line by line, every line of every repaint, which took the
+  window for up to a third of a second at a time with one device, and over
+  half of its time with four, so clicks and keys waited. A repaint now spends
+  at most 12 ms: under a flood the newest lines that fit go on screen, a line
+  says how many were skipped, and the saved log still has every line. The
+  view keeps no undo history of the log either.
+- **Terminals flooding together share the window's time.** Each terminal drew
+  for up to 30 ms a tick, so several devices' terminals streaming at once left
+  nothing for a click or a key. Together they now take at most 9 ms of each
+  15 ms tick, and a tick's output is one edit of the terminal's text.
 - **Opening a device terminal no longer holds the window.** The Android
   terminal started `adb shell` on the window's thread, and while other
   programs started too (a device connecting, more terminals opening) Windows
@@ -25,22 +36,6 @@ All notable changes are recorded here. Versions follow
   goes, and connecting holds the window for about 100 ms instead of 170.
   The Logcat, Files, Apps, Phone and Webcam pages are built in their place
   too when first shown (Files: 110 ms instead of 135).
-
-## 6.2.0
-
-### Faster
-
-- **The window keeps answering while logcat floods.** A busy device's logcat
-  was put on screen line by line, every line of every repaint, which took the
-  window for up to a third of a second at a time with one device, and over
-  half of its time with four, so clicks and keys waited. A repaint now spends
-  at most 12 ms: under a flood the newest lines that fit go on screen, a line
-  says how many were skipped, and the saved log still has every line. The
-  view keeps no undo history of the log either.
-- **Terminals flooding together share the window's time.** Each terminal drew
-  for up to 30 ms a tick, so several devices' terminals streaming at once left
-  nothing for a click or a key. Together they now take at most 9 ms of each
-  15 ms tick, and a tick's output is one edit of the terminal's text.
 - **Opening a PC folder in Files no longer freezes the window.** Windows was
   asked for each row's icon while the folder was drawn: a second for
   Downloads, every time. The icons are now fetched on a thread of their own,
