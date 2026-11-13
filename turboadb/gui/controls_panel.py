@@ -331,33 +331,35 @@ class ControlsPanel(QWidget):
         self._ncols = ncols
         self._grid_host.setMaximumWidth(ncols * _COL_MAX + (ncols - 1) * _COL_GAP)
         grid = self._card_grid
-        for g in self._groups:                # detach (kept alive by self._groups)
-            g.setParent(None)
+        # The sections stay children of the one grid host; only the column
+        # layouts that hold them are made anew.  Column widgets meant moving
+        # every section to a new parent, which applied the stylesheet again to
+        # each of their buttons: a fifth of a second of a frozen window at
+        # every column change while the window was being resized.
         for column in self._columns:
-            grid.removeWidget(column)
-            column.setParent(None)
+            while column.count():
+                column.takeAt(0)              # the section stays (self._groups)
+            grid.removeItem(column)
             column.deleteLater()
         for c in range(max(_MAX_COLS, self.STRIP_COLS) + 1):
             grid.setColumnStretch(c, 0)
-        self._columns, layouts, heights = [], [], []
+        self._columns, heights = [], []
         for c in range(ncols):
-            column = _Surface()
-            lay = QVBoxLayout(column)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(_SECTION_GAP)
+            column = QVBoxLayout()
+            grid.addLayout(column, 0, c, Qt.AlignTop)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(_SECTION_GAP)
             self._columns.append(column)
-            layouts.append(lay)
             heights.append(0)
-            grid.addWidget(column, 0, c, Qt.AlignTop)
             grid.setColumnStretch(c, 1)        # equal columns fill the full width
         column_w = self._column_width(self.width(), ncols)
         for g in self._groups:
             c = heights.index(min(heights))
-            layouts[c].addWidget(g)
+            self._columns[c].addWidget(g)
             g.setVisible(True)
             heights[c] += self._section_height(g, column_w) + _SECTION_GAP
-        for lay in layouts:
-            lay.addStretch(1)
+        for column in self._columns:
+            column.addStretch(1)
 
     def _relayout_now(self) -> None:
         """Flow the sections into the column count the current width allows."""

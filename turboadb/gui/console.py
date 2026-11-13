@@ -422,6 +422,13 @@ class AnsiConsole(QPlainTextEdit):
     _HISTORY_MAX = 1000           # lines Up/Down can recall
     _TYPED_AHEAD_MAX = 20         # typed-ahead lines followed (see forget_typed_line)
     _TICK_BUDGET = 0.030          # seconds of rendering per tick (keeps UI live)
+    # All terminals drawing a flood at once share this much of each 15 ms
+    # tick (60% of the window's thread): with four devices' terminals busy,
+    # each took its own 30 ms a tick and the window's thread had no time left
+    # for a click or a key.  What a terminal cannot draw in its share is
+    # skipped on screen as before (its saved history has it all).
+    _SHARED_BUDGET = 0.009
+    _drawing = weakref.WeakSet()  # the consoles with output waiting to be drawn
     _SUB = 8 * 1024               # max chars handed to _process at once (~20 ms of work)
     _SLICE_LINES = 128            # ... and max lines: 8 KB of ``y`` is 2,730 of them
     # The longest line of the view, in characters: output that goes on past
@@ -1757,6 +1764,7 @@ class AnsiConsole(QPlainTextEdit):
 
     def _drain_tick(self):
         if not self._inq:
+            AnsiConsole._drawing.discard(self)
             self._drain.stop()
             # All is drawn: what comes next may be faster to draw than what
             # the rate was measured on, and is not cut by that measure.
@@ -1766,10 +1774,15 @@ class AnsiConsole(QPlainTextEdit):
             return
         sb = self.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 2
+        AnsiConsole._drawing.add(self)
+        share = self._SHARED_BUDGET / max(1, len(AnsiConsole._drawing))
         started = time.perf_counter()
-        deadline = started + self._TICK_BUDGET
+        deadline = started + min(self._TICK_BUDGET, max(0.002, share))
         drawn = 0
         self.setUpdatesEnabled(False)
+        # One edit for the whole tick: the document lays out what was drawn
+        # once, not once per line (several times cheaper under a flood).
+        self._wc.beginEditBlock()
         try:
             if self._dropped and self._screen is None:
                 self._consume_pending_prompt()
@@ -1803,6 +1816,7 @@ class AnsiConsole(QPlainTextEdit):
                 self._consume_pending_prompt()
                 self._process(item)
         finally:
+            self._wc.endEditBlock()
             self.setUpdatesEnabled(True)
         spent = time.perf_counter() - started
         if drawn and spent > 0.002 and (self._inq or drawn >= 32 * 1024):

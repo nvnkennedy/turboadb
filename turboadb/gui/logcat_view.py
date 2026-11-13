@@ -1195,6 +1195,15 @@ class LogcatPanel(QWidget):
     _PENDING_MAX = 6000
     # How often the view repaints while there is output (see _render_pending).
     _RENDER_MS = 350
+    # The most one repaint may spend putting lines on screen.  Under a flood
+    # the newest lines that fit go on screen and the rest are counted as
+    # skipped (the saved log has them all): painting every line took the
+    # window's thread for 300 ms at a time with one busy device, and over
+    # half its time with four, so clicks and keys waited.  The cost of a line
+    # is measured as the view paints (a full view also trims its oldest
+    # line for each new one, a slow PC or Remote Desktop costs more).
+    _PAINT_BUDGET_S = 0.012
+    _PAINT_MIN_LINES = 200  # however slow the lines are, a repaint shows this many
     # How long the Highlight searches lines on the UI thread in one go.  Lines
     # being drawn are marked until this is spent, the rest go on screen plain,
     # and the re-marker marks lines newest first, one slice this long at a time
@@ -1231,6 +1240,7 @@ class LogcatPanel(QWidget):
         self._fmt_cache = {}  # color -> QTextCharFormat (reused per batch)
         self._carry = None  # a 'long' entry's colour, for its message lines
         self._pending = []  # lines waiting to be drawn (coalesced)
+        self._line_cost = 20e-6  # seconds to put one line on screen, as measured
         self._spec = None  # what the running capture was started with
         self._restart = None  # the spec to restart with once the worker ends
         self._resume = None  # a live capture to resume once the device is back
@@ -1413,6 +1423,8 @@ class LogcatPanel(QWidget):
         self._capture = _Capture(self._sb)
         # word-wrap off = far cheaper layout when lines pour in
         self.view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        # a log is never edited: no undo history to record every line into
+        self.view.setUndoRedoEnabled(False)
         self.view.setObjectName("logcatView")  # terminal background (theme.py)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._menu)
@@ -2052,11 +2064,20 @@ class LogcatPanel(QWidget):
             self._stop_rendering_if_idle()
             return
         lines, self._pending = self._pending, []
+        fit = max(self._PAINT_MIN_LINES, int(self._PAINT_BUDGET_S / self._line_cost))
+        if len(lines) > fit:
+            # more than a repaint can put on screen and keep the window
+            # answering: the newest ones go, the rest are counted
+            self._skipped += len(lines) - fit
+            lines = lines[-fit:]
         if self._skipped:
             what = "matching lines" if self._filter_re is not None else "lines"
             lines.insert(0, f"… ({self._skipped} {what} skipped on screen — saved log has all)")
             self._skipped = 0
+        started = time.perf_counter()
         self._draw_lines(lines)
+        cost = (time.perf_counter() - started) / len(lines)
+        self._line_cost = max(2e-6, 0.7 * self._line_cost + 0.3 * cost)
         self._stop_rendering_if_idle()
 
     def _line_color(self, line, carry):
@@ -2095,6 +2116,17 @@ class LogcatPanel(QWidget):
         at_bottom = sb.value() >= sb.maximum() - 4
         cur = self.view.textCursor()
         cur.movePosition(QTextCursor.End)
+        # One edit for the whole batch: the document lays out and trims once,
+        # not once per line (five times cheaper for a thousand lines).
+        cur.beginEditBlock()
+        try:
+            self._insert_lines(cur, lines)
+        finally:
+            cur.endEditBlock()
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def _insert_lines(self, cur, lines):
         hre = self._hl_re
         hl_fmt = self._highlight_fmt() if hre is not None else None
         budget = self._HIGHLIGHT_SLICE_S  # left for searching these lines
@@ -2125,8 +2157,6 @@ class LogcatPanel(QWidget):
             self._hl_marked.add(hre)
             if unmarked is not None:
                 self._mark_later(unmarked, self._drawn - 1)
-        if at_bottom:
-            sb.setValue(sb.maximum())
 
     def _mark_later(self, first, last):
         """Lines *first* to *last* (numbered as drawn) went on screen without

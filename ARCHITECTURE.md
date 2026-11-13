@@ -283,6 +283,7 @@ device_tab.py     per-device tab; connects in the background; hosts the sub-pane
     transfer_log.py   transfer history model + size measuring (no Qt)
     transfer_panel.py the Transfers panel: summary, table, retry, report
     file_icons.py     native file-type icons, with the glyphs as fallback
+      shell_icons.py    Windows' file icons, fetched on a thread of their own
   apps_panel.py     package list / install / uninstall / start / stop
   controls_panel.py the responsive grid of device controls
   phone_panel.py    dialer / calls / SMS
@@ -324,6 +325,18 @@ These patterns recur and are worth preserving:
   answer); if the shell reads it as a command after all, that copy goes when
   the shell echoes it after its prompt. A line typed before a shell's first
   prompt is left to that echo.
+- **Nothing slow on the window's thread.** What could take it for long goes
+  elsewhere or is bounded. A logcat repaint spends at most
+  `LogcatPanel._PAINT_BUDGET_S`, at the line cost it measures as it paints,
+  and the newest lines that fit go on screen; terminals drawing at once share
+  `AnsiConsole._SHARED_BUDGET` of each tick (`AnsiConsole._drawing`); both
+  draw a batch as one edit of the document. Windows' file icons come from
+  `shell_icons.ShellIcons`, whose worker asks the shell and makes a QImage (a
+  QPixmap may not be made off the window's thread); a Files row asks when
+  its name cell is drawn (`_NameDelegate`, `_ICON_LATER_ROLE`), so a folder
+  of thousands asks for a screenful. Moving a widget to another parent
+  applies the stylesheet again to all of its children, so a layout that
+  changes (Device Control's columns) moves layout items, never widgets.
 - **The edit region.** In `AnsiConsole` the synthetic prompt (Android shell over a
   pipe) and the line being typed are always the last characters of the document,
   and output is inserted above them. Typing while a command streams therefore never

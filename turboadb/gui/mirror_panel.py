@@ -609,11 +609,19 @@ def _bitrate_to_bps(value) -> str:
         return "16000000"
 
 
+_LOG_TAILS = {}  # log path -> ((size, mtime), the last bytes read)
+_LOG_TAILS_KEPT = 32
+
+
 def _read_log_tail(session, limit: int = 65536) -> str:
     """The last *limit* bytes of a scrcpy session log.
 
     The readiness poll runs every 500 ms on the UI thread; re-reading a log
-    that grows for the whole session there is wasted work.
+    that grows for the whole session there is wasted work.  Once the screen
+    is up the log hardly grows, and opening the file is the slow part (a
+    virus scanner looks at every open: a seventh of a second of a frozen
+    window at times), so a log whose size and time are as at the last read
+    is not opened again.
     """
     path = getattr(session, "log_path", None)
     if not path:
@@ -622,12 +630,22 @@ def _read_log_tail(session, limit: int = 65536) -> str:
         except Exception:
             return ""
     try:
+        st = os.stat(path)
+        stamp = (st.st_size, st.st_mtime_ns)
+        cached = _LOG_TAILS.get(path)
+        if cached is not None and cached[0] == stamp and (
+                len(cached[1]) >= limit or len(cached[1]) >= st.st_size):
+            return cached[1][-limit:].decode("utf-8", errors="replace")
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             fh.seek(max(0, fh.tell() - limit))
-            return fh.read().decode("utf-8", errors="replace")
+            data = fh.read()
     except OSError:
         return ""
+    if path not in _LOG_TAILS and len(_LOG_TAILS) >= _LOG_TAILS_KEPT:
+        _LOG_TAILS.pop(next(iter(_LOG_TAILS)))
+    _LOG_TAILS[path] = (stamp, data)
+    return data.decode("utf-8", errors="replace")
 
 
 # scrcpy.launch_scrcpy starts every session log with its own header: the

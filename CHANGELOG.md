@@ -3,6 +3,35 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.2.0
+
+### Faster
+
+- **The window keeps answering while logcat floods.** A busy device's logcat
+  was put on screen line by line, every line of every repaint, which took the
+  window for up to a third of a second at a time with one device, and over
+  half of its time with four, so clicks and keys waited. A repaint now spends
+  at most 12 ms: under a flood the newest lines that fit go on screen, a line
+  says how many were skipped, and the saved log still has every line. The
+  view keeps no undo history of the log either.
+- **Terminals flooding together share the window's time.** Each terminal drew
+  for up to 30 ms a tick, so several devices' terminals streaming at once left
+  nothing for a click or a key. Together they now take at most 9 ms of each
+  15 ms tick, and a tick's output is one edit of the terminal's text.
+- **Opening a PC folder in Files no longer freezes the window.** Windows was
+  asked for each row's icon while the folder was drawn: a second for
+  Downloads, every time. The icons are now fetched on a thread of their own,
+  only for the rows on screen, newest folder first; a row shows its glyph
+  until its icon is in, and a folder on a network drive that stopped
+  answering holds up no other icon. Device file types are fetched the same
+  way.
+- **Resizing Device Control is twice as quick.** Each change in its number of
+  columns moved every section to a new parent, which applied the stylesheet
+  again to all of their buttons; the sections now stay where they are.
+- **The device screen no longer opens scrcpy's log twice a second** while it
+  runs, when the log has not changed. Opening it is what a virus scanner
+  slows down.
+
 ## 6.1.0
 
 ### New

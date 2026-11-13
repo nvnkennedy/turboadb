@@ -16,16 +16,18 @@ not exist, which every device file is to this PC: there the type's icon comes
 from the desktop icon theme by its MIME type, and where the theme has none
 either, the row keeps its glyph - never an empty space.
 
-Lookups are cheap: Qt's icon engines are lazy (the shell is asked only when a
-row is painted, i.e. for the rows on screen) and cache per type; this module
-adds one shared QIcon per extension on top.
+On Windows the shell is asked on a thread of its own (see shell_icons): a row
+shows its glyph until its icon is in, and the window never waits for the
+shell.  Elsewhere Qt's provider answers; this module adds one shared QIcon per
+extension on top.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from PyQt5.QtCore import QFileInfo, QMimeDatabase, QPoint, QRect, QRectF, Qt
 from PyQt5.QtGui import (QColor, QGuiApplication, QIcon, QIconEngine, QPainter, QPen,
@@ -44,6 +46,11 @@ ANDROID_PACKAGES = frozenset((".apk", ".apks", ".xapk", ".apkm", ".aab"))
 # a desktop icon theme.
 _NATIVE_PLATFORMS = ("windows", "cocoa")
 _THEMED_PLATFORMS = ("xcb", "wayland")
+
+
+def _shell_lookups() -> bool:
+    """True where Windows' shell is asked directly, off the window's thread."""
+    return sys.platform == "win32" and (QGuiApplication.platformName() or "").lower() == "windows"
 
 
 def native_icons_available() -> bool:
@@ -120,9 +127,22 @@ class FileIcons:
     """The Files tab's row icons: native where the system has them."""
 
     def __init__(self, *, native: Optional[bool] = None,
-                 provider: Optional[Callable[[], QFileIconProvider]] = None):
+                 provider: Optional[Callable[[], QFileIconProvider]] = None, shell=None):
+        """*shell*: what answers instead of a provider while icons are looked
+        up elsewhere (a :class:`shell_icons.ShellIcons`); by default Windows'
+        shell on Windows, unless a *provider* is given."""
         self.native = native_icons_available() if native is None else bool(native)
-        self._provider = (provider or QFileIconProvider)() if self.native else None
+        if self.native and shell is None and provider is None and _shell_lookups():
+            from .shell_icons import ShellIcons
+
+            shell = ShellIcons(QGuiApplication.instance())  # it goes with the app
+        self._shell = shell if self.native else None
+        self._provider = None
+        if self.native and self._shell is None:
+            self._provider = (provider or QFileIconProvider)()
+        # icons came in: rows still showing their glyph can ask again (None
+        # where every answer is at once)
+        self.changed = getattr(self._shell, "changed", None)
         self._by_type = {}  # extension -> QIcon
         self._badged = {}  # (kind, extension) -> QIcon
         self._folder = None
@@ -133,31 +153,50 @@ class FileIcons:
                                      f"turboadb-no-such-folder-{os.getpid()}")
 
     # ---- lookups -----------------------------------------------------------
+    # Each lookup has a twin ending in _or_none that answers None while the
+    # shell is still being asked (never where a provider answers).
     def folder(self) -> QIcon:
         """The system's folder icon."""
+        return _null_if_none(self._folder_or_none())
+
+    def _folder_or_none(self, ask: bool = True) -> Optional[QIcon]:
         if self._folder is None:
-            self._folder = self._provider.icon(QFileIconProvider.Folder)
+            if self._shell is not None:
+                self._folder = self._shell.folder(ask)
+            else:
+                self._folder = self._provider.icon(QFileIconProvider.Folder)
         return self._folder
 
     def for_type(self, name: str) -> QIcon:
         """The icon of *name*'s file type (by extension), shared per type; a
         null icon where the system has none."""
+        return _null_if_none(self._type_or_none(name))
+
+    def _type_or_none(self, name: str, ask: bool = True) -> Optional[QIcon]:
         ext = os.path.splitext(name)[1].lower()
         icon = self._by_type.get(ext)
         if icon is None:
-            icon = self._type_icon(ext)
-            if ext in ANDROID_PACKAGES and self._is_generic(icon):
-                # the system's own blank file, marked as an Android package
-                icon = QIcon(_BadgeEngine(
-                    icon, icon_in("apps", "#ffffff", width=2.8), "right",
-                    plate=_ANDROID_PLATE, edge=_ANDROID_EDGE))
+            icon = self._type_icon(ext, ask)
+            if icon is None:
+                return None
+            if ext in ANDROID_PACKAGES:
+                generic = self._is_generic(icon, ask)
+                if generic is None:
+                    return None
+                if generic:
+                    # the system's own blank file, marked as an Android package
+                    icon = QIcon(_BadgeEngine(
+                        icon, icon_in("apps", "#ffffff", width=2.8), "right",
+                        plate=_ANDROID_PLATE, edge=_ANDROID_EDGE))
             self._by_type[ext] = icon
         return icon
 
-    def _type_icon(self, ext: str) -> QIcon:
+    def _type_icon(self, ext: str, ask: bool = True) -> Optional[QIcon]:
         """What the system shows for files ending in *ext*: the platform's own
         answer, else the icon theme's for the type's MIME name (see the module
-        docstring), else a null icon."""
+        docstring), else a null icon.  None while the shell is being asked."""
+        if self._shell is not None:
+            return self._shell.type_icon(ext, ask)
         icon = self._provider.icon(QFileInfo(os.path.join(self._nowhere, "x" + ext)))
         if icon.isNull():
             mime = QMimeDatabase().mimeTypeForFile("x" + ext, QMimeDatabase.MatchExtension)
@@ -166,31 +205,50 @@ class FileIcons:
                     return QIcon.fromTheme(theme_name)
         return icon
 
-    def for_path(self, path: str) -> QIcon:
+    def for_path(self, path: str, is_dir: bool = False) -> QIcon:
         """The icon of an item on this PC, exactly as the system shows it: a
         program's own icon, a shortcut's target, a special folder's icon."""
+        return _null_if_none(self._path_or_none(path, is_dir))
+
+    def _path_or_none(self, path: str, is_dir: bool, ask: bool = True) -> Optional[QIcon]:
+        if self._shell is not None:
+            return self._shell.path_icon(path, is_dir, ask)
         return self._provider.icon(QFileInfo(path))
 
     def with_link_badge(self, name: str, is_dir: bool) -> QIcon:
         """A device symbolic link: its target kind's icon plus a link badge
         (null when the system has no icon for the target's kind)."""
+        return _null_if_none(self._link_or_none(name, is_dir))
+
+    def _link_or_none(self, name: str, is_dir: bool, ask: bool = True) -> Optional[QIcon]:
         key = ("dir", "") if is_dir else ("file", os.path.splitext(name)[1].lower())
         icon = self._badged.get(key)
         if icon is None:
-            base = self.folder() if is_dir else self.for_type(name)
+            base = self._folder_or_none(ask) if is_dir else self._type_or_none(name, ask)
+            if base is None:
+                return None
             icon = base if base.isNull() else QIcon(
                 _BadgeEngine(base, _badge_glyph("link", "blue"), "left"))
             self._badged[key] = icon
         return icon
 
-    def _is_generic(self, icon: QIcon) -> bool:
+    def _is_generic(self, icon: QIcon, ask: bool = True) -> Optional[bool]:
         """True when *icon* is the system's "no application" icon (never a null
-        one: a badge on nothing floated in an empty space)."""
+        one: a badge on nothing floated in an empty space); None while the
+        shell is still being asked for that one."""
         if icon.isNull():
             return False
         if self._generic is None:
-            self._generic = self._type_icon(".turboadb-unknown-type")
+            self._generic = self._type_icon(".turboadb-unknown-type", ask)
+            if self._generic is None:
+                return None
         return _same_picture(icon, self._generic)
+
+    def new_batch(self) -> None:
+        """A folder is being listed: its icons are looked up before those of
+        the folders listed earlier."""
+        if self._shell is not None:
+            self._shell.new_batch()
 
     # ---- one call for a listing row ----------------------------------------
     def row_icon(self, name: str, is_dir: bool, ftype: str, glyph: str, tone: str,
@@ -202,15 +260,28 @@ class FileIcons:
         entries (pipes, sockets, device nodes) that no PC file manager draws,
         and wherever the system has no icon for the row.
         *local_dir* is the PC folder the row is in; empty for the device."""
+        return self.row_icon_ready(name, is_dir, ftype, glyph, tone, local_dir)[0]
+
+    def row_icon_ready(self, name: str, is_dir: bool, ftype: str, glyph: str, tone: str,
+                       local_dir: str = "", *, ask: bool = True) -> Tuple[QIcon, bool]:
+        """``(icon, ready)``: as :meth:`row_icon`, and False while the shell is
+        still being asked (the icon is the glyph till then: ask again after
+        :attr:`changed`).  *ask=False* only looks: the shell is not asked."""
         if not self.native or glyph in ("arrow-up", "chip"):
-            return cached_icon(glyph, tone)
+            return cached_icon(glyph, tone), True
         if local_dir:
-            icon = self.for_path(os.path.join(local_dir, name))
+            icon = self._path_or_none(os.path.join(local_dir, name), is_dir, ask)
         elif ftype.endswith("Link"):
-            icon = self.with_link_badge(name, is_dir or ftype == "Folder Link")
+            icon = self._link_or_none(name, is_dir or ftype == "Folder Link", ask)
         else:
-            icon = self.folder() if is_dir else self.for_type(name)
-        return cached_icon(glyph, tone) if icon.isNull() else icon
+            icon = self._folder_or_none(ask) if is_dir else self._type_or_none(name, ask)
+        if icon is None:
+            return cached_icon(glyph, tone), False
+        return (cached_icon(glyph, tone) if icon.isNull() else icon), True
+
+
+def _null_if_none(icon: Optional[QIcon]) -> QIcon:
+    return QIcon() if icon is None else icon
 
 
 _shared: Optional[FileIcons] = None

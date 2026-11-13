@@ -31,7 +31,8 @@ from collections import deque
 from itertools import accumulate
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QMimeData, QObject, QPoint,
+from PyQt5.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QMimeData, QObject,
+                          QPersistentModelIndex, QPoint,
                           QRect, QSize, QThread, QTimer, QUrl, Qt, pyqtSignal)
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -80,6 +81,11 @@ _OLD_COPIES = {"tidied": False}
 # The name cell shows the plain name; its icon is the item's DecorationRole and
 # the icon key is kept here (for tests and tooling), never in the visible text.
 ICON_ROLE = Qt.UserRole + 1
+# A name cell still showing its glyph because Windows has not given its icon
+# yet holds ``(PC folder,)`` here ("" on the device); None once the icon is on
+# the item.  The icon is asked for when the row is drawn: only the rows on
+# screen are looked up, however long the folder.
+_ICON_LATER_ROLE = Qt.UserRole + 2
 
 _IMAGE_EXT = frozenset(".png .jpg .jpeg .gif .bmp .webp .heic .heif .svg .ico .tif .tiff".split())
 _VIDEO_EXT = frozenset(".mp4 .mkv .avi .mov .webm .3gp .m4v .wmv .flv .ts".split())
@@ -580,11 +586,59 @@ class _FileEditorDialog(QDialog):
 
 
 class _NameDelegate(QStyledItemDelegate):
-    """Name cells shorten in the middle, so the extension stays visible."""
+    """Name cells shorten in the middle, so the extension stays visible.
+
+    A row still waiting for its Windows icon asks for it while it is drawn,
+    and shows it as soon as it is in (the item gets it right after)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._icon = None  # the icon of the cell being drawn, while it is
+        self._found = []  # (QPersistentModelIndex, icon) for the items
 
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         option.textElideMode = Qt.ElideMiddle
+        if self._icon is not None:
+            option.icon = self._icon
+
+    def paint(self, painter, option, index):
+        later = index.data(_ICON_LATER_ROLE)
+        if later:
+            found = _late_icon(index, later[0])
+            if found is not None:
+                self._icon = found
+                if not self._found:
+                    QTimer.singleShot(0, self._put_on_items)
+                self._found.append((QPersistentModelIndex(index), found))
+        try:
+            super().paint(painter, option, index)
+        finally:
+            self._icon = None
+
+    def _put_on_items(self) -> None:
+        """Icons found while drawing go on their items (never while drawing)."""
+        found, self._found = self._found, []
+        for where, row_icon in found:
+            if not where.isValid() or not where.data(_ICON_LATER_ROLE):
+                continue
+            model = where.model()
+            index = model.index(where.row(), where.column())
+            model.setData(index, None, _ICON_LATER_ROLE)
+            model.setData(index, row_icon, Qt.DecorationRole)
+
+
+def _late_icon(index, local_dir: str):
+    """The Windows icon of the row at *index* when it is in, else None (it is
+    asked for)."""
+    data = index.data(Qt.UserRole)
+    if not data:
+        return None
+    name, is_dir = data
+    ftype = index.sibling(index.row(), 2).data() or ""
+    glyph, tone = _entry_icon_key(name, is_dir, ftype)
+    icon, ready = file_icons().row_icon_ready(name, is_dir, ftype, glyph, tone, local_dir)
+    return icon if ready else None
 
 
 class _PathEdit(QLineEdit):
@@ -662,6 +716,7 @@ class _FileTableWidget(QTableWidget):
         super().__init__(0, 6, parent)
         self.is_remote = is_remote
         self.base_dir = ""
+        self.icons_waiting = False  # a row shows its glyph until Windows has its icon
         self.browser = None  # owning FileBrowser (identifies the device of remote drags)
         # Listed names that could not be identified exactly, or that a path
         # can't reach on this PC (see _inexact_local_name): never acted on.
@@ -2128,6 +2183,9 @@ class FileBrowser(QWidget):
         right_lay.addWidget(rhead)
 
         self.remote_table = self._create_table(is_remote=True)
+        icons_in = file_icons().changed
+        if icons_in is not None:  # Windows: icons come in after their rows
+            icons_in.connect(self._icons_came_in)
         self.remote_table.cellDoubleClicked.connect(self._on_remote_double_click)
         self.remote_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.remote_table.customContextMenuRequested.connect(self._context_remote)
@@ -2445,8 +2503,10 @@ class FileBrowser(QWidget):
         table.setUpdatesEnabled(False)
         try:
             table.setRowCount(0)
+            table.icons_waiting = False
             table.setRowCount(len(listing))  # all rows in one go, not an insertRow each
             local_dir = table.base_dir if table is self.local_table else ""
+            file_icons().new_batch()  # this folder's icons before any other's
             for index, (row, date_key) in enumerate(listing):
                 self._set_row(table, index, row[:8], date_key, local_dir)
             if file_table:
@@ -2725,8 +2785,13 @@ class FileBrowser(QWidget):
         glyph, tone = _entry_icon_key(name, is_dir, ftype)
         # the system's own icon where it has one (a PC row by its real path, a
         # device row by its type); ICON_ROLE keeps the kind either way
-        it_name.setIcon(file_icons().row_icon(name, is_dir, ftype, glyph, tone, local_dir))
+        row_icon, ready = file_icons().row_icon_ready(name, is_dir, ftype, glyph, tone, local_dir,
+                                                      ask=False)
+        it_name.setIcon(row_icon)
         it_name.setData(ICON_ROLE, glyph)
+        if not ready:  # the glyph until the row is drawn and Windows has answered
+            it_name.setData(_ICON_LATER_ROLE, (local_dir,))
+            table.icons_waiting = True
         it_size = _FileItem(sz_str)
         it_size.setData(Qt.UserRole, raw_size)
         it_size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -2740,6 +2805,16 @@ class FileBrowser(QWidget):
                                   _FileItem(owner))):
             it.setFlags(flags)
             table.setItem(row, col, it)
+
+    def _icons_came_in(self) -> None:
+        """Windows has answered for some icons: the tables with rows still
+        showing their glyph are drawn again, and those rows take theirs (the
+        window never waited for the shell)."""
+        if self._closing:
+            return
+        for table in (self.local_table, self.remote_table):
+            if table.icons_waiting:
+                table.viewport().update()
 
     # ---- Selection helpers ----
     def _select_all(self, table) -> None:

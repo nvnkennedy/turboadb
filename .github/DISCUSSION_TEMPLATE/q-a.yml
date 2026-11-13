@@ -8,7 +8,7 @@ body:
     attributes:
       label: TurboADB version
       description: Shown in the About window, or run `turboadb --version`.
-      placeholder: "6.1.0"
+      placeholder: "6.2.0"
     validations:
       required: true
   - type: input
