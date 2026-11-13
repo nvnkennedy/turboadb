@@ -31,12 +31,6 @@ def _wait(qapp, done, timeout=5.0):
     return True
 
 
-def _busy(seconds):
-    end = time.perf_counter() + seconds
-    while time.perf_counter() < end:
-        pass
-
-
 # --------------------------------------------------------------------------- #
 # logcat: a repaint puts on screen what fits in its budget
 # --------------------------------------------------------------------------- #
@@ -98,14 +92,29 @@ def test_terminals_flooding_together_share_the_windows_time(qapp, monkeypatch):
     """Issue: each terminal drew for up to 30 ms a tick; with several
     devices' terminals flooding at once the window's thread had nothing left
     for a click or a key."""
+    from turboadb.gui import console as console_mod
     from turboadb.gui.console import AnsiConsole
 
+    class Clock:
+        """The terminals' clock: it moves only as they draw, so a runner that
+        pauses the test meanwhile changes nothing."""
+
+        now = 1000.0
+
+        def perf_counter(self):
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    clock = Clock()
+    monkeypatch.setattr(console_mod, "time", clock)
     monkeypatch.setattr(AnsiConsole, "_drawing", weakref.WeakSet())
     drawn = []
 
     def slow_draw(self, _text):  # one slice of output costs a millisecond
         drawn.append(self)
-        _busy(0.001)
+        clock.now += 0.001
 
     monkeypatch.setattr(AnsiConsole, "_process", slow_draw)
     consoles = [AnsiConsole() for _ in range(3)]
