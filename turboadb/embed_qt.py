@@ -9,6 +9,9 @@
 
 TurboADB runs as a process of its own inside the widget, so its Qt never
 meets your program's: a PySide6 program holds it as well as a PyQt5 one.
+Some of its pages need more room than others; :attr:`minimum_changed` says
+how much, and ``follow_minimum=True`` makes it the widget's own minimum size,
+so your layout makes room instead of cutting TurboADB off.
 :attr:`TurboADBWidget.client` is the :class:`turboadb.embed.Embedded` client
 for everything else the API offers.  The widget uses the Qt your program has
 already imported (else the first of PyQt5, PySide6, PyQt6, PySide2 found).
@@ -17,6 +20,7 @@ already imported (else the first of PyQt5, PySide6, PyQt6, PySide2 found).
 from __future__ import annotations
 
 import importlib
+import math
 import sys
 import threading
 
@@ -57,27 +61,45 @@ class TurboADBWidget(QtWidgets.QWidget):
     TurboADB closes with it.  Signals, all on the widget's thread:
     :attr:`started` (``client`` can be used), :attr:`failed` (why not),
     :attr:`event_received` (each event of the API), :attr:`finished` (it has
-    closed).  (Not ``event``: that name is QWidget's own, and taking it
-    crashed the widget.)"""
+    closed), :attr:`minimum_changed` (width, height: the smallest this widget
+    can be, in its own logical pixels, without cutting TurboADB off; also
+    :attr:`turboadb_minimum`).  With ``follow_minimum=True`` the widget takes
+    that as its minimum size (never below 320 x 240); without, the widget's
+    minimum stays yours to set.  A new minimum counts once it has held for
+    :attr:`SETTLE_MS` (TurboADB's minimum jumps for a moment as it starts,
+    and a layout that followed each jump would jump with it).  (Not
+    ``event``: that name is QWidget's own, and taking it crashed the
+    widget.)"""
 
     started = Signal()
     failed = Signal(str)
     event_received = Signal(object)
     finished = Signal()
+    minimum_changed = Signal(int, int)
+
+    BASE_MINIMUM = (320, 240)
+    SETTLE_MS = 300
 
     def __init__(self, parent=None, *, exe=None, hide=(), autostart: bool = True,
-                 timeout: float = 90.0):
+                 timeout: float = 90.0, follow_minimum: bool = False):
         super().__init__(parent)
         # A window of its own (a handle) for TurboADB to go into, without
         # turning the widgets around it into windows as well.
         self.setAttribute(_attribute("WA_NativeWindow"), True)
         self.setAttribute(_attribute("WA_DontCreateNativeAncestors"), True)
-        self.setMinimumSize(320, 240)
+        self.setMinimumSize(*self.BASE_MINIMUM)
         self.client: Embedded | None = None
         self._exe = exe
         self._hide = tuple(hide)
         self._autostart = autostart
         self._timeout = timeout
+        self._follow_minimum = bool(follow_minimum)
+        self._reported = None  # TurboADB's last minimum report (GET /v1/ui, min_size)
+        self.turboadb_minimum = None  # (width, height) in this widget's pixels, once known
+        self._settle = QtCore.QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(self.SETTLE_MS)
+        self._settle.timeout.connect(self._apply_minimum)
         self._starting = False
         self._closed = False
         # results of the worker threads, handed to this widget's thread
@@ -122,18 +144,58 @@ class TurboADBWidget(QtWidgets.QWidget):
             self._starting = False
             self.failed.emit(value)
         elif kind == "event":
+            if isinstance(value, dict) and value.get("type") == "min_size":
+                self._take_minimum(value)
             self.event_received.emit(value)
+        elif kind == "minimum":
+            self._take_minimum(value)
         elif kind == "finished":
             self.client = None
             self.finished.emit()
 
     def _follow_events(self, client: Embedded) -> None:
         try:
-            for found in client.events():
+            # Its minimum as it is now, then every change (min_size events)
+            # from the event that was the newest before it was read.  An older
+            # TurboADB has no minimum to tell: then nothing is learnt.
+            try:
+                after = client.info()["events"]
+                minimum = client.ui()
+            except Exception:  # (only a size hint: never a reason to stop)
+                after, minimum = None, None
+            if minimum is not None:
+                self._result.emit(("minimum", minimum))
+            for found in client.events() if after is None else client.events(after):
                 self._result.emit(("event", found))
             self._result.emit(("finished", None))
         except RuntimeError:
             pass  # the widget has gone (and TurboADB with it)
+
+    # ---- TurboADB's minimum size ----
+    def _take_minimum(self, report) -> None:
+        if not isinstance(report, dict) or "min_width_px" not in report:
+            return
+        self._reported = report
+        self._settle.start()  # (again: only a minimum that holds counts)
+
+    def _apply_minimum(self) -> None:
+        """TurboADB's minimum in device pixels, as this widget's logical
+        pixels (the two programs may scale differently)."""
+        report = self._reported
+        if report is None:
+            return
+        try:
+            ratio = float(self.devicePixelRatioF() or 1.0)
+            width = math.ceil(round(int(report["min_width_px"]) / ratio, 6))
+            height = math.ceil(round(int(report["min_height_px"]) / ratio, 6))
+        except (KeyError, TypeError, ValueError):
+            return
+        if (width, height) != self.turboadb_minimum:
+            self.turboadb_minimum = (width, height)
+            if self._follow_minimum:
+                self.setMinimumSize(max(self.BASE_MINIMUM[0], width),
+                                    max(self.BASE_MINIMUM[1], height))
+            self.minimum_changed.emit(width, height)
 
     def stop(self) -> None:
         """Close TurboADB (it also closes by itself when this widget goes)."""

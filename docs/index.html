@@ -72,6 +72,18 @@
       <h2>What's new</h2>
       <div class="whatsnew">
         <div class="wn">
+          <h3><span class="ver">v6.4.0</span> Room to fit, devices that come back</h3>
+          <ul>
+            <li><b>Your program learns how much room TurboADB needs</b>: the
+            control API reports its minimum size and says when it changes, and
+            <code>TurboADBWidget(follow_minimum=True)</code> makes room by itself.</li>
+            <li><b>An embedded TurboADB in too small an area</b> is no longer
+            resized again and again.</li>
+            <li><b>The Connect dialog follows your devices</b> while it is open:
+            a phone that reboots comes back to its list, still picked.</li>
+          </ul>
+        </div>
+        <div class="wn">
           <h3><span class="ver">v6.3.0</span> Smooth with every device busy</h3>
           <ul>
             <li><b>The window keeps answering</b> while logcat floods, terminals
@@ -301,7 +313,7 @@
       <div class="cols">
         <div>
           <h3>Windows app (no Python)</h3>
-          <p>Download <code>TurboADB-6.3.1-win64.exe</code> from the latest release
+          <p>Download <code>TurboADB-6.4.0-win64.exe</code> from the latest release
           and double-click it. The first run installs <code>adb</code> and <code>scrcpy</code>
           through winget. It adds a desktop shortcut.</p>
           <a class="btn btn-primary" data-gh="exe" href="#">⤓ Download TurboADB for Windows</a>
@@ -309,8 +321,8 @@
         <div>
           <h3>With pip (CLI + API + GUI)</h3>
           <div class="code">
-            <button class="copy" data-copy="pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.1/turboadb-6.3.1-py3-none-any.whl">Copy</button>
-            <pre><code>pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.1/turboadb-6.3.1-py3-none-any.whl</code></pre>
+            <button class="copy" data-copy="pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.4.0/turboadb-6.4.0-py3-none-any.whl">Copy</button>
+            <pre><code>pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.4.0/turboadb-6.4.0-py3-none-any.whl</code></pre>
           </div>
           <p class="muted">Then run <code>turboadb-gui</code>, or use
           <code>turboadb</code> on the command line, or

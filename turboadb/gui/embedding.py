@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -302,13 +303,41 @@ def write_handshake(path: str, info: dict) -> None:
 
 # ---- the window inside the host ----------------------------------------------------
 try:
-    from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QTimer, pyqtSignal
+    from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 except ImportError:  # the host side imports this module's helpers without Qt
     QObject = object
     pyqtSignal = None
 
 
 if pyqtSignal is not None:
+
+    def settable_size(window, wanted):
+        """The size Qt gives *window* when asked for *wanted* (a QSize): each
+        side within the window's maximum and then at least its minimum, as
+        QWidget.setGeometry makes it."""
+        return wanted.boundedTo(window.maximumSize()).expandedTo(window.minimumSize())
+
+    def minimum_report(window) -> dict:
+        """The smallest size *window* takes, for a host that wants to give it
+        room: ``min_width`` / ``min_height`` in TurboADB's logical pixels,
+        ``min_width_px`` / ``min_height_px`` in device pixels (what the host's
+        area must measure, as GetClientRect counts it), and ``pixel_ratio``
+        (device pixels per logical one; TurboADB's and the host's logical
+        pixels differ when their DPI scaling does)."""
+        size = window.minimumSize()
+        try:
+            ratio = float(window.devicePixelRatioF() or 1.0)
+        except RuntimeError:  # the window is being destroyed
+            ratio = 1.0
+        width, height = max(0, size.width()), max(0, size.height())
+        return {
+            "min_width": width, "min_height": height,
+            # an area this big in device pixels is at least the minimum in
+            # logical ones (see Embedder._follow's rounding)
+            "min_width_px": math.ceil(round(width * ratio, 6)),
+            "min_height_px": math.ceil(round(height * ratio, 6)),
+            "pixel_ratio": round(ratio, 4),
+        }
 
     class _Owners(QObject):
         """Gives every window TurboADB shows besides its own (dialogs,
@@ -337,7 +366,12 @@ if pyqtSignal is not None:
 
     class Embedder(QObject):
         """Keeps *window* inside the host window *parent*: as its child, the
-        size of its client area, until it goes (then :attr:`host_closed`)."""
+        size of its client area, until it goes (then :attr:`host_closed`).
+
+        An area smaller than the window's minimum size (a page that needs more
+        room) leaves the window at its minimum, sticking out of the area: the
+        host learns the minimum from the control API (``GET /v1/ui``, the
+        ``min_size`` event) and can make room."""
 
         host_closed = pyqtSignal()
         POLL_MS = 120
@@ -347,6 +381,9 @@ if pyqtSignal is not None:
             self._window = window
             self._parent = int(parent)
             self._host = None
+            # (what was asked for, the geometry Qt made of it): not asked again
+            # while both stay the same
+            self._asked = None
             self._timer = QTimer(self)
             self._timer.setInterval(self.POLL_MS)
             self._timer.timeout.connect(self._follow)
@@ -391,11 +428,22 @@ if pyqtSignal is not None:
                 self._timer.stop()
                 self.host_closed.emit()
                 return
-            keep_to_itself(int(self._window.winId()))  # (Qt may set the styles again)
+            window = self._window
+            keep_to_itself(int(window.winId()))  # (Qt may set the styles again)
             size = host_client_size(self._parent)
             if size is None:
                 return
-            ratio = float(self._window.devicePixelRatioF() or 1.0)
-            wanted = QRect(0, 0, max(1, round(size[0] / ratio)), max(1, round(size[1] / ratio)))
-            if self._window.geometry() != wanted:
-                self._window.setGeometry(wanted)
+            ratio = float(window.devicePixelRatioF() or 1.0)
+            area = QSize(max(1, round(size[0] / ratio)), max(1, round(size[1] / ratio)))
+            # What Qt can set: never smaller than the window's minimum.  Asked
+            # for the area itself, a window clamped to its minimum never
+            # equalled it, and was resized again every POLL_MS, for ever.
+            wanted = QRect(QPoint(0, 0), settable_size(window, area))
+            current = window.geometry()
+            if current == wanted:
+                self._asked = None
+                return
+            if self._asked == (wanted, current):
+                return  # asked for already, and this is what came of it
+            window.setGeometry(wanted)
+            self._asked = (wanted, window.geometry())

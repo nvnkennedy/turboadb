@@ -128,6 +128,12 @@ class Client:
         return self.request("POST", "/screen", body)
 
     def ui(self) -> dict:
+        """Which parts of the window show, the Webcam page setting, the theme,
+        and the window's minimum size: ``min_width`` / ``min_height`` in
+        TurboADB's logical pixels, ``min_width_px`` / ``min_height_px`` in
+        device pixels (the size the area you gave it must have, as
+        GetClientRect counts) and ``pixel_ratio``.  An area smaller than that
+        cuts TurboADB off: the ``min_size`` event says when it changes."""
         return self.request("GET", "/ui")
 
     def set_ui(self, **parts) -> dict:

@@ -39,7 +39,8 @@ class HostWindow(QtWidgets.QMainWindow):
                        self.pages, open_button, sidebar):
             bar.addWidget(widget)
 
-        self.turboadb = TurboADBWidget(hide=("menubar",))
+        # follow_minimum: this window never gets so small that TurboADB is cut off
+        self.turboadb = TurboADBWidget(hide=("menubar",), follow_minimum=True)
         self.turboadb.started.connect(self.refresh_devices)
         self.turboadb.failed.connect(lambda why: self.statusBar().showMessage(f"TurboADB: {why}"))
         self.turboadb.event_received.connect(self.on_event)

@@ -32,7 +32,7 @@ HTTP on `127.0.0.1`, protected by a token.
    variable `TURBOADB_API_TOKEN` (so the token never appears on a command line):
 
    ```text
-   TurboADB-6.3.1-win64.exe --embed-into <HWND> --api-port 0 --handshake-file <file>
+   TurboADB-6.4.0-win64.exe --embed-into <HWND> --api-port 0 --handshake-file <file>
    ```
 
    With TurboADB installed in a Python (`pip install "turboadb[gui]"`), start
@@ -50,7 +50,7 @@ HTTP on `127.0.0.1`, protected by a token.
 
    ```json
    {"api": "http://127.0.0.1:52817/v1", "port": 52817, "token": "…", "pid": 18320,
-    "version": "6.3.1", "api_version": 1, "window": 3540230, "embedded": true}
+    "version": "6.4.0", "api_version": 1, "window": 3540230, "embedded": true}
    ```
 
    If it cannot start, the file says why instead: `{"error": "there is no window 5 to go into", "pid": 18320}`.
@@ -94,11 +94,21 @@ layout.addWidget(view)
 `view.client` is a `turboadb.embed.Embedded` client: `devices()`, `tabs()`,
 `open(serial, page=...)`, `show(...)`, `screen(serial)`, `shell(serial, command)`,
 `call(serial, method, *args)`, `set_ui(...)`, `dialog(name)` and `quit()`. The widget's
-signals are `started`, `failed(str)`, `event_received(dict)` and `finished`.
+signals are `started`, `failed(str)`, `event_received(dict)`, `finished` and
+`minimum_changed(width, height)`.
+
+Some of TurboADB's pages need more room than others (Device Control about 720 × 350
+in a program scaled to 125%). `minimum_changed` says how big the widget must be, in
+your program's own pixels, so
+that TurboADB is not cut off (also `view.turboadb_minimum`). With
+`TurboADBWidget(follow_minimum=True)` the widget makes that its minimum size (never
+below 320 × 240), so your layout makes room by itself. Without it, the widget's
+minimum stays yours to set. A new minimum counts once it has held for 0.3 s, because
+TurboADB's minimum jumps for a moment as it starts.
 
 TurboADB itself runs on PyQt5. In a PySide6 or PyQt6 program whose Python has no
 PyQt5, point the widget at the standalone app:
-`TurboADBWidget(exe=r"C:\Tools\TurboADB-6.3.1-win64.exe")`.
+`TurboADBWidget(exe=r"C:\Tools\TurboADB-6.4.0-win64.exe")`.
 
 [`examples/embed_in_qt.py`](examples/embed_in_qt.py) is a complete program with its
 own toolbar above an embedded TurboADB: `python examples/embed_in_qt.py`, or add
@@ -160,7 +170,7 @@ Shown += async (_, _) =>
 {
     var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     var handshake = Path.Combine(Path.GetTempPath(), $"tadb-{Guid.NewGuid()}.json");
-    var start = new ProcessStartInfo(@"C:\Tools\TurboADB-6.3.1-win64.exe",
+    var start = new ProcessStartInfo(@"C:\Tools\TurboADB-6.4.0-win64.exe",
         $"--embed-into {area.Handle} --api-port 0 --handshake-file \"{handshake}\" --hide menubar")
         { UseShellExecute = false };
     start.Environment["TURBOADB_API_TOKEN"] = token;
@@ -212,7 +222,7 @@ Create a child window as the area, and start TurboADB with its handle:
 HWND area = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE,
                             0, 40, width, height - 40, hMainWnd, nullptr, hInst, nullptr);
 SetEnvironmentVariableW(L"TURBOADB_API_TOKEN", token.c_str());
-std::wstring cmd = L"\"C:\\Tools\\TurboADB-6.3.1-win64.exe\" --embed-into "
+std::wstring cmd = L"\"C:\\Tools\\TurboADB-6.4.0-win64.exe\" --embed-into "
     + std::to_wstring((UINT_PTR)area) + L" --api-port 0 --handshake-file \"" + handshake + L"\"";
 CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
 SetEnvironmentVariableW(L"TURBOADB_API_TOKEN", nullptr);
@@ -310,7 +320,7 @@ busy, for example with a dialog open).
 | `POST /v1/close` | `{"serial"}` or `{"tab"}` | Closes a tab. |
 | `POST /v1/screen` | `{"serial", "action": "start" or "stop", "display_id"}` | Starts or stops the device's screen in Device Control. |
 | `POST /v1/device` | `{"serial", "method", "args": [], "kwargs": {}}` | Runs one device command and returns its result: `{"success", "value", "error", …}`. |
-| `GET /v1/ui` | | Which parts show, the Webcam page setting and the theme. |
+| `GET /v1/ui` | | Which parts show, the Webcam page setting, the theme, and the window's minimum size (see [Size and DPI](#rules-for-a-smooth-embed)). |
 | `POST /v1/ui` | any of `menubar`, `ribbon`, `sidebar`, `statusbar`, `log`, `webcam_page` (true or false) and `theme` | Shows or hides those parts, turns the Webcam page on or off, or changes the theme. |
 | `POST /v1/dialog` | `{"name": "settings", "new_target", "connect" or "about"}` | Opens one of TurboADB's dialogs (for a program that hides TurboADB's menu bar). |
 | `GET /v1/events?after=N&wait=S` | | What happened since event `N`, waiting up to `S` seconds (60 at most) for something. |
@@ -345,6 +355,7 @@ POST /v1/device
 | `tab_closed` | `tab` |
 | `page` | `tab`, `serial`, `page` |
 | `screen` | `tab`, `serial`, `active` |
+| `min_size` | `min_width`, `min_height`, `min_width_px`, `min_height_px`, `pixel_ratio`: the window's minimum size changed (another page, a device connected) |
 | `log` | `text`: a line of TurboADB's log |
 | `closing` | TurboADB is closing |
 
@@ -367,6 +378,22 @@ POST /v1/device
 - **Size and DPI.** TurboADB fills the area and follows it, and takes the DPI
   awareness of your window, so it is sized right whether or not your program is
   per-monitor aware.
+- **Give it room.** TurboADB's window has a minimum size, which depends on the page
+  it shows. In an area smaller than that, its window stays at its minimum and the
+  part outside the area is cut off. `GET /v1/ui` has the minimum, and the `min_size`
+  event says when it changes. Device Control on a display scaled to 125%:
+
+  ```json
+  {"min_width": 900, "min_height": 435, "min_width_px": 900, "min_height_px": 435,
+   "pixel_ratio": 1.0}
+  ```
+
+  `min_width` and `min_height` are TurboADB's logical pixels; `min_width_px` and
+  `min_height_px` are device pixels, the size your area must have as `GetClientRect`
+  measures it. Use the device pixels: your program and TurboADB may scale
+  differently. Here TurboADB draws at 1.0 while a Qt program with high-DPI scaling
+  works at 1.25, so that program needs 900 / 1.25 = 720 × 348 of its own pixels.
+  `TurboADBWidget(follow_minimum=True)` does this for a Qt program.
 - **Several at once.** Each area can hold its own TurboADB, and the normal TurboADB
   window can run beside them. They share the adb server and `~/.turboadb`.
 - **Updates.** Inside your program, TurboADB does not restart itself after an update.

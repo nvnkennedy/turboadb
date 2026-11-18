@@ -1,4 +1,4 @@
-"""The Connect dialog's USB page follows this PC's devices while it is open (6.3.1).
+"""The Connect dialog's USB page follows this PC's devices while it is open (6.4.0).
 
 It listed what one scan found when it opened, and again only on Refresh: a
 phone that rebooted while the dialog was open went offline, dropped off, and

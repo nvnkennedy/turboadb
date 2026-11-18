@@ -8,7 +8,7 @@ or ``{"ok": false, "error": "…"}`` with a matching HTTP status.
     GET  /v1/info                  this TurboADB: version, window, what it offers
     GET  /v1/devices               the devices adb reports, and which are open
     GET  /v1/tabs                  the open tabs, and the page each shows
-    GET  /v1/ui                    which parts of the window show
+    GET  /v1/ui                    which parts of the window show, and its minimum size
     GET  /v1/events?after=N&wait=S what happened since event N (waits up to S s)
     POST /v1/open                  {"serial"} or {"host", "port"}, optional "page"
     POST /v1/show                  {"serial" or "index", "page"}: bring a tab and page up
@@ -275,7 +275,7 @@ class ControlApi(QObject):
         self._thread = None
         self._tab_ids = {}  # tab widget -> its number in the API
         self._next_tab = 1
-        self._seen = {"devices": {}, "tabs": {}, "current": None, "pages": {}}
+        self._seen = {"devices": {}, "tabs": {}, "current": None, "pages": {}, "min_size": None}
         self._snapshot = {}  # what the window showed at the last look (_notice)
         self._snapshot_lock = threading.Lock()
         self._watch = QTimer(self)
@@ -603,6 +603,7 @@ class ControlApi(QObject):
         parts = self.window.ui_parts()
         parts["webcam_page"] = bool(settings_mod.get("show_webcam_page", False))
         parts["theme"] = theme.current_name()
+        parts.update(embedding.minimum_report(self.window))
         return parts
 
     def _set_ui(self, body: dict) -> dict:
@@ -711,6 +712,12 @@ class ControlApi(QObject):
             if page and seen["pages"].get(number) not in (None, page):
                 self.events.publish("page", tab=number, serial=self.tab_serial(tab), page=page)
         seen["pages"] = pages
+        # The window's minimum size (a page that needs more room): a host
+        # gives it room.  The first look only notes it; GET /v1/ui has it.
+        minimum = embedding.minimum_report(self.window)
+        if seen.get("min_size") is not None and seen["min_size"] != minimum:
+            self.events.publish("min_size", **minimum)
+        seen["min_size"] = minimum
         self._remember()
 
     # devices

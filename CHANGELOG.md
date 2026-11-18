@@ -3,7 +3,20 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
-## 6.3.1
+## 6.4.0
+
+### New
+
+- **A program that holds TurboADB learns how much room it needs.** Some pages
+  need more room than others: Device Control about 900 × 435 pixels on a
+  display scaled to 125%. `GET /v1/ui` now has the window's minimum size
+  (`min_width`, `min_height` in TurboADB's pixels, `min_width_px`,
+  `min_height_px` in device pixels, `pixel_ratio`), and a `min_size` event
+  says when it changes. `TurboADBWidget` has a `minimum_changed(width,
+  height)` signal in the program's own pixels, and with `follow_minimum=True`
+  it makes that its minimum size, so the program's layout makes room instead
+  of cutting TurboADB off. A new minimum counts once it has held for 0.3 s:
+  TurboADB's minimum jumps for a moment as it starts.
 
 ### Fixed
 
@@ -16,6 +29,13 @@ All notable changes are recorded here. Versions follow
   A device you picked stays picked while it is away, shown as not
   connected, so Connect still means that device; a scan that finished after
   a newer change is not shown over it, and Refresh keeps your pick.
+- **An embedded TurboADB in an area smaller than its minimum is no longer
+  resized again and again.** Qt keeps a window at least at its minimum size,
+  so the window never became the area's size, and TurboADB asked for it again
+  every 120 ms for as long as it ran (8 times a second, measured inside a
+  host). It now asks for what Qt can set, once for each change of the area.
+  The window still sticks out of an area that is too small; the host can now
+  make room (see above).
 
 ## 6.3.0
 

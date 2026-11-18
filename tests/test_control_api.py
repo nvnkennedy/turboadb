@@ -5,6 +5,7 @@ window work on the window's thread and device commands from a fixed list.
 The window and its device tabs are stand-ins here: no device or adb is used.
 """
 import json
+import math
 import os
 import sys
 import threading
@@ -367,6 +368,42 @@ def test_a_screen_that_starts_is_an_event(qapp, api):
     tab.screen_active.emit(True)
     found, _last = api.events.after(last)
     assert found[0]["type"] == "screen" and found[0]["serial"] == "A" and found[0]["active"]
+
+
+# ---- the window's minimum size ------------------------------------------------------------
+def test_the_window_minimum_is_in_ui_and_an_event_when_it_changes(qapp, api):
+    """A page that needs more room than the host gave it was cut off, and the
+    host could only guess the size from TurboADB's window."""
+    last = api.events.last
+    api.window.setMinimumSize(720, 348)  # (Device Control came up)
+    api._notice()
+    api._notice()  # nothing new: no second event
+    found, _last = api.events.after(last)
+    sizes = [e for e in found if e["type"] == "min_size"]
+    ratio = api.window.devicePixelRatioF()
+    assert len(sizes) == 1
+    assert sizes[0]["min_width"] == 720 and sizes[0]["min_height"] == 348
+    assert sizes[0]["min_width_px"] == math.ceil(720 * ratio) and sizes[0]["pixel_ratio"] == ratio
+    status, body = _ask(qapp, api, "GET", "/v1/ui")
+    assert status == 200 and body["result"]["min_width"] == 720
+    assert body["result"]["min_height_px"] == math.ceil(348 * ratio)
+    # the last look answers the same while the window is busy
+    assert api._snapshot["ui"]["min_width"] == 720
+
+
+def test_the_first_look_at_the_minimum_is_no_event(qapp):
+    window = _Window()
+    window.setMinimumSize(500, 400)
+    made = control_api.ControlApi(window, token="secret")
+    made.start()
+    try:
+        found, _last = made.events.after(0)
+        assert [e["type"] for e in found] == ["ready"]
+        assert made._ui()["min_width"] == 500  # GET /v1/ui has it
+    finally:
+        made.stop()
+        window.deleteLater()
+        qapp.processEvents()
 
 
 def test_the_event_log_keeps_the_newest():
