@@ -777,6 +777,9 @@ def _describe_settings(changes: dict) -> str:
 
 
 class MainWindow(QMainWindow):
+    # This PC's devices whenever their list changes (the sidebar's list): the
+    # Connect dialog follows it while it is open.
+    devices_changed = pyqtSignal(list)
     # Socket tracking is the primary, immediate notification channel.  This is
     # deliberately only a reconciliation fallback, never a second fast poller.
     _DEVICE_POLL_INTERVAL_MS = 15_000
@@ -1864,6 +1867,7 @@ class MainWindow(QMainWindow):
         self._last_device_sigs = new_sigs
 
         self._live_devices = devices
+        self.devices_changed.emit(list(devices))
         self._set_device_indicator(devices)
         # A live result replaces the last session's "verifying…" hint, empty or not.
         self._cached_devices = []
@@ -2471,7 +2475,9 @@ class MainWindow(QMainWindow):
     # ---- one unified Connect dialog (USB / Network / Remote PC) ----
     def open_connect(self, *_):
         from .connect_dialog import ConnectDialog
-        dlg = ConnectDialog(self)
+        # It lists this PC's devices at once and follows them while it is
+        # open: a phone that reboots meanwhile comes back by itself.
+        dlg = ConnectDialog(self, devices=self._live_devices, device_feed=self.devices_changed)
         try:
             s = dlg.session() if dlg.exec_() == dlg.Accepted else None
         finally:

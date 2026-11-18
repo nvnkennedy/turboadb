@@ -56,6 +56,18 @@ TRANSPORT_ICONS = (("usb", "green"), ("wifi", "blue"), ("server", "purple"))
 
 # Device-list rows: a phone tinted by its adb state.
 _STATE_TONES = {"device": "green", "unauthorized": "amber", "offline": "red"}
+# a device picked on the USB page that has gone (it reboots): its row stays
+_GONE = "not connected"
+
+
+class _Gone:
+    """The row of a picked device that is not connected right now."""
+
+    state = _GONE
+    label = ""
+
+    def __init__(self, serial):
+        self.serial = serial
 
 
 def _dialog_footer(parent_layout):
@@ -231,10 +243,21 @@ class _ServeThread(QThread):
 
 
 class ConnectDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, devices=None, device_feed=None):
+        """*devices*: this PC's devices as known now, listed at once on the
+        USB page; *device_feed*: a signal carrying that list whenever it
+        changes (the main window's device tracker), which the USB page then
+        follows while the dialog is open.  Without them the page shows what
+        a scan finds, and Refresh scans again."""
         super().__init__(parent)
         self.setWindowTitle("Connect to a device")
         self.resize(560, 520)
+        self._feed = device_feed
+        self._feed_reports = 0      # lists the feed has delivered
+        self._usb_since = 0         # ... when the USB scan running started
+        self._usb_choice = None     # the serial picked on the USB page by the user
+        self._usb_shown = 0         # devices listed there (a picked one gone is not one)
+        self._refilling = False
         self._scan = None
         # Scans asked for while one runs: one per page, keyed by its status
         # line, run in turn (see _start_scan).
@@ -303,6 +326,10 @@ class ConnectDialog(QDialog):
         footer.addWidget(btns)
 
         self._on_mode(0)
+        if devices is not None:
+            self._show_usb(list(devices))
+        if device_feed is not None:
+            device_feed.connect(self._on_device_feed)
         self._scan_usb()
 
     # ---- pages ----
@@ -313,7 +340,7 @@ class ConnectDialog(QDialog):
         v.setSpacing(8)
         v.addWidget(QLabel("Devices plugged into this PC"))
         self.usb_list = QListWidget()
-        self.usb_list.currentItemChanged.connect(lambda *_: self._autoname())
+        self.usb_list.currentItemChanged.connect(self._usb_picked)
         self.usb_list.itemDoubleClicked.connect(lambda _: self._accept())
         v.addWidget(_list_card(self.usb_list), 1)
         row = QHBoxLayout()
@@ -533,8 +560,39 @@ class ConnectDialog(QDialog):
     # ---- scanning ----
     def _scan_usb(self):
         self.usb_status.setText("scanning…")
-        self.usb_list.clear()
+        if self._feed is None:
+            self.usb_list.clear()
+        # (with a feed its list stays while the scan runs, and is newer than
+        # the scan's when it reported meanwhile: see _fill_usb)
+        self._usb_since = self._feed_reports
         self._start_scan(None, 5037, self._fill_usb, self.usb_status)
+
+    def _on_device_feed(self, devices) -> None:
+        """This PC's devices changed (plugged in, unplugged, a reboot)."""
+        self._feed_reports += 1
+        if self._closing:
+            return
+        # (newer than what a scan running now will find: see _fill_usb)
+        self.usb_status.setText(f"{self._show_usb(list(devices))} device(s)")
+
+    def _usb_picked(self, *_):
+        if not self._refilling:
+            item = self.usb_list.currentItem()
+            self._usb_choice = item.data(Qt.UserRole) if item is not None else None
+        self._autoname()
+
+    def _show_usb(self, devs) -> int:
+        """List *devs* on the USB page; returns how many there are.  The
+        device the user picked stays picked, and while it is not connected
+        (it reboots) its row stays too, so Connect still means that device."""
+        keep = self._usb_choice
+        rows = list(devs)
+        if keep and not any(d.serial == keep for d in rows):
+            rows.append(_Gone(keep))
+        self._fill(self.usb_list, rows, keep=keep)
+        self._autoname()
+        self._usb_shown = len(devs)
+        return self._usb_shown
 
     def _scan_remote(self):
         host, port = _split_host_port(self.rem_host.currentText(), self.rem_port.value())
@@ -577,8 +635,8 @@ class ConnectDialog(QDialog):
         self._scan = None
         if not self._closing:
             if error is None:
-                on_done(devices)
-                status_label.setText(f"{len(devices)} device(s)")
+                shown = on_done(devices)
+                status_label.setText(f"{len(devices) if shown is None else shown} device(s)")
             else:
                 status_label.setText(error)
         if self._pending_scans and not self._closing:
@@ -593,6 +651,12 @@ class ConnectDialog(QDialog):
         but never let them call back into it."""
         self._closing = True
         self._pending_scans.clear()
+        feed, self._feed = self._feed, None
+        if feed is not None:
+            try:
+                feed.disconnect(self._on_device_feed)
+            except (TypeError, RuntimeError):
+                pass
         for thread in (self._scan, self._serve):
             if thread is None:
                 continue
@@ -614,19 +678,32 @@ class ConnectDialog(QDialog):
             # loop, so the dialog is no longer leaked on every use.
             self.deleteLater()
 
-    def _fill(self, widget, devs):
-        widget.clear()
-        for d in devs:
-            tone = _STATE_TONES.get(str(d.state), "dim")
-            it = QListWidgetItem(icon("smartphone", tone), f"{d.serial}    {d.label} · {d.state}")
-            it.setData(Qt.UserRole, d.serial)
-            widget.addItem(it)
-        if devs:
-            widget.setCurrentRow(0)
+    def _fill(self, widget, devs, keep=None):
+        """List *devs*; *keep*: the serial to select (else the first)."""
+        self._refilling = True
+        try:
+            widget.clear()
+            row = 0
+            for index, d in enumerate(devs):
+                tone = _STATE_TONES.get(str(d.state), "dim")
+                text = (f"{d.serial}    {d.label} · {d.state}" if d.label
+                        else f"{d.serial}    {d.state}")
+                it = QListWidgetItem(icon("smartphone", tone), text)
+                it.setData(Qt.UserRole, d.serial)
+                widget.addItem(it)
+                if keep is not None and d.serial == keep:
+                    row = index
+            if devs:
+                widget.setCurrentRow(row)
+        finally:
+            self._refilling = False
 
     def _fill_usb(self, devs):
-        self._fill(self.usb_list, devs)
-        self._autoname()
+        """A USB scan's result: unless the feed reported while it ran (its
+        list is newer); returns the number of devices shown."""
+        if self._feed is not None and self._usb_since != self._feed_reports:
+            return self._usb_shown
+        return self._show_usb(devs)
 
     def _fill_remote(self, devs):
         self._fill(self.rem_list, devs)

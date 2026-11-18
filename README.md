@@ -65,7 +65,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-6.3.0-win64.exe`** from the
+1. Download **`TurboADB-6.3.1-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
@@ -77,7 +77,7 @@ TurboADB is published on GitHub Releases, not on PyPI, so pip installs the wheel
 attached to the release:
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.0/turboadb-6.3.0-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.1/turboadb-6.3.1-py3-none-any.whl
 ```
 
 On Windows this already includes the app: the package carries the same
@@ -87,7 +87,7 @@ replace the packaged file). To run the GUI from the Python code instead — on
 Linux or macOS, for example — add the GUI extra:
 
 ```bash
-pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.0/turboadb-6.3.0-py3-none-any.whl"
+pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.3.1/turboadb-6.3.1-py3-none-any.whl"
 ```
 
 Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or

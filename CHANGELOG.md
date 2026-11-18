@@ -3,6 +3,20 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.3.1
+
+### Fixed
+
+- **The Connect dialog follows the devices while it is open.** Its USB page
+  listed what one scan found when the dialog opened, and again only on
+  Refresh: a phone that rebooted with the dialog open went offline, dropped
+  off the list and never came back to it. The page now lists this PC's
+  devices at once, as the window knows them, and follows every change the
+  window's device tracker sees (plugged in, unplugged, rebooting, allowed).
+  A device you picked stays picked while it is away, shown as not
+  connected, so Connect still means that device; a scan that finished after
+  a newer change is not shown over it, and Refresh keeps your pick.
+
 ## 6.3.0
 
 ### Faster

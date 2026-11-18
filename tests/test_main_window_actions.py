@@ -576,7 +576,7 @@ def test_connecting_goes_ahead_when_the_target_cannot_be_saved(window, monkeypat
     class Dialog:
         Accepted = 1
 
-        def __init__(self, parent):
+        def __init__(self, parent, **_devices):
             pass
 
         def exec_(self):
@@ -605,7 +605,7 @@ def _connect(window, monkeypatch, session, answer=None):
     class Dialog:
         Accepted = 1
 
-        def __init__(self, parent):
+        def __init__(self, parent, **_devices):
             pass
 
         def exec_(self):
