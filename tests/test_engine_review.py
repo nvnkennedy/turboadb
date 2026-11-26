@@ -404,7 +404,8 @@ def test_pull_into_existing_directory_measures_only_the_pulled_file(fake_adb, mo
     monkeypatch.setattr(core.subprocess, "Popen", Proc)
     res = ADBHandler(ADBConfig(serial="x")).pull("/sdcard/log.txt", str(tmp_path))
     assert res.size_bytes == 5 and res.files == 1
-    assert seen.get("encoding") == "utf-8" and seen.get("errors") == "replace"
+    # 6.5.0: a line that is not UTF-8 keeps its bytes, read again as adbproc reads them
+    assert seen.get("encoding") == "utf-8" and seen.get("errors") == "surrogateescape"
 
 
 # --------------------------------------------------------------------------- #
@@ -649,15 +650,18 @@ def test_tools_dir_does_not_create_directories(monkeypatch, tmp_path):
 # get_state reads problem states from stderr
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    "stderr,state",
+    "listing,state",
     [
-        ("error: device unauthorized.\nThis adb server's $ADB_VENDOR_KEYS is not set", "unauthorized"),
-        ("error: device offline", "offline"),
-        ("error: device 'x' not found", "unknown"),
+        ("x\tunauthorized usb:1-1 transport_id:3", "unauthorized"),
+        ("x\toffline transport_id:3", "offline"),
+        ("x\tno permissions (missing udev rules?); see [http://developer.android.com/tools/device.html] usb:1-1",
+         "no permissions"),
+        ("y\tdevice product:p model:m", "unknown"),  # (not listed)
     ],
 )
-def test_get_state_from_stderr(fake_adb, stderr, state):
-    fake_adb.add("get-state", returncode=1, stderr=stderr)
+def test_get_state_from_the_device_list(fake_adb, listing, state):
+    """6.5.0: from adb devices, which never waits for a device (get-state could)."""
+    fake_adb.add("devices", stdout=f"List of devices attached\n{listing}\n\n")
     assert ADBHandler(ADBConfig(serial="x")).get_state() == state
 
 

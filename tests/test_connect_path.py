@@ -62,11 +62,12 @@ def test_without_a_known_state_a_successful_wait_is_enough(fake_adb, server_up):
 
 def test_a_failed_wait_still_asks_for_the_state_and_reports_it(fake_adb, server_up):
     fake_adb.add("wait-for-device", returncode=1, stderr="error: device unauthorized.")
-    fake_adb.add("get-state", returncode=1, stderr="error: device unauthorized.")
+    # (6.5.0: the state comes from the device list, which never waits for a device)
+    fake_adb.add("devices", stdout="List of devices attached\nR58M123\tunauthorized usb:1-1\n")
     handler = ADBHandler(ADBConfig(serial="R58M123"))
     with pytest.raises(ADBConnectionError, match="unauthorized"):
         handler.connect(safe=False)
-    assert _adb_verbs(fake_adb) == ["wait-for-device", "get-state"]
+    assert _adb_verbs(fake_adb) == ["wait-for-device", "devices"]
 
 
 def test_a_state_other_than_device_is_checked_as_before(fake_adb, server_up):
@@ -76,10 +77,10 @@ def test_a_state_other_than_device_is_checked_as_before(fake_adb, server_up):
 
 
 def test_without_auto_wait_get_state_decides(fake_adb, server_up):
-    fake_adb.add("get-state", stdout="device\n")
+    fake_adb.add("devices", stdout="List of devices attached\nR58M123\tdevice product:p\n")
     handler = ADBHandler(ADBConfig(serial="R58M123", auto_wait=False))
     handler.connect(safe=False)
-    assert _adb_verbs(fake_adb) == ["get-state"]
+    assert _adb_verbs(fake_adb) == ["devices"]  # (get_state: the device list)
 
 
 def test_an_already_connected_network_target_skips_the_wait(fake_adb, server_up):

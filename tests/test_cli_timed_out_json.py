@@ -44,7 +44,8 @@ def slow_ping(fake_adb, monkeypatch, capsys):
 
 
 def _check(doc, command):
-    assert doc["timed_out"] is True and doc["exit_code"] == -1
+    # 6.5.0: ended at its time limit, as everywhere: exit code 124
+    assert doc["timed_out"] is True and doc["exit_code"] == 124
     assert doc["stdout"] == _PARTIAL.decode()
     assert "timed out after 5" in doc["error"] and command in doc["command"]
 

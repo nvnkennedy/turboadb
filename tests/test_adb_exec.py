@@ -14,9 +14,13 @@ import threading
 import pytest
 
 import turboadb.core as core
+from turboadb import adbproc
 from turboadb.config import ADBConfig
 from turboadb.core import ADBHandler
 from turboadb.exceptions import ADBError, ADBTimeoutError
+
+
+_REAL_ADBPROC_RUN = adbproc.run  # (the fake_adb fixture replaces it)
 
 
 def _raising(error):
@@ -36,7 +40,8 @@ def test_a_timeout_keeps_what_the_command_printed(fake_adb, monkeypatch):
     with pytest.raises(ADBTimeoutError, match="timed out after 1.0s") as info:
         handler.shell("ping 8.8.8.8", timeout=1.0)
     result = info.value.result
-    assert result.exit_code == -1 and not result.ok
+    # 6.5.0: ended by TurboADB at its time limit, as everywhere: exit code 124
+    assert result.exit_code == 124 and result.timed_out and not result.ok
     assert result.stdout == printed.decode() and result.stderr == "note\n"
     assert result.command == "shell ping 8.8.8.8" and result.device == "R58M1"
 
@@ -94,11 +99,16 @@ def test_an_adb_that_cannot_run_is_an_adb_error(fake_adb, monkeypatch, error):
     assert not failed.success and isinstance(failed.error, ADBError)
 
 
-def test_the_cancellable_path_converts_it_too(fake_adb, monkeypatch):
+@pytest.mark.parametrize("cancellable", [False, True])
+def test_an_adb_that_cannot_start_is_an_adb_error_however_it_runs(fake_adb, monkeypatch,
+                                                                  cancellable):
+    """Every client starts through adbproc.popen (6.5.0: the cancellable path
+    is the only one)."""
+    monkeypatch.setattr(adbproc, "run", _REAL_ADBPROC_RUN)  # (not the fixture's)
     monkeypatch.setattr(core.subprocess, "Popen", _raising(PermissionError(13, "Access is denied")))
     handler = ADBHandler(ADBConfig(serial="R58M1"))
     with pytest.raises(ADBError, match="adb executable not runnable"):
-        handler._run(["wait-for-device"], cancel=threading.Event())
+        handler._run(["wait-for-device"], cancel=threading.Event() if cancellable else None)
 
 
 def test_pairing_with_an_adb_that_cannot_run_is_an_adb_error(fake_adb, monkeypatch):

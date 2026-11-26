@@ -78,16 +78,23 @@ def test_reverse_rules_list_and_remove(fake_adb):
 
 
 def test_wait_for_boot(fake_adb):
+    """6.5.0: listed as device and sys.boot_completed 1, two reads in a row,
+    each look bounded (never adb's own waits, which could hang)."""
+    fake_adb.add("devices", stdout="List of devices attached\nx\tdevice product:p\n")
     fake_adb.add("sys.boot_completed", stdout="1\n")
-    assert handler().wait_for_boot(30) is True
+    result = handler().wait_for_boot(30, interval=0.01)
+    assert result["ok"] and result["state"] == "device" and result["boot_completed"]
     calls = joined(fake_adb)
-    assert any("wait-for-disconnect" in c for c in calls)
-    assert any("wait-for-device" in c for c in calls)
+    assert len([c for c in calls if "sys.boot_completed" in c]) == 2
+    assert not any("wait-for" in c for c in calls)
 
 
 def test_wait_for_boot_times_out(fake_adb):
-    with pytest.raises(ADBTimeoutError):
-        handler().wait_for_boot(0)
+    result = handler().wait_for_boot(0)
+    assert not result["ok"] and result["timed_out"]
+    with pytest.raises(ADBTimeoutError):  # (a caller that needs it raises, as the CLI does)
+        if not result["ok"]:
+            raise ADBTimeoutError("did not boot")
 
 
 def test_stat_path_and_chmod(fake_adb):

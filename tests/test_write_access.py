@@ -50,7 +50,9 @@ class _Steps:
         monkeypatch.setattr(handler, "root", record("root", "restarting adbd as root"))
         monkeypatch.setattr(handler, "disable_verity", record("disable-verity", disable_output))
         monkeypatch.setattr(handler, "reboot", record("reboot"))
-        monkeypatch.setattr(handler, "wait_for_boot", record("wait_for_boot"))
+        # (6.5.0: its result is a dict)
+        monkeypatch.setattr(handler, "wait_for_boot",
+                            record("wait_for_boot", {"ok": True, "state": "device"}))
         monkeypatch.setattr(handler, "shell", record("sync"))
 
         def remount_once():

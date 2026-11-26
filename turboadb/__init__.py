@@ -29,7 +29,7 @@ exceptions (ideal for GUIs). The raw adb path is always at ``dev.adb_path``.
 
 from __future__ import annotations
 
-__version__ = "6.4.0"
+__version__ = "6.5.0"
 
 from .config import (
     ADBConfig,
@@ -75,17 +75,23 @@ from .toolsdl import (
     check_updates,
     upgrade_tools,
 )
-from .results import CommandResult, TransferResult, StreamResult, OperationResult, strip_ansi
+from .results import (
+    TIMEOUT_EXIT_CODE, CommandResult, TransferResult, StreamResult, OperationResult, strip_ansi,
+)
 from .exceptions import (
     ADBError,
     ADBNotFoundError,
     ADBConnectionError,
     ADBTimeoutError,
+    ADBDeviceTimeoutError,
+    ADBCancelledError,
     ADBNotConnectedError,
     ADBCommandError,
     ADBTransferError,
     ADBInstallError,
     ScrcpyError,
+    DEVICE_PROBLEMS,
+    device_problem,
 )
 
 __all__ = [
@@ -136,11 +142,16 @@ __all__ = [
     "TransferResult",
     "StreamResult",
     "OperationResult",
+    "TIMEOUT_EXIT_CODE",
     "strip_ansi",
     "ADBError",
     "ADBNotFoundError",
     "ADBConnectionError",
     "ADBTimeoutError",
+    "ADBDeviceTimeoutError",
+    "ADBCancelledError",
+    "DEVICE_PROBLEMS",
+    "device_problem",
     "ADBNotConnectedError",
     "ADBCommandError",
     "ADBTransferError",

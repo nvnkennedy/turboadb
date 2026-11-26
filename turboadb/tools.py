@@ -38,6 +38,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from . import adbproc
 from .config import user_path
 from .exceptions import ADBNotFoundError
 
@@ -517,15 +518,7 @@ def _adb_version_output(exe: str, timeout: float = 15.0) -> str:
 
     adb prints where it is installed: decoded with the system code page, a
     folder name that has no character there cost the whole output."""
-    out = subprocess.run(
-        [exe, "version"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        creationflags=NO_WINDOW,
-    )
+    out = adbproc.run_text([exe, "version"], timeout=timeout, creationflags=NO_WINDOW)
     return out.stdout or out.stderr or ""
 
 
@@ -784,7 +777,9 @@ class _Launch:
         if port != DEFAULT_ADB_SERVER_PORT:
             cmd += ["-P", str(port)]
         try:
-            self.proc = subprocess.Popen(
+            # In the kill-on-close job, as every adb client: the daemon it
+            # starts leaves the job (silent breakaway) and outlives TurboADB.
+            self.proc = adbproc.popen(
                 cmd + ["start-server"],
                 stdin=subprocess.DEVNULL,
                 stdout=self.out if self.out is not None else subprocess.DEVNULL,
@@ -1097,7 +1092,7 @@ def kill_adb_server(
         if left is not None:
             timeout = min(timeout, max(1.0, left))
         try:
-            done = subprocess.run(
+            done = adbproc.run_compat(
                 cmd + ["kill-server"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,

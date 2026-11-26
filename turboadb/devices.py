@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
+from . import adbproc
 from .config import adb_server_args, parse_host_port, user_path, validate_port
 from .exceptions import ADBNotFoundError
 from .scrcpy import TUNNEL_PORT_FIREWALL_RANGE
@@ -218,15 +219,8 @@ def list_devices(
     )
     run_timeout = min(timeout, 3.0) if is_local else timeout
     try:
-        out = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=run_timeout,
-            creationflags=NO_WINDOW,
-        )
+        # (an adb client: in TurboADB's kill-on-close job, read as adbproc reads)
+        out = adbproc.run_text(cmd, timeout=run_timeout, creationflags=NO_WINDOW)
     except subprocess.TimeoutExpired as exc:
         if server_host and not is_local:  # a hung connection = unreachable server
             raise ConnectionError(_unreachable) from exc
@@ -307,17 +301,10 @@ def mdns_devices(
     elif server_port != DEFAULT_ADB_SERVER_PORT:
         cmd += ["-P", str(server_port)]
     try:
-        out = subprocess.run(
-            cmd + ["mdns", "services"],
-            capture_output=True,
-            text=True,
-            # adb prints the names devices announce as UTF-8: read strictly in
-            # the system's code page, one of them cost every device found
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            creationflags=NO_WINDOW,
-        )
+        # adb prints the names devices announce as UTF-8: read strictly in the
+        # system's code page, one of them cost every device found
+        out = adbproc.run_text(cmd + ["mdns", "services"], timeout=timeout,
+                               creationflags=NO_WINDOW)
     except Exception:
         return []
     found = []

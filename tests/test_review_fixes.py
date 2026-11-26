@@ -178,16 +178,21 @@ def test_the_window_s_packages_come_with_its_update(monkeypatch, gui, expected):
 
 # ---- wireless discovery ---------------------------------------------------------
 def test_wireless_discovery_reads_any_name(monkeypatch):
+    """A name announced in UTF-8 is read as it is, and one that is not UTF-8
+    never costs the other devices (6.5.0: adb's output is read by adbproc)."""
     seen = {}
+    listing = ("adb-Küche-1\t_adb-tls-connect._tcp\t192.168.1.7:37001\n".encode("utf-8")
+               + b"adb-K\x81che-2\t_adb-tls-connect._tcp\t192.168.1.8:37002\n")  # (not UTF-8)
 
     def run(cmd, **kw):
         seen.update(kw)
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout=listing, stderr=b"")
 
     monkeypatch.setattr(devices, "find_adb", lambda path=None: "adb")
     monkeypatch.setattr(devices.subprocess, "run", run)
-    devices.mdns_devices()
-    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
+    found = devices.mdns_devices()
+    assert seen["capture_output"] and "encoding" not in seen  # (TurboADB reads the bytes)
+    assert [d["name"] for d in found][:1] == ["adb-Küche-1"] and len(found) == 2
 
 
 # ---- the screen's zoom bars -----------------------------------------------------

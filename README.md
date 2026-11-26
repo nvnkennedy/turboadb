@@ -16,6 +16,8 @@
 
 ---
 
+> **6.5.0:** for programs that drive adb through TurboADB: no adb.exe outlives a crashed host, every blocking call can be cancelled, timeouts and device problems are reported one way, boot waiting a test can rely on, and a UI-tree helper.
+>
 > **6.4.0:** a program that holds TurboADB learns how much room it needs and can make it; the Connect dialog follows devices while it is open, so a phone that reboots comes back to its list.
 >
 > **6.3.0:** the window keeps answering while logcat floods, terminals stream and several devices run at once; terminals open without a pause, a device connects with half the wait, and opening a PC folder in Files no longer freezes it.
@@ -54,7 +56,7 @@ steps, the **CLI** command, and the **Python** call.
   - [Remote devices](#remote-devices) · [Share devices (serve)](#share-devices-serve) · [Deploy serve over WinRM](#deploy-serve-over-winrm)
   - [Keep things up to date](#keep-things-up-to-date)
 - [CLI cheatsheet](#cli-cheatsheet) — full [CLI reference](https://github.com/NVNKENNEDY/turboadb/blob/main/CLI.md)
-- [Python API notes](#python-api-notes)
+- [Python API notes](#python-api-notes): [adb ends with your program](#adb-ends-with-your-program) · [cancel and timeouts](#cancel-and-timeouts) · [non-English Windows](#output-on-a-non-english-windows) · [device problems](#device-problems) · [waiting for a boot](#waiting-for-a-boot) · [UI tree](#ui-tree)
 - [Embedding in your own program](#embedding-in-your-own-program) — TurboADB inside a PyQt5, PySide6, Delphi or C# window, driven by its API
 - [Android Automotive / IVI tips](#android-automotive--ivi-tips)
 - [Build from source](#build-from-source)
@@ -67,7 +69,7 @@ Pick whichever fits — both give you the full GUI.
 
 ### A · Windows app — no Python needed
 
-1. Download **`TurboADB-6.4.0-win64.exe`** from the
+1. Download **`TurboADB-6.5.0-win64.exe`** from the
    **[latest GitHub Release](https://github.com/NVNKENNEDY/turboadb/releases/latest)**
    (also linked from the [website](https://nvnkennedy.github.io/turboadb/)).
 2. Double-click it. The first run installs `adb` and `scrcpy` through winget, with
@@ -79,7 +81,7 @@ TurboADB is published on GitHub Releases, not on PyPI, so pip installs the wheel
 attached to the release:
 
 ```bash
-pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.4.0/turboadb-6.4.0-py3-none-any.whl
+pip install https://github.com/NVNKENNEDY/turboadb/releases/download/v6.5.0/turboadb-6.5.0-py3-none-any.whl
 ```
 
 On Windows this already includes the app: the package carries the same
@@ -89,7 +91,7 @@ replace the packaged file). To run the GUI from the Python code instead — on
 Linux or macOS, for example — add the GUI extra:
 
 ```bash
-pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.4.0/turboadb-6.4.0-py3-none-any.whl"
+pip install "turboadb[gui] @ https://github.com/NVNKENNEDY/turboadb/releases/download/v6.5.0/turboadb-6.5.0-py3-none-any.whl"
 ```
 
 Then use any of: `turboadb-gui` (the app), `turboadb <command>` (the CLI), or
@@ -930,6 +932,108 @@ assert dev.shell("getprop ro.build.version.release").ok
 dev.install("app.apk", grant_perms=True)
 dev.screenshot("after_install.png")
 ```
+
+### adb ends with your program
+
+Every adb client TurboADB starts (each `adb shell`, `push`, `logcat` …) runs in a
+Windows job object that ends it when your program ends, also when it crashes: no
+`adb.exe` is left behind. The adb **server** a client may start is never in the
+job: it is shared with every other tool on the PC and keeps running. (On Linux and
+macOS an adb client is an ordinary child process.)
+
+### Cancel and timeouts
+
+Every blocking call takes `cancel=`: a `threading.Event`, or a function that
+returns True when the call should stop. It is looked at every 0.1 s; when it says
+stop, the adb client (and only it) is ended at once. A timeout ends the client the
+same way. Both are reported alike everywhere:
+
+| | Exception | On the result | Exit code |
+|---|---|---|---|
+| Cancelled | `ADBCancelledError` | `cancelled=True` | 124 |
+| Timed out | `ADBTimeoutError` | `timed_out=True` | 124 |
+
+```python
+import threading
+from turboadb import ADBCancelledError, ADBTimeoutError
+
+stop = threading.Event()          # stop.set() from another thread (a Stop button)
+try:
+    dev.shell("ping -c 100 8.8.8.8", cancel=stop, timeout=60)
+except ADBCancelledError as exc:
+    print("stopped", exc.result.stdout)        # what it printed until then
+except ADBTimeoutError as exc:
+    print("timed out", exc.result.exit_code)   # 124
+
+dev.push("big.bin", "/sdcard/", cancel=lambda: user_pressed_stop)
+result = dev.logcat(tail=1, timeout=30)          # a stream returns instead:
+result.timed_out, result.exit_code               # True, 124
+```
+
+In safe mode the `OperationResult` says it too: `.timed_out`, `.cancelled`. The
+calls that take `cancel=` are `adb()`, `shell()`, `push`, `pull`, `install`,
+`install_multiple`, `uninstall`, `reboot`, `root`, `unroot`, `remount`,
+`wait_for_device`, `wait_for_boot`, `get_state`, `logcat`, `stream`, `iter_lines`,
+`bugreport` and `ui_dump`. `ADBCancelledError` is an `ADBConnectionError` and an
+`ADBTransferError` as well, which a cancelled connect, shell, push or pull raised
+before 6.5.0.
+
+### Output on a non-English Windows
+
+adb's own messages, and Windows' around them, come in the OEM code page on a
+German Windows (cp850). TurboADB reads each line as UTF-8 when it is valid UTF-8,
+else in the OEM code page: "Zeitüberschreitung" arrives as it was written, and
+reading never fails. `stdout` and `stderr` are always text, never None (or bytes,
+with `binary=True`).
+
+### Device problems
+
+`ADBHandler.device_problem(text)` says what adb's text reports, as one kind;
+every `ADBError`, a failed `CommandResult` and a failed `OperationResult` have it
+as `.device_problem`:
+
+| Kind | adb said |
+|---|---|
+| `"no-device"` | no devices/emulators found |
+| `"not-found"` | the serial asked for is not listed |
+| `"unauthorized"` | the device waits for "Allow USB debugging" (also while authorizing) |
+| `"offline"` | listed, but not answering |
+| `"more-than-one"` | several devices and no serial given |
+| `"no-permissions"` | this user may not use the USB device (Linux udev rules) |
+| `""` | none of these |
+
+`unauthorized` and `more-than-one` say nothing about whether the device is on:
+treat them as "can't tell", never as "the device is off".
+
+### Waiting for a boot
+
+```python
+dev.reboot()
+booted = dev.wait_for_boot(timeout=180, stable=2, interval=1.0, cancel=stop)
+# {"ok": True, "seconds": 41.2, "state": "device", "boot_completed": True,
+#  "first_seen": 1764151234.5, "timed_out": False, "cancelled": False}
+```
+
+It is done when the device is listed as `device` and `sys.boot_completed` is 1,
+`stable` reads in a row. `first_seen` is when the device was listed again
+(`time.time()`): the boot time is `first_seen` minus the moment of the reboot.
+After `dev.reboot()` a read from the boot before it does not count: the device is
+often still up for a moment after `adb reboot` returns, so TurboADB waits for a
+new kernel boot id. Every look is bounded, so it never hangs. `get_state(cancel=None,
+timeout=5)` reads the state from the device list (`adb devices`), which never waits
+for a device as adb's own `get-state` can.
+
+### UI tree
+
+```python
+xml = dev.ui_dump()                 # uiautomator dump, read back as text
+xml2 = dev.ui_dump(display_id=2)    # one display of an IVI: <displays><display id="2">…
+```
+
+`ui_dump(display_id=None, *, tries=3, timeout=45, cancel=None)` tries again while
+uiautomator says "could not get idle state" (the screen kept changing) or "null
+root node". With `display_id`, every window is dumped (`--windows`) and only that
+display's part returned.
 
 ## Embedding in your own program
 

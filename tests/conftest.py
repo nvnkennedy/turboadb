@@ -100,6 +100,27 @@ class FakeAdb:
             err = err.decode() if isinstance(err, bytes) else err
         return FakeCompleted(argv, rc, out, err)
 
+    def adbproc_run(self, cmd, *, timeout=None, cancel=None, input=None, **kw):
+        """turboadb.adbproc.run (every adb client goes through it): the answer
+        of subprocess.run, which the fixture makes this fake's (a test may
+        replace it again: one that raises), as the result of a client run to
+        its end.  A TimeoutExpired it raises is a client ended at its time
+        limit; an OSError goes on (adb could not be started)."""
+        import subprocess
+
+        from turboadb import adbproc
+
+        try:
+            done = subprocess.run(cmd, timeout=timeout, input=input, **kw)
+        except subprocess.TimeoutExpired as exc:
+            return adbproc.Finished(adbproc.TIMEOUT_EXIT_CODE, exc.stdout or b"",
+                                    exc.stderr or b"", "timeout")
+
+        def raw(data):
+            return data.encode() if isinstance(data, str) else (data or b"")
+
+        return adbproc.Finished(done.returncode, raw(done.stdout), raw(done.stderr), "")
+
     def _as_the_device_shell(self, command, rc, out, err):
         from turboadb.remotefs import DONE_MARK
 
@@ -131,9 +152,14 @@ def fake_adb(monkeypatch, tmp_path):
     monkeypatch.setenv("TURBOADB_ADB", str(dummy))
     monkeypatch.setenv("TURBOADB_AUTO_FETCH", "0")  # never touch the network
 
+    from turboadb import adbproc
+
     fake = FakeAdb()
     monkeypatch.setattr(core.subprocess, "run", fake.run)
     monkeypatch.setattr(tools.subprocess, "run", fake.run)
+    # every adb client goes through turboadb.adbproc (6.5.0); its run_compat,
+    # run_text and call answer from a replaced subprocess.run / call by themselves
+    monkeypatch.setattr(adbproc, "run", fake.adbproc_run)
     return fake
 
 

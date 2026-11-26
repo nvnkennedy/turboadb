@@ -486,9 +486,12 @@ def test_brightness_modes(run):
 
 # --- system and forwarding -------------------------------------------------- #
 def test_reboot_wait_and_verity_reboot(run):
-    dev = FakeDev()
+    # (6.5.0: wait_for_boot's result is a dict)
+    dev = FakeDev(wait_for_boot={"ok": True, "state": "device", "seconds": 41.0})
     assert run(["reboot", "--wait"], dev)[0] == 0
     assert dev.called("wait_for_boot") == [((180,), {})]
+    late = FakeDev(wait_for_boot={"ok": False, "state": "unknown", "seconds": 180.0})
+    assert run(["reboot", "--wait"], late)[0] != 0  # a boot that did not come is an error
     dev = FakeDev()
     assert run(["disable-verity", "--reboot"], dev)[0] == 0
     assert dev.called("shell") == [(("sync",), {})] and dev.called("reboot")

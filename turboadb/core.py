@@ -30,23 +30,28 @@ import dataclasses
 import subprocess
 from typing import Callable, NamedTuple, Optional, Sequence, Union
 
+from . import adbproc
 from .config import ADBConfig, ScrcpyOptions, adb_server_args, format_host_port, validate_port
-from .devices import is_mdns_serial, is_network_serial, list_devices
+from .devices import _parse_line, is_mdns_serial, is_network_serial, list_devices
 from . import touch
 from .proctree import stop_process
 from .results import (
-    CommandResult, TransferResult, StreamResult, OperationResult, human_bytes, strip_ansi,
+    TIMEOUT_EXIT_CODE, CommandResult, TransferResult, StreamResult, OperationResult,
+    human_bytes, strip_ansi,
 )
 from .tools import DEFAULT_ADB_SERVER_PORT, NO_WINDOW, find_adb, is_adb_server_alive
 from .exceptions import (
+    ADBCancelledError,
     ADBCommandError,
     ADBConnectionError,
+    ADBDeviceTimeoutError,
     ADBError,
     ADBInstallError,
     ADBNotConnectedError,
     ADBTimeoutError,
     ADBTransferError,
     ADBNotFoundError,
+    device_problem as _device_problem,
 )
 
 
@@ -84,10 +89,6 @@ def _unique_token() -> str:
     ``time.monotonic_ns()`` alone is not enough: on Windows it ticks only every
     ~15 ms, so two quick calls from one thread produced the same name."""
     return f"{os.getpid()}_{threading.get_ident()}_{next(_TOKEN_COUNTER)}_{time.time_ns()}"
-
-
-class _Cancelled(Exception):
-    """A cancellable adb command was called off (see ADBHandler._run_cancellable)."""
 
 
 _ROW_SPLIT_RE = re.compile(r"(?m)^Row: \d+ ")
@@ -605,6 +606,7 @@ class ADBHandler:
         self._screencap_ids: dict = {}  # logical display id -> physical id
         self._su_forms: dict = {}  # serial -> how its su runs a command (see _su_form)
         self._cut_saves: dict = {}  # device file -> the copy kept after a save cut it short
+        self._booted_before: dict = {}  # serial -> the boot id a reboot() ended (wait_for_boot)
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -712,13 +714,19 @@ class ADBHandler:
         cancel=None,
         log_as: Optional[str] = None,
     ) -> CommandResult:
-        """Run one adb command to completion. *cancel* (a ``threading.Event``,
-        used by the connect path) lets another thread end it early: see
-        :meth:`_run_cancellable`. *log_as* names the command in the result
-        and in errors instead of its arguments (see :meth:`_logged_run`).
+        """Run one adb command to completion, its adb client in TurboADB's
+        kill-on-close job (see :mod:`turboadb.adbproc`).  *cancel* (a
+        ``threading.Event``, or a callable returning a bool) lets another
+        thread end it early; it is looked at every ``adbproc.POLL_S``.
+        *log_as* names the command in the result and in errors instead of its
+        arguments (see :meth:`_logged_run`).  Its output is read as UTF-8, a
+        line that is not valid UTF-8 in the OEM code page (see
+        :func:`turboadb.adbproc.decode`).
 
-        A command that runs out of time raises ADBTimeoutError whose
-        ``result`` holds what it printed until then (exit code -1)."""
+        A command that runs out of time raises ADBTimeoutError, one that is
+        cancelled ADBCancelledError: their ``result`` holds what it printed
+        until then, with exit code 124 and ``timed_out`` / ``cancelled`` set.
+        Only the adb client is ended, never an adb server it started."""
         cmd = self._base(target=target) + list(args)
         command = " ".join(args) if log_as is None else log_as
         eff_timeout = timeout if timeout is not None else self.config.command_timeout
@@ -726,97 +734,59 @@ class ADBHandler:
         # get the end time, so both stay on the wall clock.  Deadlines that
         # drive control flow use time.monotonic() instead (see iter_lines).
         start = time.time()
-        enc = "utf-8" if binary else self.config.encoding
+        enc = self.config.encoding
 
-        def result(exit_code, stdout, stderr) -> CommandResult:
+        def result(exit_code, stdout, stderr, **ended) -> CommandResult:
             return CommandResult(
                 command,
                 exit_code,
-                (stdout or b"") if binary else (stdout or b"").decode(enc, "replace"),
-                (stderr or b"").decode(enc, "replace"),
+                (stdout or b"") if binary else adbproc.decode(stdout, enc),
+                adbproc.decode(stderr, enc),
                 time.time() - start,
                 device=self._serial or "",
                 started_at=start,
+                **ended,
             )
 
         try:
-            if cancel is not None:
-                out = self._run_cancellable(cmd, eff_timeout, cancel)
-            else:
-                out = subprocess.run(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    timeout=eff_timeout,
-                    creationflags=NO_WINDOW,
-                )
-        except subprocess.TimeoutExpired as exc:
-            # A hidden command line stays hidden: the TimeoutExpired it would
-            # be chained to spells it out.
-            raise ADBTimeoutError(
-                f"adb command timed out after {eff_timeout}s: {command!r}",
-                result=result(-1, exc.stdout, exc.stderr),
-            ) from (exc if log_as is None else None)
-        except _Cancelled:
-            raise ADBConnectionError(f"adb {command} was cancelled") from None
+            done = adbproc.run(cmd, timeout=eff_timeout, cancel=cancel)
         except OSError as exc:
             # not only a missing adb: one that antivirus quarantined or locked,
             # or a file that is not a program, must still be an ADBError
             raise ADBError(f"adb executable not runnable: {exc}") from exc
-        res = result(out.returncode, out.stdout, out.stderr)
+        if done.ended == "timeout":
+            raise ADBTimeoutError(
+                f"adb command timed out after {eff_timeout}s: {command!r}",
+                result=result(done.returncode, done.stdout, done.stderr, timed_out=True),
+            )
+        if done.ended == "cancelled":
+            raise ADBCancelledError(
+                f"adb {command} was cancelled",
+                result=result(done.returncode, done.stdout, done.stderr, cancelled=True),
+            )
+        res = result(done.returncode, done.stdout, done.stderr)
         if check and not res.ok:
             raise ADBCommandError(command, res)
         return res
 
-    # How often a cancellable command looks at its cancel event.
-    _CANCEL_POLL_S = 0.1
-
-    def _run_cancellable(self, cmd, timeout, cancel) -> subprocess.CompletedProcess:
-        """``subprocess.run(cmd, capture_output=True, timeout=timeout)`` that
-        another thread can call off by setting *cancel*: the adb child is then
-        killed at once, instead of waiting out the rest of its timeout (a
-        ``wait-for-device`` for a tab that was closed ran on for up to 20 s)."""
-        if cancel.is_set():
-            raise _Cancelled()
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=NO_WINDOW,
-        )
-        deadline = None if timeout is None else time.monotonic() + timeout
-        try:
-            while True:
-                try:
-                    out, err = proc.communicate(timeout=self._CANCEL_POLL_S)
-                except subprocess.TimeoutExpired:
-                    if cancel.is_set():
-                        raise _Cancelled() from None
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise subprocess.TimeoutExpired(cmd, timeout) from None
-                    continue
-                return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
-        except BaseException as exc:
-            proc.kill()
-            try:
-                out, err = proc.communicate(timeout=5.0)  # reap it and close its pipes
-            except Exception:
-                out = err = None
-            if isinstance(exc, subprocess.TimeoutExpired):
-                exc.stdout, exc.stderr = out, err  # what it printed in time
-            raise
-
     @staticmethod
     def _spawn(cmd, **kwargs) -> subprocess.Popen:
         """``subprocess.Popen(cmd, …)`` for an adb child that is read while it
-        runs: a transfer, a stream, an interactive shell, a recorder. An adb
-        that can't be started is an ADBError here too, as for a one-shot
-        command (see :meth:`_exec`)."""
+        runs: a transfer, a stream, an interactive shell, a recorder.  It runs
+        in TurboADB's kill-on-close job, as every adb client does (see
+        :mod:`turboadb.adbproc`).  An adb that can't be started is an ADBError
+        here too, as for a one-shot command (see :meth:`_exec`)."""
         try:
-            return subprocess.Popen(cmd, **kwargs)
+            return adbproc.popen(cmd, **kwargs)
         except OSError as exc:
             raise ADBError(f"adb executable not runnable: {exc}") from exc
+
+    #: The kind of device problem adb's text reports (``"no-device"``,
+    #: ``"not-found"``, ``"unauthorized"``, ``"offline"``, ``"more-than-one"``,
+    #: ``"no-permissions"`` or ``""``): see
+    #: :func:`turboadb.exceptions.device_problem`.  Every ADBError has it as
+    #: ``error.device_problem`` too.
+    device_problem = staticmethod(_device_problem)
 
     def _run(
         self, args, *, timeout=None, check=False, binary=False, cancel=None, log_as=None
@@ -955,11 +925,15 @@ class ADBHandler:
         out = cls._ECHO_LINE_RE.sub("", cls._combined_output(res)).lower()
         return any(marker in out for marker in cls._FAILURE_MARKERS + tuple(extra))
 
-    def adb(self, *args, timeout=None, check=False, safe: Optional[bool] = None):
+    def adb(self, *args, timeout=None, check=False, cancel=None, safe: Optional[bool] = None):
         """Escape hatch: run an arbitrary ``adb -s SERIAL`` command and get a
-        CommandResult. e.g. ``dev.adb("shell", "wm", "size")``."""
+        CommandResult. e.g. ``dev.adb("shell", "wm", "size")``.  *cancel* (a
+        ``threading.Event`` or a callable returning a bool) ends it at once
+        (ADBCancelledError); a *timeout* ends it too (ADBTimeoutError)."""
         return self._guard(
-            "adb", lambda: self._run(list(args), timeout=timeout, check=check), safe=safe
+            "adb",
+            lambda: self._run(list(args), timeout=timeout, check=check, cancel=cancel),
+            safe=safe,
         )
 
     # ------------------------------------------------------------------ #
@@ -1122,15 +1096,18 @@ class ADBHandler:
 
         get-state is polled, so a device that never answers the prompt is
         reported in the state it was left in. Raises ADBConnectionError when
-        it has not accepted in time, or when *cancel* is set."""
+        it has not accepted in time, ADBCancelledError when *cancel* says so."""
         deadline = time.monotonic() + max(0.0, timeout)
+        stop = adbproc.cancel_check(cancel)
         while True:
-            if cancel is not None and cancel.is_set():
-                raise ADBConnectionError(f"adb connect {target} was cancelled")
+            if stop is not None and stop():
+                raise ADBCancelledError(f"adb connect {target} was cancelled")
             try:
                 state = self._parse_state(
-                    self._run_global(["-s", target, "get-state"], timeout=10)
+                    self._run_global(["-s", target, "get-state"], timeout=10, cancel=cancel)
                 )
+            except ADBCancelledError:
+                raise
             except ADBError:
                 state = "unknown"
             if state == "device":
@@ -1138,10 +1115,7 @@ class ADBHandler:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
-            if cancel is not None:
-                cancel.wait(min(self._AUTH_POLL_S, left))
-            else:
-                time.sleep(min(self._AUTH_POLL_S, left))
+            self._pause(min(self._AUTH_POLL_S, left), stop)
         raise ADBConnectionError(
             f"Device {target} is '{state}': it did not authorise this PC within "
             f"{timeout:g}s. Accept the 'Allow USB debugging?' prompt on the device's "
@@ -1173,9 +1147,21 @@ class ADBHandler:
         try:
             return self._run(args, timeout=timeout, check=False, cancel=cancel)
         except ADBTimeoutError as exc:
-            raise ADBConnectionError(
-                f"Timed out after {timeout}s waiting for {self._serial or 'a device'}."
-            ) from exc
+            raise ADBDeviceTimeoutError(
+                f"Timed out after {timeout}s waiting for {self._serial or 'a device'}.",
+                result=exc.result,
+            ) from None
+
+    @staticmethod
+    def _pause(seconds: float, stop=None) -> None:
+        """Sleep *seconds*, looking at *stop* (see :func:`adbproc.cancel_check`)
+        every ``adbproc.POLL_S``: it raises nothing, the caller looks again."""
+        end = time.monotonic() + max(0.0, seconds)
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or (stop is not None and stop()):
+                return
+            time.sleep(min(adbproc.POLL_S, left))
 
     # adb's own wording when the target isn't attached to the server at all —
     # a different problem from "it is there but not ready yet".
@@ -1183,15 +1169,19 @@ class ADBHandler:
         r"not found|not connected|no devices?(?:/emulators?)? found", re.I
     )
 
-    def wait_for_device(self, timeout: Optional[float] = None, *, safe: Optional[bool] = None):
+    def wait_for_device(self, timeout: Optional[float] = None, *, cancel=None,
+                        safe: Optional[bool] = None):
         """Block until the device is online (``adb wait-for-device``).
 
         Raises ADBNotConnectedError when adb reports the target as not
         connected (a stale serial, or a network device that was never
-        ``connect``ed), and ADBConnectionError for any other failure."""
+        ``connect``ed), ADBDeviceTimeoutError (an ADBTimeoutError, and an
+        ADBConnectionError as before) when *timeout* runs out,
+        ADBCancelledError when *cancel* ends it, and ADBConnectionError for
+        any other failure."""
 
         def _do():
-            res = self._wait_for_device(timeout or self.config.connect_timeout)
+            res = self._wait_for_device(timeout or self.config.connect_timeout, cancel=cancel)
             if not res.ok:
                 detail = self._combined_output(res) or f"exit {res.exit_code}"
                 target = self._serial or "a device"
@@ -1261,16 +1251,35 @@ class ADBHandler:
         except Exception:
             return False
 
-    def get_state(self) -> str:
-        """``device`` | ``offline`` | ``unauthorized`` | ``bootloader`` | … | ``unknown``.
+    def get_state(self, cancel=None, timeout: float = 5) -> str:
+        """``device`` | ``offline`` | ``unauthorized`` | ``authorizing`` |
+        ``no permissions`` | ``recovery`` | ``sideload`` | … | ``unknown``
+        (not listed, several devices and no serial, or adb did not answer).
 
-        adb reports problem states as an error on stderr with a non-zero exit
-        (``error: device unauthorized.``), so both streams are examined."""
+        Read from the adb server's device list (``adb devices -l``), which
+        never waits for a device: ``adb get-state`` could hang on one that was
+        going away.  *timeout* (seconds) bounds it: the adb client is ended
+        then, and the state is ``unknown``.  *cancel* (a ``threading.Event``
+        or a callable returning a bool) ends it at once (ADBCancelledError)."""
+        return self._listed_state(cancel=cancel, timeout=timeout) or "unknown"
+
+    def _listed_state(self, *, cancel=None, timeout: float = 5.0) -> Optional[str]:
+        """This target's state in the adb server's device list, or None when
+        it is not listed (or adb did not answer in *timeout* seconds).  Without
+        a serial: the one device's, None for none or several."""
         try:
-            res = self._run(["get-state"], timeout=10, check=False)
+            res = self._run_global(["devices", "-l"], timeout=timeout, cancel=cancel)
+        except ADBCancelledError:
+            raise
         except ADBError:
-            return "unknown"
-        return self._parse_state(res)
+            return None
+        if not res.ok:
+            return None
+        rows = [d for d in (_parse_line(line) for line in res.text.splitlines()) if d is not None]
+        if self._serial:
+            found = next((d for d in rows if d.serial == self._serial), None)
+            return found.state if found is not None else None
+        return rows[0].state if len(rows) == 1 else None
 
     @classmethod
     def _parse_state(cls, res) -> str:
@@ -1518,20 +1527,18 @@ class ADBHandler:
 
         def _do():
             try:
-                proc = subprocess.run(
+                done = adbproc.run(
                     self._base(target=False) + ["pair", format_host_port(host, port)],
                     input=(code + "\n").encode(),
-                    capture_output=True,
                     timeout=30,
-                    creationflags=NO_WINDOW,
                 )
-            except subprocess.TimeoutExpired as exc:
-                raise ADBTimeoutError(
-                    f"adb pair {format_host_port(host, port)} timed out after 30s"
-                ) from exc
             except OSError as exc:
                 raise ADBError(f"adb executable not runnable: {exc}") from exc
-            out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+            if done.ended:
+                raise ADBTimeoutError(
+                    f"adb pair {format_host_port(host, port)} timed out after 30s"
+                )
+            out = adbproc.decode(done.stdout + done.stderr)
             if "Successfully paired" not in out:
                 raise ADBConnectionError(f"Pairing failed: {out.strip()}")
             self._emit(logging.INFO, f"Paired with {format_host_port(host, port)}.")
@@ -1542,17 +1549,52 @@ class ADBHandler:
     # ------------------------------------------------------------------ #
     # Reboot / root / device state
     # ------------------------------------------------------------------ #
-    def reboot(self, mode: Optional[str] = None, *, safe: Optional[bool] = None):
+    def reboot(self, mode: Optional[str] = None, *, cancel=None, safe: Optional[bool] = None):
         """Reboot the device. *mode*: None (normal), ``recovery``, ``bootloader``,
-        ``fastboot`` (userspace fastbootd) or ``sideload``."""
-        args = ["reboot"] + ([mode] if mode else [])
-        return self._guard("reboot", lambda: self._run(args, timeout=30, check=False).ok, safe=safe)
+        ``fastboot`` (userspace fastbootd) or ``sideload``.  *cancel* ends the
+        ``adb reboot`` client at once (ADBCancelledError).
 
-    def _checked_adb(self, args, markers, *, timeout=30, shell=False):
+        A normal reboot first notes the device's kernel boot id, so that
+        :meth:`wait_for_boot` waits for the boot after it (the device is often
+        still up for a moment after ``adb reboot`` returns)."""
+        args = ["reboot"] + ([mode] if mode else [])
+
+        def _do():
+            key = self._serial or ""
+            if not mode:
+                boot = self._boot_reading(cancel=cancel, timeout=5.0)[1]
+                if boot:
+                    self._booted_before[key] = boot
+            return self._run(args, timeout=30, check=False, cancel=cancel).ok
+
+        return self._guard("reboot", _do, safe=safe)
+
+    # sys.boot_completed and the kernel's boot id in one shell call (see
+    # _boot_reading): the id changes with every boot
+    _BOOT_READ = "getprop sys.boot_completed; cat /proc/sys/kernel/random/boot_id 2>/dev/null"
+
+    def _boot_reading(self, *, cancel=None, timeout: float = 10.0):
+        """``(sys.boot_completed is 1, boot id or "")`` read from the device;
+        ``(False, "")`` when it could not be read.  Raises ADBCancelledError."""
+        try:
+            res = self._run(["shell", self._BOOT_READ], timeout=timeout, check=False, cancel=cancel)
+        except ADBCancelledError:
+            raise
+        except ADBError:
+            return False, ""
+        if not res.ok:
+            return False, ""
+        words = res.text.split()
+        completed = bool(words) and words[0] == "1"
+        boot = next((w for w in words[1:] if re.fullmatch(r"[0-9a-f-]{16,}", w)), "")
+        return completed, boot
+
+    def _checked_adb(self, args, markers, *, timeout=30, shell=False, cancel=None):
         """Run *args*; raise ADBCommandError on a non-zero exit or when the
         output contains one of *markers* (these commands often exit 0 while
         refusing). Returns the combined output, or "ok" when there was none."""
-        res = self._run(self._shell_args(*args) if shell else list(args), timeout=timeout)
+        res = self._run(self._shell_args(*args) if shell else list(args), timeout=timeout,
+                        cancel=cancel)
         text = self._combined_output(res)
         low = text.lower()
         refused = any(m in low for m in markers)
@@ -1560,22 +1602,25 @@ class ADBHandler:
             raise self._command_error(" ".join(("shell",) + tuple(args)) if shell else " ".join(args), res)
         return text or "ok"
 
-    def _adbd_restart(self, verb: str, already: str):
-        text = self._checked_adb([verb], ("cannot run as root", "error"))
+    def _adbd_restart(self, verb: str, already: str, cancel=None):
+        text = self._checked_adb([verb], ("cannot run as root", "error"), cancel=cancel)
         if already not in text.lower():
-            self._wait_for_adbd(root=verb == "root")
+            self._wait_for_adbd(root=verb == "root", cancel=cancel)
         return text
 
-    def _wait_for_adbd(self, *, root: bool, timeout: float = 20.0) -> None:
+    def _wait_for_adbd(self, *, root: bool, timeout: float = 20.0, cancel=None) -> None:
         """Wait until adbd has really restarted as root (or not).
 
         ``adb root`` returns while the old adbd is still up, and ``wait-for-device``
         is satisfied by that one: the next command then met it going away and
         failed ("error: closed"), now and then.  So adbd is asked who it is."""
         deadline = time.monotonic() + timeout
+        stop = adbproc.cancel_check(cancel)
         while True:
             try:
-                res = self._run(self._shell_args("id", "-u"), timeout=5, check=False)
+                res = self._run(self._shell_args("id", "-u"), timeout=5, check=False, cancel=cancel)
+            except ADBCancelledError:
+                raise
             except ADBError:
                 res = None
             if res is not None and res.ok:
@@ -1584,19 +1629,24 @@ class ADBHandler:
                     return
             if time.monotonic() >= deadline:
                 return
-            time.sleep(0.3)
+            self._pause(0.3, stop)
+            if stop is not None and stop():
+                raise ADBCancelledError(f"adb {'root' if root else 'unroot'} was cancelled")
 
-    def root(self, *, safe: Optional[bool] = None):
+    def root(self, *, cancel=None, safe: Optional[bool] = None):
         """Restart adbd as root (``adb root``). Raises ADBCommandError on
-        production/secure builds ("adbd cannot run as root")."""
+        production/secure builds ("adbd cannot run as root").  *cancel* ends
+        it, and the wait for the new adbd, at once (ADBCancelledError)."""
         return self._guard(
-            "root", lambda: self._adbd_restart("root", "already running as root"), safe=safe
+            "root", lambda: self._adbd_restart("root", "already running as root", cancel),
+            safe=safe,
         )
 
-    def unroot(self, *, safe: Optional[bool] = None):
-        """Restart adbd without root (``adb unroot``)."""
+    def unroot(self, *, cancel=None, safe: Optional[bool] = None):
+        """Restart adbd without root (``adb unroot``); *cancel* as for :meth:`root`."""
         return self._guard(
-            "unroot", lambda: self._adbd_restart("unroot", "not running as root"), safe=safe
+            "unroot", lambda: self._adbd_restart("unroot", "not running as root", cancel),
+            safe=safe,
         )
 
     _REMOUNT_REFUSALS = ("remount failed", "not running as root", "permission denied", "error:")
@@ -1604,9 +1654,10 @@ class ADBHandler:
         "Reboot the device and run adb remount again: /system stays read-only until then."
     )
 
-    def remount(self, *, safe: Optional[bool] = None):
+    def remount(self, *, cancel=None, safe: Optional[bool] = None):
         """Remount /system (and friends) read-write (needs root). Returns adb's
-        output; raises ADBCommandError when the remount is refused.
+        output; raises ADBCommandError when the remount is refused, and
+        ADBCancelledError when *cancel* ends it.
 
         On Android 10+ the first remount may only set up overlayfs (or turn
         verity off) and ask for a reboot: the partitions stay read-only until
@@ -1617,12 +1668,12 @@ class ADBHandler:
 
         def _do():
             try:
-                text, reboot_needed = self._remount_once()
+                text, reboot_needed = self._remount_once(cancel=cancel)
             except ADBCommandError as exc:
                 if "not running as root" not in str(exc).lower():
                     raise
-                self._adbd_restart("root", "already running as root")
-                text, reboot_needed = self._remount_once()
+                self._adbd_restart("root", "already running as root", cancel)
+                text, reboot_needed = self._remount_once(cancel=cancel)
             if reboot_needed:
                 self._emit(logging.WARNING, f"adb remount: {self._REMOUNT_REBOOT_NOTE}")
                 text = f"{text}\n{self._REMOUNT_REBOOT_NOTE}"
@@ -1682,16 +1733,19 @@ class ADBHandler:
         "connection reset", "device not found",
     )
 
-    def _remount_once(self, tries: int = 3):
+    def _remount_once(self, tries: int = 3, cancel=None):
         """``adb remount`` -> ``(output, reboot_needed)``; raises when refused."""
+        stop = adbproc.cancel_check(cancel)
         for attempt in range(tries):
-            res = self._run(["remount"], timeout=60, check=False)
+            res = self._run(["remount"], timeout=60, check=False, cancel=cancel)
             text = self._combined_output(res)
             low = text.lower()
             if res.ok or not any(marker in low for marker in self._ADBD_RESTARTING):
                 break
             if attempt + 1 < tries:
-                time.sleep(1.5)
+                self._pause(1.5, stop)
+                if stop is not None and stop():
+                    raise ADBCancelledError("adb remount was cancelled")
         succeeded = "remount succeeded" in low
         reboot_needed = not succeeded and bool(self._REBOOT_REQUEST_RE.search(text))
         refused = not res.ok or any(marker in low for marker in self._REMOUNT_REFUSALS)
@@ -1746,7 +1800,12 @@ class ADBHandler:
                 if not self.reboot(safe=False):
                     raise ADBError(f"reboot after {reason} was refused")
                 note("waiting for the device to boot")
-                self.wait_for_boot(boot_timeout, safe=False)
+                booted = self.wait_for_boot(boot_timeout, safe=False)
+                if not booted["ok"]:
+                    raise ADBTimeoutError(
+                        f"{self._serial or 'the device'} did not finish booting within "
+                        f"{boot_timeout:g} s (it is {booted['state']})"
+                    )
                 steps.append(("reboot", f"rebooted after {reason}"))
                 state["rebooted"] = True
                 if root:
@@ -3169,12 +3228,14 @@ class ADBHandler:
 
     _BUGREPORT_COPIED_RE = re.compile(r"(?m)^Bug report copied to (.+?)\s*$")
 
-    def bugreport(self, local_path: str, *, timeout: float = 900, safe: Optional[bool] = None):
+    def bugreport(self, local_path: str, *, timeout: float = 900, cancel=None,
+                  safe: Optional[bool] = None):
         """Capture a full ``adb bugreport`` to *local_path* (a .zip on modern
         devices) and return the file it was saved as: *local_path* with
         ``.zip`` added when it lacks it, as adb names it, or the file adb
         names itself when *local_path* is an existing folder. Slow — a couple
-        of minutes is normal; *timeout* is generous."""
+        of minutes is normal; *timeout* is generous.  *cancel* ends it at once
+        (ADBCancelledError)."""
 
         def _do():
             lp = os.path.expanduser(local_path)
@@ -3184,7 +3245,7 @@ class ADBHandler:
             if not os.path.isdir(lp) and not lp.lower().endswith(".zip"):
                 lp += ".zip"  # adb's own rule, so the file checked is the one it writes
             self._emit(logging.INFO, f"Capturing bugreport → {lp} (takes a few minutes)…")
-            res = self._run(["bugreport", lp], timeout=timeout, check=False)
+            res = self._run(["bugreport", lp], timeout=timeout, check=False, cancel=cancel)
             copied = self._BUGREPORT_COPIED_RE.search(res.text)
             if copied and os.path.isfile(copied.group(1)):
                 lp = copied.group(1)  # in a folder: under the name the device gave it
@@ -3832,9 +3893,11 @@ class ADBHandler:
         of userdebug and eng builds), or as it is when adbd already runs as
         root (``adb root``).
 
-        *cancel* (a ``threading.Event``) lets another thread call the command
-        off: adb is killed at once instead of running until it ends or times
-        out, and the call fails with ADBConnectionError.
+        *cancel* (a ``threading.Event``, or a callable returning a bool) lets
+        another thread call the command off: adb is killed at once instead of
+        running until it ends or times out, and the call fails with
+        ADBCancelledError (an ADBConnectionError too, as before 6.5.0).  A
+        *timeout* ends it with ADBTimeoutError.
         """
 
         def _do():
@@ -3999,8 +4062,8 @@ class ADBHandler:
         cmd = self._base(target=True) + list(args)
         self._emit(logging.DEBUG, f"$ adb {' '.join(args)}")
         try:
-            # call() kills and reaps the child on any exception, Ctrl+C included
-            return subprocess.call(cmd, timeout=timeout)
+            # in the kill-on-close job, as every client; killed on any exception
+            return adbproc.call(cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise ADBTimeoutError(
                 f"adb command timed out after {timeout:g}s: {' '.join(args)!r}"
@@ -4009,34 +4072,148 @@ class ADBHandler:
             # not only a missing adb (see _exec): a locked or quarantined one too
             raise ADBError(f"adb executable not runnable: {exc}") from exc
 
-    def wait_for_boot(self, timeout: float = 180, *, safe: Optional[bool] = None):
-        """After a reboot: wait until adb sees the device again and Android
-        reports ``sys.boot_completed=1``. Raises ADBTimeoutError after
-        *timeout* seconds."""
+    def wait_for_boot(self, timeout: float = 180, *, stable: int = 2, interval: float = 1.0,
+                      cancel=None, safe: Optional[bool] = None):
+        """Wait until the device has booted: listed as ``device`` and
+        ``sys.boot_completed`` 1, *stable* reads in a row, *interval* seconds
+        apart.  Returns a dict:
+
+        * ``ok``: it booted within *timeout* seconds
+        * ``seconds``: how long the wait took
+        * ``state``: the device's state at the last look (``"unknown"`` while
+          it is not listed)
+        * ``boot_completed``: what the last read of ``sys.boot_completed`` said
+        * ``first_seen``: when the device was first listed (``time.time()``),
+          or None; after a :meth:`reboot` of this handler, when it was listed
+          again: the boot time is ``first_seen`` minus the reboot's time
+        * ``timed_out`` / ``cancelled``: *timeout* ran out, or *cancel* (a
+          ``threading.Event`` or a callable returning a bool, looked at every
+          0.1 s) ended the wait
+
+        It never hangs: each look is bounded (the device list 5 s, the boot
+        read 10 s) and ends at *cancel* too.  After a :meth:`reboot` of this
+        handler, a read from the boot before it does not count (the device is
+        often still up for a moment after ``adb reboot`` returns): it must
+        report a new kernel boot id.  ``unauthorized`` is waited through as
+        any state but ``device``: it says nothing about whether it booted."""
 
         def _do():
-            limit = float(timeout)
-            deadline = time.monotonic() + limit
-            try:  # the device is often still online for a moment after `reboot`
-                self._run(["wait-for-disconnect"], timeout=min(60.0, limit), check=False)
-            except ADBError:
-                pass
+            stop = adbproc.cancel_check(cancel)
+            need = max(1, int(stable))
+            key = self._serial or ""
+            before = self._booted_before.get(key)  # the boot a reboot() ended
+            started = time.monotonic()
+            deadline = started + max(0.0, float(timeout))
+            gone = before is None  # (after a reboot it must first go away)
+            first_seen = None
+            state, completed, streak, outcome = "unknown", False, 0, "timeout"
             while True:
+                if stop is not None and stop():
+                    outcome = "cancelled"
+                    break
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    raise ADBTimeoutError(
-                        f"{self._serial or 'the device'} did not finish booting within {limit:g} s"
-                    )
+                    break
                 try:
-                    self._run(["wait-for-device"], timeout=max(1.0, left), check=False)
-                    res = self._run(["shell", "getprop", "sys.boot_completed"], timeout=10, check=False)
-                    if res.ok and res.text.strip() == "1":
-                        return True
-                except ADBError:
-                    pass
-                time.sleep(2.0)
+                    listed = self._listed_state(cancel=cancel, timeout=min(5.0, max(0.5, left)))
+                    state = listed or "unknown"
+                    if listed is None:
+                        gone, streak = True, 0
+                    else:
+                        if gone and first_seen is None:
+                            first_seen = time.time()
+                        if listed == "device":
+                            completed, boot = self._boot_reading(
+                                cancel=cancel, timeout=min(10.0, max(0.5, deadline - time.monotonic()))
+                            )
+                            if before is not None and boot:
+                                if boot == before:
+                                    completed = False  # still the boot before the reboot
+                                elif first_seen is None:
+                                    first_seen = time.time()  # back between two looks
+                            streak = streak + 1 if completed else 0
+                        else:
+                            streak = 0
+                except ADBCancelledError:
+                    outcome = "cancelled"
+                    break
+                if streak >= need:
+                    outcome = "ok"
+                    break
+                self._pause(min(float(interval), max(0.0, deadline - time.monotonic())), stop)
+            if outcome == "ok":
+                self._booted_before.pop(key, None)
+            return {
+                "ok": outcome == "ok",
+                "seconds": round(time.monotonic() - started, 3),
+                "state": state,
+                "boot_completed": bool(completed),
+                "first_seen": first_seen,
+                "timed_out": outcome == "timeout",
+                "cancelled": outcome == "cancelled",
+            }
 
         return self._guard("wait_for_boot", _do, safe=safe)
+
+    # what uiautomator says when the screen never settled, or it got no window
+    _UI_DUMP_RETRY_RE = re.compile(r"could not get idle state|null root node", re.I)
+
+    def ui_dump(self, display_id: Optional[int] = None, *, tries: int = 3, timeout: float = 45,
+                cancel=None, safe: Optional[bool] = None):
+        """The UI tree as ``uiautomator dump`` writes it: XML text.
+
+        Tried up to *tries* times while uiautomator says ``could not get idle
+        state`` (the screen kept changing) or ``null root node``; *timeout*
+        (seconds) is for all of them, *cancel* ends it at once
+        (ADBCancelledError).  With *display_id* the dump of every window
+        (``--windows``) is taken and only that display's part returned:
+        ``<displays><display id="N">…</display></displays>``.  Raises
+        ADBError when no dump came, or the device has no such display."""
+
+        def _do():
+            remote = f"/data/local/tmp/turboadb-ui-{_unique_token()}.xml"
+            windows = " --windows" if display_id is not None else ""
+            line = (f"uiautomator dump{windows} {remote} 2>&1; cat {remote} 2>/dev/null; "
+                    f"rm -f {remote}")
+            deadline = time.monotonic() + max(1.0, float(timeout))
+            stop = adbproc.cancel_check(cancel)
+            said = ""
+            for attempt in range(max(1, int(tries))):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ADBTimeoutError(f"ui_dump: no UI dump within {float(timeout):g} s")
+                res = self._run(["shell", line], timeout=left, check=False, cancel=cancel)
+                text = res.text if isinstance(res.stdout, str) else ""
+                start = text.find("<?xml")
+                if start >= 0:
+                    return self._ui_display(text[start:], display_id)
+                said = self._combined_output(res) or f"exit {res.exit_code}"
+                if not self._UI_DUMP_RETRY_RE.search(said) or attempt + 1 >= tries:
+                    break
+                self._pause(min(1.0, max(0.0, deadline - time.monotonic())), stop)
+                if stop is not None and stop():
+                    raise ADBCancelledError("ui_dump was cancelled")
+            raise ADBError(f"ui_dump: uiautomator gave no UI dump: {said.strip()[:300]}")
+
+        return self._guard("ui_dump", _do, safe=safe)
+
+    @staticmethod
+    def _ui_display(xml: str, display_id: Optional[int]) -> str:
+        """*xml* as it is, or with *display_id* only that display's part of a
+        ``--windows`` dump (raises ADBError for a display it has not got)."""
+        if display_id is None:
+            return xml
+        wanted = int(display_id)
+        if "<displays" not in xml:
+            if wanted == 0:
+                return xml  # an Android without --windows: the default display's
+            raise ADBError(f"ui_dump: this device dumps only display 0, not {wanted}")
+        found = re.search(r'(?s)<display id="%d"[^>]*>.*?</display>' % wanted, xml)
+        if found is None:
+            ids = ", ".join(re.findall(r'<display id="(\d+)"', xml)) or "none"
+            raise ADBError(f"ui_dump: display {wanted} is not in the UI dump (displays: {ids})")
+        head = xml[: xml.find("<displays")]
+        return f"{head}<displays>{found.group(0)}</displays>"
 
     # ------------------------------------------------------------------ #
     # Streaming (logcat -f, live shell loops…)
@@ -4050,18 +4227,22 @@ class ADBHandler:
         encoding: str = "utf-8",
         stderr: str = "merge",
         status: Optional[dict] = None,
+        cancel=None,
     ):
         """Run an adb command and yield its stdout **line by line, live**. Stop
-        by breaking out, setting ``stop_event`` (a threading.Event), or after
+        by breaking out, setting ``stop_event`` (a threading.Event) or
+        *cancel* (an Event or a callable returning a bool), or after
         ``timeout`` seconds. The process is always terminated on exit.
+        Lines are read as UTF-8, one that is not valid UTF-8 in the OEM code
+        page (see :func:`turboadb.adbproc.decode`).
 
         *stderr* ``"merge"`` (the default) yields adb's error text as ordinary
         lines; ``"separate"`` keeps it out of them (it is drained in the
         background, so it can never block adb).  Pass a dict as *status* to
         learn how the command ended once the generator is done: ``returncode``,
-        ``stderr`` (the text, with ``"separate"``) and ``stopped`` — True when
-        *stop_event*, *timeout* or the consumer ended the stream, not the
-        command itself."""
+        ``stderr`` (the text, with ``"separate"``), ``stopped`` — True when
+        *stop_event*, *cancel*, *timeout* or the consumer ended the stream,
+        not the command itself — and ``timed_out`` / ``cancelled``."""
         if stderr not in ("merge", "separate"):
             raise ValueError("stderr must be 'merge' or 'separate'")
         separate = stderr == "separate"
@@ -4081,6 +4262,22 @@ class ADBHandler:
         start = time.monotonic()
         buf = b""
         ended = False  # the command itself finished (EOF and exit)
+        cancelled = adbproc.cancel_check(cancel)
+        why = {}  # "cancelled" / "timed_out": what ended it (first seen)
+
+        def _stop() -> bool:
+            if cancelled is not None and cancelled():
+                why.setdefault("cancelled", True)
+                return True
+            if stop_event is not None and stop_event.is_set():
+                return True
+            if timeout and (time.monotonic() - start) > timeout:
+                why.setdefault("timed_out", True)
+                return True
+            return False
+
+        def _decode(raw: bytes) -> str:
+            return adbproc.decode(raw, encoding).rstrip("\r")
 
         # A watcher thread terminates the process the instant a stop is requested
         # (or the timeout elapses) so a blocking read on a quiet stream — e.g.
@@ -4089,11 +4286,9 @@ class ADBHandler:
 
         def _watch():
             while not watcher_done.is_set():
-                if stop_event is not None and stop_event.is_set():
+                if _stop():
                     break
-                if timeout and (time.monotonic() - start) > timeout:
-                    break
-                watcher_done.wait(0.1)
+                watcher_done.wait(adbproc.POLL_S)
             try:
                 if proc.poll() is None:
                     proc.terminate()
@@ -4104,9 +4299,7 @@ class ADBHandler:
         watcher.start()
         try:
             while True:
-                if stop_event is not None and stop_event.is_set():
-                    break
-                if timeout and (time.monotonic() - start) > timeout:
+                if _stop():
                     break
                 chunk = (
                     proc.stdout.read1(65536)
@@ -4123,19 +4316,15 @@ class ADBHandler:
                 parts = buf.split(b"\n")
                 buf = parts.pop()
                 for ln in parts:
-                    yield ln.decode(encoding, errors="replace").rstrip("\r")
+                    yield _decode(ln)
                 if len(buf) > self._MAX_LINE_BYTES:
-                    yield buf.decode(encoding, errors="replace").rstrip("\r")
+                    yield _decode(buf)
                     buf = b""
             if buf:
-                yield buf.decode(encoding, errors="replace").rstrip("\r")
+                yield _decode(buf)
         finally:
             watcher_done.set()
-            stopped = (
-                not ended
-                or (stop_event is not None and stop_event.is_set())
-                or bool(timeout and (time.monotonic() - start) > timeout)
-            )
+            stopped = not ended or _stop()
             err = b""
             if separate and not stopped:
                 # adb's last words are usually why it ended: let the drain finish
@@ -4151,7 +4340,9 @@ class ADBHandler:
                 status.update(
                     returncode=code,
                     stopped=stopped,
-                    stderr=err.decode(encoding, errors="replace"),
+                    stderr=adbproc.decode(err, encoding),
+                    timed_out=stopped and bool(why.get("timed_out")) and not why.get("cancelled"),
+                    cancelled=stopped and bool(why.get("cancelled")),
                 )
 
     # Longest line iter_lines will assemble before flushing it as-is. A
@@ -4195,6 +4386,7 @@ class ADBHandler:
         stop_event=None,
         encoding: str = "utf-8",
         stderr: str = "merge",
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Consume a streaming adb command with built-in matching + file logging.
@@ -4206,8 +4398,10 @@ class ADBHandler:
         folder created, as for :meth:`screenshot`.
 
         The result says how the command ended: ``exit_code`` is its exit status
-        when it ended by itself (None when *stop_event*, *timeout*,
-        *stop_on_match* or a failing callback ended it), and with
+        when it ended by itself, 124 with ``timed_out`` / ``cancelled`` when
+        *timeout* or *cancel* (an Event or a callable returning a bool) ended
+        it, None when *stop_event*, *stop_on_match* or a failing callback did;
+        and with
         ``stderr="separate"`` (see :meth:`iter_lines`) adb's error text is in
         ``stderr`` — kept out of the lines, so *keep* can never hide it.  A
         command that fails before printing a single line raises
@@ -4223,7 +4417,7 @@ class ADBHandler:
             status = {}
             lines = self.iter_lines(
                 args, timeout=timeout, stop_event=stop_event, encoding=encoding,
-                stderr=stderr, status=status,
+                stderr=stderr, status=status, cancel=cancel,
             )
             try:
                 for line in lines:
@@ -4254,9 +4448,12 @@ class ADBHandler:
                     close()
                 if fh:
                     fh.close()
+            timed_out, was_cancelled = bool(status.get("timed_out")), bool(status.get("cancelled"))
             code = None if status.get("stopped", True) else status.get("returncode")
+            if timed_out or was_cancelled:
+                code = TIMEOUT_EXIT_CODE
             err = status.get("stderr") or ""
-            if code not in (None, 0):
+            if code not in (None, 0) and not (timed_out or was_cancelled):
                 command = " ".join(args)
                 if not received:
                     raise ADBCommandError(command, CommandResult(
@@ -4265,7 +4462,8 @@ class ADBHandler:
                     ))
                 detail = " ".join(err.split())[:240] or "no error text"
                 self._emit(logging.WARNING, f"adb {command} ended with exit {code}: {detail}")
-            return StreamResult(count, matches, path, exit_code=code, stderr=err)
+            return StreamResult(count, matches, path, exit_code=code, stderr=err,
+                                timed_out=timed_out, cancelled=was_cancelled)
 
         return self._guard("stream", _do, safe=safe)
 
@@ -4392,11 +4590,15 @@ class ADBHandler:
         timeout: Optional[float] = None,
         stop_event=None,
         clear_first: bool = False,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """
         Stream ``adb logcat`` LIVE, line by line, cleanly formatted, with regex
-        matching, match callbacks, stop-on-match, and tee-to-file.
+        matching, match callbacks, stop-on-match, and tee-to-file.  *timeout*
+        ends it after that many seconds, *cancel* (an Event or a callable
+        returning a bool) at once: the result then has ``timed_out`` /
+        ``cancelled`` and exit code 124.
 
         :param buffers:    logcat buffers, e.g. ``["main","system","crash"]``.
         :param fmt:        logcat ``-v`` format (default ``threadtime``).
@@ -4471,6 +4673,7 @@ class ADBHandler:
                 timeout=timeout,
                 stop_event=stop_event,
                 stderr="separate",
+                cancel=cancel,
                 safe=False,
             )
 
@@ -4898,6 +5101,7 @@ class ADBHandler:
         on_progress=None,
         timeout: Optional[float] = None,
         cancel_event=None,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Upload a file or directory to the device. Returns TransferResult.
@@ -4905,12 +5109,24 @@ class ADBHandler:
         *on_progress* receives an int percent as the copy goes (never
         backwards; 100 once it is done). *timeout* (default
         ``transfer_timeout``) ends a copy that moves nothing for that many
-        seconds, however long it takes in all; *cancel_event* ends it at once.
+        seconds, however long it takes in all (ADBTimeoutError); *cancel* (a
+        ``threading.Event`` or a callable returning a bool; *cancel_event*,
+        an Event, is the older name) ends it at once (ADBCancelledError).
         After either, files already copied stay on the device."""
         return self._guard(
             "push", self._transfer, "push", local_path, remote_path, on_progress, timeout,
-            cancel_event, safe=safe
+            self._either_cancel(cancel_event, cancel), safe=safe
         )
+
+    @staticmethod
+    def _either_cancel(*cancels):
+        """One cancel for several (None when none is given): any of them."""
+        checks = [adbproc.cancel_check(c) for c in cancels if c is not None]
+        if not checks:
+            return None
+        if len(checks) == 1:
+            return checks[0]
+        return lambda: any(check() for check in checks)
 
     def pull(
         self,
@@ -4920,17 +5136,18 @@ class ADBHandler:
         on_progress=None,
         timeout: Optional[float] = None,
         cancel_event=None,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Download a file or directory from the device. Returns TransferResult.
 
-        *on_progress*, *timeout* and *cancel_event* work as for :meth:`push`.
+        *on_progress*, *timeout* and *cancel* work as for :meth:`push`.
         A pull of one file that is ended early removes the unfinished file it
         created (one it overwrote, or a folder, is left and the error says
         so), so a cut-off copy is never mistaken for the real thing."""
         return self._guard(
             "pull", self._transfer, "pull", remote_path, local_path, on_progress, timeout,
-            cancel_event, safe=safe
+            self._either_cancel(cancel_event, cancel), safe=safe
         )
 
     _PCT_RE = re.compile(r"\[\s*(\d+)%\]")
@@ -5031,7 +5248,7 @@ class ADBHandler:
         self._emit(logging.WARNING,
                    f"{name!r} is saved as {stored!r}: Windows cannot store a file of that name")
 
-    def _transfer(self, direction, a, b, on_progress, timeout, cancel_event) -> TransferResult:
+    def _transfer(self, direction, a, b, on_progress, timeout, cancel) -> TransferResult:
         # direction push: a=local, b=remote ; pull: a=remote, b=local
         if direction == "push":
             local, remote = a, b
@@ -5062,11 +5279,14 @@ class ADBHandler:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
-            # adb prints device paths as UTF-8; the locale codec (e.g. cp1252)
-            # in strict mode raised UnicodeDecodeError and killed the reader
+            # adb prints device paths as UTF-8 and its own messages, on a
+            # non-English Windows, in the OEM code page: the bytes of a line
+            # that is not UTF-8 are kept (surrogateescape) and read again as
+            # adbproc.decode does.  The locale codec (e.g. cp1252) in strict
+            # mode raised UnicodeDecodeError and killed the reader.
             text=True,
             encoding="utf-8",
-            errors="replace",
+            errors="surrogateescape",
             creationflags=NO_WINDOW,
             start_new_session=_OWN_SESSION,
         )
@@ -5076,15 +5296,26 @@ class ADBHandler:
         def _read_output():
             try:
                 for line in iter(proc.stdout.readline, ""):
+                    try:
+                        line.encode("utf-8")
+                    except UnicodeEncodeError:  # (not UTF-8: see above)
+                        line = adbproc.decode_line(line.encode("utf-8", "surrogateescape"))
                     lines.put(line)
             except (OSError, ValueError):
                 pass  # pipe closed underneath us during cancel/timeout
             finally:
                 lines.put(None)
 
-        def _give_up(error, what):
+        stop = adbproc.cancel_check(cancel)
+
+        def _give_up(error, what, **ended):
             self._stop_process(proc)
-            return error(f"adb {direction} {what}{self._leftover_note(direction, measure, fresh)}")
+            message = f"adb {direction} {what}{self._leftover_note(direction, measure, fresh)}"
+            result = CommandResult(
+                " ".join(args), TIMEOUT_EXIT_CODE, tail, "\n".join(errors),
+                time.monotonic() - start, device=self._serial or "", **ended,
+            )
+            return error(message, result=result)
 
         reader = None
         last = -1
@@ -5096,13 +5327,14 @@ class ADBHandler:
             reader.start()
             watch.start()
             while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _give_up(ADBTransferError, "cancelled")
+                if stop is not None and stop():
+                    raise _give_up(ADBCancelledError, "cancelled", cancelled=True)
                 if watch.moved_at is not None:
                     moved = max(moved, watch.moved_at)
                 if eff_timeout is not None and time.monotonic() - moved >= eff_timeout:
                     raise _give_up(ADBTimeoutError,
-                                   f"timed out: nothing was copied for {eff_timeout:g} s")
+                                   f"timed out: nothing was copied for {eff_timeout:g} s",
+                                   timed_out=True)
                 try:
                     line = lines.get(timeout=0.2)
                 except queue.Empty:
@@ -5221,13 +5453,15 @@ class ADBHandler:
         grant_perms: bool = False,
         allow_test: bool = False,
         extra_args: Optional[Sequence[str]] = None,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Install a single APK (``adb install``).
 
         It may take five minutes plus the time a slow link needs for the
         file; a longer ``command_timeout`` raises that limit, and None lifts
-        it (see :meth:`_work_timeout`)."""
+        it (see :meth:`_work_timeout`).  *cancel* ends it at once
+        (ADBCancelledError)."""
 
         def _do():
             path = os.path.expanduser(apk)
@@ -5235,7 +5469,8 @@ class ADBHandler:
             args += list(extra_args or [])
             args.append(path)
             self._emit(logging.INFO, f"Installing {apk}…")
-            res = self._run(args, timeout=self._install_timeout(self._INSTALL_TIMEOUT, [path]))
+            res = self._run(args, timeout=self._install_timeout(self._INSTALL_TIMEOUT, [path]),
+                            cancel=cancel)
             return self._pm_answer("Install", res)
 
         return self._guard("install", _do, safe=safe)
@@ -5248,10 +5483,11 @@ class ADBHandler:
         grant_perms: bool = False,
         downgrade: bool = False,
         allow_test: bool = False,
+        cancel=None,
         safe: Optional[bool] = None,
     ):
         """Install split APKs together (``adb install-multiple``). Its time
-        limit works as :meth:`install`'s, from ten minutes."""
+        limit works as :meth:`install`'s, from ten minutes; *cancel* too."""
 
         def _do():
             paths = [os.path.expanduser(a) for a in apks]
@@ -5260,29 +5496,33 @@ class ADBHandler:
             args += paths
             self._emit(logging.INFO, f"Installing {len(apks)} split APK(s)…")
             res = self._run(
-                args, timeout=self._install_timeout(self._INSTALL_MULTIPLE_TIMEOUT, paths)
+                args, timeout=self._install_timeout(self._INSTALL_MULTIPLE_TIMEOUT, paths),
+                cancel=cancel,
             )
             return self._pm_answer("install-multiple", res)
 
         return self._guard("install_multiple", _do, safe=safe)
 
-    def uninstall(self, package: str, *, keep_data: bool = False, safe: Optional[bool] = None):
+    def uninstall(self, package: str, *, keep_data: bool = False, cancel=None,
+                  safe: Optional[bool] = None):
         """Uninstall a package. *keep_data=True* keeps the app's data and cache:
         ``adb uninstall`` refuses its ``-k``, so the device's package manager
         is asked itself (``cmd package uninstall -k``, or ``pm`` on a device
-        without ``cmd``)."""
+        without ``cmd``).  *cancel* ends it at once (ADBCancelledError)."""
 
         def _do():
             if keep_data:
                 res = self._run(
-                    self._shell_args("cmd", "package", "uninstall", "-k", package), timeout=120
+                    self._shell_args("cmd", "package", "uninstall", "-k", package), timeout=120,
+                    cancel=cancel,
                 )
                 if not self._PM_VERDICT_RE.search(self._combined_output(res)):
                     res = self._run(
-                        self._shell_args("pm", "uninstall", "-k", package), timeout=120
+                        self._shell_args("pm", "uninstall", "-k", package), timeout=120,
+                        cancel=cancel,
                     )
             else:
-                res = self._run(["uninstall", package], timeout=120)
+                res = self._run(["uninstall", package], timeout=120, cancel=cancel)
             return self._pm_answer("Uninstall", res)
 
         return self._guard("uninstall", _do, safe=safe)

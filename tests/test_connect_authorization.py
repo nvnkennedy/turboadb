@@ -94,9 +94,11 @@ def test_a_prompt_nobody_accepts_is_reported_as_such(fake_adb, server_up):
 def test_without_auto_wait_the_state_is_reported_at_once(fake_adb, server_up):
     handler = ADBHandler(ADBConfig(host="10.0.0.5", auto_wait=False))
     _device_asking(fake_adb, accepted_after=2)
+    # (6.5.0: get_state reads the device list, which never waits for a device)
+    fake_adb.add("devices", stdout="List of devices attached\n10.0.0.5:5555\tunauthorized\n")
     with pytest.raises(ADBConnectionError, match="'unauthorized', not ready"):
         handler.connect(safe=False)
-    assert _verbs(fake_adb) == ["connect", "get-state"]
+    assert _verbs(fake_adb) == ["connect", "devices"]
 
 
 def test_closing_the_tab_ends_the_wait(fake_adb, server_up, monkeypatch):

@@ -2736,8 +2736,13 @@ def main(argv=None) -> int:
             if ok and args.wait:
                 if args.mode is None:
                     print("Waiting for the device to boot…", file=sys.stderr)
-                    dev.wait_for_boot(args.wait_timeout)
-                    label += " — the device is back"
+                    booted = dev.wait_for_boot(args.wait_timeout)
+                    if not booted["ok"]:
+                        raise ADBTimeoutError(
+                            f"the device did not finish booting within {args.wait_timeout:g} s "
+                            f"(it is {booted['state']})"
+                        )
+                    label += f" — the device is back after {booted['seconds']:.0f} s"
                 else:
                     print(f"--wait only waits for a normal boot, not {args.mode}.", file=sys.stderr)
             rc = _report(ok, label, f"{label} failed")

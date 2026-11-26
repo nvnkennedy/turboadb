@@ -3,6 +3,74 @@
 All notable changes are recorded here. Versions follow
 [semantic versioning](https://semver.org/).
 
+## 6.5.0
+
+### New
+
+- **No adb.exe outlives a crashed host.** Every adb client TurboADB starts (each
+  command, stream, transfer and interactive shell of `ADBHandler`, and the device
+  list, `adb version`, `start-server` and `kill-server`) runs in a Windows job
+  object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+  `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`: started suspended, put into the job,
+  then resumed, it ends with the program that holds TurboADB, also when that
+  program crashes. The adb server a client starts leaves the job and is never
+  ended with it (it is shared with every other tool), and the server started
+  directly for sharing (`adb -a nodaemon server`) is never in it.
+- **Every blocking call can be cancelled.** `adb()`, `shell()`, `push`, `pull`,
+  `install`, `install_multiple`, `uninstall`, `reboot`, `root`, `unroot`,
+  `remount`, `wait_for_device`, `wait_for_boot`, `get_state`, `logcat`, `stream`,
+  `iter_lines`, `bugreport` and `ui_dump` take `cancel=`: a `threading.Event` or
+  a callable returning a bool, looked at every 0.1 s. On cancel the adb client,
+  and only it, ends at once, and the call raises `ADBCancelledError` (a stream
+  returns with `cancelled=True`). A timeout ends the client the same way and is
+  reported the same way everywhere: `ADBTimeoutError`, `timed_out=True` and exit
+  code 124 (`TIMEOUT_EXIT_CODE`) on the result; in safe mode
+  `OperationResult.timed_out` / `.cancelled`.
+- **Device problems as kinds.** `ADBHandler.device_problem(text)` (and
+  `turboadb.device_problem`) gives `"no-device"`, `"not-found"`,
+  `"unauthorized"`, `"offline"`, `"more-than-one"`, `"no-permissions"` or `""`;
+  every `ADBError`, a failed `CommandResult` and a failed `OperationResult` have
+  it as `.device_problem`. `unauthorized` and `more-than-one` mean "can't tell",
+  never "the device is off".
+- **Boot waiting a test can rely on.** `wait_for_boot(timeout=180, *, stable=2,
+  interval=1.0, cancel=None)` returns `{"ok", "seconds", "state",
+  "boot_completed", "first_seen", "timed_out", "cancelled"}`: done once the
+  device is listed as `device` and `sys.boot_completed` is 1, `stable` reads in
+  a row; `first_seen` is when the device was listed again. After `reboot()`, a
+  read from the boot before it does not count (the device is often still up for
+  a moment): it waits for a new kernel boot id.
+- **`ui_dump(display_id=None, *, tries=3, timeout=45, cancel=None)`**: the UI tree
+  as `uiautomator dump` writes it, tried again on "could not get idle state" and
+  "null root node"; with `display_id`, one display's part of the dump of every
+  window.
+
+### Changed
+
+- **adb's output is read as UTF-8, and a line that is not valid UTF-8 in the OEM
+  code page.** On a German Windows adb's messages and Windows' around them are
+  cp850: "Zeitüberschreitung" arrived as "Zeit?berschreitung". Reading never
+  fails, and `stdout` is never None.
+- **`get_state(cancel=None, timeout=5)` never hangs.** It reads the device list
+  (`adb devices`), which never waits for a device: adb's own `get-state` could.
+- `wait_for_boot` returns that dict instead of True, and no longer raises
+  `ADBTimeoutError`: check `result["ok"]`.
+- A command that times out has exit code 124 and `timed_out=True` on its result
+  (it was -1). A stream ended by its timeout has exit code 124 and
+  `timed_out=True` (its exit code was None); `StreamResult.failed` stays False.
+- A cancelled call raises `ADBCancelledError`, which is an `ADBConnectionError`
+  and an `ADBTransferError` as well (a cancelled connect or shell raised the one,
+  a cancelled push or pull the other). A `wait_for_device` that times out raises
+  `ADBDeviceTimeoutError`: an `ADBTimeoutError`, and an `ADBConnectionError` as
+  before.
+
+### Tests
+
+- A fake adb, a Python script behind an `adb.exe` launcher (pip's console-script
+  launcher), that really runs as a separate process: the job (a client is in it,
+  what it starts is not, it ends with a host that is killed while the server
+  lives on), cancel and timeout for every call listed above, the decoding, the
+  device problems, boot waiting, `get_state` and `ui_dump`.
+
 ## 6.4.0
 
 ### New

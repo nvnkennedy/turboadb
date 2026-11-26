@@ -50,9 +50,18 @@ def human_bytes(num) -> str:
     return f"{num:.1f} TB"  # pragma: no cover - the loop always returns
 
 
+# The exit code of a command TurboADB ended: it ran past its time limit, or
+# its call was cancelled (turboadb.adbproc.TIMEOUT_EXIT_CODE).
+TIMEOUT_EXIT_CODE = 124
+
+
 @dataclass
 class CommandResult:
-    """Result of an adb / adb-shell command execution."""
+    """Result of an adb / adb-shell command execution.
+
+    ``timed_out`` / ``cancelled``: TurboADB ended the command, at its time
+    limit or because the call was cancelled; ``exit_code`` is then 124
+    (:data:`TIMEOUT_EXIT_CODE`)."""
 
     command: str
     exit_code: int
@@ -61,10 +70,21 @@ class CommandResult:
     duration: float
     device: str = ""
     started_at: float = field(default_factory=time.time)
+    timed_out: bool = False
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
         return self.exit_code == 0
+
+    @property
+    def device_problem(self) -> str:
+        """The device problem the command's output reports (see
+        :func:`turboadb.exceptions.device_problem`), or ``""``."""
+        from .exceptions import device_problem
+
+        out = self.stdout if isinstance(self.stdout, str) else ""
+        return "" if self.ok else device_problem(self.stderr + chr(10) + out)
 
     @property
     def text(self) -> str:
@@ -89,8 +109,14 @@ class CommandResult:
     def as_dict(self) -> dict:
         # dataclasses.asdict() deep-copies every field, and stdout can be
         # megabytes of screencap or logcat.  No field here is a nested
-        # dataclass, so a shallow mapping is identical and free.
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        # dataclass, so a shallow mapping is identical and free.  timed_out
+        # and cancelled are there only when set: the usual document (the
+        # CLI's --json) keeps the keys it always had.
+        found = {f.name: getattr(self, f.name) for f in fields(self)}
+        for flag in ("timed_out", "cancelled"):
+            if not found[flag]:
+                del found[flag]
+        return found
 
     def __str__(self) -> str:
         status = "ok" if self.ok else f"FAILED (exit {self.exit_code})"
@@ -140,15 +166,20 @@ class StreamResult:
     """Result of a streaming operation (logcat / live shell), returned when it
     ends (stop_event, timeout, stop-on-match, or EOF).
 
-    ``exit_code`` is the command's exit status when it ended by itself (None
-    when it was stopped), and ``stderr`` is adb's error text when the stream
-    kept it apart from the lines (logcat does)."""
+    ``exit_code`` is the command's exit status when it ended by itself, 124
+    (:data:`TIMEOUT_EXIT_CODE`) when its *timeout* or its *cancel* ended it
+    (``timed_out`` / ``cancelled`` say which), and None when it was stopped
+    otherwise (its stop_event, stop-on-match, the consumer).  ``stderr`` is
+    adb's error text when the stream kept it apart from the lines (logcat
+    does)."""
 
     lines: int
     matches: list
     saved_to: Optional[str] = None
     exit_code: Optional[int] = None
     stderr: str = ""
+    timed_out: bool = False
+    cancelled: bool = False
 
     @property
     def matched(self) -> bool:
@@ -157,7 +188,7 @@ class StreamResult:
     @property
     def failed(self) -> bool:
         """The command ended by itself with a non-zero exit status."""
-        return self.exit_code not in (None, 0)
+        return self.exit_code not in (None, 0) and not (self.timed_out or self.cancelled)
 
     def __bool__(self) -> bool:
         return self.matched
@@ -187,6 +218,29 @@ class OperationResult:
     @property
     def ok(self) -> bool:
         return self.success
+
+    @property
+    def timed_out(self) -> bool:
+        """The operation ran past its time limit (its error is an
+        ADBTimeoutError, or its result says so)."""
+        return bool(getattr(self.error, "timed_out", False)
+                    or getattr(self.value, "timed_out", False))
+
+    @property
+    def cancelled(self) -> bool:
+        """The operation was cancelled (its error is an ADBCancelledError, or
+        its result says so)."""
+        return bool(getattr(self.error, "cancelled", False)
+                    or getattr(self.value, "cancelled", False))
+
+    @property
+    def device_problem(self) -> str:
+        """The device problem the failure reports (see
+        :func:`turboadb.exceptions.device_problem`), or ``""``."""
+        problem = getattr(self.error, "device_problem", "")
+        if problem:
+            return problem
+        return getattr(self.value, "device_problem", "") if not self.success else ""
 
     @property
     def stdout(self) -> str:

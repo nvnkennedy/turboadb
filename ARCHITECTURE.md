@@ -34,6 +34,8 @@ turboadb/
 ├── __init__.py        public API surface (__all__) + __version__
 ├── __main__.py        enables `python -m turboadb`
 ├── core.py            ADBHandler — the engine. Every device operation.
+├── adbproc.py         how an adb client is started (a kill-on-close job on Windows), waited for
+│                      (cancel, time limit) and read (UTF-8, else the OEM code page)
 ├── config.py          ADBConfig, ScrcpyOptions (dataclasses)
 ├── results.py         CommandResult/TransferResult/StreamResult/OperationResult, strip_ansi
 ├── exceptions.py      ADBError hierarchy
@@ -325,6 +327,21 @@ These patterns recur and are worth preserving:
   answer); if the shell reads it as a command after all, that copy goes when
   the shell echoes it after its prompt. A line typed before a shell's first
   prompt is left to that echo.
+- **Every adb client goes through `adbproc`.** `ADBHandler._exec` (one-shot
+  commands), `_spawn` (streams, transfers, shells), `pair`, `run_attached`,
+  `list_devices`, `adb version`, the `start-server` launcher and `kill-server`
+  start their client with `adbproc.popen`: on Windows it is started
+  suspended, put into the process's kill-on-close job, and resumed
+  (`NtResumeProcess` on the handle Popen holds; a thread snapshot costs a
+  tenth of a second), so it ends with the host, a crashed one too. The job
+  lets what a client starts leave it silently: the adb server is shared and
+  never ended with a client. The server started directly (`adb -a nodaemon
+  server`, for sharing) is never a client and never in the job. `adbproc.run`
+  is the one wait: *cancel* (an Event or a callable) and the time limit are
+  looked at every `adbproc.POLL_S`, and either ends only the client, with exit
+  code 124 (`ADBTimeoutError` / `ADBCancelledError`, `timed_out` /
+  `cancelled` on the result). Tests fake adb at this seam (`conftest.FakeAdb`
+  patches `adbproc.run`), or run a real fake adb process (`tests/fakeadb.py`).
 - **Nothing slow on the window's thread.** What could take it for long goes
   elsewhere or is bounded. A logcat repaint spends at most
   `LogcatPanel._PAINT_BUDGET_S`, at the line cost it measures as it paints,

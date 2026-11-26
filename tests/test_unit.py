@@ -121,7 +121,8 @@ def test_package_actions_surface_adb_failures(fake_adb):
 
 
 def test_get_state(fake_adb):
-    fake_adb.add("get-state", stdout="device\n")
+    # 6.5.0: read from the device list, which never waits for the device
+    fake_adb.add("devices", stdout="List of devices attached\nx\tdevice product:p model:m\n")
     h = ADBHandler(ADBConfig(serial="x"))
     assert h.get_state() == "device"
     assert h.is_connected is True
